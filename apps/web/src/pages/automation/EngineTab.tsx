@@ -34,11 +34,22 @@ export default function EngineTab({ onCycle }: { onCycle: () => void }) {
     try {
       const res = await api.post<CycleResult>("/api/v1/automation/run", kind === "drain" ? { scan: false, force: false } : { force: true });
       setLast(res);
-      toast.success(
-        kind === "drain"
-          ? `Drained ${num(res.drain?.executed)} queued run(s)`
-          : `Scanned ${num(res.scan?.rulesScanned)} schedule rule(s), executed ${num((res.scan?.executed ?? 0) + (res.drain?.executed ?? 0))} run(s)`,
-      );
+      if (res.drain?.busy) {
+        // Zero counters here mean "nothing was attempted", not "nothing was
+        // queued" — the scheduler's drain held the lock.
+        toast.warning(res.drain.reason ?? "A drain was already running; nothing was executed by this cycle.");
+      } else if (kind === "drain") {
+        toast.success(`Drained ${num(res.drain?.executed)} queued run(s)`);
+      } else {
+        toast.success(
+          `Scanned ${num(res.scan?.rulesScanned)} schedule rule(s), executed ${num((res.scan?.executed ?? 0) + (res.drain?.executed ?? 0))} run(s)`,
+        );
+      }
+      if (res.scan && res.scan.truncated.length > 0) {
+        toast.warning(
+          `${res.scan.truncated.length} rule(s) hit the ${num(res.scan.truncated[0]?.limit)}-record scan cap: some live records were not evaluated.`,
+        );
+      }
       onCycle();
       void load();
     } catch (err) {
@@ -57,6 +68,11 @@ export default function EngineTab({ onCycle }: { onCycle: () => void }) {
     { label: "Max chain depth", value: String(status.options.maxChainDepth), hint: "AUTOMATION_MAX_CHAIN_DEPTH — a rule may never trigger itself; other rules chain this deep" },
     { label: "Max deferrals", value: String(status.options.maxAttempts), hint: "After this many rate-limit deferrals a run is marked throttled for an operator" },
     { label: "Drain batch", value: String(status.options.drainBatch) },
+    {
+      label: "Schedule scan cap",
+      value: String(status.scan.limit),
+      hint: "Records one scan looks at, earliest deadline first. A rule whose live set is larger is flagged above.",
+    },
     { label: "Webhook timeout", value: msDuration(status.options.requestTimeoutMs) },
     {
       label: "Webhook signing key",
@@ -76,6 +92,25 @@ export default function EngineTab({ onCycle }: { onCycle: () => void }) {
           Queued runs and schedule scans only execute when a cycle is run manually below (or from the platform scheduler page).
         </Alert>
       ) : null}
+      {status.scan.cappedRules.length > 0 ? (
+        <Alert tone="warning" size="sm" title={`${status.scan.cappedRules.length} schedule rule(s) could not see every record`}>
+          <div className="space-y-1">
+            <p>
+              A scan looks at the {num(status.scan.limit)} records with the earliest deadline of its type and no further, so these rules
+              answered from a partial list — a nil result from them is not evidence that nothing matched.
+            </p>
+            <ul className="list-disc pl-4">
+              {status.scan.cappedRules.map((r) => (
+                <li key={r.id}>
+                  <span className="font-medium">{r.name}</span> · {r.objectType} · {num(r.candidates)} record(s) scanned
+                  {r.orderedBy ? ` ordered by ${r.orderedBy}` : ""} · last scan {formatDateTime(r.lastScanAt)}
+                </li>
+              ))}
+            </ul>
+            <p>Narrow the rule (per project, or a tighter trigger type) so its live set fits inside the cap.</p>
+          </div>
+        </Alert>
+      ) : null}
       {h.lastError ? (
         <Alert tone="danger" size="sm" title={`Last engine error${h.lastErrorAt ? ` · ${formatDateTime(h.lastErrorAt)}` : ""}`}>
           {h.lastError}
@@ -86,7 +121,12 @@ export default function EngineTab({ onCycle }: { onCycle: () => void }) {
         <Stat label="Ledger events seen" value={num(h.eventsSeen)} hint={`${num(h.eventsMatched)} matched at least one rule`} />
         <Stat label="Runs enqueued" value={num(h.runsEnqueued)} hint={`${num(h.runsExecuted)} executed since boot`} />
         <Stat label="Runs failed" value={num(h.runsFailed)} tone={h.runsFailed > 0 ? "danger" : "neutral"} hint={`${num(h.runsThrottled)} throttled`} />
-        <Stat label="Hook failures" value={num(h.hookFailures)} tone={h.hookFailures > 0 ? "danger" : "neutral"} hint="A failing hook never fails the business write" />
+        <Stat
+          label="Hook failures"
+          value={num(h.hookFailures)}
+          tone={h.hookFailures > 0 ? "danger" : "neutral"}
+          hint={`A failing hook never fails the business write · ${num(h.scansTruncated)} capped scan(s)`}
+        />
       </div>
 
       <Card>
@@ -153,6 +193,11 @@ export default function EngineTab({ onCycle }: { onCycle: () => void }) {
                 <div className="mt-1 text-content-muted">
                   {num(last.scan.rulesScanned)} rule(s) scanned · {num(last.scan.candidates)} candidate record(s) · {num(last.scan.matched)} matched ·{" "}
                   {num(last.scan.deduped)} inside cooldown · {num(last.scan.executed)} executed
+                  {last.scan.truncated.length > 0 ? (
+                    <div className="text-warning-fg">
+                      {last.scan.truncated.length} rule(s) hit the row cap: {last.scan.truncated.map((t) => t.ruleName).join(", ")}
+                    </div>
+                  ) : null}
                 </div>
               ) : (
                 <div className="mt-1 text-content-subtle">Skipped</div>
@@ -160,7 +205,11 @@ export default function EngineTab({ onCycle }: { onCycle: () => void }) {
             </div>
             <div className="text-xs">
               <div className="text-label uppercase text-content-subtle">Drain</div>
-              {last.drain ? (
+              {last.drain?.busy ? (
+                <div className="mt-1 text-warning-fg">
+                  Not attempted — {last.drain.reason ?? "a drain was already running"}. The scheduler's drain will pick these up.
+                </div>
+              ) : last.drain ? (
                 <div className="mt-1 text-content-muted">
                   {num(last.drain.executed)} executed · {num(last.drain.succeeded)} succeeded · {num(last.drain.failed)} failed · {num(last.drain.skipped)} skipped ·{" "}
                   {num(last.drain.deferred)} deferred · {num(last.drain.throttled)} throttled

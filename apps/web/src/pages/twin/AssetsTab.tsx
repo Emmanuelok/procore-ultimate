@@ -41,7 +41,7 @@ import {
   type AssetDetail,
   type AssetRow,
   type AssetTreeNode,
-  type CompanyUser,
+  type AssignablePerson,
   type ListResponse,
 } from "./twinShared";
 
@@ -63,7 +63,7 @@ export default function AssetsTab({
   const [unlinked, setUnlinked] = useState(false);
   const [tree, setTree] = useState<AssetTreeNode[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [users, setUsers] = useState<CompanyUser[]>([]);
+  const [users, setUsers] = useState<AssignablePerson[]>([]);
   const [busy, setBusy] = useState(false);
 
   const [createOpen, setCreateOpen] = useState(false);
@@ -124,8 +124,12 @@ export default function AssetsTab({
   }, [view, projectId]);
 
   useEffect(() => {
+    // the owner picker offers only people who can open this project, which is
+    // exactly what the API accepts on write
     api
-      .get<ListResponse<CompanyUser>>("/api/v1/company/users?pageSize=200")
+      .get<{ items: AssignablePerson[] }>(
+        `/api/v1/projects/${projectId}/twin/assignable-people`,
+      )
       .then((res) => setUsers(res.items))
       .catch(() => setUsers([]));
   }, []);

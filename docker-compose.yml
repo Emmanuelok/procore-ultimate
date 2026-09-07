@@ -1,4 +1,18 @@
-version: "3.9"
+# ConstructOS — local stack.
+#
+# Two ways to use this file:
+#
+#   docker compose up -d postgres
+#       Just the database, for `pnpm dev` on the host. This is the everyday
+#       loop and the only service started by default.
+#
+#   docker compose --profile full up --build
+#       The production image as it actually ships — API plus the SPA served
+#       same-origin — against that database. Use it to reproduce anything that
+#       only happens under the real container: the CSP applied to the built
+#       SPA, the migration runner, the readiness endpoint, graceful shutdown.
+#
+# `version:` is deliberately absent — Compose v2 ignores it and warns.
 
 services:
   postgres:
@@ -17,5 +31,54 @@ services:
       timeout: 3s
       retries: 10
 
+  api:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: "4000"
+      DATABASE_URL: postgres://constructos:constructos@postgres:5432/constructos
+      # Local only. In production this must be `openssl rand -hex 32` held in
+      # the platform's secret store — the boot guard in config.ts refuses a
+      # placeholder, and this value is long and varied enough to clear it while
+      # being obviously not a secret.
+      AUTH_SECRET: local-compose-only-not-a-production-secret-9f3a7c
+      APP_BASE_URL: http://localhost:4000
+      # The image ships the local-disk driver; production should use S3.
+      # ALLOW_LOCAL_STORAGE lets the production boot guard through for this
+      # deliberate single-replica local run.
+      STORAGE_DRIVER: local
+      ALLOW_LOCAL_STORAGE: "true"
+      # No proxy in front of this one, so client addresses are real and
+      # x-forwarded-* must NOT be believed.
+      TRUST_PROXY: "false"
+      # Off by default locally: a ticker firing sweeps every minute is noise
+      # while you are reading logs. Set it to true to exercise the jobs.
+      SCHEDULER_ENABLED: "false"
+    ports:
+      - "4000:4000"
+    volumes:
+      - apidata:/data
+    healthcheck:
+      # Readiness, not liveness: "the process is up" is not the question a
+      # dependent service wants answered.
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4000/api/v1/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
 volumes:
   pgdata:
+  apidata:

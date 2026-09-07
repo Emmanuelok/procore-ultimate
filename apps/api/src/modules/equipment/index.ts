@@ -16,8 +16,11 @@ import {
 import { z } from "zod";
 import {
   apiTokens,
+  assertions,
   assuranceGrants,
+  budgetLineItems,
   carbonFactors,
+  costCodes,
   equipment,
   equipmentAssignments,
   equipmentCertificates,
@@ -26,6 +29,7 @@ import {
   equipmentReadings,
   equipmentTelematicsReadings,
   equipmentUtilisation,
+  evidence,
   ingestedRecords,
   ingestionRuns,
   ingestionSources,
@@ -37,6 +41,7 @@ import {
   nonConformanceReports,
   obligations,
   projects,
+  reconciliations,
   signals,
   vendors,
 } from "@constructos/db";
@@ -61,23 +66,34 @@ import {
   METER_TYPES,
   SHIFTS,
   STOCK_MOVEMENT_TYPES,
+  ASSIGNMENT_CANCEL_REASONS,
   TELEMATICS_PROVIDERS,
   type AssuranceRole,
   type HireRateUnit,
   type MaintenanceIntervalKind,
   type MeterType,
+  type ReconciliationResult,
   type SignalSeverity,
   type StockMovementType,
 } from "@constructos/shared";
 import { hashPayload, sha256Hex } from "@constructos/ledger";
+import type { Db } from "../../lib/db.js";
+import { forEachCompany } from "../../lib/scheduler.js";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
-import { badRequest, conflict, forbidden, notFound, unauthorized } from "../../lib/errors.js";
+import {
+  badRequest,
+  conflict,
+  forbidden,
+  notFound,
+  unauthorized,
+} from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { isExpired } from "../../lib/time.js";
 import { addDaysISO, isoDateSchema, todayISO } from "../field/dates.js";
 import { computeTco2e, normaliseUnit, unitsMatch } from "../esg/carbon.js";
+import { compareOwnership, type OwnershipDay } from "./ownership.js";
 import {
   assessIdlePlant,
   computeDayCost,
@@ -109,8 +125,14 @@ import {
   signedQuantity,
 } from "./stock.js";
 import {
+  assessFaults,
+  CARRY_IN_LOOKBACK_DAYS,
+  checkGeofence,
   coerceTelematicsRow,
   engineHoursFromCounter,
+  engineHoursSeries,
+  localDateOf,
+  reconcileFuel,
   reconcileTelematics,
   TELEMATICS_DATASET,
   TELEMATICS_FIELDS,
@@ -119,7 +141,23 @@ import {
   telematicsKey,
   type EquipmentReconcileInput,
   type TelematicsDayInput,
+  type TelematicsFault,
 } from "./telematics.js";
+import {
+  assessSupplyItem,
+  detectDelayedDeliveries,
+  MIN_DELIVERIES_TO_SCORE,
+  PROCUREMENT_ALLOWANCE_DAYS,
+  scoreSuppliers,
+  valueInventory,
+} from "./materials.js";
+import {
+  companyScopeOf,
+  companyToolGate,
+  projectsWithTool,
+  scopeProjectFilter,
+  type CompanyScope,
+} from "./gates.js";
 import {
   certificateVerdict,
   EQUIPMENT_DETECTORS,
@@ -142,6 +180,21 @@ const isoTimestamp = z
 
 const nonEmpty = (max: number) => z.string().min(1).max(max);
 const idRef = z.string().min(1).max(64);
+
+/**
+ * A BOOLEAN QUERY FLAG THAT MEANS WHAT IT SAYS.
+ *
+ * These filters were `z.coerce.boolean()`, which runs JS truthiness over
+ * the raw query string: `Boolean("false") === true`, so `?catalogueOnly=false`
+ * returned ONLY catalogue items and `?unverifiedOnly=false` returned only the
+ * unverified rows — the exact opposite of the question asked, silently, with
+ * a 200. The web pages only ever send the literal `true`, so nothing on the
+ * screen was wrong; an integrator writing `false` was answered with a lie.
+ * Here `false` means false and an unrecognised value is a 400.
+ */
+const boolQuery = z
+  .union([z.boolean(), z.enum(["true", "false", "1", "0", "yes", "no"])])
+  .transform((v) => (typeof v === "boolean" ? v : v === "true" || v === "1" || v === "yes"));
 const money = z.number().finite();
 const hours = z.number().finite().min(0).max(1000);
 
@@ -151,6 +204,16 @@ function dateOf(timestamp: string): string {
 }
 
 const MAX_TELEMATICS_RECORDS = 5000;
+
+/**
+ * How far ahead the sweep looks for certificates. A certificate expiring in
+ * two years cannot change state today, so scanning it on every read buys
+ * nothing; anything inside this horizon can move to expiring or expired.
+ */
+const CERTIFICATE_HORIZON_DAYS = 120;
+
+/** A read may trigger the sweep at most this often per company. */
+const SWEEP_MIN_INTERVAL_MS = 5 * 60_000;
 
 /**
  * EQUIPMENT, PLANT & MATERIALS (M23) — tool key `equipment`.
@@ -195,36 +258,176 @@ const MAX_TELEMATICS_RECORDS = 5000;
  * approver or verifier may never be the creator (only an integrity reviewer
  * may knowingly self-verify, and the override is ledgered); every
  * consequential mutation appends to the ledger.
+ *
+ * ---------------------------------------------------------------------------
+ * PLATFORM UPGRADE WAVE
+ *
+ *  • THE COMPANY ROUTES ARE GATED BY THE TOOL, not by company membership.
+ *    `companyToolGate` (gates.ts) asks for `equipment` at the stated level on
+ *    at least one project; before it, a company guest could read the whole
+ *    fleet and the raw telematics feed, and any member could register plant,
+ *    verify certificates and remap devices.
+ *  • THE SWEEP IS A SCHEDULED JOB (`equipment.sweep`), bounded to certificates
+ *    inside the expiry horizon and live schedules, debounced on the read path
+ *    and run as the SYSTEM actor — it used to scan the whole fleet with
+ *    per-row writes and ledger appends on every list and detail GET, under a
+ *    read-only permission.
+ *  • CERTIFICATE COVER IS PER TYPE. The latest validTo per (machine, type)
+ *    decides whether a machine is out of certificate, and adding a renewal
+ *    supersedes the earlier rows automatically. A renewal filed without
+ *    `supersedesId` used to leave in-date plant flagged and raise a critical
+ *    "stop the machine" signal against it.
+ *  • ASSIGNMENTS CAN BE CANCELLED AND TRANSFERRED, and confirming an off-hire
+ *    closes the live assignment; a hire that was approved and never arrived
+ *    used to block the machine from every other project for good.
+ *  • MATERIALS: order-by dates from lead time, shortage forecasts, delayed
+ *    deliveries, supplier scorecards and inventory valuation
+ *    (materials.ts), with `equipment.materials-supply` raising the signals.
+ *  • Delivery receipt validates every line before writing any of them and
+ *    books them in ONE transaction; stock movements take a row lock; company
+ *    catalogue items hold no stock at all.
+ *  • THE PLANT-HOURS CHECK IS AN ASSURANCE FACT, not only a signal.
+ *    `POST /projects/:id/equipment-telematics/reconciliation/run` records the
+ *    Assertion (hours claimed on the plant sheet, attributed to whoever filled
+ *    it in), the Evidence (the machine's own counter, independence 0.9 — a
+ *    counter can be reset and the device mapping is a human decision) and the
+ *    Reconciliation between them, marked `selfCertified` and downgraded when
+ *    the pack is assembled by one of the claimants. Re-running a window
+ *    replaces the triple instead of stacking a second copy of one finding.
  */
 export const equipmentModule: FastifyPluginAsync = async (app) => {
-  const readGate = [app.authenticate, app.requireCompany, app.requireTool("equipment", "read")];
+  const readGate = [
+    app.authenticate,
+    app.requireCompany,
+    app.requireTool("equipment", "read"),
+  ];
   const standardGate = [
     app.authenticate,
     app.requireCompany,
     app.requireTool("equipment", "standard"),
   ];
-  const companyRead = [app.authenticate, app.requireCompany];
+  /** Posting plant cost onto the cost report moves somebody's budget. */
+  const projectAdminGate = [
+    app.authenticate,
+    app.requireCompany,
+    app.requireTool("equipment", "admin"),
+  ];
+  /**
+   * The fleet register sits ABOVE the projects, so `requireTool` (which
+   * resolves permission through `:projectId`) cannot gate it. `companyToolGate`
+   * asks the same question against every project the caller is a member of:
+   * hold `equipment` at this level on at least one job, or be an owner/admin.
+   * Before this the company routes ran on membership alone, and a company
+   * guest could read the whole fleet, every certificate and the raw telematics
+   * feed while any member could register, off-hire and verify plant.
+   */
+  /**
+   * A company route that names ONE machine must also respect what the caller
+   * may see: the register is narrowed by project, and a narrowing you can
+   * step around by guessing an id is not a narrowing. No-ops when the route
+   * has no `:equipmentId`, and for owners, admins and company-wide assurance
+   * grants (whose scope is already "all"). It answers 404, not 403 — a
+   * caller who may not see a machine may not learn it exists either.
+   */
+  const machineScopeGate = async (req: FastifyRequest): Promise<void> => {
+    const params = req.params as { equipmentId?: string };
+    if (!params.equipmentId) return;
+    const scope = companyScopeOf(req);
+    if (scope.all) return;
+    const [row] = await app.db
+      .select({ projectId: equipment.projectId })
+      .from(equipment)
+      .where(
+        and(
+          eq(equipment.id, params.equipmentId),
+          eq(equipment.companyId, req.companyId!),
+        ),
+      )
+      .limit(1);
+    if (row && row.projectId && !scope.projectIds.includes(row.projectId)) {
+      throw notFound(
+        `Equipment ${params.equipmentId} was not found in this company's register.`,
+      );
+    }
+  };
+
+  /**
+   * The same narrowing for a route that names a CHILD of a machine rather
+   * than the machine — a certificate to verify, a maintenance record to
+   * countersign. `machineScopeGate` cannot see those ids, and a scope you can
+   * step around by naming the certificate instead of the excavator it belongs
+   * to is not a scope. 404 for the same reason: existence is information.
+   */
+  async function assertMachineVisible(
+    req: FastifyRequest,
+    equipmentId: string,
+  ): Promise<void> {
+    const scope = companyScopeOf(req);
+    if (scope.all) return;
+    const [row] = await app.db
+      .select({ projectId: equipment.projectId })
+      .from(equipment)
+      .where(
+        and(eq(equipment.id, equipmentId), eq(equipment.companyId, req.companyId!)),
+      )
+      .limit(1);
+    if (row && row.projectId && !scope.projectIds.includes(row.projectId)) {
+      throw notFound(
+        `Equipment ${equipmentId} was not found in this company's register.`,
+      );
+    }
+  }
+
+  const companyRead = [
+    app.authenticate,
+    app.requireCompany,
+    companyToolGate(app, "equipment", "read"),
+    machineScopeGate,
+  ];
   const companyWrite = [
     app.authenticate,
     app.requireCompany,
-    app.requireCompanyRole(["owner", "admin", "member"]),
+    companyToolGate(app, "equipment", "standard"),
+    machineScopeGate,
+  ];
+  /** Verification, off-hire and device remapping — the irreversible three. */
+  const companyAdmin = [
+    app.authenticate,
+    app.requireCompany,
+    companyToolGate(app, "equipment", "admin"),
+    machineScopeGate,
   ];
 
   /* ---------------------------------------------------------------- */
   /* Fetchers and guards                                               */
   /* ---------------------------------------------------------------- */
 
+  /** Run inside the caller's transaction, or open one. */
+  async function withTx<T>(
+    tx: Db | undefined,
+    fn: (tx: Db) => Promise<T>,
+  ): Promise<T> {
+    if (tx) return fn(tx);
+    return app.db.transaction(async (inner) => fn(inner as unknown as Db));
+  }
+
   async function fetchEquipment(equipmentId: string, companyId: string) {
     const rows = await app.db
       .select()
       .from(equipment)
-      .where(and(eq(equipment.id, equipmentId), eq(equipment.companyId, companyId)))
+      .where(
+        and(eq(equipment.id, equipmentId), eq(equipment.companyId, companyId)),
+      )
       .limit(1);
     if (!rows[0]) throw notFound("Equipment not found");
     return rows[0];
   }
 
-  async function fetchAssignment(assignmentId: string, companyId: string, projectId: string) {
+  async function fetchAssignment(
+    assignmentId: string,
+    companyId: string,
+    projectId: string,
+  ) {
     const rows = await app.db
       .select()
       .from(equipmentAssignments)
@@ -240,7 +443,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     return rows[0];
   }
 
-  async function fetchUtilisation(utilisationId: string, companyId: string, projectId: string) {
+  async function fetchUtilisation(
+    utilisationId: string,
+    companyId: string,
+    projectId: string,
+  ) {
     const rows = await app.db
       .select()
       .from(equipmentUtilisation)
@@ -286,7 +493,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     return rows[0];
   }
 
-  async function fetchMaterialItem(itemId: string, companyId: string, projectId: string | null) {
+  async function fetchMaterialItem(
+    itemId: string,
+    companyId: string,
+    projectId: string | null,
+  ) {
     const rows = await app.db
       .select()
       .from(materialItems)
@@ -295,16 +506,26 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           ? and(
               eq(materialItems.id, itemId),
               eq(materialItems.companyId, companyId),
-              or(eq(materialItems.projectId, projectId), isNull(materialItems.projectId))!,
+              or(
+                eq(materialItems.projectId, projectId),
+                isNull(materialItems.projectId),
+              )!,
             )
-          : and(eq(materialItems.id, itemId), eq(materialItems.companyId, companyId)),
+          : and(
+              eq(materialItems.id, itemId),
+              eq(materialItems.companyId, companyId),
+            ),
       )
       .limit(1);
     if (!rows[0]) throw notFound("Material item not found");
     return rows[0];
   }
 
-  async function fetchDelivery(deliveryId: string, companyId: string, projectId: string) {
+  async function fetchDelivery(
+    deliveryId: string,
+    companyId: string,
+    projectId: string,
+  ) {
     const rows = await app.db
       .select()
       .from(materialDeliveries)
@@ -320,22 +541,146 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     return rows[0];
   }
 
-  async function assertVendor(vendorId: string, companyId: string): Promise<void> {
+  async function assertVendor(
+    vendorId: string,
+    companyId: string,
+  ): Promise<void> {
     const rows = await app.db
       .select({ id: vendors.id })
       .from(vendors)
       .where(and(eq(vendors.id, vendorId), eq(vendors.companyId, companyId)))
       .limit(1);
-    if (!rows[0]) throw badRequest("supplierVendorId is not a vendor in this company");
+    if (!rows[0])
+      throw badRequest("supplierVendorId is not a vendor in this company");
   }
 
-  async function assertProject(projectId: string, companyId: string): Promise<void> {
+  async function assertProject(
+    projectId: string,
+    companyId: string,
+  ): Promise<void> {
     const rows = await app.db
       .select({ id: projects.id })
       .from(projects)
       .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
       .limit(1);
-    if (!rows[0]) throw badRequest("projectId is not a project in this company");
+    if (!rows[0])
+      throw badRequest("projectId is not a project in this company");
+  }
+
+  /**
+   * THE TOOL, ON A PROJECT THE ROUTE DID NOT NAME.
+   *
+   * `requireTool` gates on `:projectId`, which is the project the caller is
+   * standing on. A transfer WRITES to a second project — it books an
+   * assignment there and moves the machine onto it — and the gate on the
+   * source job says nothing about whether the caller may touch the
+   * destination. Without this, `equipment` standard on one job was enough to
+   * push plant, its hire cost and its cost coding onto any other job in the
+   * company. Owners and admins bypass, as they do in `requireTool` itself.
+   */
+  async function assertToolOnProject(
+    req: FastifyRequest,
+    projectId: string,
+    level: "read" | "standard" | "admin",
+  ): Promise<void> {
+    if (req.companyRole === "owner" || req.companyRole === "admin") return;
+    const held = await projectsWithTool(app, req, "equipment", level);
+    if (!held.includes(projectId)) {
+      throw forbidden(
+        `Requires ${level} access to equipment on project ${projectId}. Moving plant onto a job ` +
+          "puts its hire cost on that job's budget, so it is gated by that job's permissions and " +
+          "not only by the one you are standing on.",
+      );
+    }
+  }
+
+  /**
+   * COST CODING BELONGS TO A PROJECT.
+   *
+   * A cost code with a null projectId is the company standard list and is
+   * valid everywhere; one carrying a projectId, and every budget line item,
+   * is that project's own vocabulary. Coding inherited from somewhere else —
+   * the source assignment on a transfer, or the machine's default coding when
+   * the machine was last on another job — used to be copied onto the new row
+   * unchanged, so plant days on job B were booked against a budget line
+   * belonging to job A. Nothing corrupted job B's budget (the poster reads
+   * lines `eq(projectId)` and reports the miss), but the days sat uncoded
+   * until somebody noticed, which is the "plant coded to nothing never
+   * reaches the cost report" failure the poster itself warns about.
+   *
+   * Coding the CALLER supplied for the wrong project is a mistake and is
+   * refused. Coding INHERITED from elsewhere is dropped with a note, because
+   * refusing the whole transfer over a stale default would strand the machine.
+   */
+  async function resolveCoding(
+    companyId: string,
+    projectId: string,
+    input: {
+      costCodeId: string | null | undefined;
+      budgetLineItemId: string | null | undefined;
+      costCodeExplicit: boolean;
+      budgetLineExplicit: boolean;
+    },
+  ): Promise<{
+    costCodeId: string | null;
+    budgetLineItemId: string | null;
+    notes: string[];
+  }> {
+    const notes: string[] = [];
+    let costCodeId = input.costCodeId ?? null;
+    let budgetLineItemId = input.budgetLineItemId ?? null;
+
+    if (costCodeId) {
+      const [row] = await app.db
+        .select({ id: costCodes.id, projectId: costCodes.projectId, code: costCodes.code })
+        .from(costCodes)
+        .where(and(eq(costCodes.id, costCodeId), eq(costCodes.companyId, companyId)))
+        .limit(1);
+      const belongs = row && (row.projectId === null || row.projectId === projectId);
+      if (!belongs) {
+        if (input.costCodeExplicit) {
+          throw badRequest(
+            `cost code ${costCodeId} is not on project ${projectId} (and is not on the company ` +
+              "standard list). A cost code is a project's own vocabulary; coding work to another " +
+              "job's code puts the cost where nobody is looking for it.",
+          );
+        }
+        notes.push(
+          `The cost code carried over (${row?.code ?? costCodeId}) belongs to another project and ` +
+            "was not applied here. Code these rows to this project's own cost code.",
+        );
+        costCodeId = null;
+      }
+    }
+
+    if (budgetLineItemId) {
+      const [row] = await app.db
+        .select({ id: budgetLineItems.id, projectId: budgetLineItems.projectId })
+        .from(budgetLineItems)
+        .where(
+          and(
+            eq(budgetLineItems.id, budgetLineItemId),
+            eq(budgetLineItems.companyId, companyId),
+          ),
+        )
+        .limit(1);
+      if (!row || row.projectId !== projectId) {
+        if (input.budgetLineExplicit) {
+          throw badRequest(
+            `budget line ${budgetLineItemId} is not on project ${projectId}. Plant posted to ` +
+              "another job's budget line is a cost on a job that never incurred it.",
+          );
+        }
+        notes.push(
+          "The budget line carried over belongs to another project and was not applied here. " +
+            "Until these rows are coded to a line on this project they will not reach its cost " +
+            "report.",
+        );
+        budgetLineItemId = null;
+      }
+    }
+
+    return { costCodeId, budgetLineItemId, notes };
   }
 
   async function holdsAssuranceRole(
@@ -375,7 +720,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     projectId?: string | null,
   ): Promise<boolean> {
     if (!creatorId || creatorId !== req.user!.id) return false;
-    const override = await holdsAssuranceRole(req, ["integrity_reviewer"], projectId ?? null);
+    const override = await holdsAssuranceRole(
+      req,
+      ["integrity_reviewer"],
+      projectId ?? null,
+    );
     if (!override) {
       throw forbidden(
         `${subject} is not independent of its author — the actor who created this record cannot ` +
@@ -392,11 +741,41 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
 
   /** Keys already raised for a detector in this company — the idempotence
    *  guard the whole lazy-sweep pattern rests on. */
-  async function alreadySignalled(companyId: string, detector: string): Promise<Set<string>> {
-    const rows = await app.db
+  /*
+   * `db` defaults to `app.db`, and a caller INSIDE a transaction MUST pass
+   * its `tx`. PGlite (the test and local database) is one connection behind
+   * an exclusive mutex: a query issued on the outer handle while a
+   * transaction is open on it waits for a transaction that is itself waiting
+   * for the query, and the process hangs with no error. The same call on a
+   * pooled Postgres would take a second client and block on the row locks
+   * the transaction holds. Either way it is a deadlock, not a slow query.
+   */
+  async function alreadySignalled(
+    companyId: string,
+    detector: string,
+    candidateKeys?: string[],
+    db: Db = app.db,
+  ): Promise<Set<string>> {
+    // Bounded by the keys we are about to consider: an unbounded scan of
+    // every signal a detector ever raised runs on every list read.
+    const clauses = [
+      eq(signals.companyId, companyId),
+      eq(signals.detector, detector),
+    ];
+    if (candidateKeys && candidateKeys.length > 0) {
+      clauses.push(
+        sql`${signals.evidenceRefs}->>'key' in (${sql.join(
+          candidateKeys.map((k) => sql`${k}`),
+          sql`, `,
+        )})`,
+      );
+    } else if (candidateKeys) {
+      return new Set<string>();
+    }
+    const rows = await db
       .select({ refs: signals.evidenceRefs })
       .from(signals)
-      .where(and(eq(signals.companyId, companyId), eq(signals.detector, detector)));
+      .where(and(...clauses));
     const keys = new Set<string>();
     for (const row of rows) {
       const refs = row.refs as { key?: unknown } | null;
@@ -415,17 +794,27 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     explanation: string;
     refs: Record<string, unknown>;
     seen: Set<string>;
+    /** the caller's transaction, when there is one — see alreadySignalled */
+    db?: Db;
   }): Promise<string | null> {
     if (input.seen.has(input.key)) return null;
     input.seen.add(input.key);
     const id = newId("sig");
-    await app.db.insert(signals).values({
+    await (input.db ?? app.db).insert(signals).values({
       id,
       companyId: input.companyId,
       projectId: input.projectId,
       detector: input.detector,
       severity: input.severity,
       confidence: 1,
+      /*
+       * The dedupe key also goes in the INDEXED column, namespaced by
+       * detector so it cannot collide with another module's fingerprints.
+       * `alreadySignalled` still reads `evidenceRefs->>'key'` because rows
+       * written before this carry no fingerprint, and switching the read
+       * would make the sweep re-raise every one of them once.
+       */
+      fingerprint: `${input.detector}:${input.key}`,
       title: input.title,
       explanation: input.explanation,
       evidenceRefs: { key: input.key, ...input.refs },
@@ -434,13 +823,114 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
   }
 
   /* ---------------------------------------------------------------- */
-  /* THE LAZY SWEEP — certificates and maintenance                     */
+  /* THE SWEEP — certificates and maintenance                          */
   /* ---------------------------------------------------------------- */
+
+  /**
+   * `equipment.nextCertificateExpiry` for one machine, computed the way the
+   * question is actually asked: the EARLIEST of the LATEST certificate per
+   * type. Two thorough examinations a year apart do not make a machine out of
+   * certificate; a missing LOLER examination does.
+   */
+  async function refreshCertificateColumn(
+    companyId: string,
+    equipmentId: string,
+  ): Promise<string | null> {
+    const rows = await app.db
+      .select({
+        certificateType: equipmentCertificates.certificateType,
+        validTo: equipmentCertificates.validTo,
+      })
+      .from(equipmentCertificates)
+      .where(
+        and(
+          eq(equipmentCertificates.companyId, companyId),
+          eq(equipmentCertificates.equipmentId, equipmentId),
+          inArray(equipmentCertificates.status, [
+            "valid",
+            "expiring",
+            "expired",
+          ]),
+        ),
+      );
+    const latestByType = new Map<string, string>();
+    for (const r of rows) {
+      const held = latestByType.get(r.certificateType);
+      if (!held || r.validTo > held)
+        latestByType.set(r.certificateType, r.validTo);
+    }
+    const next = [...latestByType.values()].sort()[0] ?? null;
+    await app.db
+      .update(equipment)
+      .set({ nextCertificateExpiry: next, updatedAt: new Date().toISOString() })
+      .where(eq(equipment.id, equipmentId));
+    return next;
+  }
+
+  /**
+   * The read path's entry to the sweep. The sweep proper is a scheduled job
+   * (`equipment.sweep`); a read may still nudge it, but at most once every
+   * five minutes per company and always as the SYSTEM actor, so a viewer with
+   * read-only permission never appears in the ledger as the author of a
+   * status flip they did not make. Disabled debouncing under test keeps the
+   * suite deterministic.
+   */
+  const lastSweptAt = new Map<string, number>();
+  async function maybeSweep(companyId: string): Promise<void> {
+    if (process.env["NODE_ENV"] !== "test") {
+      const now = Date.now();
+      const last = lastSweptAt.get(companyId) ?? 0;
+      if (now - last < SWEEP_MIN_INTERVAL_MS) return;
+      lastSweptAt.set(companyId, now);
+    }
+    await sweepEquipment(companyId, null);
+  }
+
+  /**
+   * The machines a company-level route may show THIS caller.
+   *
+   * `companyToolGate` answers "may you be here at all"; this answers "whose
+   * plant may you see once you are". Holding `equipment` on one job is not
+   * permission to enumerate every machine on every other job, so a caller who
+   * is neither owner, admin nor company-wide assurance sees the machines on
+   * the projects they hold the tool on, plus the ones on no project at all —
+   * yard plant is a company asset, and hiding it would make the register
+   * useless to the plant manager the gate just admitted.
+   *
+   * Returns null when there is no restriction to apply, so the caller can
+   * skip the extra query entirely.
+   */
+  async function visibleMachineIds(req: FastifyRequest): Promise<string[] | null> {
+    const scope = companyScopeOf(req);
+    if (scope.all) return null;
+    const filter = scopeProjectFilter(scope, equipment.projectId);
+    const rows = await app.db
+      .select({ id: equipment.id })
+      .from(equipment)
+      .where(
+        filter
+          ? and(eq(equipment.companyId, req.companyId!), filter)
+          : eq(equipment.companyId, req.companyId!),
+      );
+    return rows.map((r) => r.id);
+  }
+
+  /** A clause restricting `column` to those machines; `false` when none. */
+  function machineScopeClause(
+    ids: string[] | null,
+    column: Parameters<typeof eq>[0],
+  ) {
+    if (ids === null) return undefined;
+    if (ids.length === 0) return sql`false`;
+    return inArray(column as never, ids);
+  }
 
   /** Which machines are on a project right now? An expired certificate in
    *  the yard is housekeeping; the same certificate on a machine that is
    *  lifting today is an unlawful lift. */
-  async function inServiceEquipmentIds(companyId: string): Promise<Map<string, string>> {
+  async function inServiceEquipmentIds(
+    companyId: string,
+  ): Promise<Map<string, string>> {
     const rows = await app.db
       .select({
         equipmentId: equipmentAssignments.equipmentId,
@@ -450,7 +940,9 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       .where(
         and(
           eq(equipmentAssignments.companyId, companyId),
-          inArray(equipmentAssignments.status, [...IN_SERVICE_ASSIGNMENT_STATUSES]),
+          inArray(equipmentAssignments.status, [
+            ...IN_SERVICE_ASSIGNMENT_STATUSES,
+          ]),
         ),
       );
     const map = new Map<string, string>();
@@ -459,10 +951,16 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
   }
 
   /**
-   * Idempotent expiry / overdue sweep, run on every equipment, certificate
-   * and maintenance list read. The platform pattern (insurance, payments,
-   * contract time bars): no cron, because a record nobody reads harms
-   * nobody and the read is the moment the answer must be true.
+   * The idempotent expiry / overdue sweep.
+   *
+   * It is a SCHEDULED JOB (`equipment.sweep`, hourly) and a read may nudge it
+   * at most once every five minutes per company, as the system actor. It used
+   * to run in full on every equipment, certificate and maintenance list and
+   * detail read: a whole-fleet scan with per-row UPDATEs and ledger appends,
+   * under a read-only permission, so a viewer authored status flips they
+   * never made and concurrent readers raced on the same rows. Candidates are
+   * now bounded to certificates inside CERTIFICATE_HORIZON_DAYS and live
+   * schedules — a certificate expiring in two years cannot change state today.
    *
    * Three detectors, each keyed in `evidenceRefs.key`:
    *  - `equipment_certificate_expired_in_service`  key = certificateId
@@ -473,33 +971,109 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
    * are a second, independent guard: a swept row leaves the candidate set,
    * so a repeated read writes nothing at all.
    */
-  async function sweepEquipment(companyId: string, actorId: string): Promise<void> {
+  async function sweepEquipment(
+    companyId: string,
+    actorId: string | null,
+  ): Promise<void> {
     const asOf = todayISO();
     const now = new Date().toISOString();
 
-    const fleet = await app.db.select().from(equipment).where(eq(equipment.companyId, companyId));
+    /*
+     * CANDIDATES, NOT THE WHOLE FLEET. This ran on every list and detail read
+     * over every machine, every certificate and every signal the detectors had
+     * ever raised, with per-row UPDATEs and ledger appends — hundreds of
+     * milliseconds of write work triggered by a read-only viewer. Now it is a
+     * scheduled job (equipment.sweep) plus a debounced read path, and the
+     * candidate set is bounded to certificates inside the expiry horizon and
+     * schedules that are actually live.
+     */
+    const horizon = addDaysISO(asOf, CERTIFICATE_HORIZON_DAYS);
+    const dueCerts = await app.db
+      .select({ equipmentId: equipmentCertificates.equipmentId })
+      .from(equipmentCertificates)
+      .where(
+        and(
+          eq(equipmentCertificates.companyId, companyId),
+          lte(equipmentCertificates.validTo, horizon),
+        ),
+      );
+    const liveSchedules = await app.db
+      .select()
+      .from(equipmentMaintenanceSchedules)
+      .where(
+        and(
+          eq(equipmentMaintenanceSchedules.companyId, companyId),
+          inArray(equipmentMaintenanceSchedules.status, [
+            "active",
+            "due",
+            "overdue",
+          ]),
+        ),
+      );
+    const candidateIds = [
+      ...new Set([
+        ...dueCerts.map((c) => c.equipmentId),
+        ...liveSchedules.map((s) => s.equipmentId),
+      ]),
+    ];
+    if (candidateIds.length === 0) return;
+
+    const fleet = await app.db
+      .select()
+      .from(equipment)
+      .where(
+        and(
+          eq(equipment.companyId, companyId),
+          inArray(equipment.id, candidateIds),
+        ),
+      );
     if (fleet.length === 0) return;
     const fleetById = new Map(fleet.map((e) => [e.id, e] as const));
     const inService = await inServiceEquipmentIds(companyId);
 
-    /* (1) certificates */
+    /* (1) certificates — EVERY certificate of a candidate machine, because
+     *     "is this machine out of certificate" is answered per TYPE: a valid
+     *     thorough examination issued this year answers last year's expired
+     *     row, and treating the old row as live is how a machine with current
+     *     paperwork gets a critical "stop the machine" signal. */
     const certs = await app.db
       .select()
       .from(equipmentCertificates)
-      .where(eq(equipmentCertificates.companyId, companyId));
+      .where(
+        and(
+          eq(equipmentCertificates.companyId, companyId),
+          inArray(equipmentCertificates.equipmentId, candidateIds),
+        ),
+      );
+    const liveCerts = certs.filter(
+      (c) => c.status !== "revoked" && c.status !== "superseded",
+    );
+    /** the latest validTo per (equipmentId, certificateType) */
+    const latestByType = new Map<string, string>();
+    for (const cert of liveCerts) {
+      const key = `${cert.equipmentId}|${cert.certificateType}`;
+      const held = latestByType.get(key);
+      if (!held || cert.validTo > held) latestByType.set(key, cert.validTo);
+    }
+    const certKeys = liveCerts.map((c) => c.id);
     const seenCritical = await alreadySignalled(
       companyId,
       "equipment_certificate_expired_in_service",
+      certKeys,
     );
-    const seenExpired = await alreadySignalled(companyId, "equipment_certificate_expired");
+    const seenExpired = await alreadySignalled(
+      companyId,
+      "equipment_certificate_expired",
+      certKeys,
+    );
     /** earliest live expiry per machine, for the materialized column */
     const earliestExpiry = new Map<string, string>();
 
-    for (const cert of certs) {
-      if (cert.status === "revoked" || cert.status === "superseded") continue;
+    for (const cert of liveCerts) {
       const machine = fleetById.get(cert.equipmentId);
       if (!machine) continue;
-      const assignedProjectId = inService.get(cert.equipmentId) ?? machine.projectId ?? null;
+      const assignedProjectId =
+        inService.get(cert.equipmentId) ?? machine.projectId ?? null;
       const verdict = certificateVerdict({
         validTo: cert.validTo,
         validFrom: cert.validFrom,
@@ -507,8 +1081,15 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         inService: assignedProjectId !== null,
         asOf,
       });
-      const current = earliestExpiry.get(cert.equipmentId);
-      if (!current || cert.validTo < current) earliestExpiry.set(cert.equipmentId, cert.validTo);
+      const typeKey = `${cert.equipmentId}|${cert.certificateType}`;
+      const latestForType = latestByType.get(typeKey) ?? cert.validTo;
+      /** a newer certificate of the same type has taken over from this one */
+      const superseded = latestForType > cert.validTo;
+      if (!superseded) {
+        const current = earliestExpiry.get(cert.equipmentId);
+        if (!current || cert.validTo < current)
+          earliestExpiry.set(cert.equipmentId, cert.validTo);
+      }
 
       if (cert.status !== verdict.status) {
         await app.db
@@ -531,16 +1112,32 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         });
       }
 
-      if (verdict.status !== "expired" || !verdict.detector || !verdict.severity) continue;
+      if (
+        verdict.status !== "expired" ||
+        !verdict.detector ||
+        !verdict.severity
+      )
+        continue;
+      if (superseded) {
+        // A later certificate of the same type covers this machine. The old
+        // row expiring is bookkeeping, not an unlawful lift.
+        continue;
+      }
       // A lapsed renewal obligation is breached — the same time-bar machinery
       // the insurance module binds certificate renewal to (ADR 0012).
       if (cert.obligationId) {
         await app.db
           .update(obligations)
           .set({ status: "breached" })
-          .where(and(eq(obligations.id, cert.obligationId), eq(obligations.status, "open")));
+          .where(
+            and(
+              eq(obligations.id, cert.obligationId),
+              eq(obligations.status, "open"),
+            ),
+          );
       }
-      const critical = verdict.detector === "equipment_certificate_expired_in_service";
+      const critical =
+        verdict.detector === "equipment_certificate_expired_in_service";
       const seen = critical ? seenCritical : seenExpired;
       const signalId = await raiseSignalOnce({
         companyId,
@@ -583,17 +1180,13 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       }
     }
 
-    /* (2) maintenance schedules */
-    const schedules = await app.db
-      .select()
-      .from(equipmentMaintenanceSchedules)
-      .where(
-        and(
-          eq(equipmentMaintenanceSchedules.companyId, companyId),
-          inArray(equipmentMaintenanceSchedules.status, ["active", "due", "overdue"]),
-        ),
-      );
-    const seenOverdue = await alreadySignalled(companyId, "equipment_maintenance_overdue_critical");
+    /* (2) maintenance schedules — already loaded as sweep candidates */
+    const schedules = liveSchedules;
+    const seenOverdue = await alreadySignalled(
+      companyId,
+      "equipment_maintenance_overdue_critical",
+      schedules.map((sch) => sch.id),
+    );
     /** earliest computed due date per machine, for the materialized column */
     const earliestDueAt = new Map<string, string>();
 
@@ -614,7 +1207,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         asOf,
       });
       const nextStatus =
-        due.status === "overdue" ? "overdue" : due.status === "due_soon" ? "due" : "active";
+        due.status === "overdue"
+          ? "overdue"
+          : due.status === "due_soon"
+            ? "due"
+            : "active";
       const changed =
         schedule.status !== nextStatus ||
         schedule.nextDueAt !== due.nextDueAt ||
@@ -648,14 +1245,16 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const candidate = due.nextDueAt ?? due.projectedDueAt;
       if (candidate) {
         const held = earliestDueAt.get(schedule.equipmentId);
-        if (!held || candidate < held) earliestDueAt.set(schedule.equipmentId, candidate);
+        if (!held || candidate < held)
+          earliestDueAt.set(schedule.equipmentId, candidate);
       }
 
       // Overdue maintenance on CRITICAL plant only. Every machine on a site
       // has a service coming; the ones whose failure stops the job or hurts
       // somebody are the ones worth a Signal.
       if (due.status !== "overdue" || machine.isCritical !== 1) continue;
-      const assignedProjectId = inService.get(schedule.equipmentId) ?? machine.projectId ?? null;
+      const assignedProjectId =
+        inService.get(schedule.equipmentId) ?? machine.projectId ?? null;
       await raiseSignalOnce({
         companyId,
         projectId: schedule.projectId ?? assignedProjectId,
@@ -689,7 +1288,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     for (const machine of fleet) {
       const nextCert = earliestExpiry.get(machine.id) ?? null;
       const nextMaint = earliestDueAt.get(machine.id) ?? null;
-      if (machine.nextCertificateExpiry === nextCert && machine.nextMaintenanceDue === nextMaint) {
+      if (
+        machine.nextCertificateExpiry === nextCert &&
+        machine.nextMaintenanceDue === nextMaint
+      ) {
         continue;
       }
       await app.db
@@ -718,7 +1320,13 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     model: z.string().max(120).nullable().optional(),
     serialNumber: z.string().max(120).nullable().optional(),
     registrationNumber: z.string().max(60).nullable().optional(),
-    yearOfManufacture: z.number().int().min(1900).max(2200).nullable().optional(),
+    yearOfManufacture: z
+      .number()
+      .int()
+      .min(1900)
+      .max(2200)
+      .nullable()
+      .optional(),
     capacity: z.string().max(120).nullable().optional(),
     projectId: idRef.nullable().optional(),
     purchaseDate: isoDateSchema.nullable().optional(),
@@ -767,9 +1375,9 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     ownership: z.enum(EQUIPMENT_OWNERSHIPS).optional(),
     status: z.enum(EQUIPMENT_STATUSES).optional(),
     projectId: idRef.optional(),
-    isCritical: z.coerce.boolean().optional(),
+    isCritical: boolQuery.optional(),
     /** only machines whose earliest certificate expiry has passed */
-    outOfCertificate: z.coerce.boolean().optional(),
+    outOfCertificate: boolQuery.optional(),
     q: z.string().max(200).optional(),
   });
 
@@ -781,9 +1389,12 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
   function decorateEquipment(row: typeof equipment.$inferSelect, asOf: string) {
     const outOfCertificate =
       row.nextCertificateExpiry !== null && row.nextCertificateExpiry < asOf;
-    const onHire = ["hired", "operator_hired", "leased"].includes(row.ownership);
+    const onHire = ["hired", "operator_hired", "leased"].includes(
+      row.ownership,
+    );
     const hireRunning = onHire && row.offHiredAt === null;
-    const offHireRequestedNotCollected = row.offHireRequestedAt !== null && row.offHiredAt === null;
+    const offHireRequestedNotCollected =
+      row.offHireRequestedAt !== null && row.offHiredAt === null;
     return {
       ...row,
       requiresCertification: row.requiresCertification === 1,
@@ -799,152 +1410,178 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
             ? `the agreed hire end was ${row.hireEndDate} and the machine has not been off-hired — ` +
               "every day since is being charged at the full rate"
             : null,
-        maintenanceOverdue: row.nextMaintenanceDue !== null && row.nextMaintenanceDue < asOf,
+        maintenanceOverdue:
+          row.nextMaintenanceDue !== null && row.nextMaintenanceDue < asOf,
       },
     };
   }
 
-  async function nextEquipmentNumber(companyId: string): Promise<{ number: number; reference: string }> {
+  async function nextEquipmentNumber(
+    companyId: string,
+  ): Promise<{ number: number; reference: string }> {
     const number = await nextRecordNumber(app.db, companyId, "equipment");
     return { number, reference: `EQP-${pad(number)}` };
   }
 
-  app.post("/companies/current/equipment", { preHandler: companyWrite }, async (req, reply) => {
-    const body = equipmentCreateSchema.parse(req.body);
-    const companyId = req.companyId!;
-    if (body.supplierVendorId) await assertVendor(body.supplierVendorId, companyId);
-    if (body.projectId) await assertProject(body.projectId, companyId);
-    if (body.hireRateAmount != null && !body.hireRateUnit) {
-      throw badRequest(
-        "a hire rate amount was given with no hireRateUnit — an amount with no unit cannot be " +
-          "turned into a day's cost, which is the only thing the rate is for",
-      );
-    }
-    if (body.hireStartDate && body.hireEndDate && body.hireEndDate < body.hireStartDate) {
-      throw badRequest(
-        `hireEndDate ${body.hireEndDate} falls before hireStartDate ${body.hireStartDate}`,
-      );
-    }
-    const { number, reference } = await nextEquipmentNumber(companyId);
-    const id = newId("eqp");
-    await app.db.insert(equipment).values({
-      id,
-      companyId,
-      projectId: body.projectId ?? null,
-      number,
-      reference,
-      assetTag: body.assetTag ?? null,
-      name: body.name,
-      description: body.description ?? null,
-      category: body.category,
-      equipmentType: body.equipmentType ?? null,
-      ownership: body.ownership,
-      manufacturer: body.manufacturer ?? null,
-      model: body.model ?? null,
-      serialNumber: body.serialNumber ?? null,
-      registrationNumber: body.registrationNumber ?? null,
-      yearOfManufacture: body.yearOfManufacture ?? null,
-      capacity: body.capacity ?? null,
-      purchaseDate: body.purchaseDate ?? null,
-      purchaseCost: body.purchaseCost ?? null,
-      bookValue: body.bookValue ?? null,
-      internalRateAmount: body.internalRateAmount ?? null,
-      supplierVendorId: body.supplierVendorId ?? null,
-      hireAgreementRef: body.hireAgreementRef ?? null,
-      commitmentId: body.commitmentId ?? null,
-      hireRateAmount: body.hireRateAmount ?? null,
-      hireRateUnit: body.hireRateUnit ?? null,
-      idleRateAmount: body.idleRateAmount ?? null,
-      operatorRateAmount: body.operatorRateAmount ?? null,
-      currency: body.currency,
-      hireStartDate: body.hireStartDate ?? null,
-      hireEndDate: body.hireEndDate ?? null,
-      status: body.status,
-      condition: body.condition,
-      locationId: body.locationId ?? null,
-      locationText: body.locationText ?? null,
-      latitude: body.latitude ?? null,
-      longitude: body.longitude ?? null,
-      currentOperatorWorkerId: body.currentOperatorWorkerId ?? null,
-      meterType: body.meterType,
-      currentMeterReading: body.currentMeterReading ?? null,
-      fuelType: body.fuelType,
-      fuelCapacityLitres: body.fuelCapacityLitres ?? null,
-      carbonFactorId: body.carbonFactorId ?? null,
-      telematicsProvider: body.telematicsProvider ?? null,
-      telematicsDeviceId: body.telematicsDeviceId ?? null,
-      requiresCertification: body.requiresCertification ? 1 : 0,
-      isCritical: body.isCritical ? 1 : 0,
-      costCodeId: body.costCodeId ?? null,
-      budgetLineItemId: body.budgetLineItemId ?? null,
-      photoFileIds: body.photoFileIds ?? [],
-      detail: body.detail ?? {},
-      createdBy: req.user!.id,
-    });
-    await appendLedger(app.db, {
-      companyId,
-      actorId: req.user!.id,
-      action: "create",
-      objectType: "equipment",
-      objectId: id,
-      projectId: body.projectId ?? null,
-      payload: {
+  app.post(
+    "/companies/current/equipment",
+    { preHandler: companyWrite },
+    async (req, reply) => {
+      const body = equipmentCreateSchema.parse(req.body);
+      const companyId = req.companyId!;
+      if (body.supplierVendorId)
+        await assertVendor(body.supplierVendorId, companyId);
+      if (body.projectId) await assertProject(body.projectId, companyId);
+      if (body.hireRateAmount != null && !body.hireRateUnit) {
+        throw badRequest(
+          "a hire rate amount was given with no hireRateUnit — an amount with no unit cannot be " +
+            "turned into a day's cost, which is the only thing the rate is for",
+        );
+      }
+      if (
+        body.hireStartDate &&
+        body.hireEndDate &&
+        body.hireEndDate < body.hireStartDate
+      ) {
+        throw badRequest(
+          `hireEndDate ${body.hireEndDate} falls before hireStartDate ${body.hireStartDate}`,
+        );
+      }
+      const { number, reference } = await nextEquipmentNumber(companyId);
+      const id = newId("eqp");
+      await app.db.insert(equipment).values({
+        id,
+        companyId,
+        projectId: body.projectId ?? null,
+        number,
         reference,
+        assetTag: body.assetTag ?? null,
         name: body.name,
+        description: body.description ?? null,
         category: body.category,
+        equipmentType: body.equipmentType ?? null,
         ownership: body.ownership,
+        manufacturer: body.manufacturer ?? null,
+        model: body.model ?? null,
+        serialNumber: body.serialNumber ?? null,
+        registrationNumber: body.registrationNumber ?? null,
+        yearOfManufacture: body.yearOfManufacture ?? null,
+        capacity: body.capacity ?? null,
+        purchaseDate: body.purchaseDate ?? null,
+        purchaseCost: body.purchaseCost ?? null,
+        bookValue: body.bookValue ?? null,
+        internalRateAmount: body.internalRateAmount ?? null,
+        supplierVendorId: body.supplierVendorId ?? null,
+        hireAgreementRef: body.hireAgreementRef ?? null,
+        commitmentId: body.commitmentId ?? null,
         hireRateAmount: body.hireRateAmount ?? null,
         hireRateUnit: body.hireRateUnit ?? null,
+        idleRateAmount: body.idleRateAmount ?? null,
+        operatorRateAmount: body.operatorRateAmount ?? null,
         currency: body.currency,
         hireStartDate: body.hireStartDate ?? null,
         hireEndDate: body.hireEndDate ?? null,
-        isCritical: body.isCritical,
-      },
-      storePayload: true,
-    });
-    const created = await fetchEquipment(id, companyId);
-    return reply.status(201).send(decorateEquipment(created, todayISO()));
-  });
+        status: body.status,
+        condition: body.condition,
+        locationId: body.locationId ?? null,
+        locationText: body.locationText ?? null,
+        latitude: body.latitude ?? null,
+        longitude: body.longitude ?? null,
+        currentOperatorWorkerId: body.currentOperatorWorkerId ?? null,
+        meterType: body.meterType,
+        currentMeterReading: body.currentMeterReading ?? null,
+        fuelType: body.fuelType,
+        fuelCapacityLitres: body.fuelCapacityLitres ?? null,
+        carbonFactorId: body.carbonFactorId ?? null,
+        telematicsProvider: body.telematicsProvider ?? null,
+        telematicsDeviceId: body.telematicsDeviceId ?? null,
+        requiresCertification: body.requiresCertification ? 1 : 0,
+        isCritical: body.isCritical ? 1 : 0,
+        costCodeId: body.costCodeId ?? null,
+        budgetLineItemId: body.budgetLineItemId ?? null,
+        photoFileIds: body.photoFileIds ?? [],
+        detail: body.detail ?? {},
+        createdBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "equipment",
+        objectId: id,
+        projectId: body.projectId ?? null,
+        payload: {
+          reference,
+          name: body.name,
+          category: body.category,
+          ownership: body.ownership,
+          hireRateAmount: body.hireRateAmount ?? null,
+          hireRateUnit: body.hireRateUnit ?? null,
+          currency: body.currency,
+          hireStartDate: body.hireStartDate ?? null,
+          hireEndDate: body.hireEndDate ?? null,
+          isCritical: body.isCritical,
+        },
+        storePayload: true,
+      });
+      const created = await fetchEquipment(id, companyId);
+      return reply.status(201).send(decorateEquipment(created, todayISO()));
+    },
+  );
 
-  app.get("/companies/current/equipment", { preHandler: companyRead }, async (req) => {
-    const q = equipmentListQuery.parse(req.query);
-    const companyId = req.companyId!;
-    await sweepEquipment(companyId, req.user!.id);
-    const asOf = todayISO();
-    const clauses = [eq(equipment.companyId, companyId)];
-    if (q.category) clauses.push(eq(equipment.category, q.category));
-    if (q.ownership) clauses.push(eq(equipment.ownership, q.ownership));
-    if (q.status) clauses.push(eq(equipment.status, q.status));
-    if (q.projectId) clauses.push(eq(equipment.projectId, q.projectId));
-    if (q.isCritical !== undefined) clauses.push(eq(equipment.isCritical, q.isCritical ? 1 : 0));
-    if (q.outOfCertificate) {
-      clauses.push(isNotNull(equipment.nextCertificateExpiry));
-      clauses.push(lte(equipment.nextCertificateExpiry, addDaysISO(asOf, -1)));
-    }
-    if (q.q) {
-      clauses.push(
-        or(
-          sql`lower(${equipment.name}) like ${`%${q.q.toLowerCase()}%`}`,
-          sql`lower(${equipment.reference}) like ${`%${q.q.toLowerCase()}%`}`,
-          sql`lower(coalesce(${equipment.assetTag}, '')) like ${`%${q.q.toLowerCase()}%`}`,
-        )!,
+  app.get(
+    "/companies/current/equipment",
+    { preHandler: companyRead },
+    async (req) => {
+      const q = equipmentListQuery.parse(req.query);
+      const companyId = req.companyId!;
+      await maybeSweep(companyId);
+      const asOf = todayISO();
+      const clauses = [eq(equipment.companyId, companyId)];
+      // Holding the tool on one job admits you to the register; it does not
+      // hand you every other job's plant (plan §6.3).
+      const fleetScope = scopeProjectFilter(companyScopeOf(req), equipment.projectId);
+      if (fleetScope) clauses.push(fleetScope);
+      if (q.category) clauses.push(eq(equipment.category, q.category));
+      if (q.ownership) clauses.push(eq(equipment.ownership, q.ownership));
+      if (q.status) clauses.push(eq(equipment.status, q.status));
+      if (q.projectId) clauses.push(eq(equipment.projectId, q.projectId));
+      if (q.isCritical !== undefined)
+        clauses.push(eq(equipment.isCritical, q.isCritical ? 1 : 0));
+      if (q.outOfCertificate) {
+        clauses.push(isNotNull(equipment.nextCertificateExpiry));
+        clauses.push(
+          lte(equipment.nextCertificateExpiry, addDaysISO(asOf, -1)),
+        );
+      }
+      if (q.q) {
+        clauses.push(
+          or(
+            sql`lower(${equipment.name}) like ${`%${q.q.toLowerCase()}%`}`,
+            sql`lower(${equipment.reference}) like ${`%${q.q.toLowerCase()}%`}`,
+            sql`lower(coalesce(${equipment.assetTag}, '')) like ${`%${q.q.toLowerCase()}%`}`,
+          )!,
+        );
+      }
+      const where = and(...clauses);
+      const [totalRow] = await app.db
+        .select({ n: count() })
+        .from(equipment)
+        .where(where);
+      const rows = await app.db
+        .select()
+        .from(equipment)
+        .where(where)
+        .orderBy(asc(equipment.number))
+        .limit(q.pageSize)
+        .offset(pageOffset(q));
+      return paginate(
+        rows.map((r) => decorateEquipment(r, asOf)),
+        Number(totalRow?.n ?? 0),
+        q,
       );
-    }
-    const where = and(...clauses);
-    const [totalRow] = await app.db.select({ n: count() }).from(equipment).where(where);
-    const rows = await app.db
-      .select()
-      .from(equipment)
-      .where(where)
-      .orderBy(asc(equipment.number))
-      .limit(q.pageSize)
-      .offset(pageOffset(q));
-    return paginate(
-      rows.map((r) => decorateEquipment(r, asOf)),
-      Number(totalRow?.n ?? 0),
-      q,
-    );
-  });
+    },
+  );
 
   app.get(
     "/companies/current/equipment/:equipmentId",
@@ -952,7 +1589,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     async (req) => {
       const { equipmentId } = req.params as { equipmentId: string };
       await fetchEquipment(equipmentId, req.companyId!); // 404 before sweeping
-      await sweepEquipment(req.companyId!, req.user!.id);
+      await maybeSweep(req.companyId!);
       const asOf = todayISO();
       const machine = await fetchEquipment(equipmentId, req.companyId!);
       const certs = await app.db
@@ -1001,7 +1638,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           }),
         })),
         assignments,
-        maintenance: { schedules: scheduleDue, governing: earliestDue(scheduleDue) },
+        maintenance: {
+          schedules: scheduleDue,
+          governing: earliestDue(scheduleDue),
+        },
       };
     },
   );
@@ -1014,9 +1654,12 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const body = equipmentPatchSchema.parse(req.body);
       const companyId = req.companyId!;
       const before = await fetchEquipment(equipmentId, companyId);
-      if (body.supplierVendorId) await assertVendor(body.supplierVendorId, companyId);
+      if (body.supplierVendorId)
+        await assertVendor(body.supplierVendorId, companyId);
       if (body.projectId) await assertProject(body.projectId, companyId);
-      const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+      const patch: Record<string, unknown> = {
+        updatedAt: new Date().toISOString(),
+      };
       for (const [key, value] of Object.entries(body)) {
         if (value === undefined) continue;
         if (key === "requiresCertification" || key === "isCritical") {
@@ -1025,7 +1668,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           patch[key] = value;
         }
       }
-      await app.db.update(equipment).set(patch).where(eq(equipment.id, equipmentId));
+      await app.db
+        .update(equipment)
+        .set(patch)
+        .where(eq(equipment.id, equipmentId));
       await appendLedger(app.db, {
         companyId,
         actorId: req.user!.id,
@@ -1035,7 +1681,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         projectId: before.projectId,
         payload: { changed: Object.keys(body) },
       });
-      return decorateEquipment(await fetchEquipment(equipmentId, companyId), todayISO());
+      return decorateEquipment(
+        await fetchEquipment(equipmentId, companyId),
+        todayISO(),
+      );
     },
   );
 
@@ -1047,11 +1696,14 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
    */
   app.post(
     "/companies/current/equipment/:equipmentId/verify",
-    { preHandler: companyWrite },
+    { preHandler: companyAdmin },
     async (req) => {
       const { equipmentId } = req.params as { equipmentId: string };
       const body = z
-        .object({ note: z.string().max(2000).optional(), condition: z.enum(EQUIPMENT_CONDITIONS).optional() })
+        .object({
+          note: z.string().max(2000).optional(),
+          condition: z.enum(EQUIPMENT_CONDITIONS).optional(),
+        })
         .parse(req.body ?? {});
       const companyId = req.companyId!;
       const machine = await fetchEquipment(equipmentId, companyId);
@@ -1087,7 +1739,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         storePayload: true,
       });
       return {
-        ...decorateEquipment(await fetchEquipment(equipmentId, companyId), todayISO()),
+        ...decorateEquipment(
+          await fetchEquipment(equipmentId, companyId),
+          todayISO(),
+        ),
         independentVerification: !override,
       };
     },
@@ -1103,7 +1758,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
    */
   app.post(
     "/companies/current/equipment/:equipmentId/off-hire",
-    { preHandler: companyWrite },
+    { preHandler: companyAdmin },
     async (req) => {
       const { equipmentId } = req.params as { equipmentId: string };
       const body = z
@@ -1122,7 +1777,9 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
             "Owned plant is released by ending its assignment, not by off-hiring it.",
         );
       }
-      const at = body.at ? new Date(body.at).toISOString() : new Date().toISOString();
+      const at = body.at
+        ? new Date(body.at).toISOString()
+        : new Date().toISOString();
       const now = new Date().toISOString();
       if (body.action === "request") {
         if (machine.offHiredAt) {
@@ -1157,6 +1814,49 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
             updatedAt: now,
           })
           .where(eq(equipment.id, equipmentId));
+        /*
+         * THE ASSIGNMENT GOES BACK WITH THE MACHINE. Clearing
+         * equipment.projectId while leaving a live assignment row on_site kept
+         * the machine in `inServiceEquipmentIds`, so a returned machine still
+         * counted as on the project — and its certificates were still judged
+         * as "in service", which is what makes the critical detector fire.
+         */
+        const live = await app.db
+          .select()
+          .from(equipmentAssignments)
+          .where(
+            and(
+              eq(equipmentAssignments.companyId, companyId),
+              eq(equipmentAssignments.equipmentId, equipmentId),
+              inArray(equipmentAssignments.status, [...IN_SERVICE_ASSIGNMENT_STATUSES]),
+            ),
+          );
+        for (const assignment of live) {
+          await app.db
+            .update(equipmentAssignments)
+            .set({
+              status: "returned",
+              returnedAt: at,
+              assignedTo: assignment.assignedTo ?? at.slice(0, 10),
+              updatedAt: now,
+            })
+            .where(eq(equipmentAssignments.id, assignment.id));
+          await appendLedger(app.db, {
+            companyId,
+            actorId: req.user!.id,
+            action: "state_change",
+            objectType: "equipment_assignment",
+            objectId: assignment.id,
+            projectId: assignment.projectId,
+            payload: {
+              from: assignment.status,
+              to: "returned",
+              closedBy: "off_hire_confirm",
+              equipmentId,
+              at,
+            },
+          });
+        }
       } else {
         await app.db
           .update(equipment)
@@ -1190,7 +1890,9 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           ? Math.max(
               0,
               Math.round(
-                (Date.parse(after.offHiredAt) - Date.parse(after.offHireRequestedAt)) / 86_400_000,
+                (Date.parse(after.offHiredAt) -
+                  Date.parse(after.offHireRequestedAt)) /
+                  86_400_000,
               ),
             )
           : null;
@@ -1257,12 +1959,19 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       // An overlapping live assignment means one machine in two places. It is
       // always a data error and it always corrupts the utilisation figures.
       const live = await app.db
-        .select({ id: equipmentAssignments.id, projectId: equipmentAssignments.projectId })
+        .select({
+          id: equipmentAssignments.id,
+          projectId: equipmentAssignments.projectId,
+        })
         .from(equipmentAssignments)
         .where(
           and(
             eq(equipmentAssignments.equipmentId, body.equipmentId),
-            inArray(equipmentAssignments.status, ["approved", "mobilising", "on_site"]),
+            inArray(equipmentAssignments.status, [
+              "approved",
+              "mobilising",
+              "on_site",
+            ]),
           ),
         );
       if (live.length > 0) {
@@ -1272,6 +1981,15 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
             "cannot be on two projects, and a register that says it is will bill both.",
         );
       }
+      // The machine's default coding belongs to whichever job it was last on.
+      // Inherited coding that is not valid here is dropped with a reason
+      // rather than carried onto this project's assignment.
+      const coding = await resolveCoding(companyId, projectId, {
+        costCodeId: body.costCodeId ?? machine.costCodeId,
+        budgetLineItemId: body.budgetLineItemId ?? machine.budgetLineItemId,
+        costCodeExplicit: body.costCodeId != null,
+        budgetLineExplicit: body.budgetLineItemId != null,
+      });
       const id = newId("eqa");
       await app.db.insert(equipmentAssignments).values({
         id,
@@ -1284,8 +2002,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         assignedTo: body.assignedTo ?? null,
         locationId: body.locationId ?? null,
         scheduleActivityId: body.scheduleActivityId ?? null,
-        costCodeId: body.costCodeId ?? machine.costCodeId,
-        budgetLineItemId: body.budgetLineItemId ?? machine.budgetLineItemId,
+        costCodeId: coding.costCodeId,
+        budgetLineItemId: coding.budgetLineItemId,
         operatorWorkerId: body.operatorWorkerId ?? null,
         crewId: body.crewId ?? null,
         mobilisationCost: body.mobilisationCost ?? null,
@@ -1318,6 +2036,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       return reply.status(201).send({
         ...created,
         equipment: decorateEquipment(machine, todayISO()),
+        codingNotes: coding.notes,
         mobilisationNote:
           body.mobilisationCost === null || body.mobilisationCost === undefined
             ? "no mobilisation cost was recorded — transport is the cost most often forgotten " +
@@ -1337,7 +2056,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         eq(equipmentAssignments.projectId, req.projectId!),
       ];
       if (q.status) clauses.push(eq(equipmentAssignments.status, q.status));
-      if (q.equipmentId) clauses.push(eq(equipmentAssignments.equipmentId, q.equipmentId));
+      if (q.equipmentId)
+        clauses.push(eq(equipmentAssignments.equipmentId, q.equipmentId));
       const where = and(...clauses);
       const [totalRow] = await app.db
         .select({ n: count() })
@@ -1359,7 +2079,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     { preHandler: readGate },
     async (req) => {
       const { assignmentId } = req.params as { assignmentId: string };
-      const row = await fetchAssignment(assignmentId, req.companyId!, req.projectId!);
+      const row = await fetchAssignment(
+        assignmentId,
+        req.companyId!,
+        req.projectId!,
+      );
       const machine = await fetchEquipment(row.equipmentId, req.companyId!);
       return { ...row, equipment: decorateEquipment(machine, todayISO()) };
     },
@@ -1370,15 +2094,24 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     { preHandler: standardGate },
     async (req) => {
       const { assignmentId } = req.params as { assignmentId: string };
-      const body = assignmentCreateSchema.partial().omit({ equipmentId: true }).parse(req.body);
-      const existing = await fetchAssignment(assignmentId, req.companyId!, req.projectId!);
+      const body = assignmentCreateSchema
+        .partial()
+        .omit({ equipmentId: true })
+        .parse(req.body);
+      const existing = await fetchAssignment(
+        assignmentId,
+        req.companyId!,
+        req.projectId!,
+      );
       if (existing.status === "returned" || existing.status === "cancelled") {
         throw badRequest(
           `this assignment is ${existing.status} — it is a closed record of what happened and is ` +
             "not editable. Raise a new assignment instead.",
         );
       }
-      const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+      const patch: Record<string, unknown> = {
+        updatedAt: new Date().toISOString(),
+      };
       for (const [key, value] of Object.entries(body)) {
         if (value !== undefined) patch[key] = value;
       }
@@ -1405,9 +2138,15 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     { preHandler: standardGate },
     async (req) => {
       const { assignmentId } = req.params as { assignmentId: string };
-      const assignment = await fetchAssignment(assignmentId, req.companyId!, req.projectId!);
+      const assignment = await fetchAssignment(
+        assignmentId,
+        req.companyId!,
+        req.projectId!,
+      );
       if (assignment.status !== "requested") {
-        throw badRequest(`assignment is ${assignment.status}, not requested — nothing to approve`);
+        throw badRequest(
+          `assignment is ${assignment.status}, not requested — nothing to approve`,
+        );
       }
       const override = await assertIndependent(
         req,
@@ -1418,7 +2157,12 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const now = new Date().toISOString();
       await app.db
         .update(equipmentAssignments)
-        .set({ status: "approved", approvedBy: req.user!.id, approvedAt: now, updatedAt: now })
+        .set({
+          status: "approved",
+          approvedBy: req.user!.id,
+          approvedAt: now,
+          updatedAt: now,
+        })
         .where(eq(equipmentAssignments.id, assignmentId));
       await appendLedger(app.db, {
         companyId: req.companyId!,
@@ -1436,7 +2180,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         storePayload: true,
       });
       return {
-        ...(await fetchAssignment(assignmentId, req.companyId!, req.projectId!)),
+        ...(await fetchAssignment(
+          assignmentId,
+          req.companyId!,
+          req.projectId!,
+        )),
         independentApproval: !override,
       };
     },
@@ -1463,9 +2211,17 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         .parse(req.body);
       const companyId = req.companyId!;
       const projectId = req.projectId!;
-      const assignment = await fetchAssignment(assignmentId, companyId, projectId);
-      if (!["requested", "approved", "mobilising"].includes(assignment.status)) {
-        throw badRequest(`assignment is ${assignment.status} — it cannot be mobilised again`);
+      const assignment = await fetchAssignment(
+        assignmentId,
+        companyId,
+        projectId,
+      );
+      if (
+        !["requested", "approved", "mobilising"].includes(assignment.status)
+      ) {
+        throw badRequest(
+          `assignment is ${assignment.status} — it cannot be mobilised again`,
+        );
       }
       if (assignment.status === "requested") {
         throw badRequest(
@@ -1474,7 +2230,9 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         );
       }
       const machine = await fetchEquipment(assignment.equipmentId, companyId);
-      const at = body.mobilisedAt ? new Date(body.mobilisedAt).toISOString() : new Date().toISOString();
+      const at = body.mobilisedAt
+        ? new Date(body.mobilisedAt).toISOString()
+        : new Date().toISOString();
       const now = new Date().toISOString();
       await app.db
         .update(equipmentAssignments)
@@ -1483,8 +2241,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           mobilisedAt: at,
           conditionOnArrival: body.conditionOnArrival,
           arrivalPhotoFileIds: body.arrivalPhotoFileIds ?? [],
-          transportDocketRef: body.transportDocketRef ?? assignment.transportDocketRef,
-          mobilisationCost: body.mobilisationCost ?? assignment.mobilisationCost,
+          transportDocketRef:
+            body.transportDocketRef ?? assignment.transportDocketRef,
+          mobilisationCost:
+            body.mobilisationCost ?? assignment.mobilisationCost,
           notes: body.notes ?? assignment.notes,
           updatedAt: now,
         })
@@ -1497,7 +2257,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           status: "in_use",
           condition: body.conditionOnArrival,
           currentMeterReading: body.meterReading ?? machine.currentMeterReading,
-          lastMeterReadingAt: body.meterReading != null ? at : machine.lastMeterReadingAt,
+          lastMeterReadingAt:
+            body.meterReading != null ? at : machine.lastMeterReadingAt,
           updatedAt: now,
         })
         .where(eq(equipment.id, assignment.equipmentId));
@@ -1550,7 +2311,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         .parse(req.body);
       const companyId = req.companyId!;
       const projectId = req.projectId!;
-      const assignment = await fetchAssignment(assignmentId, companyId, projectId);
+      const assignment = await fetchAssignment(
+        assignmentId,
+        companyId,
+        projectId,
+      );
       if (assignment.status === "returned") {
         throw conflict("this assignment has already been demobilised");
       }
@@ -1561,7 +2326,9 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         );
       }
       const machine = await fetchEquipment(assignment.equipmentId, companyId);
-      const at = body.returnedAt ? new Date(body.returnedAt).toISOString() : new Date().toISOString();
+      const at = body.returnedAt
+        ? new Date(body.returnedAt).toISOString()
+        : new Date().toISOString();
       const now = new Date().toISOString();
       const CONDITION_RANK: Record<string, number> = {
         new: 0,
@@ -1572,7 +2339,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       };
       const arrival = assignment.conditionOnArrival ?? "good";
       const deteriorated =
-        (CONDITION_RANK[body.conditionOnReturn] ?? 0) > (CONDITION_RANK[arrival] ?? 0);
+        (CONDITION_RANK[body.conditionOnReturn] ?? 0) >
+        (CONDITION_RANK[arrival] ?? 0);
       await app.db
         .update(equipmentAssignments)
         .set({
@@ -1581,7 +2349,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           conditionOnReturn: body.conditionOnReturn,
           returnPhotoFileIds: body.returnPhotoFileIds ?? [],
           damageOnReturnNote: body.damageOnReturnNote ?? null,
-          demobilisationCost: body.demobilisationCost ?? assignment.demobilisationCost,
+          demobilisationCost:
+            body.demobilisationCost ?? assignment.demobilisationCost,
           assignedTo: assignment.assignedTo ?? at.slice(0, 10),
           updatedAt: now,
         })
@@ -1597,7 +2366,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
             : machine.offHireRequestedAt,
           condition: body.conditionOnReturn,
           currentMeterReading: body.meterReading ?? machine.currentMeterReading,
-          lastMeterReadingAt: body.meterReading != null ? at : machine.lastMeterReadingAt,
+          lastMeterReadingAt:
+            body.meterReading != null ? at : machine.lastMeterReadingAt,
           updatedAt: now,
         })
         .where(eq(equipment.id, assignment.equipmentId));
@@ -1679,7 +2449,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     to: isoDateSchema.optional(),
     idleReason: z.enum(IDLE_REASONS).optional(),
     shift: z.enum(SHIFTS).optional(),
-    unverifiedOnly: z.coerce.boolean().optional(),
+    unverifiedOnly: boolQuery.optional(),
   });
 
   function hoursOf(row: {
@@ -1707,10 +2477,16 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     companyId: string,
     carbonFactorId: string | null,
     fuelLitres: number | null,
-  ): Promise<{ tco2e: number | null; factorId: string | null; reasons: string[] }> {
+  ): Promise<{
+    tco2e: number | null;
+    factorId: string | null;
+    reasons: string[];
+  }> {
     const reasons: string[] = [];
     if (fuelLitres === null || fuelLitres <= 0) {
-      reasons.push("no fuel was recorded for this day, so no combustion emissions can be stated");
+      reasons.push(
+        "no fuel was recorded for this day, so no combustion emissions can be stated",
+      );
       return { tco2e: null, factorId: carbonFactorId, reasons };
     }
     if (!carbonFactorId) {
@@ -1723,11 +2499,18 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     const rows = await app.db
       .select()
       .from(carbonFactors)
-      .where(and(eq(carbonFactors.id, carbonFactorId), eq(carbonFactors.companyId, companyId)))
+      .where(
+        and(
+          eq(carbonFactors.id, carbonFactorId),
+          eq(carbonFactors.companyId, companyId),
+        ),
+      )
       .limit(1);
     const factor = rows[0];
     if (!factor) {
-      reasons.push(`carbon factor ${carbonFactorId} is not in this company's factor library`);
+      reasons.push(
+        `carbon factor ${carbonFactorId} is not in this company's factor library`,
+      );
       return { tco2e: null, factorId: carbonFactorId, reasons };
     }
     if (!unitsMatch(factor.unit, "litre")) {
@@ -1756,13 +2539,19 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       hireRateAmount: machine.hireRateAmount,
       hireRateUnit: machine.hireRateUnit as HireRateUnit | null,
       idleRateAmount: machine.idleRateAmount,
+      internalRateAmount: machine.internalRateAmount,
+      ownership: machine.ownership,
       operatorRateAmount: machine.operatorRateAmount,
       fuelCost: row.fuelCost,
       fuelLitres: row.fuelLitres,
       currency: row.currency,
       hours: h,
     });
-    const carbon = await fuelCarbon(row.companyId, machine.carbonFactorId, row.fuelLitres);
+    const carbon = await fuelCarbon(
+      row.companyId,
+      machine.carbonFactorId,
+      row.fuelLitres,
+    );
     return {
       ...row,
       isBillable: row.isBillable === 1,
@@ -1848,11 +2637,27 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         hireRateAmount: machine.hireRateAmount,
         hireRateUnit: machine.hireRateUnit as HireRateUnit | null,
         idleRateAmount: machine.idleRateAmount,
+        internalRateAmount: machine.internalRateAmount,
+        ownership: machine.ownership,
         operatorRateAmount: machine.operatorRateAmount,
         fuelCost: body.fuelCost ?? null,
         fuelLitres: body.fuelLitres ?? null,
         currency: machine.currency,
         hours: h,
+      });
+      /*
+       * The MACHINE's default coding is whatever job it was last coded to, so
+       * defaulting it onto this day's row books plant on this project against
+       * another project's budget line — the poster then reports the line as
+       * missing and the day never reaches this job's cost report. Inherited
+       * coding that does not belong here is dropped with a reason; coding the
+       * caller supplied for the wrong project is refused.
+       */
+      const utilisationCoding = await resolveCoding(companyId, projectId, {
+        costCodeId: body.costCodeId ?? machine.costCodeId,
+        budgetLineItemId: body.budgetLineItemId ?? machine.budgetLineItemId,
+        costCodeExplicit: body.costCodeId != null,
+        budgetLineExplicit: body.budgetLineItemId != null,
       });
       const id = newId("equ");
       await app.db.insert(equipmentUtilisation).values({
@@ -1886,8 +2691,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         productionUnit: body.productionUnit ?? null,
         operatorWorkerId: body.operatorWorkerId ?? null,
         crewId: body.crewId ?? null,
-        costCodeId: body.costCodeId ?? machine.costCodeId,
-        budgetLineItemId: body.budgetLineItemId ?? machine.budgetLineItemId,
+        costCodeId: utilisationCoding.costCodeId,
+        budgetLineItemId: utilisationCoding.budgetLineItemId,
         locationId: body.locationId ?? null,
         isBillable: body.isBillable ? 1 : 0,
         tmTicketId: body.tmTicketId ?? null,
@@ -1897,15 +2702,44 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         detail: body.detail ?? {},
         createdBy: req.user!.id,
       });
+      /*
+       * THE MACHINE METER ONLY EVER GOES FORWARD. Writing meterEnd onto the
+       * machine unconditionally let a back-filled plant sheet regress the
+       * reading — after which every meter-based service interval gains the
+       * difference and an overdue service reads as "scheduled". The row keeps
+       * whatever was entered (it is the plant sheet, and it is evidence); the
+       * machine's own reading advances only when this row is both LATER than
+       * the last reading and HIGHER than the current one.
+       */
+      const meterAt = `${body.utilisationDate}T23:59:59Z`;
+      let meterAdvanced = false;
+      let meterNote: string | null = null;
       if (body.meterEnd != null) {
-        await app.db
-          .update(equipment)
-          .set({
-            currentMeterReading: body.meterEnd,
-            lastMeterReadingAt: `${body.utilisationDate}T23:59:59Z`,
-            updatedAt: new Date().toISOString(),
-          })
-          .where(eq(equipment.id, body.equipmentId));
+        const isLater =
+          machine.lastMeterReadingAt === null ||
+          meterAt >= machine.lastMeterReadingAt;
+        const isHigher =
+          machine.currentMeterReading === null ||
+          body.meterEnd >= machine.currentMeterReading;
+        if (isLater && isHigher) {
+          meterAdvanced = true;
+          await app.db
+            .update(equipment)
+            .set({
+              currentMeterReading: body.meterEnd,
+              lastMeterReadingAt: meterAt,
+              updatedAt: new Date().toISOString(),
+            })
+            .where(eq(equipment.id, body.equipmentId));
+        } else {
+          meterNote =
+            `The machine reads ${machine.currentMeterReading ?? "unknown"}` +
+            `${machine.lastMeterReadingAt ? ` as at ${machine.lastMeterReadingAt.slice(0, 10)}` : ""}` +
+            `, and this row reports ${body.meterEnd} on ${body.utilisationDate}. The row is kept ` +
+            "as entered, but the machine's meter has NOT been moved backwards: every meter-based " +
+            "service interval is measured from it, and regressing it turns an overdue service into " +
+            "a scheduled one.";
+        }
       }
       await appendLedger(app.db, {
         companyId,
@@ -1929,48 +2763,66 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         storePayload: true,
       });
       const created = await fetchUtilisation(id, companyId, projectId);
-      return reply.status(201).send(await decorateUtilisation(created, machine));
+      return reply.status(201).send({
+        ...(await decorateUtilisation(created, machine)),
+        meter: { advanced: meterAdvanced, note: meterNote },
+        codingNotes: utilisationCoding.notes,
+      });
     },
   );
 
-  app.get("/projects/:projectId/equipment-utilisation", { preHandler: readGate }, async (req) => {
-    const q = utilisationListQuery.parse(req.query);
-    const companyId = req.companyId!;
-    const clauses = [
-      eq(equipmentUtilisation.companyId, companyId),
-      eq(equipmentUtilisation.projectId, req.projectId!),
-    ];
-    if (q.equipmentId) clauses.push(eq(equipmentUtilisation.equipmentId, q.equipmentId));
-    if (q.from) clauses.push(gte(equipmentUtilisation.utilisationDate, q.from));
-    if (q.to) clauses.push(lte(equipmentUtilisation.utilisationDate, q.to));
-    if (q.idleReason) clauses.push(eq(equipmentUtilisation.idleReason, q.idleReason));
-    if (q.shift) clauses.push(eq(equipmentUtilisation.shift, q.shift));
-    if (q.unverifiedOnly) clauses.push(isNull(equipmentUtilisation.verifiedBy));
-    const where = and(...clauses);
-    const [totalRow] = await app.db
-      .select({ n: count() })
-      .from(equipmentUtilisation)
-      .where(where);
-    const rows = await app.db
-      .select()
-      .from(equipmentUtilisation)
-      .where(where)
-      .orderBy(desc(equipmentUtilisation.utilisationDate), asc(equipmentUtilisation.shift))
-      .limit(q.pageSize)
-      .offset(pageOffset(q));
-    const machineIds = [...new Set(rows.map((r) => r.equipmentId))];
-    const machines =
-      machineIds.length > 0
-        ? await app.db.select().from(equipment).where(inArray(equipment.id, machineIds))
-        : [];
-    const byId = new Map(machines.map((m) => [m.id, m] as const));
-    const decorated = [];
-    for (const row of rows) {
-      const machine = byId.get(row.equipmentId);
-      decorated.push(machine ? await decorateUtilisation(row, machine) : row);
-    }
-    return paginate(decorated, Number(totalRow?.n ?? 0), q);
-  });
+  app.get(
+    "/projects/:projectId/equipment-utilisation",
+    { preHandler: readGate },
+    async (req) => {
+      const q = utilisationListQuery.parse(req.query);
+      const companyId = req.companyId!;
+      const clauses = [
+        eq(equipmentUtilisation.companyId, companyId),
+        eq(equipmentUtilisation.projectId, req.projectId!),
+      ];
+      if (q.equipmentId)
+        clauses.push(eq(equipmentUtilisation.equipmentId, q.equipmentId));
+      if (q.from)
+        clauses.push(gte(equipmentUtilisation.utilisationDate, q.from));
+      if (q.to) clauses.push(lte(equipmentUtilisation.utilisationDate, q.to));
+      if (q.idleReason)
+        clauses.push(eq(equipmentUtilisation.idleReason, q.idleReason));
+      if (q.shift) clauses.push(eq(equipmentUtilisation.shift, q.shift));
+      if (q.unverifiedOnly)
+        clauses.push(isNull(equipmentUtilisation.verifiedBy));
+      const where = and(...clauses);
+      const [totalRow] = await app.db
+        .select({ n: count() })
+        .from(equipmentUtilisation)
+        .where(where);
+      const rows = await app.db
+        .select()
+        .from(equipmentUtilisation)
+        .where(where)
+        .orderBy(
+          desc(equipmentUtilisation.utilisationDate),
+          asc(equipmentUtilisation.shift),
+        )
+        .limit(q.pageSize)
+        .offset(pageOffset(q));
+      const machineIds = [...new Set(rows.map((r) => r.equipmentId))];
+      const machines =
+        machineIds.length > 0
+          ? await app.db
+              .select()
+              .from(equipment)
+              .where(inArray(equipment.id, machineIds))
+          : [];
+      const byId = new Map(machines.map((m) => [m.id, m] as const));
+      const decorated = [];
+      for (const row of rows) {
+        const machine = byId.get(row.equipmentId);
+        decorated.push(machine ? await decorateUtilisation(row, machine) : row);
+      }
+      return paginate(decorated, Number(totalRow?.n ?? 0), q);
+    },
+  );
 
   /**
    * Per-machine rollup over a window. Costs are bucketed BY CURRENCY and
@@ -1982,7 +2834,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     { preHandler: readGate },
     async (req) => {
       const q = z
-        .object({ from: isoDateSchema.optional(), to: isoDateSchema.optional() })
+        .object({
+          from: isoDateSchema.optional(),
+          to: isoDateSchema.optional(),
+        })
         .parse(req.query);
       const to = q.to ?? todayISO();
       const from = q.from ?? addDaysISO(to, -29);
@@ -2000,7 +2855,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const machineIds = [...new Set(rows.map((r) => r.equipmentId))];
       const machines =
         machineIds.length > 0
-          ? await app.db.select().from(equipment).where(inArray(equipment.id, machineIds))
+          ? await app.db
+              .select()
+              .from(equipment)
+              .where(inArray(equipment.id, machineIds))
           : [];
       const byId = new Map(machines.map((m) => [m.id, m] as const));
       const grouped = new Map<string, typeof rows>();
@@ -2038,7 +2896,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           ownership: machine?.ownership ?? null,
           days: list.length,
           hours: {
-            availableHours: totals.availableHours === null ? null : round2(totals.availableHours),
+            availableHours:
+              totals.availableHours === null
+                ? null
+                : round2(totals.availableHours),
             workingHours: round2(totals.workingHours),
             idleHours: round2(totals.idleHours),
             standbyHours: round2(totals.standbyHours),
@@ -2049,7 +2910,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           idleByReason,
           currency,
           cost: {
-            total: costed.length > 0 ? round2(costed.reduce((s, r) => s + (r.totalCost ?? 0), 0)) : null,
+            total:
+              costed.length > 0
+                ? round2(costed.reduce((s, r) => s + (r.totalCost ?? 0), 0))
+                : null,
             daysPriced: costed.length,
             daysUnpriced: list.length - costed.length,
             complete: costed.length === list.length,
@@ -2065,11 +2929,17 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           },
         };
       });
-      items.sort((a, b) => (a.utilisation.utilisationPercent ?? 101) - (b.utilisation.utilisationPercent ?? 101));
+      items.sort(
+        (a, b) =>
+          (a.utilisation.utilisationPercent ?? 101) -
+          (b.utilisation.utilisationPercent ?? 101),
+      );
       const costByCurrency: Record<string, number> = {};
       for (const item of items) {
         if (item.cost.total === null) continue;
-        costByCurrency[item.currency] = round2((costByCurrency[item.currency] ?? 0) + item.cost.total);
+        costByCurrency[item.currency] = round2(
+          (costByCurrency[item.currency] ?? 0) + item.cost.total,
+        );
       }
       return {
         from,
@@ -2088,6 +2958,286 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     },
   );
 
+  /**
+   * PLANT COST ONTO THE COST REPORT (#715).
+   *
+   * `equipment_utilisation.budgetLineItemId` is the column that makes plant
+   * a cost rather than a diary entry, and until this route existed nothing
+   * ever read it: a job could stand a 30-tonne excavator for a month and the
+   * budget would show no plant spend at all. The posting mirrors the labour
+   * one in modules/timecards/reports.ts exactly — same `detail` stamp, same
+   * replace-on-re-post arithmetic — so a cost report reads one convention.
+   *
+   * DISCIPLINE, and the reason this is not a sum:
+   *  • Only VERIFIED days post. A utilisation row is the plant claim; the
+   *    verification is the second pair of eyes, and posting unverified hours
+   *    would put an unchecked claim on the cost report as fact.
+   *  • A day that could not be costed AT ALL (no hire rate and no internal
+   *    charge-out rate) is reported as excluded, never posted at zero. A day
+   *    costed only in part IS posted at the figure that could be computed,
+   *    and the budget line's stamp records that it is a FLOOR.
+   *  • A budget line carrying plant in two currencies is refused, not
+   *    converted.
+   */
+  app.post(
+    "/projects/:projectId/equipment-utilisation/post-to-budget",
+    { preHandler: projectAdminGate },
+    async (req, reply) => {
+      const body = z
+        .object({
+          from: isoDateSchema.optional(),
+          to: isoDateSchema.optional(),
+          /** post days nobody has verified — recorded on the stamp */
+          includeUnverified: z.boolean().default(false),
+        })
+        .parse(req.body ?? {});
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const to = body.to ?? todayISO();
+      const from = body.from ?? addDaysISO(to, -30);
+      if (to < from) throw badRequest("to must not precede from");
+
+      const rows = await app.db
+        .select()
+        .from(equipmentUtilisation)
+        .where(
+          and(
+            eq(equipmentUtilisation.companyId, companyId),
+            eq(equipmentUtilisation.projectId, projectId),
+            gte(equipmentUtilisation.utilisationDate, from),
+            lte(equipmentUtilisation.utilisationDate, to),
+          ),
+        );
+      if (rows.length === 0) {
+        return reply.status(200).send({
+          runId: null,
+          from,
+          to,
+          posted: 0,
+          lines: [],
+          reasons: [
+            "no plant day is recorded in this window, so there is nothing to post. The cost " +
+              "report shows no plant because none was booked, not because none stood.",
+          ],
+        });
+      }
+      const machineIds = [...new Set(rows.map((r) => r.equipmentId))];
+      const fleet = await app.db
+        .select()
+        .from(equipment)
+        .where(
+          and(eq(equipment.companyId, companyId), inArray(equipment.id, machineIds)),
+        );
+      const machineById = new Map(fleet.map((m) => [m.id, m] as const));
+
+      const byLine = new Map<
+        string,
+        { cost: number; hours: number; currency: string; days: number }
+      >();
+      /*
+       * A LINE THAT MIXED CURRENCIES STAYS OUT, however many days follow it.
+       * Deleting the accumulator alone was not enough: the next plant day on
+       * that line started a fresh one, and the line was posted at a PARTIAL
+       * figure while `reasons` said it had not been posted at all.
+       */
+      const mixedCurrencyLines = new Set<string>();
+      const reasons: string[] = [];
+      let uncoded = 0;
+      let unverified = 0;
+      let incomplete = 0;
+      let uncosted = 0;
+      for (const row of rows) {
+        if (!row.budgetLineItemId) {
+          uncoded += 1;
+          continue;
+        }
+        if (mixedCurrencyLines.has(row.budgetLineItemId)) continue;
+        if (row.verifiedBy === null && !body.includeUnverified) {
+          unverified += 1;
+          continue;
+        }
+        const machine = machineById.get(row.equipmentId);
+        if (!machine) continue;
+        const h = hoursOf(row);
+        const cost = computeDayCost({
+          hireRateAmount: machine.hireRateAmount,
+          hireRateUnit: machine.hireRateUnit as HireRateUnit | null,
+          idleRateAmount: machine.idleRateAmount,
+          internalRateAmount: machine.internalRateAmount,
+          ownership: machine.ownership,
+          operatorRateAmount: machine.operatorRateAmount,
+          fuelCost: row.fuelCost,
+          fuelLitres: row.fuelLitres,
+          currency: row.currency,
+          hours: h,
+        });
+        if (cost.totalCost === null) {
+          uncosted += 1;
+          continue;
+        }
+        // A day that could be costed only in part IS posted — at the figure
+        // that could be computed — and the stamp says it is a floor. The
+        // alternative, posting nothing, leaves plant off the cost report
+        // entirely, which is the failure this route exists to end. What is
+        // never done is presenting the floor as the whole cost.
+        if (!cost.totalIsComplete) incomplete += 1;
+        const held = byLine.get(row.budgetLineItemId) ?? {
+          cost: 0,
+          hours: 0,
+          currency: cost.currency,
+          days: 0,
+        };
+        if (held.currency !== cost.currency) {
+          reasons.push(
+            `Budget line ${row.budgetLineItemId} carries plant in both ${held.currency} and ` +
+              `${cost.currency}. Money is never summed across currencies, so this line was not ` +
+              "posted. Split the coding by currency.",
+          );
+          mixedCurrencyLines.add(row.budgetLineItemId);
+          byLine.delete(row.budgetLineItemId);
+          continue;
+        }
+        held.cost = round2(held.cost + cost.totalCost);
+        held.hours = round2(held.hours + h.workingHours + h.idleHours + h.standbyHours);
+        held.days += 1;
+        byLine.set(row.budgetLineItemId, held);
+      }
+      if (uncoded > 0) {
+        reasons.push(
+          `${uncoded} plant day(s) carry no budget line and were not posted. Plant coded to ` +
+            "nothing never reaches the cost report, which is how plant overspend survives to " +
+            "final account.",
+        );
+      }
+      if (unverified > 0) {
+        reasons.push(
+          `${unverified} plant day(s) have not been verified and were not posted. A utilisation ` +
+            "row is the claim; the verification is the check. Send includeUnverified to post " +
+            "them anyway — the stamp records that you did.",
+        );
+      }
+      if (uncosted > 0) {
+        reasons.push(
+          `${uncosted} plant day(s) could not be costed at all (no hire rate and no internal ` +
+            "charge-out rate on the machine) and were not posted at zero.",
+        );
+      }
+      if (incomplete > 0) {
+        reasons.push(
+          `${incomplete} plant day(s) were costed only in part — an operator rate or a fuel cost ` +
+            "is missing — so the figure posted for them is a FLOOR on the day's cost, not the " +
+            "day's cost. The stamp on each budget line records this.",
+        );
+      }
+
+      const lineIds = [...byLine.keys()];
+      const posted: Array<{
+        budgetLineItemId: string;
+        costCode: string;
+        plantCost: number;
+        plantHours: number;
+        plantDays: number;
+        currency: string;
+      }> = [];
+      const now = new Date().toISOString();
+      await app.db.transaction(async (tx) => {
+        /*
+         * THE LINES ARE READ AND LOCKED INSIDE THE TRANSACTION.
+         *
+         * `directCosts` is a read-modify-write: the new value is the old one
+         * less this module's previous posting plus the new figure. Reading it
+         * outside the transaction meant the timecards module's labour posting
+         * (which writes the same two columns on the same lines) and a second
+         * plant posting could interleave and silently erase each other — the
+         * cost report would show plant OR labour, whichever landed last, with
+         * no error anywhere. `FOR UPDATE` serialises the two.
+         */
+        const lines = lineIds.length
+          ? await tx
+              .select()
+              .from(budgetLineItems)
+              .where(
+                and(
+                  eq(budgetLineItems.projectId, projectId),
+                  inArray(budgetLineItems.id, lineIds),
+                ),
+              )
+              .for("update")
+          : [];
+        const found = new Set(lines.map((l) => l.id));
+        for (const id of lineIds) {
+          if (!found.has(id)) {
+            reasons.push(
+              `Budget line ${id} is coded on plant days but does not exist on this project, so ` +
+                "those days were not posted.",
+            );
+          }
+        }
+        for (const line of lines) {
+          const held = byLine.get(line.id)!;
+          const detail = { ...(line.detail as Record<string, unknown>) };
+          const prior = (detail["plantPosting"] ?? null) as { plantCost?: number } | null;
+          const previous = typeof prior?.plantCost === "number" ? prior.plantCost : 0;
+          detail["plantPosting"] = {
+            from,
+            to,
+            plantCost: held.cost,
+            plantHours: held.hours,
+            plantDays: held.days,
+            currency: held.currency,
+            includedUnverified: body.includeUnverified,
+            isFloor: incomplete > 0,
+            postedAt: now,
+            postedBy: req.user!.id,
+            note:
+              "posted from equipment utilisation days; re-posting REPLACES this figure rather " +
+              "than adding to it",
+          };
+          await tx
+            .update(budgetLineItems)
+            .set({
+              directCosts: round2(line.directCosts - previous + held.cost),
+              jobToDateCosts: round2(line.jobToDateCosts - previous + held.cost),
+              detail,
+              updatedAt: now,
+            })
+            .where(eq(budgetLineItems.id, line.id));
+          posted.push({
+            budgetLineItemId: line.id,
+            costCode: line.costCode,
+            plantCost: held.cost,
+            plantHours: held.hours,
+            plantDays: held.days,
+            currency: held.currency,
+          });
+        }
+      });
+      const runId = newId("pcp");
+      await appendLedger(app.db, {
+        companyId,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "plant_cost_posting",
+        objectId: runId,
+        projectId,
+        payload: {
+          from,
+          to,
+          lines: posted.length,
+          days: posted.reduce((s, p) => s + p.plantDays, 0),
+          uncodedDays: uncoded,
+          unverifiedDays: unverified,
+          uncostedDays: uncosted,
+          partiallyCostedDays: incomplete,
+          includedUnverified: body.includeUnverified,
+        },
+      });
+      return reply
+        .status(201)
+        .send({ runId, from, to, posted: posted.length, lines: posted, reasons });
+    },
+  );
+
   app.patch(
     "/projects/:projectId/equipment-utilisation/:utilisationId",
     { preHandler: standardGate },
@@ -2098,7 +3248,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         .omit({ equipmentId: true, utilisationDate: true, shift: true })
         .parse(req.body);
       const companyId = req.companyId!;
-      const existing = await fetchUtilisation(utilisationId, companyId, req.projectId!);
+      const existing = await fetchUtilisation(
+        utilisationId,
+        companyId,
+        req.projectId!,
+      );
       if (existing.verifiedBy) {
         throw badRequest(
           "these hours have been independently verified and are no longer editable — a verified " +
@@ -2108,7 +3262,9 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const machine = await fetchEquipment(existing.equipmentId, companyId);
       const h: UtilisationHours = {
         availableHours:
-          body.availableHours !== undefined ? (body.availableHours ?? null) : existing.availableHours,
+          body.availableHours !== undefined
+            ? (body.availableHours ?? null)
+            : existing.availableHours,
         workingHours: body.workingHours ?? existing.workingHours,
         idleHours: body.idleHours ?? existing.idleHours,
         standbyHours: body.standbyHours ?? existing.standbyHours,
@@ -2117,21 +3273,34 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       };
       const util = computeUtilisation(h);
       if (util.utilisationPercent === null && util.accountedHours > 0) {
-        throw badRequest(`the hours on this row do not make a usable day: ${util.reasons.join("; ")}`, {
-          reasons: util.reasons,
-        });
+        throw badRequest(
+          `the hours on this row do not make a usable day: ${util.reasons.join("; ")}`,
+          {
+            reasons: util.reasons,
+          },
+        );
       }
       const cost = computeDayCost({
         hireRateAmount: machine.hireRateAmount,
         hireRateUnit: machine.hireRateUnit as HireRateUnit | null,
         idleRateAmount: machine.idleRateAmount,
+        internalRateAmount: machine.internalRateAmount,
+        ownership: machine.ownership,
         operatorRateAmount: machine.operatorRateAmount,
-        fuelCost: body.fuelCost !== undefined ? (body.fuelCost ?? null) : existing.fuelCost,
-        fuelLitres: body.fuelLitres !== undefined ? (body.fuelLitres ?? null) : existing.fuelLitres,
+        fuelCost:
+          body.fuelCost !== undefined
+            ? (body.fuelCost ?? null)
+            : existing.fuelCost,
+        fuelLitres:
+          body.fuelLitres !== undefined
+            ? (body.fuelLitres ?? null)
+            : existing.fuelLitres,
         currency: existing.currency,
         hours: h,
       });
-      const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+      const patch: Record<string, unknown> = {
+        updatedAt: new Date().toISOString(),
+      };
       for (const [key, value] of Object.entries(body)) {
         if (value === undefined) continue;
         patch[key] = key === "isBillable" ? (value ? 1 : 0) : value;
@@ -2157,7 +3326,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         objectType: "equipment_utilisation",
         objectId: utilisationId,
         projectId: req.projectId!,
-        payload: { changed: Object.keys(body), utilisationPercent: util.utilisationPercent },
+        payload: {
+          changed: Object.keys(body),
+          utilisationPercent: util.utilisationPercent,
+        },
       });
       return decorateUtilisation(
         await fetchUtilisation(utilisationId, companyId, req.projectId!),
@@ -2174,10 +3346,17 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     { preHandler: standardGate },
     async (req) => {
       const { utilisationId } = req.params as { utilisationId: string };
-      const body = z.object({ note: z.string().max(2000).optional() }).parse(req.body ?? {});
+      const body = z
+        .object({ note: z.string().max(2000).optional() })
+        .parse(req.body ?? {});
       const companyId = req.companyId!;
-      const row = await fetchUtilisation(utilisationId, companyId, req.projectId!);
-      if (row.verifiedBy) throw conflict("these hours have already been verified");
+      const row = await fetchUtilisation(
+        utilisationId,
+        companyId,
+        req.projectId!,
+      );
+      if (row.verifiedBy)
+        throw conflict("these hours have already been verified");
       const override = await assertIndependent(
         req,
         row.createdBy,
@@ -2225,7 +3404,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     days: z.coerce.number().int().min(2).max(180).optional(),
     thresholdPercent: z.coerce.number().min(0).max(100).optional(),
     sustainedDays: z.coerce.number().int().min(1).max(90).optional(),
-    includeAll: z.coerce.boolean().optional(),
+    includeAll: boolQuery.optional(),
   });
 
   /**
@@ -2240,6 +3419,14 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     companyId: string,
     projectId: string | null,
     q: z.infer<typeof idleQuery>,
+    /**
+     * The caller's visibility, for the COMPANY-level route. Holding
+     * `equipment` on one job admits you to the fleet register; it does not
+     * hand you every other job's standing plant, and an idle list is a
+     * commercially sensitive read (it says which of a competitor-run job's
+     * machines are earning nothing).
+     */
+    scope?: CompanyScope,
   ): Promise<{
     from: string;
     to: string;
@@ -2251,13 +3438,19 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
   }> {
     const to = q.to ?? todayISO();
     const from = q.from ?? addDaysISO(to, -((q.days ?? 14) - 1));
-    const thresholdPercent = q.thresholdPercent ?? IDLE_UTILISATION_THRESHOLD_PERCENT;
+    const thresholdPercent =
+      q.thresholdPercent ?? IDLE_UTILISATION_THRESHOLD_PERCENT;
     const sustainedDays = q.sustainedDays ?? IDLE_SUSTAINED_DAYS;
 
+    const fleetScope = scope ? scopeProjectFilter(scope, equipment.projectId) : undefined;
     let fleet = await app.db
       .select()
       .from(equipment)
-      .where(eq(equipment.companyId, companyId));
+      .where(
+        fleetScope
+          ? and(eq(equipment.companyId, companyId), fleetScope)
+          : eq(equipment.companyId, companyId),
+      );
     if (projectId) {
       const assigned = await app.db
         .select({ equipmentId: equipmentAssignments.equipmentId })
@@ -2266,14 +3459,24 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           and(
             eq(equipmentAssignments.companyId, companyId),
             eq(equipmentAssignments.projectId, projectId),
-            inArray(equipmentAssignments.status, [...IN_SERVICE_ASSIGNMENT_STATUSES]),
+            inArray(equipmentAssignments.status, [
+              ...IN_SERVICE_ASSIGNMENT_STATUSES,
+            ]),
           ),
         );
       const ids = new Set(assigned.map((a) => a.equipmentId));
       fleet = fleet.filter((m) => ids.has(m.id) || m.projectId === projectId);
     }
     if (fleet.length === 0) {
-      return { from, to, thresholdPercent, sustainedDays, rows: [], flagged: [], idleCostByCurrency: {} };
+      return {
+        from,
+        to,
+        thresholdPercent,
+        sustainedDays,
+        rows: [],
+        flagged: [],
+        idleCostByCurrency: {},
+      };
     }
     const utilRowsClauses = [
       eq(equipmentUtilisation.companyId, companyId),
@@ -2284,7 +3487,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         fleet.map((m) => m.id),
       ),
     ];
-    if (projectId) utilRowsClauses.push(eq(equipmentUtilisation.projectId, projectId));
+    if (projectId)
+      utilRowsClauses.push(eq(equipmentUtilisation.projectId, projectId));
     const utilRows = await app.db
       .select()
       .from(equipmentUtilisation)
@@ -2292,7 +3496,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     const byEquipment = new Map<string, IdleDayInput[]>();
     for (const row of utilRows) {
       const list = byEquipment.get(row.equipmentId) ?? [];
-      list.push({ date: row.utilisationDate, hours: hoursOf(row), idleReason: row.idleReason });
+      list.push({
+        date: row.utilisationDate,
+        hours: hoursOf(row),
+        idleReason: row.idleReason,
+      });
       byEquipment.set(row.equipmentId, list);
     }
 
@@ -2309,6 +3517,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
             hireRateAmount: m.hireRateAmount,
             hireRateUnit: m.hireRateUnit as HireRateUnit | null,
             idleRateAmount: m.idleRateAmount,
+            internalRateAmount: m.internalRateAmount,
             operatorRateAmount: m.operatorRateAmount,
             offHireRequestedAt: m.offHireRequestedAt,
             offHiredAt: m.offHiredAt,
@@ -2401,15 +3610,27 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     };
   }
 
-  app.get("/projects/:projectId/equipment-idle", { preHandler: readGate }, async (req) => {
-    const q = idleQuery.parse(req.query);
-    return idleResponse(await idleAssessments(req.companyId!, req.projectId!, q));
-  });
+  app.get(
+    "/projects/:projectId/equipment-idle",
+    { preHandler: readGate },
+    async (req) => {
+      const q = idleQuery.parse(req.query);
+      return idleResponse(
+        await idleAssessments(req.companyId!, req.projectId!, q),
+      );
+    },
+  );
 
-  app.get("/companies/current/equipment-idle", { preHandler: companyRead }, async (req) => {
-    const q = idleQuery.parse(req.query);
-    return idleResponse(await idleAssessments(req.companyId!, null, q));
-  });
+  app.get(
+    "/companies/current/equipment-idle",
+    { preHandler: companyRead },
+    async (req) => {
+      const q = idleQuery.parse(req.query);
+      return idleResponse(
+        await idleAssessments(req.companyId!, null, q, companyScopeOf(req)),
+      );
+    },
+  );
 
   /* ================================================================ */
   /* CERTIFICATES — the column the table exists for is `validTo`       */
@@ -2427,11 +3648,22 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     issuedByName: z.string().max(200).nullable().optional(),
     issuerVendorId: idRef.nullable().optional(),
     issuerAccreditation: z.string().max(200).nullable().optional(),
-    inspectionIntervalMonths: z.number().int().min(1).max(120).nullable().optional(),
+    inspectionIntervalMonths: z
+      .number()
+      .int()
+      .min(1)
+      .max(120)
+      .nullable()
+      .optional(),
     nextInspectionDue: isoDateSchema.nullable().optional(),
-    result: z.enum(["pass", "pass_with_conditions", "fail", "not_applicable"]).default("pass"),
+    result: z
+      .enum(["pass", "pass_with_conditions", "fail", "not_applicable"])
+      .default("pass"),
     conditions: z.string().max(4000).nullable().optional(),
-    defectsNoted: z.array(z.record(z.string(), z.unknown())).max(100).optional(),
+    defectsNoted: z
+      .array(z.record(z.string(), z.unknown()))
+      .max(100)
+      .optional(),
     safeWorkingLoad: z.string().max(120).nullable().optional(),
     fileId: idRef.nullable().optional(),
     fileSha256: z.string().max(64).nullable().optional(),
@@ -2449,7 +3681,9 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const companyId = req.companyId!;
       const machine = await fetchEquipment(equipmentId, companyId);
       if (body.validFrom && body.validTo < body.validFrom) {
-        throw badRequest(`validTo ${body.validTo} falls before validFrom ${body.validFrom}`);
+        throw badRequest(
+          `validTo ${body.validTo} falls before validFrom ${body.validFrom}`,
+        );
       }
       if (body.projectId) await assertProject(body.projectId, companyId);
       const projectId = body.projectId ?? machine.projectId ?? null;
@@ -2479,7 +3713,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const nextInspectionDue =
         body.nextInspectionDue ??
         (body.inspectionIntervalMonths && body.issuedAt
-          ? addDaysISO(body.issuedAt, Math.round(body.inspectionIntervalMonths * 30.44))
+          ? addDaysISO(
+              body.issuedAt,
+              Math.round(body.inspectionIntervalMonths * 30.44),
+            )
           : null);
 
       const id = newId("eqc");
@@ -2511,16 +3748,60 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         detail: body.detail ?? {},
         createdBy: req.user!.id,
       });
-      if (body.supersedesId) {
+      /*
+       * SUPERSESSION IS AUTOMATIC, not a field somebody remembers to send.
+       * A renewal added without `supersedesId` used to leave last year's row
+       * live and expired, which made the machine read as out of certificate
+       * and raised a critical "stop the machine" signal against plant whose
+       * paperwork was in order. Every earlier certificate of the SAME TYPE on
+       * the same machine whose cover ends no later than this one is closed.
+       */
+      const nowIso2 = new Date().toISOString();
+      const priorSameType = await app.db
+        .select({
+          id: equipmentCertificates.id,
+          validTo: equipmentCertificates.validTo,
+        })
+        .from(equipmentCertificates)
+        .where(
+          and(
+            eq(equipmentCertificates.companyId, companyId),
+            eq(equipmentCertificates.equipmentId, equipmentId),
+            eq(equipmentCertificates.certificateType, body.certificateType),
+            lte(equipmentCertificates.validTo, body.validTo),
+            inArray(equipmentCertificates.status, [
+              "valid",
+              "expiring",
+              "expired",
+            ]),
+          ),
+        );
+      const supersededIds = priorSameType
+        .map((c) => c.id)
+        .filter((cid) => cid !== id);
+      if (supersededIds.length > 0) {
         await app.db
           .update(equipmentCertificates)
-          .set({ supersededById: id, status: "superseded", updatedAt: new Date().toISOString() })
-          .where(
-            and(
-              eq(equipmentCertificates.id, body.supersedesId),
-              eq(equipmentCertificates.companyId, companyId),
-            ),
-          );
+          .set({ supersededById: id, status: "superseded", updatedAt: nowIso2 })
+          .where(inArray(equipmentCertificates.id, supersededIds));
+        for (const supersededId of supersededIds) {
+          await appendLedger(app.db, {
+            companyId,
+            actorId: req.user!.id,
+            action: "state_change",
+            objectType: "equipment_certificate",
+            objectId: supersededId,
+            projectId,
+            payload: {
+              to: "superseded",
+              supersededById: id,
+              certificateType: body.certificateType,
+              reason:
+                "a later certificate of the same type was issued for this machine, so this row no " +
+                "longer describes the machine's current cover",
+            },
+          });
+        }
       }
       await appendLedger(app.db, {
         companyId,
@@ -2543,7 +3824,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         },
         storePayload: true,
       });
-      await sweepEquipment(companyId, req.user!.id);
+      await refreshCertificateColumn(companyId, equipmentId);
+      await sweepEquipment(companyId, null);
       const created = await fetchCertificate(id, companyId);
       return reply.status(201).send({
         ...created,
@@ -2570,7 +3852,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     async (req) => {
       const { equipmentId } = req.params as { equipmentId: string };
       await fetchEquipment(equipmentId, req.companyId!);
-      await sweepEquipment(req.companyId!, req.user!.id);
+      await maybeSweep(req.companyId!);
       const asOf = todayISO();
       const inService = await inServiceEquipmentIds(req.companyId!);
       const rows = await app.db
@@ -2602,80 +3884,118 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
 
   /** The company-wide "which machines are out of certificate today" view —
    *  the question an inspector asks first. */
-  app.get("/companies/current/equipment-certificates", { preHandler: companyRead }, async (req) => {
-    const q = pageQuerySchema
-      .extend({
-        certificateType: z.enum(EQUIPMENT_CERTIFICATE_TYPES).optional(),
-        status: z.enum(["pending", "valid", "expiring", "expired", "revoked", "superseded"]).optional(),
-        expiringWithinDays: z.coerce.number().int().min(0).max(365).optional(),
-        inServiceOnly: z.coerce.boolean().optional(),
-        unverifiedOnly: z.coerce.boolean().optional(),
-      })
-      .parse(req.query);
-    const companyId = req.companyId!;
-    await sweepEquipment(companyId, req.user!.id);
-    const asOf = todayISO();
-    const inService = await inServiceEquipmentIds(companyId);
-    const clauses = [eq(equipmentCertificates.companyId, companyId)];
-    if (q.certificateType) clauses.push(eq(equipmentCertificates.certificateType, q.certificateType));
-    if (q.status) clauses.push(eq(equipmentCertificates.status, q.status));
-    if (q.expiringWithinDays !== undefined) {
-      clauses.push(lte(equipmentCertificates.validTo, addDaysISO(asOf, q.expiringWithinDays)));
-    }
-    if (q.unverifiedOnly) clauses.push(isNull(equipmentCertificates.verifiedBy));
-    const where = and(...clauses);
-    const rows = await app.db
-      .select()
-      .from(equipmentCertificates)
-      .where(where)
-      .orderBy(asc(equipmentCertificates.validTo));
-    const machineIds = [...new Set(rows.map((r) => r.equipmentId))];
-    const machines =
-      machineIds.length > 0
-        ? await app.db.select().from(equipment).where(inArray(equipment.id, machineIds))
-        : [];
-    const byId = new Map(machines.map((m) => [m.id, m] as const));
-    let items = rows.map((c) => {
-      const machine = byId.get(c.equipmentId);
-      const onProject = inService.get(c.equipmentId) ?? machine?.projectId ?? null;
+  app.get(
+    "/companies/current/equipment-certificates",
+    { preHandler: companyRead },
+    async (req) => {
+      const q = pageQuerySchema
+        .extend({
+          certificateType: z.enum(EQUIPMENT_CERTIFICATE_TYPES).optional(),
+          status: z
+            .enum([
+              "pending",
+              "valid",
+              "expiring",
+              "expired",
+              "revoked",
+              "superseded",
+            ])
+            .optional(),
+          expiringWithinDays: z.coerce
+            .number()
+            .int()
+            .min(0)
+            .max(365)
+            .optional(),
+          inServiceOnly: boolQuery.optional(),
+          unverifiedOnly: boolQuery.optional(),
+        })
+        .parse(req.query);
+      const companyId = req.companyId!;
+      await maybeSweep(companyId);
+      const asOf = todayISO();
+      const inService = await inServiceEquipmentIds(companyId);
+      const clauses = [eq(equipmentCertificates.companyId, companyId)];
+      const certScope = machineScopeClause(
+        await visibleMachineIds(req),
+        equipmentCertificates.equipmentId,
+      );
+      if (certScope) clauses.push(certScope);
+      if (q.certificateType)
+        clauses.push(
+          eq(equipmentCertificates.certificateType, q.certificateType),
+        );
+      if (q.status) clauses.push(eq(equipmentCertificates.status, q.status));
+      if (q.expiringWithinDays !== undefined) {
+        clauses.push(
+          lte(
+            equipmentCertificates.validTo,
+            addDaysISO(asOf, q.expiringWithinDays),
+          ),
+        );
+      }
+      if (q.unverifiedOnly)
+        clauses.push(isNull(equipmentCertificates.verifiedBy));
+      const where = and(...clauses);
+      const rows = await app.db
+        .select()
+        .from(equipmentCertificates)
+        .where(where)
+        .orderBy(asc(equipmentCertificates.validTo));
+      const machineIds = [...new Set(rows.map((r) => r.equipmentId))];
+      const machines =
+        machineIds.length > 0
+          ? await app.db
+              .select()
+              .from(equipment)
+              .where(inArray(equipment.id, machineIds))
+          : [];
+      const byId = new Map(machines.map((m) => [m.id, m] as const));
+      let items = rows.map((c) => {
+        const machine = byId.get(c.equipmentId);
+        const onProject =
+          inService.get(c.equipmentId) ?? machine?.projectId ?? null;
+        return {
+          ...c,
+          statutory: isStatutoryCertificate(c.certificateType),
+          equipmentReference: machine?.reference ?? null,
+          equipmentName: machine?.name ?? null,
+          inServiceProjectId: onProject,
+          verdict: certificateVerdict({
+            validTo: c.validTo,
+            validFrom: c.validFrom,
+            certificateType: c.certificateType,
+            inService: onProject !== null,
+            asOf,
+          }),
+        };
+      });
+      if (q.inServiceOnly)
+        items = items.filter((i) => i.inServiceProjectId !== null);
+      const total = items.length;
+      const page = items.slice(pageOffset(q), pageOffset(q) + q.pageSize);
       return {
-        ...c,
-        statutory: isStatutoryCertificate(c.certificateType),
-        equipmentReference: machine?.reference ?? null,
-        equipmentName: machine?.name ?? null,
-        inServiceProjectId: onProject,
-        verdict: certificateVerdict({
-          validTo: c.validTo,
-          validFrom: c.validFrom,
-          certificateType: c.certificateType,
-          inService: onProject !== null,
-          asOf,
-        }),
+        ...paginate(page, total, q),
+        asOf,
+        summary: {
+          expired: items.filter((i) => i.verdict.status === "expired").length,
+          expiredInServiceStatutory: items.filter(
+            (i) =>
+              i.verdict.detector === "equipment_certificate_expired_in_service",
+          ).length,
+          expiring: items.filter((i) => i.verdict.status === "expiring").length,
+          unverified: items.filter((i) => i.verifiedBy === null).length,
+        },
       };
-    });
-    if (q.inServiceOnly) items = items.filter((i) => i.inServiceProjectId !== null);
-    const total = items.length;
-    const page = items.slice(pageOffset(q), pageOffset(q) + q.pageSize);
-    return {
-      ...paginate(page, total, q),
-      asOf,
-      summary: {
-        expired: items.filter((i) => i.verdict.status === "expired").length,
-        expiredInServiceStatutory: items.filter(
-          (i) => i.verdict.detector === "equipment_certificate_expired_in_service",
-        ).length,
-        expiring: items.filter((i) => i.verdict.status === "expiring").length,
-        unverified: items.filter((i) => i.verifiedBy === null).length,
-      },
-    };
-  });
+    },
+  );
 
   /** Verification that the certificate is GENUINE. Schema comment: never the
    *  hire desk — i.e. never whoever filed it. A forged thorough examination
    *  is not a rare thing on a busy site. */
   app.post(
     "/companies/current/equipment-certificates/:certificateId/verify",
-    { preHandler: companyWrite },
+    { preHandler: companyAdmin },
     async (req) => {
       const { certificateId } = req.params as { certificateId: string };
       const body = z
@@ -2691,6 +4011,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         .parse(req.body);
       const companyId = req.companyId!;
       const cert = await fetchCertificate(certificateId, companyId);
+      await assertMachineVisible(req, cert.equipmentId);
       if (cert.status === "revoked" || cert.status === "superseded") {
         throw badRequest(`a ${cert.status} certificate cannot be verified`);
       }
@@ -2768,14 +4089,23 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
 
   /** Observed meter movement per day, from the two most recent readings —
    *  the input that lets a meter interval be projected onto a date. */
-  async function observedDailyUsage(equipmentId: string): Promise<number | null> {
+  async function observedDailyUsage(
+    equipmentId: string,
+  ): Promise<number | null> {
     const rows = await app.db
-      .select({ value: equipmentReadings.value, readAt: equipmentReadings.readAt })
+      .select({
+        value: equipmentReadings.value,
+        readAt: equipmentReadings.readAt,
+      })
       .from(equipmentReadings)
       .where(
         and(
           eq(equipmentReadings.equipmentId, equipmentId),
-          inArray(equipmentReadings.readingType, ["hours", "odometer", "cycles"]),
+          inArray(equipmentReadings.readingType, [
+            "hours",
+            "odometer",
+            "cycles",
+          ]),
           eq(equipmentReadings.isAnomalous, 0),
         ),
       )
@@ -2858,7 +4188,12 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         lastPerformedMeter: body.lastPerformedMeter ?? null,
         nextDueAt: due.nextDueAt,
         nextDueMeter: due.nextDueMeter,
-        status: due.status === "overdue" ? "overdue" : due.status === "due_soon" ? "due" : "active",
+        status:
+          due.status === "overdue"
+            ? "overdue"
+            : due.status === "due_soon"
+              ? "due"
+              : "active",
         providerVendorId: body.providerVendorId ?? null,
         estimatedCost: body.estimatedCost ?? null,
         estimatedDowntimeHours: body.estimatedDowntimeHours ?? null,
@@ -2897,15 +4232,184 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     },
   );
 
+  /**
+   * SUSPEND, RETIRE OR REINSTATE A SCHEDULE, and correct its interval.
+   *
+   * A schedule with no way out is a schedule people work around: a machine
+   * that has left the fleet, or whose statutory regime changed, kept
+   * generating overdue services and — for a statutory one — kept the plant
+   * flagged. `suspended` stops the sweep counting it while keeping the
+   * history; `retired` ends it. A STATUTORY schedule cannot be quietly
+   * suspended without saying why, because that is the paperwork that keeps a
+   * machine lawful.
+   */
+  app.patch(
+    "/companies/current/equipment/:equipmentId/maintenance-schedules/:scheduleId",
+    { preHandler: companyWrite },
+    async (req) => {
+      const { equipmentId, scheduleId } = req.params as {
+        equipmentId: string;
+        scheduleId: string;
+      };
+      const body = z
+        .object({
+          status: z.enum(["active", "suspended", "retired"]).optional(),
+          reason: z.string().max(2000).optional(),
+          name: nonEmpty(200).optional(),
+          description: z.string().max(4000).nullable().optional(),
+          intervalValue: z.number().finite().positive().optional(),
+          warnAheadValue: z.number().finite().min(0).nullable().optional(),
+          providerVendorId: idRef.nullable().optional(),
+          estimatedCost: money.nullable().optional(),
+          estimatedDowntimeHours: hours.nullable().optional(),
+        })
+        .parse(req.body ?? {});
+      const companyId = req.companyId!;
+      const machine = await fetchEquipment(equipmentId, companyId);
+      const [schedule] = await app.db
+        .select()
+        .from(equipmentMaintenanceSchedules)
+        .where(
+          and(
+            eq(equipmentMaintenanceSchedules.id, scheduleId),
+            eq(equipmentMaintenanceSchedules.companyId, companyId),
+            eq(equipmentMaintenanceSchedules.equipmentId, equipmentId),
+          ),
+        )
+        .limit(1);
+      if (!schedule) throw notFound("Maintenance schedule not found");
+      if (schedule.status === "retired" && body.status !== "active") {
+        throw conflict(
+          `${schedule.name} is retired. Reinstate it with status "active" before changing it, so ` +
+            "the reinstatement is a decision somebody made rather than a side effect of an edit.",
+        );
+      }
+      if (
+        schedule.isStatutory === 1 &&
+        (body.status === "suspended" || body.status === "retired") &&
+        !(body.reason ?? "").trim()
+      ) {
+        throw badRequest(
+          `${schedule.name} is a STATUTORY schedule — it is the regime that keeps this machine ` +
+            "lawful to operate. Say why it is being " +
+            `${body.status}, and the reason is kept on the ledger.`,
+        );
+      }
+      const now = new Date().toISOString();
+      const intervalValue = body.intervalValue ?? schedule.intervalValue;
+      const warnAheadValue =
+        body.warnAheadValue !== undefined ? body.warnAheadValue : schedule.warnAheadValue;
+      // Recompute the due date from the new interval; a suspended or retired
+      // schedule keeps its stored due date and simply stops being counted.
+      const due =
+        body.status === "suspended" || body.status === "retired"
+          ? null
+          : computeNextDue({
+              intervalKind: schedule.intervalKind as MaintenanceIntervalKind,
+              intervalValue,
+              warnAheadValue,
+              lastPerformedAt: schedule.lastPerformedAt,
+              lastPerformedMeter: schedule.lastPerformedMeter,
+              currentMeter: machine.currentMeterReading,
+              meterType: machine.meterType as MeterType,
+              baselineDate: machine.hireStartDate ?? machine.purchaseDate,
+              averageDailyUsage: await observedDailyUsage(equipmentId),
+              asOf: todayISO(),
+            });
+      const status =
+        body.status === undefined
+          ? schedule.status
+          : body.status === "active"
+            ? due?.status === "overdue"
+              ? "overdue"
+              : due?.status === "due_soon"
+                ? "due"
+                : "active"
+            : body.status;
+      await app.db
+        .update(equipmentMaintenanceSchedules)
+        .set({
+          ...(body.name !== undefined ? { name: body.name } : {}),
+          ...(body.description !== undefined ? { description: body.description } : {}),
+          ...(body.providerVendorId !== undefined
+            ? { providerVendorId: body.providerVendorId }
+            : {}),
+          ...(body.estimatedCost !== undefined ? { estimatedCost: body.estimatedCost } : {}),
+          ...(body.estimatedDowntimeHours !== undefined
+            ? { estimatedDowntimeHours: body.estimatedDowntimeHours }
+            : {}),
+          intervalValue,
+          warnAheadValue,
+          ...(due ? { nextDueAt: due.nextDueAt, nextDueMeter: due.nextDueMeter } : {}),
+          status,
+          detail: {
+            ...(schedule.detail ?? {}),
+            ...(body.status && body.status !== schedule.status
+              ? {
+                  statusChange: {
+                    from: schedule.status,
+                    to: body.status,
+                    reason: body.reason ?? null,
+                    at: now,
+                    by: req.user!.id,
+                  },
+                }
+              : {}),
+          },
+          updatedAt: now,
+        })
+        .where(eq(equipmentMaintenanceSchedules.id, scheduleId));
+      await appendLedger(app.db, {
+        companyId,
+        actorId: req.user!.id,
+        action: body.status && body.status !== schedule.status ? "state_change" : "update",
+        objectType: "equipment_maintenance_schedule",
+        objectId: scheduleId,
+        projectId: schedule.projectId,
+        payload: {
+          equipmentId,
+          equipmentReference: machine.reference,
+          name: body.name ?? schedule.name,
+          from: schedule.status,
+          to: status,
+          reason: body.reason ?? null,
+          isStatutory: schedule.isStatutory === 1,
+          intervalValue,
+        },
+        storePayload: true,
+      });
+      const [after] = await app.db
+        .select()
+        .from(equipmentMaintenanceSchedules)
+        .where(eq(equipmentMaintenanceSchedules.id, scheduleId))
+        .limit(1);
+      return {
+        ...after,
+        isStatutory: after?.isStatutory === 1,
+        due,
+        note:
+          status === "suspended"
+            ? "This schedule no longer raises a due or overdue service. Its history is kept and " +
+              "reinstating it recomputes the next due date from the last service performed."
+            : status === "retired"
+              ? "This schedule is closed. Raise a new one if the regime returns."
+              : null,
+      };
+    },
+  );
+
   app.get(
     "/companies/current/equipment/:equipmentId/maintenance-schedules",
     { preHandler: companyRead },
     async (req) => {
       const { equipmentId } = req.params as { equipmentId: string };
       const machine = await fetchEquipment(equipmentId, req.companyId!);
-      await sweepEquipment(req.companyId!, req.user!.id);
+      await maybeSweep(req.companyId!);
       const asOf = todayISO();
-      const due = await scheduleDueRows(await fetchEquipment(equipmentId, req.companyId!), asOf);
+      const due = await scheduleDueRows(
+        await fetchEquipment(equipmentId, req.companyId!),
+        asOf,
+      );
       const schedules = await app.db
         .select()
         .from(equipmentMaintenanceSchedules)
@@ -2917,7 +4421,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         currentMeterReading: machine.currentMeterReading,
         meterType: machine.meterType,
         asOf,
-        items: schedules.map((s) => ({ ...s, isStatutory: s.isStatutory === 1, due: byId.get(s.id) ?? null })),
+        items: schedules.map((s) => ({
+          ...s,
+          isStatutory: s.isStatutory === 1,
+          due: byId.get(s.id) ?? null,
+        })),
         governing: earliestDue(due),
       };
     },
@@ -2925,74 +4433,101 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
 
   /** The company-wide due/overdue register. Sweeps, so opening it is what
    *  makes the overdue-on-critical-plant Signals exist. */
-  app.get("/companies/current/equipment-maintenance", { preHandler: companyRead }, async (req) => {
-    const q = z
-      .object({
-        status: z.enum(["active", "due", "overdue", "suspended", "retired"]).optional(),
-        criticalOnly: z.coerce.boolean().optional(),
-        statutoryOnly: z.coerce.boolean().optional(),
-      })
-      .parse(req.query);
-    const companyId = req.companyId!;
-    await sweepEquipment(companyId, req.user!.id);
-    const asOf = todayISO();
-    const clauses = [eq(equipmentMaintenanceSchedules.companyId, companyId)];
-    if (q.status) clauses.push(eq(equipmentMaintenanceSchedules.status, q.status));
-    if (q.statutoryOnly) clauses.push(eq(equipmentMaintenanceSchedules.isStatutory, 1));
-    const schedules = await app.db
-      .select()
-      .from(equipmentMaintenanceSchedules)
-      .where(and(...clauses));
-    const machineIds = [...new Set(schedules.map((s) => s.equipmentId))];
-    const machines =
-      machineIds.length > 0
-        ? await app.db.select().from(equipment).where(inArray(equipment.id, machineIds))
-        : [];
-    const byId = new Map(machines.map((m) => [m.id, m] as const));
-    const items = schedules
-      .filter((s) => !q.criticalOnly || byId.get(s.equipmentId)?.isCritical === 1)
-      .map((s) => {
-        const machine = byId.get(s.equipmentId);
-        const due = machine
-          ? computeNextDue({
-              intervalKind: s.intervalKind as MaintenanceIntervalKind,
-              intervalValue: s.intervalValue,
-              warnAheadValue: s.warnAheadValue,
-              lastPerformedAt: s.lastPerformedAt,
-              lastPerformedMeter: s.lastPerformedMeter,
-              currentMeter: machine.currentMeterReading,
-              meterType: machine.meterType as MeterType,
-              baselineDate: machine.hireStartDate ?? machine.purchaseDate,
-              asOf,
-            })
-          : null;
-        return {
-          ...s,
-          isStatutory: s.isStatutory === 1,
-          equipmentReference: machine?.reference ?? null,
-          equipmentName: machine?.name ?? null,
-          isCriticalPlant: machine?.isCritical === 1,
-          due,
-        };
+  app.get(
+    "/companies/current/equipment-maintenance",
+    { preHandler: companyRead },
+    async (req) => {
+      const q = z
+        .object({
+          status: z
+            .enum(["active", "due", "overdue", "suspended", "retired"])
+            .optional(),
+          criticalOnly: boolQuery.optional(),
+          statutoryOnly: boolQuery.optional(),
+        })
+        .parse(req.query);
+      const companyId = req.companyId!;
+      await maybeSweep(companyId);
+      const asOf = todayISO();
+      const clauses = [eq(equipmentMaintenanceSchedules.companyId, companyId)];
+      const maintScope = machineScopeClause(
+        await visibleMachineIds(req),
+        equipmentMaintenanceSchedules.equipmentId,
+      );
+      if (maintScope) clauses.push(maintScope);
+      if (q.status)
+        clauses.push(eq(equipmentMaintenanceSchedules.status, q.status));
+      if (q.statutoryOnly)
+        clauses.push(eq(equipmentMaintenanceSchedules.isStatutory, 1));
+      const schedules = await app.db
+        .select()
+        .from(equipmentMaintenanceSchedules)
+        .where(and(...clauses));
+      const machineIds = [...new Set(schedules.map((s) => s.equipmentId))];
+      const machines =
+        machineIds.length > 0
+          ? await app.db
+              .select()
+              .from(equipment)
+              .where(inArray(equipment.id, machineIds))
+          : [];
+      const byId = new Map(machines.map((m) => [m.id, m] as const));
+      const items = schedules
+        .filter(
+          (s) => !q.criticalOnly || byId.get(s.equipmentId)?.isCritical === 1,
+        )
+        .map((s) => {
+          const machine = byId.get(s.equipmentId);
+          const due = machine
+            ? computeNextDue({
+                intervalKind: s.intervalKind as MaintenanceIntervalKind,
+                intervalValue: s.intervalValue,
+                warnAheadValue: s.warnAheadValue,
+                lastPerformedAt: s.lastPerformedAt,
+                lastPerformedMeter: s.lastPerformedMeter,
+                currentMeter: machine.currentMeterReading,
+                meterType: machine.meterType as MeterType,
+                baselineDate: machine.hireStartDate ?? machine.purchaseDate,
+                asOf,
+              })
+            : null;
+          return {
+            ...s,
+            isStatutory: s.isStatutory === 1,
+            equipmentReference: machine?.reference ?? null,
+            equipmentName: machine?.name ?? null,
+            isCriticalPlant: machine?.isCritical === 1,
+            due,
+          };
+        });
+      items.sort((a, b) => {
+        const rank = (x: typeof a) =>
+          x.due?.status === "overdue"
+            ? 0
+            : x.due?.status === "due_soon"
+              ? 1
+              : 2;
+        return (
+          rank(a) - rank(b) ||
+          (a.equipmentReference ?? "").localeCompare(b.equipmentReference ?? "")
+        );
       });
-    items.sort((a, b) => {
-      const rank = (x: typeof a) => (x.due?.status === "overdue" ? 0 : x.due?.status === "due_soon" ? 1 : 2);
-      return rank(a) - rank(b) || (a.equipmentReference ?? "").localeCompare(b.equipmentReference ?? "");
-    });
-    return {
-      asOf,
-      total: items.length,
-      summary: {
-        overdue: items.filter((i) => i.due?.status === "overdue").length,
-        overdueOnCriticalPlant: items.filter(
-          (i) => i.due?.status === "overdue" && i.isCriticalPlant,
-        ).length,
-        dueSoon: items.filter((i) => i.due?.status === "due_soon").length,
-        notScheduled: items.filter((i) => i.due?.status === "not_scheduled").length,
-      },
-      items,
-    };
-  });
+      return {
+        asOf,
+        total: items.length,
+        summary: {
+          overdue: items.filter((i) => i.due?.status === "overdue").length,
+          overdueOnCriticalPlant: items.filter(
+            (i) => i.due?.status === "overdue" && i.isCriticalPlant,
+          ).length,
+          dueSoon: items.filter((i) => i.due?.status === "due_soon").length,
+          notScheduled: items.filter((i) => i.due?.status === "not_scheduled")
+            .length,
+        },
+        items,
+      };
+    },
+  );
 
   const maintenanceRecordSchema = z.object({
     scheduleId: idRef.nullable().optional(),
@@ -3040,7 +4575,9 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const body = maintenanceRecordSchema.parse(req.body);
       const companyId = req.companyId!;
       const machine = await fetchEquipment(equipmentId, companyId);
-      let schedule: typeof equipmentMaintenanceSchedules.$inferSelect | undefined;
+      let schedule:
+        | typeof equipmentMaintenanceSchedules.$inferSelect
+        | undefined;
       if (body.scheduleId) {
         const rows = await app.db
           .select()
@@ -3053,7 +4590,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           )
           .limit(1);
         schedule = rows[0];
-        if (!schedule) throw badRequest("scheduleId is not a maintenance schedule in this company");
+        if (!schedule)
+          throw badRequest(
+            "scheduleId is not a maintenance schedule in this company",
+          );
         if (schedule.equipmentId !== equipmentId) {
           throw badRequest(
             `schedule ${body.scheduleId} belongs to a different machine — a service performed on ` +
@@ -3064,12 +4604,18 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const performedAt = body.performedAt
         ? new Date(body.performedAt).toISOString()
         : new Date().toISOString();
-      const number = await nextRecordNumber(app.db, companyId, "equipment_maintenance");
+      const number = await nextRecordNumber(
+        app.db,
+        companyId,
+        "equipment_maintenance",
+      );
       const reference = `MNT-${pad(number)}`;
       const partsCost = body.partsCost ?? null;
       const labourCost = body.labourCost ?? null;
       const totalCost =
-        partsCost === null && labourCost === null ? null : round2((partsCost ?? 0) + (labourCost ?? 0));
+        partsCost === null && labourCost === null
+          ? null
+          : round2((partsCost ?? 0) + (labourCost ?? 0));
 
       // The next due point after this service, computed from the schedule's
       // own interval and the meter at which the work was actually done.
@@ -3079,7 +4625,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
             intervalValue: schedule.intervalValue,
             warnAheadValue: schedule.warnAheadValue,
             lastPerformedAt: performedAt.slice(0, 10),
-            lastPerformedMeter: body.meterReading ?? machine.currentMeterReading,
+            lastPerformedMeter:
+              body.meterReading ?? machine.currentMeterReading,
             currentMeter: body.meterReading ?? machine.currentMeterReading,
             meterType: machine.meterType as MeterType,
             asOf: todayISO(),
@@ -3128,34 +4675,63 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         createdBy: req.user!.id,
       });
 
-      if (schedule && (body.result === "completed" || body.result === "partial")) {
+      if (
+        schedule &&
+        (body.result === "completed" || body.result === "partial")
+      ) {
         await app.db
           .update(equipmentMaintenanceSchedules)
           .set({
             lastPerformedAt: performedAt.slice(0, 10),
-            lastPerformedMeter: body.meterReading ?? schedule.lastPerformedMeter,
+            /*
+             * The BASELINE the next service is measured from, and it must be
+             * the same input the record's own nextDue was computed from
+             * (body.meterReading ?? machine.currentMeterReading). Storing the
+             * OLD baseline when no reading was supplied left the schedule
+             * measuring from the last service but two: the sweep recomputed
+             * old-baseline + interval, found it already passed, and flipped
+             * the schedule straight back to overdue — contradicting the
+             * maintenance record that had just closed it.
+             */
+            lastPerformedMeter:
+              body.meterReading ??
+              machine.currentMeterReading ??
+              schedule.lastPerformedMeter,
             nextDueAt: nextDue?.nextDueAt ?? null,
             nextDueMeter: nextDue?.nextDueMeter ?? null,
             status:
-              nextDue?.status === "overdue" ? "overdue" : nextDue?.status === "due_soon" ? "due" : "active",
+              nextDue?.status === "overdue"
+                ? "overdue"
+                : nextDue?.status === "due_soon"
+                  ? "due"
+                  : "active",
             updatedAt: new Date().toISOString(),
           })
           .where(eq(equipmentMaintenanceSchedules.id, schedule.id));
       }
-      if (body.meterReading != null) {
+      if (
+        body.meterReading != null &&
+        (machine.currentMeterReading === null ||
+          body.meterReading >= machine.currentMeterReading)
+      ) {
         await app.db
           .update(equipment)
           .set({
             currentMeterReading: body.meterReading,
             lastMeterReadingAt: performedAt,
-            status: body.result === "condemned" ? "quarantined" : machine.status,
+            status:
+              body.result === "condemned" ? "quarantined" : machine.status,
             updatedAt: new Date().toISOString(),
           })
           .where(eq(equipment.id, equipmentId));
       } else if (body.result === "condemned") {
         await app.db
           .update(equipment)
-          .set({ status: "quarantined", condition: "unserviceable", updatedAt: new Date().toISOString() })
+          .set({
+            status: "quarantined",
+            condition: "unserviceable",
+            updatedAt: new Date().toISOString(),
+          })
           .where(eq(equipment.id, equipmentId));
       }
       await appendLedger(app.db, {
@@ -3227,7 +4803,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
    *  performed it — a fitter signing off their own repair is not a check. */
   app.post(
     "/companies/current/equipment-maintenance-records/:recordId/verify",
-    { preHandler: companyWrite },
+    { preHandler: companyAdmin },
     async (req) => {
       const { recordId } = req.params as { recordId: string };
       const body = z
@@ -3238,7 +4814,9 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         .parse(req.body ?? {});
       const companyId = req.companyId!;
       const record = await fetchMaintenanceRecord(recordId, companyId);
-      if (record.verifiedBy) throw conflict("this maintenance record has already been verified");
+      await assertMachineVisible(req, record.equipmentId);
+      if (record.verifiedBy)
+        throw conflict("this maintenance record has already been verified");
       const override = await assertIndependent(
         req,
         record.createdBy,
@@ -3252,8 +4830,12 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           verifiedBy: req.user!.id,
           verifiedAt: now,
           status: "verified",
-          returnedToServiceAt: body.returnToService ? (record.returnedToServiceAt ?? now) : record.returnedToServiceAt,
-          returnedToServiceBy: body.returnToService ? req.user!.id : record.returnedToServiceBy,
+          returnedToServiceAt: body.returnToService
+            ? (record.returnedToServiceAt ?? now)
+            : record.returnedToServiceAt,
+          returnedToServiceBy: body.returnToService
+            ? req.user!.id
+            : record.returnedToServiceBy,
           updatedAt: now,
         })
         .where(eq(equipmentMaintenanceRecords.id, recordId));
@@ -3264,7 +4846,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           .where(
             and(
               eq(equipment.id, record.equipmentId),
-              inArray(equipment.status, ["under_maintenance", "breakdown", "quarantined"]),
+              inArray(equipment.status, [
+                "under_maintenance",
+                "breakdown",
+                "quarantined",
+              ]),
             ),
           );
       }
@@ -3336,10 +4922,16 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const body = readingCreateSchema.parse(req.body);
       const companyId = req.companyId!;
       const machine = await fetchEquipment(equipmentId, companyId);
-      if (body.supplierVendorId) await assertVendor(body.supplierVendorId, companyId);
-      const readAt = body.readAt ? new Date(body.readAt).toISOString() : new Date().toISOString();
+      if (body.supplierVendorId)
+        await assertVendor(body.supplierVendorId, companyId);
+      const readAt = body.readAt
+        ? new Date(body.readAt).toISOString()
+        : new Date().toISOString();
       const previous = await app.db
-        .select({ value: equipmentReadings.value, readAt: equipmentReadings.readAt })
+        .select({
+          value: equipmentReadings.value,
+          readAt: equipmentReadings.readAt,
+        })
         .from(equipmentReadings)
         .where(
           and(
@@ -3377,7 +4969,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         delta: anomaly.delta,
         fuelLitres: body.fuelLitres ?? null,
         fuelCost: body.fuelCost ?? null,
-        currency: body.currency ?? (body.fuelCost != null ? machine.currency : null),
+        currency:
+          body.currency ?? (body.fuelCost != null ? machine.currency : null),
         fuelCardRef: body.fuelCardRef ?? null,
         supplierVendorId: body.supplierVendorId ?? null,
         docketNumber: body.docketNumber ?? null,
@@ -3397,7 +4990,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
 
       let signalId: string | null = null;
       if (anomaly.isAnomalous) {
-        const seen = await alreadySignalled(companyId, "equipment_meter_anomaly");
+        const seen = await alreadySignalled(
+          companyId,
+          "equipment_meter_anomaly",
+        );
         signalId = await raiseSignalOnce({
           companyId,
           projectId: body.projectId ?? machine.projectId ?? null,
@@ -3492,17 +5088,21 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const q = pageQuerySchema
         .extend({
           readingType: z.enum(EQUIPMENT_READING_TYPES).optional(),
-          anomalousOnly: z.coerce.boolean().optional(),
+          anomalousOnly: boolQuery.optional(),
         })
         .parse(req.query);
       const clauses = [
         eq(equipmentReadings.companyId, req.companyId!),
         eq(equipmentReadings.equipmentId, equipmentId),
       ];
-      if (q.readingType) clauses.push(eq(equipmentReadings.readingType, q.readingType));
+      if (q.readingType)
+        clauses.push(eq(equipmentReadings.readingType, q.readingType));
       if (q.anomalousOnly) clauses.push(eq(equipmentReadings.isAnomalous, 1));
       const where = and(...clauses);
-      const [totalRow] = await app.db.select({ n: count() }).from(equipmentReadings).where(where);
+      const [totalRow] = await app.db
+        .select({ n: count() })
+        .from(equipmentReadings)
+        .where(where);
       const rows = await app.db
         .select()
         .from(equipmentReadings)
@@ -3525,7 +5125,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
   const telematicsPushSchema = z.object({
     projectId: idRef.optional(),
     providerKey: z.enum(TELEMATICS_PROVIDERS).default("generic_aemp"),
-    records: z.array(z.record(z.string(), z.unknown())).min(1).max(MAX_TELEMATICS_RECORDS),
+    records: z
+      .array(z.record(z.string(), z.unknown()))
+      .min(1)
+      .max(MAX_TELEMATICS_RECORDS),
   });
 
   /**
@@ -3537,7 +5140,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
    */
   async function authenticateTelematicsToken(req: FastifyRequest) {
     const header = req.headers.authorization;
-    if (!header?.startsWith("Bearer ")) throw unauthorized("Missing bearer token");
+    if (!header?.startsWith("Bearer "))
+      throw unauthorized("Missing bearer token");
     const rawToken = header.slice(7).trim();
     const rows = await app.db
       .select()
@@ -3565,7 +5169,9 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
   /** One implicit `api_token` ingestion source per token, created on first
    *  use — the same row the ingestion module's own push endpoint makes, so a
    *  token that pushes both datasets has one source, not two. */
-  async function implicitSource(token: typeof apiTokens.$inferSelect): Promise<string> {
+  async function implicitSource(
+    token: typeof apiTokens.$inferSelect,
+  ): Promise<string> {
     const candidates = await app.db
       .select()
       .from(ingestionSources)
@@ -3613,9 +5219,12 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const rows = await app.db
         .select({ id: projects.id })
         .from(projects)
-        .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
+        .where(
+          and(eq(projects.id, projectId), eq(projects.companyId, companyId)),
+        )
         .limit(1);
-      if (!rows[0]) throw badRequest("projectId is not a project in this company");
+      if (!rows[0])
+        throw badRequest("projectId is not a project in this company");
     }
 
     const sourceId = await implicitSource(token);
@@ -3634,13 +5243,17 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
 
     /* stage every record verbatim, then validate */
     const staged = body.records.map((record, i) => {
-      const coerced = coerceTelematicsRow(record, { providerKey: body.providerKey });
+      const coerced = coerceTelematicsRow(record, {
+        providerKey: body.providerKey,
+      });
       const externalRaw = record["externalId"];
       return {
         rowNumber: i + 1,
         recordId: newId("irc"),
         externalId:
-          typeof externalRaw === "string" && externalRaw.trim() !== "" ? externalRaw.trim() : null,
+          typeof externalRaw === "string" && externalRaw.trim() !== ""
+            ? externalRaw.trim()
+            : null,
         record,
         coerced,
       };
@@ -3657,12 +5270,22 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       })),
     );
 
-    const report: { row: number; field: string | null; code: string; message: string }[] = [];
+    const report: {
+      row: number;
+      field: string | null;
+      code: string;
+      message: string;
+    }[] = [];
     const accepted: typeof staged = [];
     for (const s of staged) {
       if (s.coerced.row === null) {
         for (const issue of s.coerced.issues) {
-          report.push({ row: s.rowNumber, field: issue.field, code: issue.code, message: issue.message });
+          report.push({
+            row: s.rowNumber,
+            field: issue.field,
+            code: issue.code,
+            message: issue.message,
+          });
         }
         await app.db
           .update(ingestedRecords)
@@ -3677,9 +5300,23 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     }
 
     /* dedupe: against the batch itself and against what is already stored */
-    const deviceIds = [...new Set(accepted.map((s) => s.coerced.row!.deviceId))];
+    const deviceIds = [
+      ...new Set(accepted.map((s) => s.coerced.row!.deviceId)),
+    ];
     const existingKeys = new Set<string>();
     if (deviceIds.length > 0) {
+      /*
+       * BOUNDED BY THE BATCH'S OWN TIME WINDOW. This used to select every
+       * reading ever stored for each device in the push: a machine reporting
+       * every minute accumulates half a million rows a year, so each push read
+       * the entire history to look for duplicates of the last five minutes.
+       * The (company_id, device_id, recorded_at) index makes this a range scan,
+       * and the unique index + ON CONFLICT below is the backstop for a racing
+       * concurrent push.
+       */
+      const times = accepted.map((s) => s.coerced.row!.recordedAt).sort();
+      const earliest = times[0]!;
+      const latest = times[times.length - 1]!;
       const existing = await app.db
         .select({
           providerKey: equipmentTelematicsReadings.providerKey,
@@ -3691,10 +5328,14 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           and(
             eq(equipmentTelematicsReadings.companyId, companyId),
             inArray(equipmentTelematicsReadings.deviceId, deviceIds),
+            gte(equipmentTelematicsReadings.recordedAt, earliest),
+            lte(equipmentTelematicsReadings.recordedAt, latest),
           ),
         );
       for (const row of existing) {
-        existingKeys.add(telematicsKey(row.providerKey, row.deviceId, row.recordedAt));
+        existingKeys.add(
+          telematicsKey(row.providerKey, row.deviceId, row.recordedAt),
+        );
       }
     }
 
@@ -3718,10 +5359,14 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       if (!m.telematicsProvider) mapped.set(`*|${m.telematicsDeviceId}`, m);
     }
     const resolve = (providerKey: string, deviceId: string) =>
-      mapped.get(`${providerKey}|${deviceId}`) ?? mapped.get(`*|${deviceId}`) ?? null;
+      mapped.get(`${providerKey}|${deviceId}`) ??
+      mapped.get(`*|${deviceId}`) ??
+      null;
 
     const inserts: (typeof equipmentTelematicsReadings.$inferInsert)[] = [];
     const commits: { recordId: string; readingId: string }[] = [];
+    /** staged rows that were duplicates — updated in ONE statement, not 5000 */
+    const skippedIds: string[] = [];
     let duplicates = 0;
     const unmappedDevices = new Set<string>();
     const seenInBatch = new Set<string>();
@@ -3733,15 +5378,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const key = telematicsKey(row.providerKey, row.deviceId, row.recordedAt);
       if (existingKeys.has(key) || seenInBatch.has(key)) {
         duplicates += 1;
-        await app.db
-          .update(ingestedRecords)
-          .set({
-            status: "skipped",
-            reason:
-              `duplicate of an existing reading for (${row.providerKey}, ${row.deviceId}, ` +
-              `${row.recordedAt}) — replaying a batch never double-counts`,
-          })
-          .where(eq(ingestedRecords.id, s.recordId));
+        skippedIds.push(s.recordId);
         continue;
       }
       seenInBatch.add(key);
@@ -3750,7 +5387,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       if (machine && row.engineHours !== null) {
         const held = meterHigh.get(machine.id);
         if (!held || row.engineHours > held.hours) {
-          meterHigh.set(machine.id, { hours: row.engineHours, at: row.recordedAt });
+          meterHigh.set(machine.id, {
+            hours: row.engineHours,
+            at: row.recordedAt,
+          });
         }
       }
       const readingId = newId("etr");
@@ -3788,33 +5428,87 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       commits.push({ recordId: s.recordId, readingId });
     }
 
+    /*
+     * ON CONFLICT DO NOTHING against (provider_key, device_id, recorded_at):
+     * the in-memory dedupe above cannot see a batch that is landing on another
+     * replica at the same moment. RETURNING tells us which rows actually
+     * landed, so a row lost to the race is reported as a duplicate rather than
+     * committed against a reading that is not ours.
+     */
+    const insertedIds = new Set<string>();
     for (let i = 0; i < inserts.length; i += 500) {
-      await app.db.insert(equipmentTelematicsReadings).values(inserts.slice(i, i + 500));
+      const returned = await app.db
+        .insert(equipmentTelematicsReadings)
+        .values(inserts.slice(i, i + 500))
+        .onConflictDoNothing({
+          target: [
+            equipmentTelematicsReadings.providerKey,
+            equipmentTelematicsReadings.deviceId,
+            equipmentTelematicsReadings.recordedAt,
+          ],
+        })
+        .returning({ id: equipmentTelematicsReadings.id });
+      for (const r of returned) insertedIds.add(r.id);
     }
+    const landed = commits.filter((c) => insertedIds.has(c.readingId));
     for (const c of commits) {
+      if (!insertedIds.has(c.readingId)) {
+        duplicates += 1;
+        skippedIds.push(c.recordId);
+      }
+    }
+    // One UPDATE per 200 staged rows instead of one per row.
+    for (let i = 0; i < skippedIds.length; i += 200) {
+      const chunk = skippedIds.slice(i, i + 200);
       await app.db
         .update(ingestedRecords)
-        .set({ status: "committed", committedRecordId: c.readingId })
-        .where(eq(ingestedRecords.id, c.recordId));
+        .set({
+          status: "skipped",
+          reason:
+            "duplicate of a reading already stored for this (provider, device, timestamp) — " +
+            "replaying a batch never double-counts",
+        })
+        .where(inArray(ingestedRecords.id, chunk));
+    }
+    for (let i = 0; i < landed.length; i += 200) {
+      const chunk = landed.slice(i, i + 200);
+      await app.db
+        .update(ingestedRecords)
+        .set({
+          status: "committed",
+          committedRecordId: sql`case ${ingestedRecords.id} ${sql.join(
+            chunk.map((c) => sql`when ${c.recordId} then ${c.readingId}`),
+            sql` `,
+          )} end`,
+        })
+        .where(
+          inArray(
+            ingestedRecords.id,
+            chunk.map((c) => c.recordId),
+          ),
+        );
     }
     for (const [equipmentId, high] of meterHigh) {
       const machine = fleet.find((m) => m.id === equipmentId);
       if (!machine) continue;
       const advance =
         machine.meterType === "hours" &&
-        (machine.currentMeterReading === null || high.hours > machine.currentMeterReading);
+        (machine.currentMeterReading === null ||
+          high.hours > machine.currentMeterReading);
       await app.db
         .update(equipment)
         .set({
           telematicsLastSeenAt: high.at,
-          currentMeterReading: advance ? high.hours : machine.currentMeterReading,
+          currentMeterReading: advance
+            ? high.hours
+            : machine.currentMeterReading,
           lastMeterReadingAt: advance ? high.at : machine.lastMeterReadingAt,
           updatedAt: new Date().toISOString(),
         })
         .where(eq(equipment.id, equipmentId));
     }
 
-    const committed = commits.length;
+    const committed = landed.length;
     const rejected = staged.length - accepted.length;
     await app.db
       .update(ingestionRuns)
@@ -3880,16 +5574,20 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
   });
 
   /** What the inlet accepts — published so a vendor can be told what to send. */
-  app.get("/companies/current/telematics/dataset", { preHandler: companyRead }, async () => ({
-    dataset: TELEMATICS_DATASET,
-    endpoint: "POST /api/v1/ingestion/push/telematics",
-    auth: "Authorization: Bearer <api token>, scoped for telematics (see acceptedScopes)",
-    acceptedScopes: TELEMATICS_PUSH_SCOPES,
-    providers: TELEMATICS_PROVIDERS,
-    idempotencyKey: ["providerKey", "deviceId", "recordedAt"],
-    fields: TELEMATICS_FIELDS,
-    provenance: ["ingestionRunId", "apiTokenId", "sourceSha256", "raw"],
-  }));
+  app.get(
+    "/companies/current/telematics/dataset",
+    { preHandler: companyRead },
+    async () => ({
+      dataset: TELEMATICS_DATASET,
+      endpoint: "POST /api/v1/ingestion/push/telematics",
+      auth: "Authorization: Bearer <api token>, scoped for telematics (see acceptedScopes)",
+      acceptedScopes: TELEMATICS_PUSH_SCOPES,
+      providers: TELEMATICS_PROVIDERS,
+      idempotencyKey: ["providerKey", "deviceId", "recordedAt"],
+      fields: TELEMATICS_FIELDS,
+      provenance: ["ingestionRunId", "apiTokenId", "sourceSha256", "raw"],
+    }),
+  );
 
   /**
    * Devices the feed is reporting that nobody has mapped to a machine.
@@ -3897,145 +5595,221 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
    * they are the ones that prove a machine was running while the register
    * said it was in the yard.
    */
-  app.get("/companies/current/telematics/devices", { preHandler: companyRead }, async (req) => {
-    const q = z
-      .object({ mapped: z.coerce.boolean().optional(), providerKey: z.enum(TELEMATICS_PROVIDERS).optional() })
-      .parse(req.query);
-    const clauses = [eq(equipmentTelematicsReadings.companyId, req.companyId!)];
-    if (q.providerKey) clauses.push(eq(equipmentTelematicsReadings.providerKey, q.providerKey));
-    if (q.mapped === true) clauses.push(isNotNull(equipmentTelematicsReadings.equipmentId));
-    if (q.mapped !== true) clauses.push(isNull(equipmentTelematicsReadings.equipmentId));
-    const rows = await app.db
-      .select({
-        providerKey: equipmentTelematicsReadings.providerKey,
-        deviceId: equipmentTelematicsReadings.deviceId,
-        readings: count(),
-        firstSeenAt: sql<string>`min(${equipmentTelematicsReadings.recordedAt})`,
-        lastSeenAt: sql<string>`max(${equipmentTelematicsReadings.recordedAt})`,
-        lastEngineHours: sql<number | null>`max(${equipmentTelematicsReadings.engineHours})`,
-      })
-      .from(equipmentTelematicsReadings)
-      .where(and(...clauses))
-      .groupBy(equipmentTelematicsReadings.providerKey, equipmentTelematicsReadings.deviceId);
-    return {
-      mapped: q.mapped === true,
-      total: rows.length,
-      items: rows.map((r) => ({ ...r, readings: Number(r.readings) })),
-      note:
-        q.mapped === true
-          ? null
-          : "these devices are reporting to a machine nobody has identified. Every reading has " +
-            "been kept with a null equipmentId; map the device and the history binds to the " +
-            "machine retrospectively.",
-    };
-  });
+  app.get(
+    "/companies/current/telematics/devices",
+    { preHandler: companyRead },
+    async (req) => {
+      const q = z
+        .object({
+          mapped: boolQuery.optional(),
+          providerKey: z.enum(TELEMATICS_PROVIDERS).optional(),
+        })
+        .parse(req.query);
+      const clauses = [
+        eq(equipmentTelematicsReadings.companyId, req.companyId!),
+      ];
+      if (q.providerKey)
+        clauses.push(
+          eq(equipmentTelematicsReadings.providerKey, q.providerKey),
+        );
+      if (q.mapped === true)
+        clauses.push(isNotNull(equipmentTelematicsReadings.equipmentId));
+      if (q.mapped !== true)
+        clauses.push(isNull(equipmentTelematicsReadings.equipmentId));
+      const rows = await app.db
+        .select({
+          providerKey: equipmentTelematicsReadings.providerKey,
+          deviceId: equipmentTelematicsReadings.deviceId,
+          readings: count(),
+          firstSeenAt: sql<string>`min(${equipmentTelematicsReadings.recordedAt})`,
+          lastSeenAt: sql<string>`max(${equipmentTelematicsReadings.recordedAt})`,
+          lastEngineHours: sql<
+            number | null
+          >`max(${equipmentTelematicsReadings.engineHours})`,
+        })
+        .from(equipmentTelematicsReadings)
+        .where(and(...clauses))
+        .groupBy(
+          equipmentTelematicsReadings.providerKey,
+          equipmentTelematicsReadings.deviceId,
+        );
+      return {
+        mapped: q.mapped === true,
+        total: rows.length,
+        items: rows.map((r) => ({ ...r, readings: Number(r.readings) })),
+        note:
+          q.mapped === true
+            ? null
+            : "these devices are reporting to a machine nobody has identified. Every reading has " +
+              "been kept with a null equipmentId; map the device and the history binds to the " +
+              "machine retrospectively.",
+      };
+    },
+  );
 
   /** Map a device to a machine — and BACKFILL the readings already stored
    *  under it, which is the entire reason they were kept. */
-  app.post("/companies/current/telematics/devices/map", { preHandler: companyWrite }, async (req) => {
-    const body = z
-      .object({
-        providerKey: z.enum(TELEMATICS_PROVIDERS),
-        deviceId: nonEmpty(200),
-        equipmentId: idRef,
-      })
-      .parse(req.body);
-    const companyId = req.companyId!;
-    const machine = await fetchEquipment(body.equipmentId, companyId);
-    const clash = await app.db
-      .select({ id: equipment.id, reference: equipment.reference })
-      .from(equipment)
-      .where(
-        and(
-          eq(equipment.companyId, companyId),
-          eq(equipment.telematicsDeviceId, body.deviceId),
-        ),
-      );
-    const other = clash.find((c) => c.id !== body.equipmentId);
-    if (other) {
-      throw conflict(
-        `device ${body.deviceId} is already mapped to ${other.reference}. One device cannot report ` +
-          "for two machines — unmap it there first, and check which machine the history belongs to.",
-      );
-    }
-    const now = new Date().toISOString();
-    await app.db
-      .update(equipment)
-      .set({ telematicsProvider: body.providerKey, telematicsDeviceId: body.deviceId, updatedAt: now })
-      .where(eq(equipment.id, body.equipmentId));
-    const backfilled = await app.db
-      .update(equipmentTelematicsReadings)
-      .set({ equipmentId: body.equipmentId, projectId: machine.projectId })
-      .where(
-        and(
-          eq(equipmentTelematicsReadings.companyId, companyId),
-          eq(equipmentTelematicsReadings.providerKey, body.providerKey),
-          eq(equipmentTelematicsReadings.deviceId, body.deviceId),
-          isNull(equipmentTelematicsReadings.equipmentId),
-        ),
-      )
-      .returning({ id: equipmentTelematicsReadings.id });
-    await appendLedger(app.db, {
-      companyId,
-      actorId: req.user!.id,
-      action: "update",
-      objectType: "equipment",
-      objectId: body.equipmentId,
-      projectId: machine.projectId,
-      payload: {
-        telematicsMapped: true,
+  app.post(
+    "/companies/current/telematics/devices/map",
+    { preHandler: companyAdmin },
+    async (req) => {
+      const body = z
+        .object({
+          providerKey: z.enum(TELEMATICS_PROVIDERS),
+          deviceId: nonEmpty(200),
+          equipmentId: idRef,
+        })
+        .parse(req.body);
+      const companyId = req.companyId!;
+      /*
+       * THE MACHINE IS NAMED IN THE BODY, so `machineScopeGate` (which reads
+       * `:equipmentId` off the params) never sees it. Without this, `equipment`
+       * admin on one job was enough to bind a telematics device to a machine on
+       * a job the caller cannot see — and the device feed is the independent
+       * evidence the hours reconciliation is built on, so mis-binding it is how
+       * that control is defeated from outside its own project.
+       */
+      await assertMachineVisible(req, body.equipmentId);
+      const machine = await fetchEquipment(body.equipmentId, companyId);
+      const clash = await app.db
+        .select({ id: equipment.id, reference: equipment.reference })
+        .from(equipment)
+        .where(
+          and(
+            eq(equipment.companyId, companyId),
+            eq(equipment.telematicsDeviceId, body.deviceId),
+          ),
+        );
+      const other = clash.find((c) => c.id !== body.equipmentId);
+      if (other) {
+        throw conflict(
+          `device ${body.deviceId} is already mapped to ${other.reference}. One device cannot report ` +
+            "for two machines — unmap it there first, and check which machine the history belongs to.",
+        );
+      }
+      const now = new Date().toISOString();
+      await app.db
+        .update(equipment)
+        .set({
+          telematicsProvider: body.providerKey,
+          telematicsDeviceId: body.deviceId,
+          updatedAt: now,
+        })
+        .where(eq(equipment.id, body.equipmentId));
+      const backfilled = await app.db
+        .update(equipmentTelematicsReadings)
+        .set({ equipmentId: body.equipmentId, projectId: machine.projectId })
+        .where(
+          and(
+            eq(equipmentTelematicsReadings.companyId, companyId),
+            eq(equipmentTelematicsReadings.providerKey, body.providerKey),
+            eq(equipmentTelematicsReadings.deviceId, body.deviceId),
+            isNull(equipmentTelematicsReadings.equipmentId),
+          ),
+        )
+        .returning({ id: equipmentTelematicsReadings.id });
+      await appendLedger(app.db, {
+        companyId,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "equipment",
+        objectId: body.equipmentId,
+        projectId: machine.projectId,
+        payload: {
+          telematicsMapped: true,
+          providerKey: body.providerKey,
+          deviceId: body.deviceId,
+          backfilledReadings: backfilled.length,
+        },
+        storePayload: true,
+      });
+      return {
+        equipmentId: body.equipmentId,
+        equipmentReference: machine.reference,
         providerKey: body.providerKey,
         deviceId: body.deviceId,
         backfilledReadings: backfilled.length,
-      },
-      storePayload: true,
-    });
-    return {
-      equipmentId: body.equipmentId,
-      equipmentReference: machine.reference,
-      providerKey: body.providerKey,
-      deviceId: body.deviceId,
-      backfilledReadings: backfilled.length,
-      note:
-        backfilled.length > 0
-          ? `${backfilled.length} reading(s) that arrived before anyone mapped this device have ` +
-            "been bound to the machine. That history is now available to the hours reconciliation."
-          : "no unmapped readings were waiting for this device",
-    };
-  });
+        note:
+          backfilled.length > 0
+            ? `${backfilled.length} reading(s) that arrived before anyone mapped this device have ` +
+              "been bound to the machine. That history is now available to the hours reconciliation."
+            : "no unmapped readings were waiting for this device",
+      };
+    },
+  );
 
-  app.get("/companies/current/telematics/readings", { preHandler: companyRead }, async (req) => {
-    const q = pageQuerySchema
-      .extend({
-        equipmentId: idRef.optional(),
-        deviceId: z.string().max(200).optional(),
-        providerKey: z.enum(TELEMATICS_PROVIDERS).optional(),
-        from: isoTimestamp.optional(),
-        to: isoTimestamp.optional(),
-        unmappedOnly: z.coerce.boolean().optional(),
-      })
-      .parse(req.query);
-    const clauses = [eq(equipmentTelematicsReadings.companyId, req.companyId!)];
-    if (q.equipmentId) clauses.push(eq(equipmentTelematicsReadings.equipmentId, q.equipmentId));
-    if (q.deviceId) clauses.push(eq(equipmentTelematicsReadings.deviceId, q.deviceId));
-    if (q.providerKey) clauses.push(eq(equipmentTelematicsReadings.providerKey, q.providerKey));
-    if (q.from) clauses.push(gte(equipmentTelematicsReadings.recordedAt, new Date(q.from).toISOString()));
-    if (q.to) clauses.push(lte(equipmentTelematicsReadings.recordedAt, new Date(q.to).toISOString()));
-    if (q.unmappedOnly) clauses.push(isNull(equipmentTelematicsReadings.equipmentId));
-    const where = and(...clauses);
-    const [totalRow] = await app.db
-      .select({ n: count() })
-      .from(equipmentTelematicsReadings)
-      .where(where);
-    const rows = await app.db
-      .select()
-      .from(equipmentTelematicsReadings)
-      .where(where)
-      .orderBy(desc(equipmentTelematicsReadings.recordedAt))
-      .limit(q.pageSize)
-      .offset(pageOffset(q));
-    return paginate(rows, Number(totalRow?.n ?? 0), q);
-  });
+  app.get(
+    "/companies/current/telematics/readings",
+    { preHandler: companyRead },
+    async (req) => {
+      const q = pageQuerySchema
+        .extend({
+          equipmentId: idRef.optional(),
+          deviceId: z.string().max(200).optional(),
+          providerKey: z.enum(TELEMATICS_PROVIDERS).optional(),
+          from: isoTimestamp.optional(),
+          to: isoTimestamp.optional(),
+          unmappedOnly: boolQuery.optional(),
+        })
+        .parse(req.query);
+      const clauses = [
+        eq(equipmentTelematicsReadings.companyId, req.companyId!),
+      ];
+      // The raw feed is the strongest evidence in the module and the least
+      // interpreted; it is narrowed to the plant the caller may see, with
+      // the still-unmapped devices kept visible so somebody can map them.
+      const visible = await visibleMachineIds(req);
+      if (visible !== null) {
+        clauses.push(
+          visible.length === 0
+            ? isNull(equipmentTelematicsReadings.equipmentId)
+            : or(
+                isNull(equipmentTelematicsReadings.equipmentId),
+                inArray(equipmentTelematicsReadings.equipmentId, visible),
+              )!,
+        );
+      }
+      if (q.equipmentId)
+        clauses.push(
+          eq(equipmentTelematicsReadings.equipmentId, q.equipmentId),
+        );
+      if (q.deviceId)
+        clauses.push(eq(equipmentTelematicsReadings.deviceId, q.deviceId));
+      if (q.providerKey)
+        clauses.push(
+          eq(equipmentTelematicsReadings.providerKey, q.providerKey),
+        );
+      if (q.from)
+        clauses.push(
+          gte(
+            equipmentTelematicsReadings.recordedAt,
+            new Date(q.from).toISOString(),
+          ),
+        );
+      if (q.to)
+        clauses.push(
+          lte(
+            equipmentTelematicsReadings.recordedAt,
+            new Date(q.to).toISOString(),
+          ),
+        );
+      if (q.unmappedOnly)
+        clauses.push(isNull(equipmentTelematicsReadings.equipmentId));
+      const where = and(...clauses);
+      const [totalRow] = await app.db
+        .select({ n: count() })
+        .from(equipmentTelematicsReadings)
+        .where(where);
+      const rows = await app.db
+        .select()
+        .from(equipmentTelematicsReadings)
+        .where(where)
+        .orderBy(desc(equipmentTelematicsReadings.recordedAt))
+        .limit(q.pageSize)
+        .offset(pageOffset(q));
+      return paginate(rows, Number(totalRow?.n ?? 0), q);
+    },
+  );
 
   /**
    * TELEMATICS versus MANUAL — the independent-evidence-stream check.
@@ -4051,51 +5825,201 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
    * `.varianceHours` is what those columns exist for: the reconciliation
    * must be readable from the utilisation row itself, not only from here.
    */
+  const telematicsReconcileQuery = z.object({
+    from: isoDateSchema.optional(),
+    to: isoDateSchema.optional(),
+    days: z.coerce.number().int().min(1).max(180).optional(),
+    equipmentId: idRef.optional(),
+    /*
+     * The site's offset from UTC in minutes (+480 for UTC+8). A night shift
+     * east of UTC straddles two UTC days, so neither of them matches the
+     * plant sheet the foreman filled in; the caller says which clock the days
+     * are cut on and the default stays UTC.
+     */
+    tzOffsetMinutes: z.coerce.number().int().min(-840).max(840).optional(),
+  });
+
+  /**
+   * Load and compute the plant-hours reconciliation for a window. Shared by
+   * the read (which writes the comparison back onto the utilisation rows and
+   * raises the standing signal) and by the RUN route (which additionally
+   * records the Assertion / Evidence / Reconciliation triple). One code path,
+   * so the register and the assurance record can never disagree.
+   */
+  async function loadTelematicsReconciliation(
+    companyId: string,
+    projectId: string,
+    q: z.infer<typeof telematicsReconcileQuery>,
+  ) {
+    const to = q.to ?? todayISO();
+    const from = q.from ?? addDaysISO(to, -((q.days ?? 14) - 1));
+    const tz = q.tzOffsetMinutes ?? 0;
+
+    const utilClauses = [
+      eq(equipmentUtilisation.companyId, companyId),
+      eq(equipmentUtilisation.projectId, projectId),
+      gte(equipmentUtilisation.utilisationDate, from),
+      lte(equipmentUtilisation.utilisationDate, to),
+    ];
+    if (q.equipmentId)
+      utilClauses.push(eq(equipmentUtilisation.equipmentId, q.equipmentId));
+    const utilRows = await app.db
+      .select()
+      .from(equipmentUtilisation)
+      .where(and(...utilClauses));
+
+    const assigned = await app.db
+      .select({ equipmentId: equipmentAssignments.equipmentId })
+      .from(equipmentAssignments)
+      .where(
+        and(
+          eq(equipmentAssignments.companyId, companyId),
+          eq(equipmentAssignments.projectId, projectId),
+        ),
+      );
+    const machineIds = [
+      ...new Set([
+        ...utilRows.map((r) => r.equipmentId),
+        ...assigned.map((a) => a.equipmentId),
+      ]),
+    ].filter((id) => !q.equipmentId || id === q.equipmentId);
+    if (machineIds.length === 0) {
+      return { from, to, tz, empty: true as const };
+    }
+    const fleet = await app.db
+      .select()
+      .from(equipment)
+      .where(
+        and(
+          eq(equipment.companyId, companyId),
+          inArray(equipment.id, machineIds),
+        ),
+      );
+    const teleRows = await app.db
+      .select()
+      .from(equipmentTelematicsReadings)
+      .where(
+        and(
+          eq(equipmentTelematicsReadings.companyId, companyId),
+          inArray(equipmentTelematicsReadings.equipmentId, machineIds),
+          /*
+           * The window starts CARRY_IN_LOOKBACK_DAYS early on purpose. A
+           * day's engine hours are the last reading of that day minus the
+           * last reading before it began — normally the previous day's
+           * final reading — so the first day of the window needs a reading
+           * from before the window to be measurable at all.
+           */
+          gte(
+            equipmentTelematicsReadings.recordedAt,
+            `${addDaysISO(from, -CARRY_IN_LOOKBACK_DAYS)}T00:00:00.000Z`,
+          ),
+          lte(equipmentTelematicsReadings.recordedAt, `${to}T23:59:59.999Z`),
+        ),
+      );
+
+    /*
+     * Every reading per machine, INCLUDING the carry-in lookback, plus the
+     * days inside the window that the feed itself reported on. Grouping by
+     * calendar day and taking last-minus-first inside each group lost every
+     * hour run between the last reading of one day and the first of the
+     * next, and returned null for any device reporting once a day — which
+     * the 1h + 15% tolerance then turned into "hours the machine does not
+     * corroborate" against an honest plant sheet.
+     */
+    const teleByMachine = new Map<
+      string,
+      { recordedAt: string; engineHours: number | null }[]
+    >();
+    const teleDaysByMachine = new Map<string, Set<string>>();
+    const windowStartMs = Date.parse(`${from}T00:00:00.000Z`) - tz * 60_000;
+    for (const row of teleRows) {
+      if (!row.equipmentId) continue;
+      const list = teleByMachine.get(row.equipmentId) ?? [];
+      list.push({ recordedAt: row.recordedAt, engineHours: row.engineHours });
+      teleByMachine.set(row.equipmentId, list);
+      if (Date.parse(row.recordedAt) < windowStartMs) continue;
+      const days = teleDaysByMachine.get(row.equipmentId) ?? new Set<string>();
+      days.add(localDateOf(row.recordedAt, tz));
+      teleDaysByMachine.set(row.equipmentId, days);
+    }
+    /* manual hours per machine per day — shifts on the same day are summed,
+       because the telematics counter does not know about shifts */
+    const manualByMachineDay = new Map<
+      string,
+      { hours: number; rowIds: string[] }
+    >();
+    for (const row of utilRows) {
+      const key = `${row.equipmentId}|${row.utilisationDate}`;
+      const held = manualByMachineDay.get(key) ?? { hours: 0, rowIds: [] };
+      held.hours = round2(held.hours + row.workingHours);
+      held.rowIds.push(row.id);
+      manualByMachineDay.set(key, held);
+    }
+
+    const inputs: EquipmentReconcileInput[] = fleet.map((machine) => {
+      const dates = new Set<string>();
+      for (const key of manualByMachineDay.keys()) {
+        const [id, date] = key.split("|");
+        if (id === machine.id && date && date >= from && date <= to) dates.add(date);
+      }
+      for (const date of teleDaysByMachine.get(machine.id) ?? []) {
+        if (date >= from && date <= to) dates.add(date);
+      }
+      const series = engineHoursSeries({
+        dates: [...dates],
+        readings: teleByMachine.get(machine.id) ?? [],
+        tzOffsetMinutes: tz,
+      });
+      const days: TelematicsDayInput[] = series.map(({ date, delta }) => {
+        const manual = manualByMachineDay.get(`${machine.id}|${date}`);
+        return {
+          date,
+          manualWorkingHours: manual ? manual.hours : null,
+          telematicsEngineHours: delta.hours,
+          telematicsReasons: delta.reasons,
+        };
+      });
+      return {
+        equipmentId: machine.id,
+        reference: machine.reference,
+        name: machine.name,
+        currency: machine.currency,
+        hireRateAmount: machine.hireRateAmount,
+        hireRateUnit: machine.hireRateUnit as HireRateUnit | null,
+        internalRateAmount: machine.internalRateAmount,
+        operatorRateAmount: machine.operatorRateAmount,
+        days,
+      };
+    });
+
+    const summary = reconcileTelematics(inputs, {
+      periodStart: from,
+      periodEnd: to,
+    });
+
+    return {
+      from,
+      to,
+      tz,
+      empty: false as const,
+      summary,
+      utilRows,
+      manualByMachineDay,
+      teleByMachine,
+      teleRowsById: teleRows,
+    };
+  }
+
   app.get(
     "/projects/:projectId/equipment-telematics/reconciliation",
     { preHandler: readGate },
     async (req) => {
-      const q = z
-        .object({
-          from: isoDateSchema.optional(),
-          to: isoDateSchema.optional(),
-          days: z.coerce.number().int().min(1).max(180).optional(),
-          equipmentId: idRef.optional(),
-        })
-        .parse(req.query);
+      const q = telematicsReconcileQuery.parse(req.query);
       const companyId = req.companyId!;
       const projectId = req.projectId!;
-      const to = q.to ?? todayISO();
-      const from = q.from ?? addDaysISO(to, -((q.days ?? 14) - 1));
-
-      const utilClauses = [
-        eq(equipmentUtilisation.companyId, companyId),
-        eq(equipmentUtilisation.projectId, projectId),
-        gte(equipmentUtilisation.utilisationDate, from),
-        lte(equipmentUtilisation.utilisationDate, to),
-      ];
-      if (q.equipmentId) utilClauses.push(eq(equipmentUtilisation.equipmentId, q.equipmentId));
-      const utilRows = await app.db
-        .select()
-        .from(equipmentUtilisation)
-        .where(and(...utilClauses));
-
-      const assigned = await app.db
-        .select({ equipmentId: equipmentAssignments.equipmentId })
-        .from(equipmentAssignments)
-        .where(
-          and(
-            eq(equipmentAssignments.companyId, companyId),
-            eq(equipmentAssignments.projectId, projectId),
-          ),
-        );
-      const machineIds = [
-        ...new Set([
-          ...utilRows.map((r) => r.equipmentId),
-          ...assigned.map((a) => a.equipmentId),
-        ]),
-      ].filter((id) => !q.equipmentId || id === q.equipmentId);
-      if (machineIds.length === 0) {
+      const loaded = await loadTelematicsReconciliation(companyId, projectId, q);
+      const { from, to, tz } = loaded;
+      if (loaded.empty) {
         return {
           from,
           to,
@@ -4103,88 +6027,27 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           machinesWithVariance: 0,
           machinesPersistent: 0,
           valueAtRiskByCurrency: {},
-          totals: { manualHours: 0, telematicsHours: 0, varianceHours: 0, daysCompared: 0 },
+          totals: {
+            manualHours: 0,
+            telematicsHours: 0,
+            varianceHours: 0,
+            daysCompared: 0,
+          },
           rows: [],
           method:
             "no plant has been assigned to this project and no utilisation has been recorded — " +
             "there is nothing to reconcile",
         };
       }
-      const fleet = await app.db
-        .select()
-        .from(equipment)
-        .where(and(eq(equipment.companyId, companyId), inArray(equipment.id, machineIds)));
-      const teleRows = await app.db
-        .select()
-        .from(equipmentTelematicsReadings)
-        .where(
-          and(
-            eq(equipmentTelematicsReadings.companyId, companyId),
-            inArray(equipmentTelematicsReadings.equipmentId, machineIds),
-            gte(equipmentTelematicsReadings.recordedAt, `${from}T00:00:00.000Z`),
-            lte(equipmentTelematicsReadings.recordedAt, `${to}T23:59:59.999Z`),
-          ),
-        );
-
-      /* telematics engine hours per machine per calendar day (UTC) */
-      const teleByMachineDay = new Map<string, { recordedAt: string; engineHours: number | null }[]>();
-      for (const row of teleRows) {
-        if (!row.equipmentId) continue;
-        const key = `${row.equipmentId}|${dateOf(row.recordedAt)}`;
-        const list = teleByMachineDay.get(key) ?? [];
-        list.push({ recordedAt: row.recordedAt, engineHours: row.engineHours });
-        teleByMachineDay.set(key, list);
-      }
-      /* manual hours per machine per day — shifts on the same day are summed,
-         because the telematics counter does not know about shifts */
-      const manualByMachineDay = new Map<string, { hours: number; rowIds: string[] }>();
-      for (const row of utilRows) {
-        const key = `${row.equipmentId}|${row.utilisationDate}`;
-        const held = manualByMachineDay.get(key) ?? { hours: 0, rowIds: [] };
-        held.hours = round2(held.hours + row.workingHours);
-        held.rowIds.push(row.id);
-        manualByMachineDay.set(key, held);
-      }
-
-      const inputs: EquipmentReconcileInput[] = fleet.map((machine) => {
-        const dates = new Set<string>();
-        for (const key of manualByMachineDay.keys()) {
-          const [id, date] = key.split("|");
-          if (id === machine.id && date) dates.add(date);
-        }
-        for (const key of teleByMachineDay.keys()) {
-          const [id, date] = key.split("|");
-          if (id === machine.id && date) dates.add(date);
-        }
-        const days: TelematicsDayInput[] = [...dates].sort().map((date) => {
-          const counter = engineHoursFromCounter(teleByMachineDay.get(`${machine.id}|${date}`) ?? []);
-          const manual = manualByMachineDay.get(`${machine.id}|${date}`);
-          return {
-            date,
-            manualWorkingHours: manual ? manual.hours : null,
-            telematicsEngineHours: counter.hours,
-            telematicsReasons: counter.reasons,
-          };
-        });
-        return {
-          equipmentId: machine.id,
-          reference: machine.reference,
-          name: machine.name,
-          currency: machine.currency,
-          hireRateAmount: machine.hireRateAmount,
-          hireRateUnit: machine.hireRateUnit as HireRateUnit | null,
-          operatorRateAmount: machine.operatorRateAmount,
-          days,
-        };
-      });
-
-      const summary = reconcileTelematics(inputs, { periodStart: from, periodEnd: to });
+      const { summary, utilRows, manualByMachineDay } = loaded;
 
       /* write the comparison back onto the utilisation rows */
       const now = new Date().toISOString();
       for (const machineRow of summary.rows) {
         for (const day of machineRow.days) {
-          const manual = manualByMachineDay.get(`${machineRow.equipmentId}|${day.date}`);
+          const manual = manualByMachineDay.get(
+            `${machineRow.equipmentId}|${day.date}`,
+          );
           if (!manual) continue;
           for (const rowId of manual.rowIds) {
             const existing = utilRows.find((r) => r.id === rowId);
@@ -4210,7 +6073,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       /* a persistent variance is a Signal */
       const persistent = summary.rows.filter((r) => r.persistent);
       if (persistent.length > 0) {
-        const seen = await alreadySignalled(companyId, "equipment_telematics_variance");
+        const seen = await alreadySignalled(
+          companyId,
+          "equipment_telematics_variance",
+        );
         for (const row of persistent) {
           await raiseSignalOnce({
             companyId,
@@ -4254,14 +6120,357 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         ...summary,
         method:
           "engine hours are a CUMULATIVE counter, so a day's telematics hours are the last " +
-          "reading of the day minus the first. A day with one reading, or a counter that fell " +
-          "(a device reset), yields null rather than zero — 'the machine did not work' and 'the " +
-          "feed cannot say' are opposite facts. Claimed hours must exceed engine hours by more " +
-          "than 1 hour AND more than 1.15x before the day is called unsupported.",
+          "reading of that day minus the last reading BEFORE it began — normally the previous " +
+          "day's final reading, which is why the feed is read " +
+          `${CARRY_IN_LOOKBACK_DAYS} day(s) before the window. Measuring inside the calendar day ` +
+          "instead lost every hour run between one day's last reading and the next day's first, " +
+          "and gave null for any device reporting once a day. A counter that fell (a device " +
+          "reset), and a day the feed never reached at all, yield null rather than zero — 'the " +
+          "machine did not work' and 'the feed cannot say' are opposite facts. Claimed hours " +
+          "must exceed engine hours by more than 1 hour AND more than 1.15x before the day is " +
+          "called unsupported." +
+          (tz === 0
+            ? " Days are cut on UTC; pass tzOffsetMinutes to cut them on the site's clock."
+            : ` Days are cut on the site clock (UTC${tz >= 0 ? "+" : "-"}${Math.floor(Math.abs(tz) / 60)}:${String(Math.abs(tz) % 60).padStart(2, "0")}).`),
         currencyNote:
           Object.keys(summary.valueAtRiskByCurrency).length > 1
             ? "value at risk is reported per currency and never added"
             : null,
+      };
+    },
+  );
+
+  /**
+   * RECORD THE RECONCILIATION AS AN ASSURANCE FACT (plan §0, §1).
+   *
+   * The read above computes the comparison and raises the standing signal.
+   * This route additionally writes the platform's three primitives, so the
+   * plant-hours check reads on the owner's assurance page next to every other
+   * claim that has been tested:
+   *
+   *   • ASSERTION — the working hours CLAIMED for the machine in the window,
+   *     attributed to the people who filled in the plant sheets, not to
+   *     whoever ran this route. `duration` in hours, with the utilisation
+   *     rows named as its source.
+   *   • EVIDENCE — the telematics feed for the same window. Independence is
+   *     high but not 1: a counter is a device somebody can reset, and the
+   *     mapping from device to machine is a human decision. Where the feed
+   *     is silent there is no evidence row and the reconciliation says
+   *     `insufficient_evidence` rather than "unsupported" — absence of a
+   *     reading is absence of a reading, never proof of a false claim.
+   *   • RECONCILIATION — the variance, the confidence and the disposition,
+   *     marked `selfCertified` when whoever recorded the hours is also the
+   *     one producing the evidence pack, which is exactly the arrangement
+   *     ADR 0004 forbids from presenting as verified.
+   *
+   * Idempotent per (machine, window): re-running replaces the triple rather
+   * than stacking a second copy of the same finding on the register.
+   */
+  app.post(
+    "/projects/:projectId/equipment-telematics/reconciliation/run",
+    { preHandler: standardGate },
+    async (req) => {
+      const q = telematicsReconcileQuery.parse(req.body ?? {});
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const actorId = req.user!.id;
+      const loaded = await loadTelematicsReconciliation(companyId, projectId, q);
+      const { from, to } = loaded;
+      if (loaded.empty) {
+        return {
+          from,
+          to,
+          recorded: 0,
+          replaced: 0,
+          skipped: [],
+          reasons: [
+            "no plant is assigned to this project and no utilisation has been recorded — there " +
+              "is nothing to reconcile, which is not the same as everything reconciling",
+          ],
+        };
+      }
+      const { summary, utilRows } = loaded;
+
+      /** who filled in the plant sheets for this machine in this window */
+      const claimantsOf = (equipmentId: string): string[] => [
+        ...new Set(
+          utilRows
+            .filter((r) => r.equipmentId === equipmentId)
+            .map((r) => r.createdBy)
+            .filter((v): v is string => Boolean(v)),
+        ),
+      ];
+
+      const recorded: Array<{
+        equipmentId: string;
+        reference: string;
+        assertionId: string;
+        evidenceId: string | null;
+        reconciliationId: string;
+        result: string;
+        selfCertified: boolean;
+      }> = [];
+      const skipped: Array<{ equipmentId: string; reference: string; reason: string }> = [];
+      let replaced = 0;
+      const nowIso3 = new Date().toISOString();
+
+      for (const row of summary.rows) {
+        if (row.daysCompared === 0 && row.manualHours === 0) {
+          skipped.push({
+            equipmentId: row.equipmentId,
+            reference: row.reference,
+            reason:
+              "no hours were claimed for this machine in the window, so there is no assertion to " +
+              "test",
+          });
+          continue;
+        }
+        const claimants = claimantsOf(row.equipmentId);
+        const sourceId = `${row.equipmentId}|${from}|${to}`;
+
+        /* the reconciliation VERDICT, stated in the platform's vocabulary */
+        const result: ReconciliationResult =
+          row.daysCompared === 0
+            ? "insufficient_evidence"
+            : row.persistent
+              ? "unsupported"
+              : row.daysUnsupported > 0
+                ? "partially_supported"
+                : "supported";
+        /*
+         * Confidence is the share of the window the two streams could
+         * actually be compared on. A verdict drawn from one comparable day
+         * out of fourteen is a weak verdict and says so.
+         */
+        const comparableSpan =
+          row.daysCompared + row.daysWithoutTelematics + row.daysWithoutManual;
+        const confidence =
+          comparableSpan === 0 ? 0 : round2(row.daysCompared / comparableSpan);
+
+        const [existing] = await app.db
+          .select({ id: assertions.id })
+          .from(assertions)
+          .where(
+            and(
+              eq(assertions.companyId, companyId),
+              eq(assertions.projectId, projectId),
+              eq(assertions.sourceType, "equipment_utilisation_window"),
+              eq(assertions.sourceId, sourceId),
+            ),
+          )
+          .limit(1);
+
+        const assertionId = existing?.id ?? newId("asr");
+        const assertionValues = {
+          id: assertionId,
+          companyId,
+          projectId,
+          kind: "duration",
+          claimantId: claimants[0] ?? actorId,
+          claimantKind: "user",
+          value: row.manualHours,
+          unit: "hours",
+          basis:
+            `${row.manualHours} working hour(s) claimed for ${row.reference} ${row.name} on the ` +
+            `plant sheets covering ${from} to ${to}` +
+            (claimants.length > 1 ? ` (${claimants.length} authors)` : ""),
+          sourceType: "equipment_utilisation_window",
+          sourceId,
+          assertedAt: nowIso3,
+          createdBy: actorId,
+        };
+        if (existing) {
+          replaced += 1;
+          await app.db
+            .update(assertions)
+            .set({
+              value: assertionValues.value,
+              basis: assertionValues.basis,
+              claimantId: assertionValues.claimantId,
+              assertedAt: assertionValues.assertedAt,
+            })
+            .where(eq(assertions.id, assertionId));
+          /*
+           * The superseded reconciliation goes, and so does the evidence row
+           * it was drawn from — this route is the only author of those rows
+           * and they are a pure derivation of the feed, so leaving them would
+           * grow the evidence register by one dead pack per re-run while
+           * nothing points at them.
+           */
+          const stale = await app.db
+            .select({ evidenceIds: reconciliations.evidenceIds })
+            .from(reconciliations)
+            .where(
+              and(
+                eq(reconciliations.companyId, companyId),
+                eq(reconciliations.assertionId, assertionId),
+              ),
+            );
+          await app.db
+            .delete(reconciliations)
+            .where(
+              and(
+                eq(reconciliations.companyId, companyId),
+                eq(reconciliations.assertionId, assertionId),
+              ),
+            );
+          const staleEvidence = [
+            ...new Set(stale.flatMap((r) => (r.evidenceIds as string[] | null) ?? [])),
+          ];
+          if (staleEvidence.length > 0) {
+            await app.db
+              .delete(evidence)
+              .where(
+                and(
+                  eq(evidence.companyId, companyId),
+                  inArray(evidence.id, staleEvidence),
+                ),
+              );
+          }
+        } else {
+          await app.db.insert(assertions).values(assertionValues);
+        }
+
+        /*
+         * EVIDENCE ONLY WHERE THERE IS EVIDENCE. A window the feed never
+         * reached gets no evidence row: an empty evidence pack presented as
+         * an evidence pack is worse than none, because it reads as tested.
+         */
+        let evidenceId: string | null = null;
+        if (row.daysCompared > 0) {
+          evidenceId = newId("evd");
+          await app.db.insert(evidence).values({
+            id: evidenceId,
+            companyId,
+            projectId,
+            kind: "telematics",
+            source: `telematics feed for ${row.reference} (${from} to ${to})`,
+            contentHash: hashPayload({
+              equipmentId: row.equipmentId,
+              from,
+              to,
+              telematicsHours: row.telematicsHours,
+              days: row.days.map((d) => ({
+                date: d.date,
+                telematicsEngineHours: d.telematicsEngineHours,
+              })),
+            }),
+            capturedAt: nowIso3,
+            /*
+             * High, not total. The counter is produced by the machine and
+             * nobody on the project authors it — but a counter can be reset
+             * and the device-to-machine mapping is a human decision, so this
+             * is not a perfect witness.
+             */
+            independenceScore: 0.9,
+            provenance: {
+              stream: "equipment_telematics_readings",
+              equipmentId: row.equipmentId,
+              periodStart: from,
+              periodEnd: to,
+              daysCompared: row.daysCompared,
+              claimants,
+              recordedBy: actorId,
+            },
+            metadata: {
+              telematicsHours: row.telematicsHours,
+              manualHours: row.manualHours,
+              varianceHours: row.varianceHours,
+              daysUnsupported: row.daysUnsupported,
+              valueAtRisk: row.valueAtRisk,
+              currency: row.currency,
+            },
+            submittedBy: actorId,
+          });
+        }
+
+        /*
+         * SELF-CERTIFIED when the person recording the pack is also one of
+         * the people who claimed the hours. The row is still written — the
+         * comparison happened — but it is marked, and the result is
+         * downgraded so it can never present as an independently tested
+         * claim on the owner's page.
+         */
+        const selfCertified = claimants.includes(actorId);
+        const reconciliationId = newId("rec");
+        await app.db.insert(reconciliations).values({
+          id: reconciliationId,
+          companyId,
+          projectId,
+          assertionId,
+          evidenceIds: evidenceId ? [evidenceId] : [],
+          method: "equipment_hours_vs_telematics",
+          result:
+            selfCertified && result !== "insufficient_evidence"
+              ? "partially_supported"
+              : result,
+          variance: row.varianceHours,
+          variancePercent:
+            row.telematicsHours > 0 && row.varianceHours !== null
+              ? round2((row.varianceHours / row.telematicsHours) * 100)
+              : null,
+          confidence: selfCertified ? round2(confidence * 0.5) : confidence,
+          selfCertified,
+          notes: [
+            `${row.manualHours} claimed hour(s) against ${row.telematicsHours} engine hour(s) ` +
+              `over ${row.daysCompared} comparable day(s) of ${comparableSpan}.`,
+            row.valueAtRisk !== null
+              ? `${row.currency} ${row.valueAtRisk} of plant and operator time rests on the ` +
+                "unsupported hours."
+              : `The money cannot be stated: ${row.reasons.join("; ") || "no hourly rate is recorded"}.`,
+            selfCertified
+              ? "RECORDED BY ONE OF THE CLAIMANTS. The comparison stands but the pack is not " +
+                "independent of the claim, so the result is not offered as verified."
+              : "",
+          ]
+            .filter(Boolean)
+            .join(" "),
+          createdBy: actorId,
+        });
+
+        recorded.push({
+          equipmentId: row.equipmentId,
+          reference: row.reference,
+          assertionId,
+          evidenceId,
+          reconciliationId,
+          result:
+            selfCertified && result !== "insufficient_evidence"
+              ? "partially_supported"
+              : result,
+          selfCertified,
+        });
+      }
+
+      await appendLedger(app.db, {
+        companyId,
+        actorId,
+        action: "create",
+        objectType: "equipment_telematics_reconciliation",
+        objectId: `${projectId}|${from}|${to}`,
+        projectId,
+        payload: {
+          periodStart: from,
+          periodEnd: to,
+          recorded: recorded.length,
+          replaced,
+          skipped: skipped.length,
+          valueAtRiskByCurrency: summary.valueAtRiskByCurrency,
+        },
+      });
+
+      return {
+        from,
+        to,
+        recorded: recorded.length,
+        replaced,
+        rows: recorded,
+        skipped,
+        valueAtRiskByCurrency: summary.valueAtRiskByCurrency,
+        method:
+          "the plant sheet is the ASSERTION and the telematics feed is the EVIDENCE that tests " +
+          "it, authored by different parties through different pathways. Re-running the same " +
+          "window replaces the triple rather than stacking a second copy of the same finding.",
       };
     },
   );
@@ -4272,63 +6481,78 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
 
   /** What plant is on this project, and is any of it out of certificate?
    *  This read is what makes the sweep run for a project team. */
-  app.get("/projects/:projectId/equipment", { preHandler: readGate }, async (req) => {
-    const q = pageQuerySchema
-      .extend({
-        status: z.enum(EQUIPMENT_STATUSES).optional(),
-        category: z.enum(EQUIPMENT_CATEGORIES).optional(),
-      })
-      .parse(req.query);
-    const companyId = req.companyId!;
-    const projectId = req.projectId!;
-    await sweepEquipment(companyId, req.user!.id);
-    const asOf = todayISO();
-    const assigned = await app.db
-      .select({
-        equipmentId: equipmentAssignments.equipmentId,
-        assignmentId: equipmentAssignments.id,
-        status: equipmentAssignments.status,
-        assignedFrom: equipmentAssignments.assignedFrom,
-        assignedTo: equipmentAssignments.assignedTo,
-      })
-      .from(equipmentAssignments)
-      .where(
-        and(
-          eq(equipmentAssignments.companyId, companyId),
-          eq(equipmentAssignments.projectId, projectId),
-          inArray(equipmentAssignments.status, [...IN_SERVICE_ASSIGNMENT_STATUSES]),
-        ),
+  app.get(
+    "/projects/:projectId/equipment",
+    { preHandler: readGate },
+    async (req) => {
+      const q = pageQuerySchema
+        .extend({
+          status: z.enum(EQUIPMENT_STATUSES).optional(),
+          category: z.enum(EQUIPMENT_CATEGORIES).optional(),
+        })
+        .parse(req.query);
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      await maybeSweep(companyId);
+      const asOf = todayISO();
+      const assigned = await app.db
+        .select({
+          equipmentId: equipmentAssignments.equipmentId,
+          assignmentId: equipmentAssignments.id,
+          status: equipmentAssignments.status,
+          assignedFrom: equipmentAssignments.assignedFrom,
+          assignedTo: equipmentAssignments.assignedTo,
+        })
+        .from(equipmentAssignments)
+        .where(
+          and(
+            eq(equipmentAssignments.companyId, companyId),
+            eq(equipmentAssignments.projectId, projectId),
+            inArray(equipmentAssignments.status, [
+              ...IN_SERVICE_ASSIGNMENT_STATUSES,
+            ]),
+          ),
+        );
+      const ids = [...new Set(assigned.map((a) => a.equipmentId))];
+      if (ids.length === 0)
+        return { ...paginate([], 0, q), asOf, outOfCertificateCount: 0 };
+      const clauses = [
+        eq(equipment.companyId, companyId),
+        inArray(equipment.id, ids),
+      ];
+      if (q.status) clauses.push(eq(equipment.status, q.status));
+      if (q.category) clauses.push(eq(equipment.category, q.category));
+      const where = and(...clauses);
+      const [totalRow] = await app.db
+        .select({ n: count() })
+        .from(equipment)
+        .where(where);
+      const rows = await app.db
+        .select()
+        .from(equipment)
+        .where(where)
+        .orderBy(asc(equipment.number))
+        .limit(q.pageSize)
+        .offset(pageOffset(q));
+      const byEquipment = new Map(
+        assigned.map((a) => [a.equipmentId, a] as const),
       );
-    const ids = [...new Set(assigned.map((a) => a.equipmentId))];
-    if (ids.length === 0) return { ...paginate([], 0, q), asOf, outOfCertificateCount: 0 };
-    const clauses = [eq(equipment.companyId, companyId), inArray(equipment.id, ids)];
-    if (q.status) clauses.push(eq(equipment.status, q.status));
-    if (q.category) clauses.push(eq(equipment.category, q.category));
-    const where = and(...clauses);
-    const [totalRow] = await app.db.select({ n: count() }).from(equipment).where(where);
-    const rows = await app.db
-      .select()
-      .from(equipment)
-      .where(where)
-      .orderBy(asc(equipment.number))
-      .limit(q.pageSize)
-      .offset(pageOffset(q));
-    const byEquipment = new Map(assigned.map((a) => [a.equipmentId, a] as const));
-    const items = rows.map((r) => ({
-      ...decorateEquipment(r, asOf),
-      assignment: byEquipment.get(r.id) ?? null,
-    }));
-    return {
-      ...paginate(items, Number(totalRow?.n ?? 0), q),
-      asOf,
-      outOfCertificateCount: items.filter((i) => i.derived.outOfCertificate).length,
-      outOfCertificateNote:
-        items.some((i) => i.derived.outOfCertificate)
+      const items = rows.map((r) => ({
+        ...decorateEquipment(r, asOf),
+        assignment: byEquipment.get(r.id) ?? null,
+      }));
+      return {
+        ...paginate(items, Number(totalRow?.n ?? 0), q),
+        asOf,
+        outOfCertificateCount: items.filter((i) => i.derived.outOfCertificate)
+          .length,
+        outOfCertificateNote: items.some((i) => i.derived.outOfCertificate)
           ? "plant on this project is out of certificate. See the critical signals raised by the " +
             "sweep — an expired statutory examination on assigned plant is unlawful operation."
           : null,
-    };
-  });
+      };
+    },
+  );
 
   /* ================================================================ */
   /* MATERIALS — items and the lifecycle quantities                    */
@@ -4352,6 +6576,16 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     unitCost: money.nullable().optional(),
     currency: z.string().length(3).default("USD"),
     leadTimeDays: z.number().int().min(0).max(3650).nullable().optional(),
+    /*
+     * WHEN IT IS NEEDED, AND WHAT NEEDS IT. Both columns have existed since
+     * the table was written and no route ever wrote them, so the supply
+     * engine — order-by date, shortage forecast, the activities a late
+     * delivery holds up — could never fire on anything a user created. A
+     * field the API stores but no route accepts is a capability the product
+     * claims and does not have.
+     */
+    requiredOnSiteDate: isoDateSchema.nullable().optional(),
+    scheduleActivityId: idRef.nullable().optional(),
     quantityRequired: z.number().finite().min(0).default(0),
     quantityOrdered: z.number().finite().min(0).default(0),
     reorderLevel: z.number().finite().min(0).nullable().optional(),
@@ -4372,7 +6606,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     companyId: string,
     item: typeof materialItems.$inferSelect,
     quantity: number,
-  ): Promise<{ tco2e: number | null; factorId: string | null; reasons: string[] }> {
+  ): Promise<{
+    tco2e: number | null;
+    factorId: string | null;
+    reasons: string[];
+  }> {
     const reasons: string[] = [];
     if (!item.carbonFactorId) {
       reasons.push(
@@ -4388,11 +6626,18 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     const rows = await app.db
       .select()
       .from(carbonFactors)
-      .where(and(eq(carbonFactors.id, item.carbonFactorId), eq(carbonFactors.companyId, companyId)))
+      .where(
+        and(
+          eq(carbonFactors.id, item.carbonFactorId),
+          eq(carbonFactors.companyId, companyId),
+        ),
+      )
       .limit(1);
     const factor = rows[0];
     if (!factor) {
-      reasons.push(`carbon factor ${item.carbonFactorId} is not in this company's factor library`);
+      reasons.push(
+        `carbon factor ${item.carbonFactorId} is not in this company's factor library`,
+      );
       return { tco2e: null, factorId: item.carbonFactorId, reasons };
     }
     if (!unitsMatch(factor.unit, item.unit)) {
@@ -4412,8 +6657,12 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
 
   /** The item plus the lifecycle arithmetic nobody should have to redo. */
   function decorateMaterial(item: typeof materialItems.$inferSelect) {
-    const outstandingToOrder = round2(item.quantityRequired - item.quantityOrdered);
-    const outstandingToDeliver = round2(item.quantityOrdered - item.quantityDelivered);
+    const outstandingToOrder = round2(
+      item.quantityRequired - item.quantityOrdered,
+    );
+    const outstandingToDeliver = round2(
+      item.quantityOrdered - item.quantityDelivered,
+    );
     const available = round2(item.quantityOnHand - item.quantityReserved);
     return {
       ...item,
@@ -4424,7 +6673,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         outstandingToDeliver,
         availableToIssue: available,
         belowReorderLevel:
-          item.reorderLevel !== null && item.quantityOnHand <= item.reorderLevel,
+          item.reorderLevel !== null &&
+          item.quantityOnHand <= item.reorderLevel,
         wastagePercent:
           item.quantityDelivered > 0
             ? round2((item.quantityWasted / item.quantityDelivered) * 100)
@@ -4438,7 +6688,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           item.quantityDelivered > 0
             ? round2((item.quantityRejected / item.quantityDelivered) * 100)
             : null,
-        specControlled: item.specSectionId !== null || item.submittalId !== null,
+        specControlled:
+          item.specSectionId !== null || item.submittalId !== null,
         specNote:
           item.specSectionId === null && item.submittalId === null
             ? "this material is bound to no spec section and no approved submittal — nothing on " +
@@ -4448,209 +6699,264 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     };
   }
 
-  app.post("/projects/:projectId/materials", { preHandler: standardGate }, async (req, reply) => {
-    const body = materialCreateSchema.parse(req.body);
-    const companyId = req.companyId!;
-    if (body.supplierVendorId) await assertVendor(body.supplierVendorId, companyId);
-    const number = await nextRecordNumber(app.db, companyId, "material_item");
-    const reference = `MAT-${pad(number)}`;
-    const id = newId("mat");
-    await app.db.insert(materialItems).values({
-      id,
-      companyId,
-      projectId: req.projectId!,
-      number,
-      reference,
-      code: body.code ?? null,
-      name: body.name,
-      description: body.description ?? null,
-      category: body.category ?? null,
-      unit: body.unit,
-      specSectionId: body.specSectionId ?? null,
-      specSectionCode: body.specSectionCode ?? null,
-      submittalId: body.submittalId ?? null,
-      manufacturer: body.manufacturer ?? null,
-      modelNumber: body.modelNumber ?? null,
-      supplierVendorId: body.supplierVendorId ?? null,
-      commitmentId: body.commitmentId ?? null,
-      costCodeId: body.costCodeId ?? null,
-      budgetLineItemId: body.budgetLineItemId ?? null,
-      unitCost: body.unitCost ?? null,
-      currency: body.currency,
-      leadTimeDays: body.leadTimeDays ?? null,
-      quantityRequired: body.quantityRequired,
-      quantityOrdered: body.quantityOrdered,
-      reorderLevel: body.reorderLevel ?? null,
-      storageLocationId: body.storageLocationId ?? null,
-      isHazardous: body.isHazardous ? 1 : 0,
-      coshhFileId: body.coshhFileId ?? null,
-      storageRequirements: body.storageRequirements ?? null,
-      shelfLifeDays: body.shelfLifeDays ?? null,
-      carbonFactorId: body.carbonFactorId ?? null,
-      isTracked: body.isTracked ? 1 : 0,
-      status: body.status,
-      totalsCalculatedAt: new Date().toISOString(),
-      detail: body.detail ?? {},
-      createdBy: req.user!.id,
-    });
-    await appendLedger(app.db, {
-      companyId,
-      actorId: req.user!.id,
-      action: "create",
-      objectType: "material_item",
-      objectId: id,
-      projectId: req.projectId!,
-      payload: {
+  app.post(
+    "/projects/:projectId/materials",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const body = materialCreateSchema.parse(req.body);
+      const companyId = req.companyId!;
+      if (body.supplierVendorId)
+        await assertVendor(body.supplierVendorId, companyId);
+      const number = await nextRecordNumber(app.db, companyId, "material_item");
+      const reference = `MAT-${pad(number)}`;
+      const id = newId("mat");
+      await app.db.insert(materialItems).values({
+        id,
+        companyId,
+        projectId: req.projectId!,
+        number,
         reference,
+        code: body.code ?? null,
         name: body.name,
+        description: body.description ?? null,
+        category: body.category ?? null,
         unit: body.unit,
-        quantityRequired: body.quantityRequired,
+        specSectionId: body.specSectionId ?? null,
+        specSectionCode: body.specSectionCode ?? null,
+        submittalId: body.submittalId ?? null,
+        manufacturer: body.manufacturer ?? null,
+        modelNumber: body.modelNumber ?? null,
+        supplierVendorId: body.supplierVendorId ?? null,
+        commitmentId: body.commitmentId ?? null,
+        costCodeId: body.costCodeId ?? null,
+        budgetLineItemId: body.budgetLineItemId ?? null,
         unitCost: body.unitCost ?? null,
         currency: body.currency,
-        specSectionId: body.specSectionId ?? null,
-        submittalId: body.submittalId ?? null,
-      },
-      storePayload: true,
-    });
-    const created = await fetchMaterialItem(id, companyId, req.projectId!);
-    return reply.status(201).send({
-      ...decorateMaterial(created),
-      hazardNote:
-        body.isHazardous && !body.coshhFileId
-          ? "this material is flagged hazardous with no COSHH assessment attached. It cannot " +
-            "lawfully be issued to anyone until one exists."
-          : null,
-    });
-  });
+        leadTimeDays: body.leadTimeDays ?? null,
+        requiredOnSiteDate: body.requiredOnSiteDate ?? null,
+        scheduleActivityId: body.scheduleActivityId ?? null,
+        quantityRequired: body.quantityRequired,
+        quantityOrdered: body.quantityOrdered,
+        reorderLevel: body.reorderLevel ?? null,
+        storageLocationId: body.storageLocationId ?? null,
+        isHazardous: body.isHazardous ? 1 : 0,
+        coshhFileId: body.coshhFileId ?? null,
+        storageRequirements: body.storageRequirements ?? null,
+        shelfLifeDays: body.shelfLifeDays ?? null,
+        carbonFactorId: body.carbonFactorId ?? null,
+        isTracked: body.isTracked ? 1 : 0,
+        status: body.status,
+        totalsCalculatedAt: new Date().toISOString(),
+        detail: body.detail ?? {},
+        createdBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "material_item",
+        objectId: id,
+        projectId: req.projectId!,
+        payload: {
+          reference,
+          name: body.name,
+          unit: body.unit,
+          quantityRequired: body.quantityRequired,
+          unitCost: body.unitCost ?? null,
+          currency: body.currency,
+          specSectionId: body.specSectionId ?? null,
+          submittalId: body.submittalId ?? null,
+        },
+        storePayload: true,
+      });
+      const created = await fetchMaterialItem(id, companyId, req.projectId!);
+      return reply.status(201).send({
+        ...decorateMaterial(created),
+        hazardNote:
+          body.isHazardous && !body.coshhFileId
+            ? "this material is flagged hazardous with no COSHH assessment attached. It cannot " +
+              "lawfully be issued to anyone until one exists."
+            : null,
+      });
+    },
+  );
 
-  app.get("/projects/:projectId/materials", { preHandler: readGate }, async (req) => {
-    const q = pageQuerySchema
-      .extend({
-        status: z.enum(MATERIAL_ITEM_STATUSES).optional(),
-        category: z.string().max(120).optional(),
-        supplierVendorId: idRef.optional(),
-        belowReorder: z.coerce.boolean().optional(),
-        includeCatalogue: z.coerce.boolean().optional(),
-        q: z.string().max(200).optional(),
-      })
-      .parse(req.query);
-    const clauses = [eq(materialItems.companyId, req.companyId!)];
-    clauses.push(
-      q.includeCatalogue
-        ? or(eq(materialItems.projectId, req.projectId!), isNull(materialItems.projectId))!
-        : eq(materialItems.projectId, req.projectId!),
-    );
-    if (q.status) clauses.push(eq(materialItems.status, q.status));
-    if (q.category) clauses.push(eq(materialItems.category, q.category));
-    if (q.supplierVendorId) clauses.push(eq(materialItems.supplierVendorId, q.supplierVendorId));
-    if (q.q) {
+  app.get(
+    "/projects/:projectId/materials",
+    { preHandler: readGate },
+    async (req) => {
+      const q = pageQuerySchema
+        .extend({
+          status: z.enum(MATERIAL_ITEM_STATUSES).optional(),
+          category: z.string().max(120).optional(),
+          supplierVendorId: idRef.optional(),
+          belowReorder: boolQuery.optional(),
+          includeCatalogue: boolQuery.optional(),
+          q: z.string().max(200).optional(),
+        })
+        .parse(req.query);
+      const clauses = [eq(materialItems.companyId, req.companyId!)];
       clauses.push(
-        or(
-          sql`lower(${materialItems.name}) like ${`%${q.q.toLowerCase()}%`}`,
-          sql`lower(${materialItems.reference}) like ${`%${q.q.toLowerCase()}%`}`,
-        )!,
+        q.includeCatalogue
+          ? or(
+              eq(materialItems.projectId, req.projectId!),
+              isNull(materialItems.projectId),
+            )!
+          : eq(materialItems.projectId, req.projectId!),
       );
-    }
-    const where = and(...clauses);
-    const rows = await app.db
-      .select()
-      .from(materialItems)
-      .where(where)
-      .orderBy(asc(materialItems.number));
-    let items = rows.map(decorateMaterial);
-    if (q.belowReorder) items = items.filter((i) => i.derived.belowReorderLevel);
-    const total = items.length;
-    return paginate(items.slice(pageOffset(q), pageOffset(q) + q.pageSize), total, q);
-  });
-
-  app.get("/companies/current/materials", { preHandler: companyRead }, async (req) => {
-    const q = pageQuerySchema
-      .extend({
-        catalogueOnly: z.coerce.boolean().optional(),
-        status: z.enum(MATERIAL_ITEM_STATUSES).optional(),
-      })
-      .parse(req.query);
-    const clauses = [eq(materialItems.companyId, req.companyId!)];
-    if (q.catalogueOnly) clauses.push(isNull(materialItems.projectId));
-    if (q.status) clauses.push(eq(materialItems.status, q.status));
-    const where = and(...clauses);
-    const [totalRow] = await app.db.select({ n: count() }).from(materialItems).where(where);
-    const rows = await app.db
-      .select()
-      .from(materialItems)
-      .where(where)
-      .orderBy(asc(materialItems.number))
-      .limit(q.pageSize)
-      .offset(pageOffset(q));
-    return paginate(rows.map(decorateMaterial), Number(totalRow?.n ?? 0), q);
-  });
-
-  app.get("/projects/:projectId/materials/:itemId", { preHandler: readGate }, async (req) => {
-    const { itemId } = req.params as { itemId: string };
-    const companyId = req.companyId!;
-    const item = await fetchMaterialItem(itemId, companyId, req.projectId!);
-    const movements = await app.db
-      .select()
-      .from(materialStockMovements)
-      .where(eq(materialStockMovements.materialItemId, itemId))
-      .orderBy(desc(materialStockMovements.movedAt))
-      .limit(50);
-    return {
-      ...decorateMaterial(item),
-      embodiedCarbon: {
-        delivered: await materialCarbon(companyId, item, item.quantityDelivered),
-        installed: await materialCarbon(companyId, item, item.quantityInstalled),
-        wasted: await materialCarbon(companyId, item, item.quantityWasted),
-      },
-      recentMovements: movements,
-    };
-  });
-
-  app.patch("/projects/:projectId/materials/:itemId", { preHandler: standardGate }, async (req) => {
-    const { itemId } = req.params as { itemId: string };
-    const body = materialCreateSchema
-      .partial()
-      .omit({ quantityRequired: true, quantityOrdered: true })
-      .extend({
-        quantityRequired: z.number().finite().min(0).optional(),
-        quantityOrdered: z.number().finite().min(0).optional(),
-        quantityInstalled: z.number().finite().min(0).optional(),
-      })
-      .parse(req.body);
-    const companyId = req.companyId!;
-    const item = await fetchMaterialItem(itemId, companyId, req.projectId!);
-    if (item.projectId !== req.projectId!) {
-      throw forbidden(
-        "this is a company catalogue item and is not editable from a project — a project cannot " +
-          "quietly change a definition every other project reads",
-      );
-    }
-    const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
-    for (const [key, value] of Object.entries(body)) {
-      if (value === undefined) continue;
-      patch[key] = key === "isHazardous" || key === "isTracked" ? (value ? 1 : 0) : value;
-    }
-    if (body.quantityInstalled !== undefined) {
-      if (body.quantityInstalled > item.quantityAccepted) {
-        throw badRequest(
-          `${body.quantityInstalled} ${item.unit} cannot have been installed when only ` +
-            `${item.quantityAccepted} ${item.unit} have been accepted onto site`,
+      if (q.status) clauses.push(eq(materialItems.status, q.status));
+      if (q.category) clauses.push(eq(materialItems.category, q.category));
+      if (q.supplierVendorId)
+        clauses.push(eq(materialItems.supplierVendorId, q.supplierVendorId));
+      if (q.q) {
+        clauses.push(
+          or(
+            sql`lower(${materialItems.name}) like ${`%${q.q.toLowerCase()}%`}`,
+            sql`lower(${materialItems.reference}) like ${`%${q.q.toLowerCase()}%`}`,
+          )!,
         );
       }
-      patch["totalsCalculatedAt"] = new Date().toISOString();
-    }
-    await app.db.update(materialItems).set(patch).where(eq(materialItems.id, itemId));
-    await appendLedger(app.db, {
-      companyId,
-      actorId: req.user!.id,
-      action: "update",
-      objectType: "material_item",
-      objectId: itemId,
-      projectId: req.projectId!,
-      payload: { changed: Object.keys(body) },
-    });
-    return decorateMaterial(await fetchMaterialItem(itemId, companyId, req.projectId!));
-  });
+      const where = and(...clauses);
+      const rows = await app.db
+        .select()
+        .from(materialItems)
+        .where(where)
+        .orderBy(asc(materialItems.number));
+      let items = rows.map(decorateMaterial);
+      if (q.belowReorder)
+        items = items.filter((i) => i.derived.belowReorderLevel);
+      const total = items.length;
+      return paginate(
+        items.slice(pageOffset(q), pageOffset(q) + q.pageSize),
+        total,
+        q,
+      );
+    },
+  );
+
+  app.get(
+    "/companies/current/materials",
+    { preHandler: companyRead },
+    async (req) => {
+      const q = pageQuerySchema
+        .extend({
+          catalogueOnly: boolQuery.optional(),
+          status: z.enum(MATERIAL_ITEM_STATUSES).optional(),
+        })
+        .parse(req.query);
+      const clauses = [eq(materialItems.companyId, req.companyId!)];
+      if (q.catalogueOnly) clauses.push(isNull(materialItems.projectId));
+      if (q.status) clauses.push(eq(materialItems.status, q.status));
+      const where = and(...clauses);
+      const [totalRow] = await app.db
+        .select({ n: count() })
+        .from(materialItems)
+        .where(where);
+      const rows = await app.db
+        .select()
+        .from(materialItems)
+        .where(where)
+        .orderBy(asc(materialItems.number))
+        .limit(q.pageSize)
+        .offset(pageOffset(q));
+      return paginate(rows.map(decorateMaterial), Number(totalRow?.n ?? 0), q);
+    },
+  );
+
+  app.get(
+    "/projects/:projectId/materials/:itemId",
+    { preHandler: readGate },
+    async (req) => {
+      const { itemId } = req.params as { itemId: string };
+      const companyId = req.companyId!;
+      const item = await fetchMaterialItem(itemId, companyId, req.projectId!);
+      const movements = await app.db
+        .select()
+        .from(materialStockMovements)
+        .where(eq(materialStockMovements.materialItemId, itemId))
+        .orderBy(desc(materialStockMovements.movedAt))
+        .limit(50);
+      return {
+        ...decorateMaterial(item),
+        embodiedCarbon: {
+          delivered: await materialCarbon(
+            companyId,
+            item,
+            item.quantityDelivered,
+          ),
+          installed: await materialCarbon(
+            companyId,
+            item,
+            item.quantityInstalled,
+          ),
+          wasted: await materialCarbon(companyId, item, item.quantityWasted),
+        },
+        recentMovements: movements,
+      };
+    },
+  );
+
+  app.patch(
+    "/projects/:projectId/materials/:itemId",
+    { preHandler: standardGate },
+    async (req) => {
+      const { itemId } = req.params as { itemId: string };
+      const body = materialCreateSchema
+        .partial()
+        .omit({ quantityRequired: true, quantityOrdered: true })
+        .extend({
+          quantityRequired: z.number().finite().min(0).optional(),
+          quantityOrdered: z.number().finite().min(0).optional(),
+          quantityInstalled: z.number().finite().min(0).optional(),
+        })
+        .parse(req.body);
+      const companyId = req.companyId!;
+      const item = await fetchMaterialItem(itemId, companyId, req.projectId!);
+      if (item.projectId !== req.projectId!) {
+        throw forbidden(
+          "this is a company catalogue item and is not editable from a project — a project cannot " +
+            "quietly change a definition every other project reads",
+        );
+      }
+      const patch: Record<string, unknown> = {
+        updatedAt: new Date().toISOString(),
+      };
+      for (const [key, value] of Object.entries(body)) {
+        if (value === undefined) continue;
+        patch[key] =
+          key === "isHazardous" || key === "isTracked"
+            ? value
+              ? 1
+              : 0
+            : value;
+      }
+      if (body.quantityInstalled !== undefined) {
+        if (body.quantityInstalled > item.quantityAccepted) {
+          throw badRequest(
+            `${body.quantityInstalled} ${item.unit} cannot have been installed when only ` +
+              `${item.quantityAccepted} ${item.unit} have been accepted onto site`,
+          );
+        }
+        patch["totalsCalculatedAt"] = new Date().toISOString();
+      }
+      await app.db
+        .update(materialItems)
+        .set(patch)
+        .where(eq(materialItems.id, itemId));
+      await appendLedger(app.db, {
+        companyId,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "material_item",
+        objectId: itemId,
+        projectId: req.projectId!,
+        payload: { changed: Object.keys(body) },
+      });
+      return decorateMaterial(
+        await fetchMaterialItem(itemId, companyId, req.projectId!),
+      );
+    },
+  );
 
   /* ================================================================ */
   /* STOCK — the compound is a bank account                            */
@@ -4685,6 +6991,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     sourceRef?: string | null;
     photoFileIds?: string[];
     detail?: Record<string, unknown>;
+    /** run inside an existing transaction (delivery receipt books many lines) */
+    tx?: Db;
   }
 
   /**
@@ -4703,6 +7011,21 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     signalId: string | null;
   }> {
     const { item } = input;
+    /*
+     * A COMPANY CATALOGUE ITEM HAS NO STOCK. `projectId` null means "the
+     * product, as specified", shared by every project; moving stock against it
+     * would put project A's compound balance on project B's screen and let B
+     * issue against it. The project clones what it needs.
+     */
+    if (item.projectId === null) {
+      throw badRequest(
+        `${item.reference} ${item.name} is a COMPANY CATALOGUE item, not a project material. Its ` +
+          "balance is shared by every project, so a movement against it would move stock the site " +
+          "in front of you does not hold. Create the item on this project (POST " +
+          "/projects/:projectId/materials) and book the movement against that.",
+        { code: "catalogue_item_has_no_stock", materialItemId: item.id },
+      );
+    }
     if (input.movementType !== "adjustment" && input.quantity <= 0) {
       throw badRequest(
         `a ${input.movementType} of ${input.quantity} makes no sense — send a positive quantity ` +
@@ -4710,8 +7033,40 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       );
     }
     if (input.movementType === "adjustment" && input.quantity === 0) {
-      throw badRequest("an adjustment of zero changes nothing — record no movement at all");
+      throw badRequest(
+        "an adjustment of zero changes nothing — record no movement at all",
+      );
     }
+    /*
+     * SERIALISED. Two concurrent issues of 20 from a balance of 30 both used
+     * to pass the in-memory shortfall check, both wrote balanceAfter 10, and
+     * the item ended at −10 with no refusal and no signal — the compound
+     * balance this module sells as a bank statement, silently wrong. The row
+     * is locked for the read-check-write, and the balance is computed from
+     * the LOCKED row rather than the one the caller fetched.
+     */
+    return withTx(input.tx, async (tx) => {
+      const [locked] = await tx
+        .select()
+        .from(materialItems)
+        .where(eq(materialItems.id, item.id))
+        .for("update")
+        .limit(1);
+      if (!locked) throw notFound("Material item not found");
+      return bookMovement(tx, input, locked);
+    });
+  }
+
+  /** The body of a stock movement, running against a locked item row. */
+  async function bookMovement(
+    tx: Db,
+    input: MovementRequest,
+    item: typeof materialItems.$inferSelect,
+  ): Promise<{
+    movement: typeof materialStockMovements.$inferSelect;
+    shortfall: ReturnType<typeof checkShortfall>;
+    signalId: string | null;
+  }> {
     const shortfall = checkShortfall(
       item.quantityOnHand,
       input.movementType,
@@ -4719,30 +7074,41 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       item.unit,
     );
     if (shortfall.wouldGoNegative && !input.allowNegative) {
-      throw badRequest(shortfall.message ?? "movement would drive stock negative", {
-        code: "stock_would_go_negative",
-        materialItemId: item.id,
-        materialReference: item.reference,
-        unit: item.unit,
-        currentBalance: shortfall.currentBalance,
-        projectedBalance: shortfall.projectedBalance,
-        shortfall: shortfall.shortfall,
-        movementType: input.movementType,
-        quantity: input.quantity,
-        remedy:
-          "book in the missing receipt if it arrived, or record the loss as wastage/damage/theft " +
-          "so it is measurable. Pass allowNegative to force it and the override is signalled.",
-      });
+      throw badRequest(
+        shortfall.message ?? "movement would drive stock negative",
+        {
+          code: "stock_would_go_negative",
+          materialItemId: item.id,
+          materialReference: item.reference,
+          unit: item.unit,
+          currentBalance: shortfall.currentBalance,
+          projectedBalance: shortfall.projectedBalance,
+          shortfall: shortfall.shortfall,
+          movementType: input.movementType,
+          quantity: input.quantity,
+          remedy:
+            "book in the missing receipt if it arrived, or record the loss as wastage/damage/theft " +
+            "so it is measurable. Pass allowNegative to force it and the override is signalled.",
+        },
+      );
     }
     const stored = signedQuantity(input.movementType, input.quantity);
-    const onHandAfter = round2(item.quantityOnHand + onHandDelta(input.movementType, input.quantity));
-    const reservedAfter = round2(
-      Math.max(0, item.quantityReserved + reservedDelta(input.movementType, input.quantity)),
+    const onHandAfter = round2(
+      item.quantityOnHand + onHandDelta(input.movementType, input.quantity),
     );
-    const movedAt = input.movedAt ? new Date(input.movedAt).toISOString() : new Date().toISOString();
+    const reservedAfter = round2(
+      Math.max(
+        0,
+        item.quantityReserved +
+          reservedDelta(input.movementType, input.quantity),
+      ),
+    );
+    const movedAt = input.movedAt
+      ? new Date(input.movedAt).toISOString()
+      : new Date().toISOString();
     const id = newId("msm");
     const unitCost = input.unitCost ?? item.unitCost ?? null;
-    await app.db.insert(materialStockMovements).values({
+    await tx.insert(materialStockMovements).values({
       id,
       companyId: input.companyId,
       projectId: input.projectId,
@@ -4766,7 +7132,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       batchNumber: input.batchNumber ?? null,
       reason: input.reason ?? null,
       unitCost,
-      valueAmount: unitCost !== null ? round2(Math.abs(stored) * unitCost) : null,
+      valueAmount:
+        unitCost !== null ? round2(Math.abs(stored) * unitCost) : null,
       currency: input.currency ?? item.currency,
       balanceAfter: onHandAfter,
       source: input.source ?? "manual",
@@ -4776,11 +7143,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       createdBy: input.actorId,
     });
 
-    const wastedAfter =
-      LOSS_MOVEMENT_TYPES.includes(input.movementType)
-        ? round2(item.quantityWasted + Math.abs(stored))
-        : item.quantityWasted;
-    await app.db
+    const wastedAfter = LOSS_MOVEMENT_TYPES.includes(input.movementType)
+      ? round2(item.quantityWasted + Math.abs(stored))
+      : item.quantityWasted;
+    await tx
       .update(materialItems)
       .set({
         quantityOnHand: onHandAfter,
@@ -4793,8 +7159,18 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
 
     let signalId: string | null = null;
     if (shortfall.wouldGoNegative) {
-      const seen = await alreadySignalled(input.companyId, "material_stock_negative");
+      /*
+       * NO DEDUPE LOOKUP HERE. The key is the movement id, minted three
+       * statements ago, so nothing already stored can carry it — the query
+       * used to be issued with no candidate keys, which is the unbounded
+       * "every material_stock_negative this company ever raised" scan
+       * `alreadySignalled` warns about, run inside the transaction that holds
+       * the FOR UPDATE lock on the material row, purely to return a set that
+       * could never contain the key. Every other movement on that item waited
+       * behind it for an answer known in advance.
+       */
       signalId = await raiseSignalOnce({
+        db: tx,
         companyId: input.companyId,
         projectId: input.projectId,
         detector: "material_stock_negative",
@@ -4820,17 +7196,17 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           balanceAfter: shortfall.projectedBalance,
           shortfall: shortfall.shortfall,
         },
-        seen,
+        seen: new Set<string>(),
       });
       if (signalId) {
-        await app.db
+        await tx
           .update(materialStockMovements)
           .set({ signalId })
           .where(eq(materialStockMovements.id, id));
       }
     }
 
-    await appendLedger(app.db, {
+    await appendLedger(tx, {
       companyId: input.companyId,
       actorId: input.actorId,
       action: "create",
@@ -4852,7 +7228,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       storePayload: true,
     });
 
-    const rows = await app.db
+    const rows = await tx
       .select()
       .from(materialStockMovements)
       .where(eq(materialStockMovements.id, id))
@@ -4917,7 +7293,9 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       lines,
       derived: {
         discrepantLineCount: discrepantLines.length,
-        discrepancyKinds: [...new Set(discrepantLines.map((l) => l.discrepancyKind))],
+        discrepancyKinds: [
+          ...new Set(discrepantLines.map((l) => l.discrepancyKind)),
+        ],
         ncrLinked: delivery.ncrId !== null,
         ncrCandidate:
           delivery.hasDiscrepancy === 1 && delivery.ncrId === null
@@ -4935,8 +7313,9 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           linesWithCertificates: lines.filter(
             (l) => (l.certificateFileIds as string[]).length > 0,
           ).length,
-          linesWithBatchOrHeat: lines.filter((l) => l.batchNumber !== null || l.heatNumber !== null)
-            .length,
+          linesWithBatchOrHeat: lines.filter(
+            (l) => l.batchNumber !== null || l.heatNumber !== null,
+          ).length,
           totalLines: lines.length,
           note:
             lines.length > 0 &&
@@ -4950,8 +7329,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     };
   }
 
-  async function deliveryLines(deliveryId: string) {
-    return app.db
+  async function deliveryLines(deliveryId: string, db: Db = app.db) {
+    return db
       .select()
       .from(materialDeliveryLines)
       .where(eq(materialDeliveryLines.deliveryId, deliveryId))
@@ -4965,13 +7344,19 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const body = deliveryCreateSchema.parse(req.body);
       const companyId = req.companyId!;
       const projectId = req.projectId!;
-      if (body.supplierVendorId) await assertVendor(body.supplierVendorId, companyId);
-      const number = await nextRecordNumber(app.db, projectId, "material_delivery");
+      if (body.supplierVendorId)
+        await assertVendor(body.supplierVendorId, companyId);
+      const number = await nextRecordNumber(
+        app.db,
+        projectId,
+        "material_delivery",
+      );
       const reference = `DEL-${pad(number)}`;
       const id = newId("mdl");
       const lines = body.lines ?? [];
       for (const line of lines) {
-        if (line.materialItemId) await fetchMaterialItem(line.materialItemId, companyId, projectId);
+        if (line.materialItemId)
+          await fetchMaterialItem(line.materialItemId, companyId, projectId);
       }
       await app.db.insert(materialDeliveries).values({
         id,
@@ -5049,7 +7434,9 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         storePayload: true,
       });
       const created = await fetchDelivery(id, companyId, projectId);
-      return reply.status(201).send(decorateDelivery(created, await deliveryLines(id)));
+      return reply
+        .status(201)
+        .send(decorateDelivery(created, await deliveryLines(id)));
     },
   );
 
@@ -5058,11 +7445,17 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     { preHandler: standardGate },
     async (req, reply) => {
       const { deliveryId } = req.params as { deliveryId: string };
-      const body = z.object({ lines: z.array(deliveryLineSchema).min(1).max(500) }).parse(req.body);
+      const body = z
+        .object({ lines: z.array(deliveryLineSchema).min(1).max(500) })
+        .parse(req.body);
       const companyId = req.companyId!;
       const projectId = req.projectId!;
       const delivery = await fetchDelivery(deliveryId, companyId, projectId);
-      if (["received", "rejected", "returned", "cancelled"].includes(delivery.status)) {
+      if (
+        ["received", "rejected", "returned", "cancelled"].includes(
+          delivery.status,
+        )
+      ) {
         throw badRequest(
           `this delivery is ${delivery.status} — lines cannot be added to a closed receipt. ` +
             "What arrived is what arrived.",
@@ -5070,7 +7463,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       }
       const existing = await deliveryLines(deliveryId);
       for (const line of body.lines) {
-        if (line.materialItemId) await fetchMaterialItem(line.materialItemId, companyId, projectId);
+        if (line.materialItemId)
+          await fetchMaterialItem(line.materialItemId, companyId, projectId);
       }
       await app.db.insert(materialDeliveryLines).values(
         body.lines.map((line, i) => ({
@@ -5115,7 +7509,12 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       });
       return reply
         .status(201)
-        .send(decorateDelivery(await fetchDelivery(deliveryId, companyId, projectId), all));
+        .send(
+          decorateDelivery(
+            await fetchDelivery(deliveryId, companyId, projectId),
+            all,
+          ),
+        );
     },
   );
 
@@ -5143,7 +7542,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           photoFileIds: z.array(idRef).max(50).optional(),
         }),
       )
-      .min(1),
+      .min(1)
+      // Bounded so a body cannot be arbitrarily large. Generous on purpose: a
+      // delivery is built up 500 lines at a time and a long steel schedule can
+      // legitimately run to thousands, so the cap must not refuse a real one.
+      .max(5000),
   });
 
   /**
@@ -5168,7 +7571,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       // completed by a second drop is a SECOND delivery record against the
       // same order — receiving this one again would book the same material
       // into stock twice and give the supplier two claims for one load.
-      if (delivery.receivedAt || ["rejected", "returned", "cancelled"].includes(delivery.status)) {
+      if (
+        delivery.receivedAt ||
+        ["rejected", "returned", "cancelled"].includes(delivery.status)
+      ) {
         throw conflict(
           `this delivery is already ${delivery.status}` +
             (delivery.receivedAt ? ` (received ${delivery.receivedAt})` : "") +
@@ -5178,17 +7584,40 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       }
       const lines = await deliveryLines(deliveryId);
       const byId = new Map(lines.map((l) => [l.id, l] as const));
+      /*
+       * ONE LINE, ONE ENTRY. The same lineId twice in one body was accepted:
+       * the item roll-up summed both copies and `insertStockMovement` ran
+       * twice for the one pallet, so a single request booked the material
+       * into stock twice — exactly what the "receiving it twice" guard above
+       * exists to stop, reached through the body instead of through a second
+       * request.
+       */
+      const seenLineIds = new Set<string>();
       for (const entry of body.lines) {
         if (!byId.has(entry.lineId)) {
-          throw badRequest(`line ${entry.lineId} does not belong to delivery ${delivery.reference}`);
+          throw badRequest(
+            `line ${entry.lineId} does not belong to delivery ${delivery.reference}`,
+          );
         }
+        if (seenLineIds.has(entry.lineId)) {
+          throw badRequest(
+            `line ${entry.lineId} ("${byId.get(entry.lineId)!.description}") appears more than ` +
+              "once in this receipt. Each line is received once, at the quantity that came off " +
+              "the lorry; two entries for one line would book the same material into stock twice.",
+          );
+        }
+        seenLineIds.add(entry.lineId);
       }
       const receivedAt = body.receivedAt
         ? new Date(body.receivedAt).toISOString()
         : new Date().toISOString();
       const now = new Date().toISOString();
       const discrepancyKinds = new Set<string>();
-      const movements: { lineId: string; movementId: string; balanceAfter: number | null }[] = [];
+      const movements: {
+        lineId: string;
+        movementId: string;
+        balanceAfter: number | null;
+      }[] = [];
       const lineResults: {
         lineId: string;
         discrepancyKind: string;
@@ -5196,10 +7625,31 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         message: string | null;
       }[] = [];
 
+      /*
+       * VALIDATE EVERY LINE BEFORE WRITING ANY OF THEM.
+       *
+       * The receive loop used to update the line, increment the item's
+       * quantities and book a stock movement, and only then look at the next
+       * line — so a bad line 2 (rejected with no reason, or an arithmetic
+       * mismatch) threw a 400 AFTER line 1 had been booked into stock. The
+       * delivery stayed unreceived, the user fixed line 2 and retried, and
+       * line 1 went into stock a second time. Two passes: check the whole
+       * body, then write it all inside ONE transaction.
+       */
+      const validated: Array<{
+        input: (typeof body.lines)[number];
+        line: (typeof lines)[number];
+        kind: string;
+        verdict: ReturnType<typeof classifyDeliveryLine>;
+      }> = [];
       for (const input of body.lines) {
         const line = byId.get(input.lineId)!;
         if (
-          Math.abs(input.quantityAccepted + input.quantityRejected - input.quantityReceived) > 1e-6
+          Math.abs(
+            input.quantityAccepted +
+              input.quantityRejected -
+              input.quantityReceived,
+          ) > 1e-6
         ) {
           throw badRequest(
             `line "${line.description}": ${input.quantityAccepted} accepted + ` +
@@ -5215,7 +7665,6 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           quantityRejected: input.quantityRejected,
         });
         const kind = input.discrepancyKind ?? verdict.kind;
-        if (kind !== "none") discrepancyKinds.add(kind);
         if (input.quantityRejected > 0 && !input.rejectionReason) {
           throw badRequest(
             `line "${line.description}": ${input.quantityRejected} were rejected with no ` +
@@ -5223,106 +7672,216 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
               "or an NCR, which are the only two things a rejection is for.",
           );
         }
-        await app.db
-          .update(materialDeliveryLines)
-          .set({
-            quantityReceived: input.quantityReceived,
-            quantityAccepted: input.quantityAccepted,
-            quantityRejected: input.quantityRejected,
-            discrepancyKind: kind,
-            discrepancyNote: input.discrepancyNote ?? verdict.message,
-            rejectionReason: input.rejectionReason ?? null,
-            batchNumber: input.batchNumber ?? line.batchNumber,
-            heatNumber: input.heatNumber ?? line.heatNumber,
-            certificateFileIds: input.certificateFileIds ?? (line.certificateFileIds as string[]),
-            photoFileIds: input.photoFileIds ?? (line.photoFileIds as string[]),
-            lineTotal:
-              line.unitCost != null ? round2(line.unitCost * input.quantityAccepted) : line.lineTotal,
-            updatedAt: now,
-          })
-          .where(eq(materialDeliveryLines.id, line.id));
-        lineResults.push({
-          lineId: line.id,
-          discrepancyKind: kind,
-          variance: verdict.variance,
-          message: input.discrepancyNote ?? verdict.message,
-        });
-
-        if (!line.materialItemId) continue;
-        const item = await fetchMaterialItem(line.materialItemId, companyId, projectId);
-        await app.db
-          .update(materialItems)
-          .set({
-            quantityDelivered: round2(item.quantityDelivered + input.quantityReceived),
-            quantityAccepted: round2(item.quantityAccepted + input.quantityAccepted),
-            quantityRejected: round2(item.quantityRejected + input.quantityRejected),
-            status:
-              item.quantityRequired > 0 &&
-              round2(item.quantityDelivered + input.quantityReceived) >= item.quantityRequired
-                ? "delivered"
-                : "partially_delivered",
-            totalsCalculatedAt: now,
-            updatedAt: now,
-          })
-          .where(eq(materialItems.id, item.id));
-        if (body.createStockMovements && item.isTracked === 1 && input.quantityAccepted > 0) {
-          const refreshed = await fetchMaterialItem(line.materialItemId, companyId, projectId);
-          const result = await insertStockMovement({
+        if (line.materialItemId) {
+          const item = await fetchMaterialItem(
+            line.materialItemId,
             companyId,
             projectId,
-            item: refreshed,
-            movementType: "receipt",
-            quantity: input.quantityAccepted,
-            actorId: req.user!.id,
-            movedAt: receivedAt,
-            deliveryId,
-            deliveryLineId: line.id,
-            batchNumber: input.batchNumber ?? line.batchNumber,
-            unitCost: line.unitCost,
-            currency: line.currency,
-            toLocationId: line.storageLocationId,
-            source: "manual",
-            sourceRef: delivery.deliveryNoteNumber,
-            reason: `Receipt against ${delivery.reference}`,
-          });
-          movements.push({
-            lineId: line.id,
-            movementId: result.movement.id,
-            balanceAfter: result.movement.balanceAfter,
-          });
+          );
+          if (item.projectId === null) {
+            throw badRequest(
+              `line "${line.description}" names ${item.reference} ${item.name}, which is a COMPANY ` +
+                "CATALOGUE item. Receiving against it would move a balance every project shares. " +
+                "Create the material on this project and point the line at it.",
+              { code: "catalogue_item_has_no_stock", materialItemId: item.id },
+            );
+          }
         }
+        validated.push({ input, line, kind, verdict });
       }
 
-      const updatedLines = await deliveryLines(deliveryId);
-      const allRejected =
-        updatedLines.length > 0 &&
-        updatedLines.every((l) => l.quantityAccepted === 0 && l.quantityReceived > 0);
-      const anyOutstanding = updatedLines.some(
-        (l) => l.quantityExpected !== null && l.quantityReceived < l.quantityExpected,
-      );
-      const status = allRejected ? "rejected" : anyOutstanding ? "partially_received" : "received";
-      const totalValue = updatedLines.every((l) => l.lineTotal === null)
-        ? null
-        : round2(updatedLines.reduce((s, l) => s + (l.lineTotal ?? 0), 0));
-      const currencies = new Set(updatedLines.map((l) => l.currency ?? delivery.currency));
-      await app.db
-        .update(materialDeliveries)
-        .set({
-          status,
-          receivedAt,
-          receivedBy: req.user!.id,
-          receivedByName: body.receivedByName ?? null,
-          waitingMinutes: body.waitingMinutes ?? delivery.waitingMinutes,
-          hasDiscrepancy: discrepancyKinds.size > 0 ? 1 : 0,
-          discrepancyKinds: [...discrepancyKinds],
-          discrepancyNotes: body.discrepancyNotes ?? delivery.discrepancyNotes,
-          inspectionChecklistId: body.inspectionChecklistId ?? delivery.inspectionChecklistId,
-          photoFileIds: body.photoFileIds ?? (delivery.photoFileIds as string[]),
-          totalValue: currencies.size === 1 ? totalValue : null,
-          lineCount: updatedLines.length,
-          updatedAt: now,
-        })
-        .where(eq(materialDeliveries.id, deliveryId));
+      /*
+       * THE ITEM ROLL-UP IS APPLIED ONCE PER ITEM, NOT ONCE PER LINE.
+       *
+       * Two lines naming the same material on one delivery note is ordinary —
+       * two pallets, two batch numbers, two heat numbers. Reading the item and
+       * writing `item.quantityDelivered + line.quantityReceived` once per line
+       * loses one of them the moment the read cannot see the other line's
+       * write, which in production is every time: a read issued on `app.db`
+       * inside a transaction runs on a DIFFERENT pooled connection and sees
+       * only committed rows. The deltas are summed here and the row is written
+       * once, from a row read and locked inside the transaction.
+       */
+      const itemDeltas = new Map<
+        string,
+        { received: number; accepted: number; rejected: number }
+      >();
+      for (const { input, line } of validated) {
+        if (!line.materialItemId) continue;
+        const held = itemDeltas.get(line.materialItemId) ?? {
+          received: 0,
+          accepted: 0,
+          rejected: 0,
+        };
+        held.received = round2(held.received + input.quantityReceived);
+        held.accepted = round2(held.accepted + input.quantityAccepted);
+        held.rejected = round2(held.rejected + input.quantityRejected);
+        itemDeltas.set(line.materialItemId, held);
+      }
+
+      /*
+       * `delivery.receivedAt` IS THE IDEMPOTENCY GUARD, so it must commit with
+       * the stock it guards. The header used to be stamped on `app.db` after
+       * the transaction had already committed: a crash or a dropped connection
+       * in that window left the material booked into stock and the delivery
+       * still unreceived, so the operator's retry sailed past the "receiving
+       * it twice" check at the top of this route and booked the same load a
+       * second time. Header, lines, item roll-up and stock movements now
+       * commit or fail together.
+       */
+      let updatedLines: Awaited<ReturnType<typeof deliveryLines>> = [];
+      let status = delivery.status;
+      let totalValue: number | null = null;
+      let currencies = new Set<string>();
+      await app.db.transaction(async (tx) => {
+        const itemsById = new Map<
+          string,
+          typeof materialItems.$inferSelect
+        >();
+        for (const itemId of itemDeltas.keys()) {
+          const [locked] = await tx
+            .select()
+            .from(materialItems)
+            .where(eq(materialItems.id, itemId))
+            .for("update")
+            .limit(1);
+          if (!locked) throw notFound(`Material item ${itemId} not found`);
+          itemsById.set(itemId, locked);
+        }
+        for (const [itemId, item] of itemsById) {
+          const delta = itemDeltas.get(itemId);
+          if (!delta) continue;
+          const deliveredAfter = round2(
+            item.quantityDelivered + delta.received,
+          );
+          await tx
+            .update(materialItems)
+            .set({
+              quantityDelivered: deliveredAfter,
+              quantityAccepted: round2(item.quantityAccepted + delta.accepted),
+              quantityRejected: round2(item.quantityRejected + delta.rejected),
+              status:
+                item.quantityRequired > 0 &&
+                deliveredAfter >= item.quantityRequired
+                  ? "delivered"
+                  : "partially_delivered",
+              totalsCalculatedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(materialItems.id, itemId));
+        }
+
+        for (const { input, line, kind, verdict } of validated) {
+          if (kind !== "none") discrepancyKinds.add(kind);
+          await tx
+            .update(materialDeliveryLines)
+            .set({
+              quantityReceived: input.quantityReceived,
+              quantityAccepted: input.quantityAccepted,
+              quantityRejected: input.quantityRejected,
+              discrepancyKind: kind,
+              discrepancyNote: input.discrepancyNote ?? verdict.message,
+              rejectionReason: input.rejectionReason ?? null,
+              batchNumber: input.batchNumber ?? line.batchNumber,
+              heatNumber: input.heatNumber ?? line.heatNumber,
+              certificateFileIds:
+                input.certificateFileIds ??
+                (line.certificateFileIds as string[]),
+              photoFileIds:
+                input.photoFileIds ?? (line.photoFileIds as string[]),
+              lineTotal:
+                line.unitCost != null
+                  ? round2(line.unitCost * input.quantityAccepted)
+                  : line.lineTotal,
+              updatedAt: now,
+            })
+            .where(eq(materialDeliveryLines.id, line.id));
+          lineResults.push({
+            lineId: line.id,
+            discrepancyKind: kind,
+            variance: verdict.variance,
+            message: input.discrepancyNote ?? verdict.message,
+          });
+
+          if (!line.materialItemId) continue;
+          const item = itemsById.get(line.materialItemId);
+          if (!item) continue;
+          if (
+            body.createStockMovements &&
+            item.isTracked === 1 &&
+            input.quantityAccepted > 0
+          ) {
+            const result = await insertStockMovement({
+              tx,
+              companyId,
+              projectId,
+              item,
+              movementType: "receipt",
+              quantity: input.quantityAccepted,
+              actorId: req.user!.id,
+              movedAt: receivedAt,
+              deliveryId,
+              deliveryLineId: line.id,
+              batchNumber: input.batchNumber ?? line.batchNumber,
+              unitCost: line.unitCost,
+              currency: line.currency,
+              toLocationId: line.storageLocationId,
+              source: "manual",
+              sourceRef: delivery.deliveryNoteNumber,
+              reason: `Receipt against ${delivery.reference}`,
+            });
+            movements.push({
+              lineId: line.id,
+              movementId: result.movement.id,
+              balanceAfter: result.movement.balanceAfter,
+            });
+          }
+        }
+
+        updatedLines = await deliveryLines(deliveryId, tx);
+        const allRejected =
+          updatedLines.length > 0 &&
+          updatedLines.every(
+            (l) => l.quantityAccepted === 0 && l.quantityReceived > 0,
+          );
+        const anyOutstanding = updatedLines.some(
+          (l) =>
+            l.quantityExpected !== null &&
+            l.quantityReceived < l.quantityExpected,
+        );
+        status = allRejected
+          ? "rejected"
+          : anyOutstanding
+            ? "partially_received"
+            : "received";
+        totalValue = updatedLines.every((l) => l.lineTotal === null)
+          ? null
+          : round2(updatedLines.reduce((s, l) => s + (l.lineTotal ?? 0), 0));
+        currencies = new Set(
+          updatedLines.map((l) => l.currency ?? delivery.currency),
+        );
+        await tx
+          .update(materialDeliveries)
+          .set({
+            status,
+            receivedAt,
+            receivedBy: req.user!.id,
+            receivedByName: body.receivedByName ?? null,
+            waitingMinutes: body.waitingMinutes ?? delivery.waitingMinutes,
+            hasDiscrepancy: discrepancyKinds.size > 0 ? 1 : 0,
+            discrepancyKinds: [...discrepancyKinds],
+            discrepancyNotes: body.discrepancyNotes ?? delivery.discrepancyNotes,
+            inspectionChecklistId:
+              body.inspectionChecklistId ?? delivery.inspectionChecklistId,
+            photoFileIds:
+              body.photoFileIds ?? (delivery.photoFileIds as string[]),
+            totalValue: currencies.size === 1 ? totalValue : null,
+            lineCount: updatedLines.length,
+            updatedAt: now,
+          })
+          .where(eq(materialDeliveries.id, deliveryId));
+      });
+
       await appendLedger(app.db, {
         companyId,
         actorId: req.user!.id,
@@ -5356,53 +7915,74 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     },
   );
 
-  app.get("/projects/:projectId/material-deliveries", { preHandler: readGate }, async (req) => {
-    const q = pageQuerySchema
-      .extend({
-        status: z.enum(DELIVERY_STATUSES).optional(),
-        supplierVendorId: idRef.optional(),
-        commitmentId: idRef.optional(),
-        hasDiscrepancy: z.coerce.boolean().optional(),
-        invoiceMatched: z.coerce.boolean().optional(),
-        from: isoDateSchema.optional(),
-        to: isoDateSchema.optional(),
-      })
-      .parse(req.query);
-    const clauses = [
-      eq(materialDeliveries.companyId, req.companyId!),
-      eq(materialDeliveries.projectId, req.projectId!),
-    ];
-    if (q.status) clauses.push(eq(materialDeliveries.status, q.status));
-    if (q.supplierVendorId) clauses.push(eq(materialDeliveries.supplierVendorId, q.supplierVendorId));
-    if (q.commitmentId) clauses.push(eq(materialDeliveries.commitmentId, q.commitmentId));
-    if (q.hasDiscrepancy !== undefined) {
-      clauses.push(eq(materialDeliveries.hasDiscrepancy, q.hasDiscrepancy ? 1 : 0));
-    }
-    if (q.invoiceMatched !== undefined) {
-      clauses.push(eq(materialDeliveries.invoiceMatched, q.invoiceMatched ? 1 : 0));
-    }
-    if (q.from) clauses.push(gte(materialDeliveries.receivedAt, `${q.from}T00:00:00.000Z`));
-    if (q.to) clauses.push(lte(materialDeliveries.receivedAt, `${q.to}T23:59:59.999Z`));
-    const where = and(...clauses);
-    const [totalRow] = await app.db.select({ n: count() }).from(materialDeliveries).where(where);
-    const rows = await app.db
-      .select()
-      .from(materialDeliveries)
-      .where(where)
-      .orderBy(desc(materialDeliveries.number))
-      .limit(q.pageSize)
-      .offset(pageOffset(q));
-    return paginate(
-      rows.map((d) => ({
-        ...d,
-        craneRequired: d.craneRequired === 1,
-        hasDiscrepancy: d.hasDiscrepancy === 1,
-        invoiceMatched: d.invoiceMatched === 1,
-      })),
-      Number(totalRow?.n ?? 0),
-      q,
-    );
-  });
+  app.get(
+    "/projects/:projectId/material-deliveries",
+    { preHandler: readGate },
+    async (req) => {
+      const q = pageQuerySchema
+        .extend({
+          status: z.enum(DELIVERY_STATUSES).optional(),
+          supplierVendorId: idRef.optional(),
+          commitmentId: idRef.optional(),
+          hasDiscrepancy: boolQuery.optional(),
+          invoiceMatched: boolQuery.optional(),
+          from: isoDateSchema.optional(),
+          to: isoDateSchema.optional(),
+        })
+        .parse(req.query);
+      const clauses = [
+        eq(materialDeliveries.companyId, req.companyId!),
+        eq(materialDeliveries.projectId, req.projectId!),
+      ];
+      if (q.status) clauses.push(eq(materialDeliveries.status, q.status));
+      if (q.supplierVendorId)
+        clauses.push(
+          eq(materialDeliveries.supplierVendorId, q.supplierVendorId),
+        );
+      if (q.commitmentId)
+        clauses.push(eq(materialDeliveries.commitmentId, q.commitmentId));
+      if (q.hasDiscrepancy !== undefined) {
+        clauses.push(
+          eq(materialDeliveries.hasDiscrepancy, q.hasDiscrepancy ? 1 : 0),
+        );
+      }
+      if (q.invoiceMatched !== undefined) {
+        clauses.push(
+          eq(materialDeliveries.invoiceMatched, q.invoiceMatched ? 1 : 0),
+        );
+      }
+      if (q.from)
+        clauses.push(
+          gte(materialDeliveries.receivedAt, `${q.from}T00:00:00.000Z`),
+        );
+      if (q.to)
+        clauses.push(
+          lte(materialDeliveries.receivedAt, `${q.to}T23:59:59.999Z`),
+        );
+      const where = and(...clauses);
+      const [totalRow] = await app.db
+        .select({ n: count() })
+        .from(materialDeliveries)
+        .where(where);
+      const rows = await app.db
+        .select()
+        .from(materialDeliveries)
+        .where(where)
+        .orderBy(desc(materialDeliveries.number))
+        .limit(q.pageSize)
+        .offset(pageOffset(q));
+      return paginate(
+        rows.map((d) => ({
+          ...d,
+          craneRequired: d.craneRequired === 1,
+          hasDiscrepancy: d.hasDiscrepancy === 1,
+          invoiceMatched: d.invoiceMatched === 1,
+        })),
+        Number(totalRow?.n ?? 0),
+        q,
+      );
+    },
+  );
 
   /**
    * THREE-WAY MATCH: PO ↔ delivery ↔ invoice. An unmatched delivery is
@@ -5415,15 +7995,24 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     { preHandler: readGate },
     async (req) => {
       const q = z
-        .object({ from: isoDateSchema.optional(), to: isoDateSchema.optional() })
+        .object({
+          from: isoDateSchema.optional(),
+          to: isoDateSchema.optional(),
+        })
         .parse(req.query);
       const clauses = [
         eq(materialDeliveries.companyId, req.companyId!),
         eq(materialDeliveries.projectId, req.projectId!),
         inArray(materialDeliveries.status, ["received", "partially_received"]),
       ];
-      if (q.from) clauses.push(gte(materialDeliveries.receivedAt, `${q.from}T00:00:00.000Z`));
-      if (q.to) clauses.push(lte(materialDeliveries.receivedAt, `${q.to}T23:59:59.999Z`));
+      if (q.from)
+        clauses.push(
+          gte(materialDeliveries.receivedAt, `${q.from}T00:00:00.000Z`),
+        );
+      if (q.to)
+        clauses.push(
+          lte(materialDeliveries.receivedAt, `${q.to}T23:59:59.999Z`),
+        );
       const rows = await app.db
         .select()
         .from(materialDeliveries)
@@ -5432,7 +8021,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const matched = rows.filter((d) => d.invoiceMatched === 1);
       const unmatched = rows.filter((d) => d.invoiceMatched !== 1);
       const bucket = (list: typeof rows) => {
-        const out: Record<string, { value: number; deliveries: number; unpriced: number }> = {};
+        const out: Record<
+          string,
+          { value: number; deliveries: number; unpriced: number }
+        > = {};
         for (const d of list) {
           const cur = d.currency;
           const held = out[cur] ?? { value: 0, deliveries: 0, unpriced: 0 };
@@ -5465,7 +8057,14 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           ageDays:
             d.receivedAt === null
               ? null
-              : Math.max(0, Math.round((Date.parse(`${asOf}T00:00:00Z`) - Date.parse(d.receivedAt)) / 86_400_000)),
+              : Math.max(
+                  0,
+                  Math.round(
+                    (Date.parse(`${asOf}T00:00:00Z`) -
+                      Date.parse(d.receivedAt)) /
+                      86_400_000,
+                  ),
+                ),
           valueNote:
             d.totalValue === null
               ? "this delivery carries no value, so the exposure cannot be stated — price the " +
@@ -5487,7 +8086,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     { preHandler: readGate },
     async (req) => {
       const { deliveryId } = req.params as { deliveryId: string };
-      const delivery = await fetchDelivery(deliveryId, req.companyId!, req.projectId!);
+      const delivery = await fetchDelivery(
+        deliveryId,
+        req.companyId!,
+        req.projectId!,
+      );
       return decorateDelivery(delivery, await deliveryLines(deliveryId));
     },
   );
@@ -5500,12 +8103,21 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     { preHandler: standardGate },
     async (req) => {
       const { deliveryId } = req.params as { deliveryId: string };
-      const body = z.object({ note: z.string().max(2000).optional() }).parse(req.body ?? {});
+      const body = z
+        .object({ note: z.string().max(2000).optional() })
+        .parse(req.body ?? {});
       const companyId = req.companyId!;
-      const delivery = await fetchDelivery(deliveryId, companyId, req.projectId!);
-      if (delivery.verifiedAt) throw conflict("this delivery has already been verified");
+      const delivery = await fetchDelivery(
+        deliveryId,
+        companyId,
+        req.projectId!,
+      );
+      if (delivery.verifiedAt)
+        throw conflict("this delivery has already been verified");
       if (!delivery.receivedAt) {
-        throw badRequest("this delivery has not been received yet — there is nothing to verify");
+        throw badRequest(
+          "this delivery has not been received yet — there is nothing to verify",
+        );
       }
       const override = await assertIndependent(
         req,
@@ -5649,7 +8261,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         )
         .limit(1);
       const invoice = invoiceRows[0];
-      if (!invoice) throw badRequest("invoiceId is not an invoice on this project");
+      if (!invoice)
+        throw badRequest("invoiceId is not an invoice on this project");
       if (invoice.currency !== delivery.currency) {
         throw badRequest(
           `the delivery is valued in ${delivery.currency} and the invoice is in ` +
@@ -5666,7 +8279,10 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         projectId,
       );
       const alreadyMatched = await app.db
-        .select({ id: materialDeliveries.id, reference: materialDeliveries.reference })
+        .select({
+          id: materialDeliveries.id,
+          reference: materialDeliveries.reference,
+        })
         .from(materialDeliveries)
         .where(
           and(
@@ -5778,7 +8394,11 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const body = movementCreateSchema.parse(req.body);
       const companyId = req.companyId!;
       const projectId = req.projectId!;
-      const item = await fetchMaterialItem(body.materialItemId, companyId, projectId);
+      const item = await fetchMaterialItem(
+        body.materialItemId,
+        companyId,
+        projectId,
+      );
       if (item.isTracked !== 1) {
         throw badRequest(
           `${item.reference} ${item.name} is not stock-tracked (isTracked = false) — it is a bulk ` +
@@ -5821,13 +8441,19 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         photoFileIds: body.photoFileIds ?? [],
         detail: body.detail ?? {},
       });
-      const after = await fetchMaterialItem(body.materialItemId, companyId, projectId);
+      const after = await fetchMaterialItem(
+        body.materialItemId,
+        companyId,
+        projectId,
+      );
       return reply.status(201).send({
         ...result.movement,
         balance: {
           before: result.shortfall.currentBalance,
           after: result.movement.balanceAfter,
-          availableToIssue: round2(after.quantityOnHand - after.quantityReserved),
+          availableToIssue: round2(
+            after.quantityOnHand - after.quantityReserved,
+          ),
           unit: item.unit,
         },
         forcedNegative: result.shortfall.wouldGoNegative,
@@ -5850,18 +8476,33 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           movementType: z.enum(STOCK_MOVEMENT_TYPES).optional(),
           from: isoDateSchema.optional(),
           to: isoDateSchema.optional(),
-          lossesOnly: z.coerce.boolean().optional(),
+          lossesOnly: boolQuery.optional(),
         })
         .parse(req.query);
       const clauses = [
         eq(materialStockMovements.companyId, req.companyId!),
         eq(materialStockMovements.projectId, req.projectId!),
       ];
-      if (q.materialItemId) clauses.push(eq(materialStockMovements.materialItemId, q.materialItemId));
-      if (q.movementType) clauses.push(eq(materialStockMovements.movementType, q.movementType));
-      if (q.lossesOnly) clauses.push(inArray(materialStockMovements.movementType, [...LOSS_MOVEMENT_TYPES]));
-      if (q.from) clauses.push(gte(materialStockMovements.movedAt, `${q.from}T00:00:00.000Z`));
-      if (q.to) clauses.push(lte(materialStockMovements.movedAt, `${q.to}T23:59:59.999Z`));
+      if (q.materialItemId)
+        clauses.push(
+          eq(materialStockMovements.materialItemId, q.materialItemId),
+        );
+      if (q.movementType)
+        clauses.push(eq(materialStockMovements.movementType, q.movementType));
+      if (q.lossesOnly)
+        clauses.push(
+          inArray(materialStockMovements.movementType, [
+            ...LOSS_MOVEMENT_TYPES,
+          ]),
+        );
+      if (q.from)
+        clauses.push(
+          gte(materialStockMovements.movedAt, `${q.from}T00:00:00.000Z`),
+        );
+      if (q.to)
+        clauses.push(
+          lte(materialStockMovements.movedAt, `${q.to}T23:59:59.999Z`),
+        );
       const where = and(...clauses);
       const [totalRow] = await app.db
         .select({ n: count() })
@@ -5936,7 +8577,9 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     { preHandler: standardGate },
     async (req) => {
       const { movementId } = req.params as { movementId: string };
-      const body = z.object({ note: z.string().max(2000).optional() }).parse(req.body ?? {});
+      const body = z
+        .object({ note: z.string().max(2000).optional() })
+        .parse(req.body ?? {});
       const companyId = req.companyId!;
       const rows = await app.db
         .select()
@@ -5951,7 +8594,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         .limit(1);
       const movement = rows[0];
       if (!movement) throw notFound("Stock movement not found");
-      if (movement.verifiedAt) throw conflict("this movement has already been verified");
+      if (movement.verifiedAt)
+        throw conflict("this movement has already been verified");
       const override = await assertIndependent(
         req,
         movement.createdBy,
@@ -5995,76 +8639,1444 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
 
   /** One read that answers "what is wrong with the plant and materials on
    *  this project today", and runs the sweep while it does. */
-  app.get("/projects/:projectId/equipment-summary", { preHandler: readGate }, async (req) => {
-    const companyId = req.companyId!;
-    const projectId = req.projectId!;
-    await sweepEquipment(companyId, req.user!.id);
-    const asOf = todayISO();
-    const signalRows = await app.db
+  app.get(
+    "/projects/:projectId/equipment-summary",
+    { preHandler: readGate },
+    async (req) => {
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      await maybeSweep(companyId);
+      const asOf = todayISO();
+      const signalRows = await app.db
+        .select({
+          detector: signals.detector,
+          disposition: signals.disposition,
+          severity: signals.severity,
+          n: count(),
+        })
+        .from(signals)
+        .where(
+          and(
+            eq(signals.companyId, companyId),
+            inArray(signals.detector, [...EQUIPMENT_DETECTORS]),
+            or(eq(signals.projectId, projectId), isNull(signals.projectId))!,
+          ),
+        )
+        .groupBy(signals.detector, signals.disposition, signals.severity);
+      const byDetector: Record<string, number> = {};
+      for (const d of EQUIPMENT_DETECTORS) byDetector[d] = 0;
+      let open = 0;
+      let critical = 0;
+      let total = 0;
+      for (const row of signalRows) {
+        const n = Number(row.n);
+        byDetector[row.detector] = (byDetector[row.detector] ?? 0) + n;
+        total += n;
+        if (row.disposition === "new" || row.disposition === "under_review")
+          open += n;
+        if (row.severity === "critical") critical += n;
+      }
+      const assigned = await app.db
+        .select({ equipmentId: equipmentAssignments.equipmentId })
+        .from(equipmentAssignments)
+        .where(
+          and(
+            eq(equipmentAssignments.companyId, companyId),
+            eq(equipmentAssignments.projectId, projectId),
+            inArray(equipmentAssignments.status, [
+              ...IN_SERVICE_ASSIGNMENT_STATUSES,
+            ]),
+          ),
+        );
+      const deliveries = await app.db
+        .select({
+          status: materialDeliveries.status,
+          hasDiscrepancy: materialDeliveries.hasDiscrepancy,
+          invoiceMatched: materialDeliveries.invoiceMatched,
+          ncrId: materialDeliveries.ncrId,
+        })
+        .from(materialDeliveries)
+        .where(
+          and(
+            eq(materialDeliveries.companyId, companyId),
+            eq(materialDeliveries.projectId, projectId),
+          ),
+        );
+      return {
+        asOf,
+        plant: {
+          assignedMachines: new Set(assigned.map((a) => a.equipmentId)).size,
+        },
+        deliveries: {
+          total: deliveries.length,
+          withDiscrepancy: deliveries.filter((d) => d.hasDiscrepancy === 1)
+            .length,
+          discrepancyWithoutNcr: deliveries.filter(
+            (d) => d.hasDiscrepancy === 1 && !d.ncrId,
+          ).length,
+          unmatchedToInvoice: deliveries.filter(
+            (d) =>
+              d.invoiceMatched !== 1 &&
+              ["received", "partially_received"].includes(d.status),
+          ).length,
+        },
+        signals: { total, open, critical, byDetector },
+        detectors: EQUIPMENT_DETECTORS,
+      };
+    },
+  );
+  /* ================================================================ */
+  /* ASSIGNMENT LIFECYCLE — cancel and transfer (#714-718)             */
+  /* ================================================================ */
+
+  /**
+   * CANCEL. `cancelled` was referenced by the PATCH guard and by the
+   * demobilise error text ("cancel the assignment instead") and no route ever
+   * set it: a hire that was approved and never arrived could not be
+   * demobilised (nothing was ever mobilised) and could not be cancelled, so
+   * the machine was blocked from every other project for good.
+   */
+  app.post(
+    "/projects/:projectId/equipment/assignments/:assignmentId/cancel",
+    { preHandler: standardGate },
+    async (req) => {
+      const { assignmentId } = req.params as { assignmentId: string };
+      const body = z
+        .object({
+          reason: z.enum(ASSIGNMENT_CANCEL_REASONS).default("hire_not_required"),
+          note: z.string().max(2000).nullable().optional(),
+        })
+        .parse(req.body ?? {});
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const assignment = await fetchAssignment(assignmentId, companyId, projectId);
+      if (!["requested", "approved", "mobilising"].includes(assignment.status)) {
+        throw conflict(
+          `assignment ${assignment.id} is "${assignment.status}". A machine that has arrived is ` +
+            "demobilised, not cancelled — the difference is whether anything was ever on site, " +
+            "and the hire company's invoice will know which.",
+        );
+      }
+      const now = new Date().toISOString();
+      await app.db
+        .update(equipmentAssignments)
+        .set({
+          status: "cancelled",
+          assignedTo: assignment.assignedTo ?? todayISO(),
+          detail: {
+            ...(assignment.detail ?? {}),
+            cancelReason: body.reason,
+            cancelNote: body.note ?? null,
+          },
+          updatedAt: now,
+        })
+        .where(eq(equipmentAssignments.id, assignmentId));
+      const machine = await fetchEquipment(assignment.equipmentId, companyId);
+      if (machine.currentAssignmentId === assignmentId) {
+        await app.db
+          .update(equipment)
+          .set({
+            currentAssignmentId: null,
+            projectId: null,
+            status: machine.status === "in_use" ? "available" : machine.status,
+            updatedAt: now,
+          })
+          .where(eq(equipment.id, machine.id));
+      }
+      await appendLedger(app.db, {
+        companyId,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "equipment_assignment",
+        objectId: assignmentId,
+        projectId,
+        payload: {
+          from: assignment.status,
+          to: "cancelled",
+          reason: body.reason,
+          note: body.note ?? null,
+          equipmentId: assignment.equipmentId,
+          equipmentReference: machine.reference,
+        },
+        storePayload: true,
+      });
+      return {
+        ...(await fetchAssignment(assignmentId, companyId, projectId)),
+        note:
+          "the machine is free to be assigned again. If the hire company has charged anything " +
+          "against this booking, that is a credit to chase now rather than at the end of the job.",
+      };
+    },
+  );
+
+  /**
+   * TRANSFER. Moving plant between two of your own jobs is one decision, not
+   * a demobilisation somebody remembers to follow with a mobilisation — and
+   * the cost coding has to move with it or the receiving job runs free.
+   */
+  app.post(
+    "/projects/:projectId/equipment/assignments/:assignmentId/transfer",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { assignmentId } = req.params as { assignmentId: string };
+      const body = z
+        .object({
+          toProjectId: idRef,
+          at: isoDateSchema.optional(),
+          assignedTo: isoDateSchema.nullable().optional(),
+          locationId: idRef.nullable().optional(),
+          costCodeId: idRef.nullable().optional(),
+          budgetLineItemId: idRef.nullable().optional(),
+          transportDocketRef: z.string().max(120).nullable().optional(),
+          mobilisationCost: money.nullable().optional(),
+          notes: z.string().max(2000).nullable().optional(),
+        })
+        .parse(req.body);
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      if (body.toProjectId === projectId) {
+        throw badRequest("a machine cannot be transferred to the project it is already on");
+      }
+      await assertProject(body.toProjectId, companyId);
+      await assertToolOnProject(req, body.toProjectId, "standard");
+      const assignment = await fetchAssignment(assignmentId, companyId, projectId);
+      if (!["approved", "mobilising", "on_site"].includes(assignment.status)) {
+        throw conflict(
+          `assignment ${assignment.id} is "${assignment.status}" — there is nothing on this ` +
+            "project to transfer.",
+        );
+      }
+      const machine = await fetchEquipment(assignment.equipmentId, companyId);
+      const at = body.at ?? todayISO();
+      const now = new Date().toISOString();
+      const newAssignmentId = newId("eqa");
+      /*
+       * The coding does NOT travel with the machine unless it is valid on the
+       * receiving job. Copying the source assignment's cost code and budget
+       * line onto job B booked B's plant days against A's budget line: the
+       * poster refuses them (it reads lines by projectId) and the days sit
+       * uncoded, out of B's cost report, until somebody notices.
+       */
+      const coding = await resolveCoding(companyId, body.toProjectId, {
+        costCodeId: body.costCodeId ?? assignment.costCodeId,
+        budgetLineItemId: body.budgetLineItemId ?? assignment.budgetLineItemId,
+        costCodeExplicit: body.costCodeId != null,
+        budgetLineExplicit: body.budgetLineItemId != null,
+      });
+
+      await app.db.transaction(async (tx) => {
+        await tx
+          .update(equipmentAssignments)
+          .set({
+            status: "returned",
+            returnedAt: `${at}T00:00:00.000Z`,
+            assignedTo: at,
+            detail: {
+              ...(assignment.detail ?? {}),
+              transferredTo: { projectId: body.toProjectId, assignmentId: newAssignmentId, at },
+            },
+            updatedAt: now,
+          })
+          .where(eq(equipmentAssignments.id, assignmentId));
+        await tx.insert(equipmentAssignments).values({
+          id: newAssignmentId,
+          companyId,
+          projectId: body.toProjectId,
+          equipmentId: assignment.equipmentId,
+          fromProjectId: projectId,
+          // The hire spend was approved once; moving the machine between our
+          // own jobs does not re-open that decision, and stamping a new
+          // approver would be a fabricated approval.
+          status: assignment.approvedBy ? "approved" : "requested",
+          assignedFrom: at,
+          assignedTo: body.assignedTo ?? null,
+          locationId: body.locationId ?? null,
+          costCodeId: coding.costCodeId,
+          budgetLineItemId: coding.budgetLineItemId,
+          operatorWorkerId: assignment.operatorWorkerId,
+          crewId: null,
+          mobilisationCost: body.mobilisationCost ?? null,
+          currency: assignment.currency,
+          transportDocketRef: body.transportDocketRef ?? null,
+          notes: body.notes ?? null,
+          requestedBy: req.user!.id,
+          approvedBy: assignment.approvedBy,
+          approvedAt: assignment.approvedAt,
+          detail: { transferredFrom: { projectId, assignmentId, at } },
+          createdBy: req.user!.id,
+        });
+        await tx
+          .update(equipment)
+          .set({
+            projectId: body.toProjectId,
+            currentAssignmentId: newAssignmentId,
+            updatedAt: now,
+          })
+          .where(eq(equipment.id, assignment.equipmentId));
+      });
+
+      await appendLedger(app.db, {
+        companyId,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "equipment_assignment",
+        objectId: assignmentId,
+        projectId,
+        payload: {
+          from: assignment.status,
+          to: "returned",
+          transfer: { toProjectId: body.toProjectId, newAssignmentId, at },
+          equipmentId: assignment.equipmentId,
+          equipmentReference: machine.reference,
+          mobilisationCost: body.mobilisationCost ?? null,
+          coding: {
+            costCodeId: coding.costCodeId,
+            budgetLineItemId: coding.budgetLineItemId,
+            notes: coding.notes,
+          },
+        },
+        storePayload: true,
+      });
+      return reply.status(201).send({
+        from: await fetchAssignment(assignmentId, companyId, projectId),
+        to: await fetchAssignment(newAssignmentId, companyId, body.toProjectId),
+        codingNotes: coding.notes,
+        note:
+          body.mobilisationCost == null
+            ? "no transport cost was recorded against the move. It is the cost most often lost " +
+              "between two jobs, because neither of them raised it."
+            : null,
+      });
+    },
+  );
+
+  /**
+   * AVAILABILITY. Which machines are free between two dates — the question a
+   * plant manager asks before every booking, previously answerable only by
+   * reading the assignment list by eye.
+   */
+  app.get(
+    "/companies/current/equipment-availability",
+    { preHandler: companyRead },
+    async (req) => {
+      const q = z
+        .object({
+          from: isoDateSchema,
+          to: isoDateSchema,
+          category: z.enum(EQUIPMENT_CATEGORIES).optional(),
+        })
+        .parse(req.query);
+      if (q.to < q.from) throw badRequest("to must not precede from");
+      const companyId = req.companyId!;
+      const scope = companyScopeOf(req);
+      const clauses = [eq(equipment.companyId, companyId), isNull(equipment.offHiredAt)];
+      if (q.category) clauses.push(eq(equipment.category, q.category));
+      const projectFilter = scopeProjectFilter(scope, equipment.projectId);
+      if (projectFilter) clauses.push(projectFilter);
+      const fleet = await app.db
+        .select()
+        .from(equipment)
+        .where(and(...clauses))
+        .orderBy(asc(equipment.number));
+      if (fleet.length === 0) return { from: q.from, to: q.to, available: [], busy: [] };
+
+      const assignments = await app.db
+        .select()
+        .from(equipmentAssignments)
+        .where(
+          and(
+            eq(equipmentAssignments.companyId, companyId),
+            inArray(
+              equipmentAssignments.equipmentId,
+              fleet.map((m) => m.id),
+            ),
+            inArray(equipmentAssignments.status, [...IN_SERVICE_ASSIGNMENT_STATUSES]),
+          ),
+        );
+      const downtime = await app.db
+        .select()
+        .from(equipmentMaintenanceSchedules)
+        .where(
+          and(
+            eq(equipmentMaintenanceSchedules.companyId, companyId),
+            inArray(equipmentMaintenanceSchedules.status, ["due", "overdue"]),
+            inArray(
+              equipmentMaintenanceSchedules.equipmentId,
+              fleet.map((m) => m.id),
+            ),
+          ),
+        );
+      const overlaps = (from: string, to: string | null): boolean =>
+        from <= q.to && (to === null || to >= q.from);
+
+      const available: unknown[] = [];
+      const busy: unknown[] = [];
+      for (const machine of fleet) {
+        const clash = assignments.filter(
+          (a) => a.equipmentId === machine.id && overlaps(a.assignedFrom, a.assignedTo),
+        );
+        const service = downtime.filter((d) => d.equipmentId === machine.id);
+        const hireEnds =
+          machine.hireEndDate !== null && machine.hireEndDate < q.to ? machine.hireEndDate : null;
+        const row = {
+          id: machine.id,
+          reference: machine.reference,
+          name: machine.name,
+          category: machine.category,
+          ownership: machine.ownership,
+          status: machine.status,
+          currency: machine.currency,
+          hireRateAmount: machine.hireRateAmount,
+          hireRateUnit: machine.hireRateUnit,
+          internalRateAmount: machine.internalRateAmount,
+          outOfCertificate:
+            machine.nextCertificateExpiry !== null && machine.nextCertificateExpiry < q.to,
+          nextCertificateExpiry: machine.nextCertificateExpiry,
+          clashes: clash.map((a) => ({
+            assignmentId: a.id,
+            projectId: a.projectId,
+            status: a.status,
+            assignedFrom: a.assignedFrom,
+            assignedTo: a.assignedTo,
+          })),
+          serviceDue: service.map((d) => ({
+            scheduleId: d.id,
+            name: d.name,
+            nextDueAt: d.nextDueAt,
+          })),
+          caveats: [
+            ...(hireEnds
+              ? [`the hire agreement ends ${hireEnds}, inside the window you asked about`]
+              : []),
+            ...(service.length > 0
+              ? [
+                  `${service.length} service(s) are due or overdue — book the downtime, not just ` +
+                    "the machine",
+                ]
+              : []),
+            ...(machine.nextCertificateExpiry !== null && machine.nextCertificateExpiry < q.to
+              ? [
+                  `a certificate expires ${machine.nextCertificateExpiry}: the machine may not be ` +
+                    "worked past that date until it is renewed",
+                ]
+              : []),
+          ],
+        };
+        if (clash.length === 0) available.push(row);
+        else busy.push(row);
+      }
+      return {
+        from: q.from,
+        to: q.to,
+        available,
+        busy,
+        note:
+          "availability is computed from live assignments, the hire end date and outstanding " +
+          "services. It does not know about a machine somebody has verbally promised elsewhere.",
+      };
+    },
+  );
+
+  /* ================================================================ */
+  /* RENTAL AGAINST OWNED                                              */
+  /* ================================================================ */
+
+  /**
+   * Is the hire desk cheaper than our own fleet, per class of machine, per
+   * currency? A fleet question, so it is company-scoped and narrowed to the
+   * projects the caller may see.
+   *
+   * The engine (ownership.ts) refuses far more often than it answers, and the
+   * refusals are the useful part: the commonest one is owned plant carrying no
+   * internal charge-out rate, which makes the owned fleet read as free and is
+   * the most expensive mistake a plant department makes.
+   */
+  app.get(
+    "/companies/current/equipment-ownership-comparison",
+    { preHandler: companyRead },
+    async (req) => {
+      const q = z
+        .object({
+          from: isoDateSchema.optional(),
+          to: isoDateSchema.optional(),
+          projectId: idRef.optional(),
+          category: z.enum(EQUIPMENT_CATEGORIES).optional(),
+        })
+        .parse(req.query);
+      const companyId = req.companyId!;
+      const to = q.to ?? todayISO();
+      const from = q.from ?? addDaysISO(to, -89);
+      if (to < from) throw badRequest("to must not precede from");
+      const scope = companyScopeOf(req);
+
+      const clauses = [
+        eq(equipmentUtilisation.companyId, companyId),
+        gte(equipmentUtilisation.utilisationDate, from),
+        lte(equipmentUtilisation.utilisationDate, to),
+      ];
+      if (q.projectId) {
+        await assertProject(q.projectId, companyId);
+        if (!scope.all && !scope.projectIds.includes(q.projectId)) {
+          throw forbidden("You do not hold equipment on that project.");
+        }
+        clauses.push(eq(equipmentUtilisation.projectId, q.projectId));
+      } else {
+        const projectFilter = scopeProjectFilter(scope, equipmentUtilisation.projectId);
+        if (projectFilter) clauses.push(projectFilter);
+      }
+      const rows = await app.db
+        .select()
+        .from(equipmentUtilisation)
+        .where(and(...clauses));
+      if (rows.length === 0) {
+        return { from, to, ...compareOwnership([]) };
+      }
+      const machineIds = [...new Set(rows.map((r) => r.equipmentId))];
+      const fleet = await app.db
+        .select()
+        .from(equipment)
+        .where(
+          and(eq(equipment.companyId, companyId), inArray(equipment.id, machineIds)),
+        );
+      const byId = new Map(fleet.map((m) => [m.id, m] as const));
+
+      const days: OwnershipDay[] = [];
+      for (const row of rows) {
+        const machine = byId.get(row.equipmentId);
+        if (!machine) continue;
+        if (q.category && machine.category !== q.category) continue;
+        const h = hoursOf(row);
+        const cost = computeDayCost({
+          hireRateAmount: machine.hireRateAmount,
+          hireRateUnit: machine.hireRateUnit as HireRateUnit | null,
+          idleRateAmount: machine.idleRateAmount,
+          internalRateAmount: machine.internalRateAmount,
+          ownership: machine.ownership,
+          operatorRateAmount: machine.operatorRateAmount,
+          fuelCost: row.fuelCost,
+          fuelLitres: row.fuelLitres,
+          currency: row.currency,
+          hours: h,
+        });
+        days.push({
+          equipmentId: machine.id,
+          category: machine.category,
+          ownership: machine.ownership,
+          currency: cost.currency,
+          workingHours: row.workingHours,
+          idleHours: row.idleHours,
+          standbyHours: row.standbyHours,
+          downtimeHours: row.downtimeHours,
+          availableHours: row.availableHours,
+          cost: cost.totalCost,
+          costIsComplete: cost.totalIsComplete,
+        });
+      }
+      return {
+        from,
+        to,
+        projectId: q.projectId ?? null,
+        ...compareOwnership(days),
+        method:
+          "cost per PRODUCTIVE hour, bucketed by machine category and currency. A machine that " +
+          "stood four days out of five did not cost a fifth of the week, so cost per day is not " +
+          "used. Depreciation, financing and residual value are deliberately excluded.",
+      };
+    },
+  );
+
+  /* ================================================================ */
+  /* MATERIALS SUPPLY — order-by dates, shortages, supplier scorecard  */
+  /* ================================================================ */
+
+  /** Quantity on deliveries that are booked but have not yet been received. */
+  async function inTransitByItem(
+    companyId: string,
+    projectId: string,
+  ): Promise<Map<string, number>> {
+    const rows = await app.db
       .select({
-        detector: signals.detector,
-        disposition: signals.disposition,
-        severity: signals.severity,
-        n: count(),
+        materialItemId: materialDeliveryLines.materialItemId,
+        quantityExpected: materialDeliveryLines.quantityExpected,
       })
-      .from(signals)
+      .from(materialDeliveryLines)
+      .innerJoin(materialDeliveries, eq(materialDeliveries.id, materialDeliveryLines.deliveryId))
       .where(
         and(
-          eq(signals.companyId, companyId),
-          inArray(signals.detector, [...EQUIPMENT_DETECTORS]),
-          or(eq(signals.projectId, projectId), isNull(signals.projectId))!,
-        ),
-      )
-      .groupBy(signals.detector, signals.disposition, signals.severity);
-    const byDetector: Record<string, number> = {};
-    for (const d of EQUIPMENT_DETECTORS) byDetector[d] = 0;
-    let open = 0;
-    let critical = 0;
-    let total = 0;
-    for (const row of signalRows) {
-      const n = Number(row.n);
-      byDetector[row.detector] = (byDetector[row.detector] ?? 0) + n;
-      total += n;
-      if (row.disposition === "new" || row.disposition === "under_review") open += n;
-      if (row.severity === "critical") critical += n;
-    }
-    const assigned = await app.db
-      .select({ equipmentId: equipmentAssignments.equipmentId })
-      .from(equipmentAssignments)
-      .where(
-        and(
-          eq(equipmentAssignments.companyId, companyId),
-          eq(equipmentAssignments.projectId, projectId),
-          inArray(equipmentAssignments.status, [...IN_SERVICE_ASSIGNMENT_STATUSES]),
+          eq(materialDeliveryLines.companyId, companyId),
+          eq(materialDeliveryLines.projectId, projectId),
+          isNull(materialDeliveries.receivedAt),
+          inArray(materialDeliveries.status, ["scheduled", "in_transit", "arrived"]),
         ),
       );
-    const deliveries = await app.db
-      .select({
-        status: materialDeliveries.status,
-        hasDiscrepancy: materialDeliveries.hasDiscrepancy,
-        invoiceMatched: materialDeliveries.invoiceMatched,
-        ncrId: materialDeliveries.ncrId,
-      })
+    const out = new Map<string, number>();
+    for (const r of rows) {
+      if (!r.materialItemId || r.quantityExpected === null) continue;
+      out.set(r.materialItemId, round2((out.get(r.materialItemId) ?? 0) + r.quantityExpected));
+    }
+    return out;
+  }
+
+  async function supplyAssessment(companyId: string, projectId: string) {
+    const asOf = todayISO();
+    const items = await app.db
+      .select()
+      .from(materialItems)
+      .where(and(eq(materialItems.companyId, companyId), eq(materialItems.projectId, projectId)));
+    const inTransit = await inTransitByItem(companyId, projectId);
+    const assessments = items.map((item) =>
+      assessSupplyItem(
+        {
+          id: item.id,
+          reference: item.reference,
+          name: item.name,
+          unit: item.unit,
+          status: item.status,
+          leadTimeDays: item.leadTimeDays,
+          requiredOnSiteDate: item.requiredOnSiteDate,
+          orderPlacedAt: item.orderPlacedAt,
+          scheduleActivityId: item.scheduleActivityId,
+          quantityRequired: item.quantityRequired,
+          quantityOrdered: item.quantityOrdered,
+          quantityDelivered: item.quantityDelivered,
+          quantityAccepted: item.quantityAccepted,
+          quantityOnHand: item.quantityOnHand,
+          quantityReserved: item.quantityReserved,
+          quantityInTransit: inTransit.get(item.id) ?? 0,
+          unitCost: item.unitCost,
+          currency: item.currency,
+        },
+        asOf,
+      ),
+    );
+    const openDeliveries = await app.db
+      .select()
       .from(materialDeliveries)
       .where(
         and(
           eq(materialDeliveries.companyId, companyId),
           eq(materialDeliveries.projectId, projectId),
+          inArray(materialDeliveries.status, ["scheduled", "in_transit"]),
         ),
       );
-    return {
+    const openLines = openDeliveries.length
+      ? await app.db
+          .select({
+            deliveryId: materialDeliveryLines.deliveryId,
+            materialItemId: materialDeliveryLines.materialItemId,
+          })
+          .from(materialDeliveryLines)
+          .where(
+            inArray(
+              materialDeliveryLines.deliveryId,
+              openDeliveries.map((d) => d.id),
+            ),
+          )
+      : [];
+    const delayedDeliveries = detectDelayedDeliveries(
+      openDeliveries.map((d) => ({
+        id: d.id,
+        reference: d.reference,
+        status: d.status,
+        scheduledFor: d.scheduledFor,
+        arrivedAt: d.arrivedAt,
+        receivedAt: d.receivedAt,
+        supplierVendorId: d.supplierVendorId,
+        itemIds: openLines
+          .filter((l) => l.deliveryId === d.id && l.materialItemId)
+          .map((l) => l.materialItemId as string),
+      })),
       asOf,
-      plant: { assignedMachines: new Set(assigned.map((a) => a.equipmentId)).size },
-      deliveries: {
-        total: deliveries.length,
-        withDiscrepancy: deliveries.filter((d) => d.hasDiscrepancy === 1).length,
-        discrepancyWithoutNcr: deliveries.filter((d) => d.hasDiscrepancy === 1 && !d.ncrId).length,
-        unmatchedToInvoice: deliveries.filter(
-          (d) => d.invoiceMatched !== 1 && ["received", "partially_received"].includes(d.status),
-        ).length,
+    );
+    const valuation = valueInventory(
+      items.map((i) => ({
+        id: i.id,
+        reference: i.reference,
+        name: i.name,
+        unit: i.unit,
+        quantityOnHand: i.quantityOnHand,
+        quantityDelivered: i.quantityDelivered,
+        quantityInstalled: i.quantityInstalled,
+        quantityWasted: i.quantityWasted,
+        unitCost: i.unitCost,
+        currency: i.currency,
+      })),
+    );
+    return { asOf, items: assessments, delayedDeliveries, valuation };
+  }
+
+  app.get("/projects/:projectId/materials/supply", { preHandler: readGate }, async (req) => {
+    const result = await supplyAssessment(req.companyId!, req.projectId!);
+    return {
+      ...result,
+      summary: {
+        items: result.items.length,
+        orderByDateMissed: result.items.filter((i) => i.risk === "order_by_date_missed").length,
+        orderNow: result.items.filter((i) => i.risk === "order_now").length,
+        shortages: result.items.filter((i) => i.risk === "shortage").length,
+        unknown: result.items.filter((i) => i.risk === "unknown").length,
+        delayedDeliveries: result.delayedDeliveries.length,
       },
-      signals: { total, open, critical, byDetector },
-      detectors: EQUIPMENT_DETECTORS,
+      atRisk: result.items.filter((i) => i.risk !== "ok"),
+      method:
+        "order-by date = required-on-site − lead time − " +
+        `${PROCUREMENT_ALLOWANCE_DAYS} days to place the order. An item with no lead time or no ` +
+        "required-on-site date has no order-by date and is listed as unknown, never as safe.",
     };
+  });
+
+  /**
+   * Raise the supply signals. A read never writes, so the detectors run here
+   * and from the scheduler — idempotently, keyed on the item and the risk.
+   */
+  async function sweepMaterialSupply(companyId: string): Promise<{ raised: number }> {
+    const projectRows = await app.db
+      .select({ id: projects.id })
+      .from(projects)
+      .where(eq(projects.companyId, companyId));
+    let raised = 0;
+    for (const project of projectRows) {
+      const result = await supplyAssessment(companyId, project.id);
+      const atRisk = result.items.filter(
+        (i) => i.risk === "order_by_date_missed" || i.risk === "shortage",
+      );
+      if (atRisk.length > 0) {
+        const keys = atRisk.map((i) => `${i.id}|${i.risk}`);
+        const seenMissed = await alreadySignalled(
+          companyId,
+          "material_order_by_date_missed",
+          keys,
+        );
+        const seenShort = await alreadySignalled(companyId, "material_shortage_forecast", keys);
+        for (const item of atRisk) {
+          const detector =
+            item.risk === "shortage"
+              ? "material_shortage_forecast"
+              : "material_order_by_date_missed";
+          const id = await raiseSignalOnce({
+            companyId,
+            projectId: project.id,
+            detector: detector as EquipmentDetector,
+            key: `${item.id}|${item.risk}`,
+            severity: item.risk === "order_by_date_missed" ? "high" : "medium",
+            title:
+              item.risk === "order_by_date_missed"
+                ? `Order-by date missed — ${item.reference} ${item.name}`
+                : `Material shortage forecast — ${item.reference} ${item.name}`,
+            explanation: item.reasons.join(" "),
+            refs: {
+              materialItemId: item.id,
+              reference: item.reference,
+              orderByDate: item.orderByDate,
+              shortfall: item.shortfall,
+              exposure: item.exposure,
+              currency: item.currency,
+              scheduleActivityId: item.activityAtRisk?.id ?? null,
+            },
+            seen: detector === "material_shortage_forecast" ? seenShort : seenMissed,
+          });
+          if (id) raised += 1;
+        }
+      }
+      if (result.delayedDeliveries.length > 0) {
+        const keys = result.delayedDeliveries.map((d) => d.id);
+        const seen = await alreadySignalled(companyId, "material_delivery_delayed", keys);
+        for (const delayed of result.delayedDeliveries) {
+          const id = await raiseSignalOnce({
+            companyId,
+            projectId: project.id,
+            detector: "material_delivery_delayed" as EquipmentDetector,
+            key: delayed.id,
+            severity: delayed.overdueDays > 7 ? "high" : "medium",
+            title: `Delivery overdue — ${delayed.reference}`,
+            explanation: delayed.explanation,
+            refs: {
+              deliveryId: delayed.id,
+              reference: delayed.reference,
+              scheduledFor: delayed.scheduledFor,
+              overdueDays: delayed.overdueDays,
+              supplierVendorId: delayed.supplierVendorId,
+              itemIds: delayed.itemIds,
+            },
+            seen,
+          });
+          if (id) raised += 1;
+        }
+      }
+    }
+    return { raised };
+  }
+
+  app.post(
+    "/projects/:projectId/materials/supply/run",
+    { preHandler: standardGate },
+    async (req) => {
+      const companyId = req.companyId!;
+      const result = await sweepMaterialSupply(companyId);
+      const assessment = await supplyAssessment(companyId, req.projectId!);
+      return { ...result, ...assessment };
+    },
+  );
+
+  /**
+   * Supplier performance from deliveries alone. No survey, no opinion: the
+   * dates, the discrepancies and the invoice matches already on record.
+   */
+  app.get(
+    "/companies/current/materials/supplier-scorecard",
+    { preHandler: companyRead },
+    async (req) => {
+      const q = z
+        .object({ from: isoDateSchema.optional(), to: isoDateSchema.optional() })
+        .parse(req.query);
+      const companyId = req.companyId!;
+      const scope = companyScopeOf(req);
+      const clauses = [
+        eq(materialDeliveries.companyId, companyId),
+        isNotNull(materialDeliveries.supplierVendorId),
+      ];
+      if (q.from) clauses.push(gte(materialDeliveries.createdAt, `${q.from}T00:00:00.000Z`));
+      if (q.to) clauses.push(lte(materialDeliveries.createdAt, `${q.to}T23:59:59.999Z`));
+      const projectFilter = scopeProjectFilter(scope, materialDeliveries.projectId);
+      if (projectFilter) clauses.push(projectFilter);
+      const deliveryRows = await app.db
+        .select()
+        .from(materialDeliveries)
+        .where(and(...clauses));
+      if (deliveryRows.length === 0) {
+        return {
+          items: [],
+          total: 0,
+          method:
+            "no delivery in this window names a supplier, so nobody can be scored. A scorecard " +
+            "built on deliveries with no vendor would rank the blank.",
+        };
+      }
+      const lineRows = await app.db
+        .select({
+          deliveryId: materialDeliveryLines.deliveryId,
+          quantityReceived: materialDeliveryLines.quantityReceived,
+          quantityRejected: materialDeliveryLines.quantityRejected,
+        })
+        .from(materialDeliveryLines)
+        .where(
+          inArray(
+            materialDeliveryLines.deliveryId,
+            deliveryRows.map((d) => d.id),
+          ),
+        );
+      const facts = deliveryRows.map((d) => {
+        const own = lineRows.filter((l) => l.deliveryId === d.id);
+        return {
+          vendorId: d.supplierVendorId as string,
+          scheduledFor: d.scheduledFor,
+          receivedAt: d.receivedAt,
+          hasDiscrepancy: d.hasDiscrepancy === 1,
+          waitingMinutes: d.waitingMinutes,
+          quantityReceived: round2(own.reduce((s, l) => s + l.quantityReceived, 0)),
+          quantityRejected: round2(own.reduce((s, l) => s + l.quantityRejected, 0)),
+          invoiceMatched: d.receivedAt ? d.invoiceMatched === 1 : null,
+          invoiceVarianceAmount:
+            (d.detail as { invoiceVariance?: number } | null)?.invoiceVariance ?? null,
+          currency: d.currency,
+        };
+      });
+      const vendorIds = [...new Set(facts.map((f) => f.vendorId))];
+      const vendorRows = await app.db
+        .select({ id: vendors.id, name: vendors.name })
+        .from(vendors)
+        .where(and(eq(vendors.companyId, companyId), inArray(vendors.id, vendorIds)));
+      const items = scoreSuppliers(facts, new Map(vendorRows.map((r) => [r.id, r.name] as const)));
+      return {
+        items,
+        total: items.length,
+        method:
+          "50 points punctuality (received on or before the booked day), 15 discrepancy-free, " +
+          "10 rejection-free, 15 invoice match, 10 waiting time under two hours. A component with " +
+          `no data drops out of the denominator; fewer than ${MIN_DELIVERIES_TO_SCORE} deliveries ` +
+          "gives measured rates and no score.",
+      };
+    },
+  );
+
+  /* ================================================================ */
+  /* HEALTH INPUTS (contract 3.5) + the manual sweep                   */
+  /* ================================================================ */
+
+  app.get(
+    "/projects/:projectId/equipment/health-inputs",
+    { preHandler: readGate },
+    async (req) => {
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const asOf = todayISO();
+      const assigned = await app.db
+        .select({ equipmentId: equipmentAssignments.equipmentId })
+        .from(equipmentAssignments)
+        .where(
+          and(
+            eq(equipmentAssignments.companyId, companyId),
+            eq(equipmentAssignments.projectId, projectId),
+            inArray(equipmentAssignments.status, [...IN_SERVICE_ASSIGNMENT_STATUSES]),
+          ),
+        );
+      const machineIds = [...new Set(assigned.map((a) => a.equipmentId))];
+      const machines = machineIds.length
+        ? await app.db.select().from(equipment).where(inArray(equipment.id, machineIds))
+        : [];
+      const outOfCertificate = machines.filter(
+        (m) => m.nextCertificateExpiry !== null && m.nextCertificateExpiry < asOf,
+      ).length;
+      const maintenanceOverdue = machines.filter(
+        (m) => m.nextMaintenanceDue !== null && m.nextMaintenanceDue < asOf,
+      ).length;
+      const supply = await supplyAssessment(companyId, projectId);
+      const openSignals = await app.db
+        .select({ n: count() })
+        .from(signals)
+        .where(
+          and(
+            eq(signals.companyId, companyId),
+            eq(signals.projectId, projectId),
+            inArray(signals.detector, [...EQUIPMENT_DETECTORS]),
+            inArray(signals.disposition, ["new", "under_review", "confirmed"]),
+          ),
+        );
+      const reasons: string[] = [];
+      if (machines.length === 0) {
+        reasons.push(
+          "no plant is assigned to this project, so the plant metrics are null rather than zero",
+        );
+      }
+      return {
+        metrics: {
+          machinesOnSite: machines.length,
+          machinesOutOfCertificate: machines.length === 0 ? null : outOfCertificate,
+          machinesMaintenanceOverdue: machines.length === 0 ? null : maintenanceOverdue,
+          materialItemsAtRisk: supply.items.filter(
+            (i) => i.risk !== "ok" && i.risk !== "unknown",
+          ).length,
+          deliveriesOverdue: supply.delayedDeliveries.length,
+          openEquipmentSignals: Number(openSignals[0]?.n ?? 0),
+        },
+        reasons,
+      };
+    },
+  );
+
+  /** Run the sweep on demand — what an operator and the tests reach for. */
+  app.post("/companies/current/equipment/sweep", { preHandler: companyWrite }, async (req) => {
+    const companyId = req.companyId!;
+    await sweepEquipment(companyId, null);
+    const supply = await sweepMaterialSupply(companyId);
+    lastSweptAt.set(companyId, Date.now());
+    return { swept: true, supplySignalsRaised: supply.raised };
+  });
+
+  /* ================================================================ */
+  /* TELEMATICS INTELLIGENCE — geofence, fuel and fault codes           */
+  /* ================================================================ */
+
+  /**
+   * What the machine's own feed says beyond hours: where it was worked, what
+   * it burned against what was put in it, and what it is complaining about.
+   *
+   * Each part refuses rather than guesses. No project location means no fence
+   * and no verdict. A feed that reports no fuel consumption cannot evidence a
+   * loss, however many litres were booked in. A single off-site reading says
+   * where the machine was, not how long it was there.
+   */
+  app.get(
+    "/projects/:projectId/equipment-telematics/intelligence",
+    { preHandler: readGate },
+    async (req) => {
+      const q = z
+        .object({
+          days: z.coerce.number().int().min(1).max(90).default(14),
+          radiusMetres: z.coerce.number().int().min(50).max(200_000).optional(),
+        })
+        .parse(req.query);
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const to = todayISO();
+      const from = addDaysISO(to, -(q.days - 1));
+
+      const [project] = await app.db
+        .select({ latitude: projects.latitude, longitude: projects.longitude })
+        .from(projects)
+        .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
+        .limit(1);
+      const site =
+        project?.latitude != null && project?.longitude != null
+          ? { latitude: project.latitude, longitude: project.longitude }
+          : null;
+
+      const assigned = await app.db
+        .select({ equipmentId: equipmentAssignments.equipmentId })
+        .from(equipmentAssignments)
+        .where(
+          and(
+            eq(equipmentAssignments.companyId, companyId),
+            eq(equipmentAssignments.projectId, projectId),
+            inArray(equipmentAssignments.status, [...IN_SERVICE_ASSIGNMENT_STATUSES]),
+          ),
+        );
+      const machineIds = [...new Set(assigned.map((a) => a.equipmentId))];
+      if (machineIds.length === 0) {
+        return {
+          from,
+          to,
+          machines: [],
+          reasons: ["no plant is assigned to this project, so there is no feed to read"],
+        };
+      }
+      const fleet = await app.db
+        .select()
+        .from(equipment)
+        .where(and(eq(equipment.companyId, companyId), inArray(equipment.id, machineIds)));
+      const readings = await app.db
+        .select()
+        .from(equipmentTelematicsReadings)
+        .where(
+          and(
+            eq(equipmentTelematicsReadings.companyId, companyId),
+            inArray(equipmentTelematicsReadings.equipmentId, machineIds),
+            gte(equipmentTelematicsReadings.recordedAt, `${from}T00:00:00.000Z`),
+            lte(equipmentTelematicsReadings.recordedAt, `${to}T23:59:59.999Z`),
+          ),
+        );
+      const fuelFills = await app.db
+        .select()
+        .from(equipmentReadings)
+        .where(
+          and(
+            eq(equipmentReadings.companyId, companyId),
+            inArray(equipmentReadings.equipmentId, machineIds),
+            eq(equipmentReadings.readingType, "fuel_fill"),
+            gte(equipmentReadings.readAt, `${from}T00:00:00.000Z`),
+            lte(equipmentReadings.readAt, `${to}T23:59:59.999Z`),
+          ),
+        );
+
+      const machines = fleet.map((machine) => {
+        const own = readings.filter((r) => r.equipmentId === machine.id);
+        const geofence = checkGeofence({
+          site,
+          ...(q.radiusMetres != null ? { radiusMetres: q.radiusMetres } : {}),
+          readings: own
+            .filter((r) => r.latitude !== null && r.longitude !== null)
+            .map((r) => ({
+              latitude: r.latitude as number,
+              longitude: r.longitude as number,
+              recordedAt: r.recordedAt,
+              engineRunning: r.engineRunning,
+            })),
+        });
+        const fuel = reconcileFuel({
+          telematicsFuelUsedLitres: own.map((r) => r.fuelUsedLitres),
+          fills: fuelFills
+            .filter((f) => f.equipmentId === machine.id && (f.value ?? 0) > 0)
+            .map((f) => ({ litres: f.value as number, at: f.readAt })),
+        });
+        const faults = assessFaults(
+          own.flatMap((r) => (r.faultCodes as TelematicsFault[] | null) ?? []),
+        );
+        return {
+          equipmentId: machine.id,
+          reference: machine.reference,
+          name: machine.name,
+          readings: own.length,
+          geofence,
+          fuel,
+          faults,
+        };
+      });
+
+      return {
+        from,
+        to,
+        site,
+        machines,
+        reasons: site
+          ? []
+          : [
+              "this project records no location, so no machine can be tested against a site " +
+                "boundary. Set the project's coordinates to make off-site use detectable.",
+            ],
+      };
+    },
+  );
+
+
+  /* ================================================================ */
+  /* TELEMATICS INTELLIGENCE — the acting half                          */
+  /* ================================================================ */
+
+  /**
+   * The route above REPORTS geofence breaches, unaccounted fuel and active
+   * fault codes. A report nobody opens is not a control, so the same three
+   * engines run here on a schedule and leave a Signal — and, for a fault the
+   * manufacturer itself grades critical, take the machine out of service.
+   *
+   * Three deliberate limits:
+   *
+   *  · IDEMPOTENT. Keyed on (detector, equipmentId, window start), so a
+   *    daily run over a rolling window raises one Signal per machine per
+   *    window rather than one per run. Accusing the same machine seven times
+   *    for one week's fuel is how a register becomes noise.
+   *  · NO FABRICATED WORK ORDER. A maintenance RECORD in this schema is work
+   *    that was done — it carries a non-null `result`. Creating a draft one
+   *    from a fault code would put an outcome on a job nobody has started, so
+   *    the fault produces a Signal and a status, and the fitter raises the
+   *    record when the work happens (the record route returns the machine to
+   *    service).
+   *  · STATUS IS ONLY EVER TAKEN, NEVER GIVEN BACK. The sweep may move a
+   *    working machine to `breakdown`; it never moves anything back to
+   *    `available`, and it never touches a machine that is already off-hired,
+   *    disposed, quarantined or in the workshop.
+   */
+  const TELEMATICS_INTELLIGENCE_DAYS = 7;
+  /** Statuses the sweep is allowed to take a machine OUT of. */
+  const STOPPABLE_STATUSES = ["available", "in_use", "idle"] as const;
+
+  async function sweepTelematicsIntelligence(
+    companyId: string,
+    onlyProjectId: string | null,
+  ): Promise<{
+    from: string;
+    to: string;
+    machinesAssessed: number;
+    signalsRaised: number;
+    takenOutOfService: string[];
+    reasons: string[];
+  }> {
+    const to = todayISO();
+    const from = addDaysISO(to, -(TELEMATICS_INTELLIGENCE_DAYS - 1));
+    const reasons: string[] = [];
+
+    const assignmentClauses = [
+      eq(equipmentAssignments.companyId, companyId),
+      inArray(equipmentAssignments.status, [...IN_SERVICE_ASSIGNMENT_STATUSES]),
+    ];
+    if (onlyProjectId)
+      assignmentClauses.push(eq(equipmentAssignments.projectId, onlyProjectId));
+    const assigned = await app.db
+      .select({
+        equipmentId: equipmentAssignments.equipmentId,
+        projectId: equipmentAssignments.projectId,
+      })
+      .from(equipmentAssignments)
+      .where(and(...assignmentClauses));
+
+    const projectOf = new Map<string, string>();
+    for (const row of assigned) {
+      if (!projectOf.has(row.equipmentId))
+        projectOf.set(row.equipmentId, row.projectId);
+    }
+    const machineIds = [...projectOf.keys()];
+    if (machineIds.length === 0) {
+      return {
+        from,
+        to,
+        machinesAssessed: 0,
+        signalsRaised: 0,
+        takenOutOfService: [],
+        reasons: [
+          "no plant is on any job in this company over the window, so there is no feed to read",
+        ],
+      };
+    }
+
+    const siteRows = await app.db
+      .select({
+        id: projects.id,
+        latitude: projects.latitude,
+        longitude: projects.longitude,
+      })
+      .from(projects)
+      .where(
+        and(
+          eq(projects.companyId, companyId),
+          inArray(projects.id, [...new Set(projectOf.values())]),
+        ),
+      );
+    const siteOf = new Map(
+      siteRows.map((p) => [
+        p.id,
+        p.latitude != null && p.longitude != null
+          ? { latitude: p.latitude, longitude: p.longitude }
+          : null,
+      ]),
+    );
+    if ([...siteOf.values()].some((s) => s === null)) {
+      reasons.push(
+        "one or more projects record no coordinates, so their plant cannot be tested against a " +
+          "site boundary — off-site use is undetectable there until a location is set",
+      );
+    }
+
+    const fleet = await app.db
+      .select()
+      .from(equipment)
+      .where(
+        and(eq(equipment.companyId, companyId), inArray(equipment.id, machineIds)),
+      );
+
+    const keys = machineIds.map((id) => `${id}|${from}`);
+    const seenOffSite = await alreadySignalled(companyId, "equipment_off_site_use", keys);
+    const seenFuel = await alreadySignalled(companyId, "equipment_fuel_unaccounted", keys);
+    const seenFault = await alreadySignalled(companyId, "equipment_fault_active", keys);
+
+    let signalsRaised = 0;
+    const takenOutOfService: string[] = [];
+    const now = new Date().toISOString();
+
+    /*
+     * READ THE FEED IN BATCHES. A minute-level feed is ~10k readings per
+     * machine per week; a company-wide sweep that pulled the whole fleet's
+     * week into memory at once would be the very unbounded roll-up this
+     * platform forbids. Twenty machines at a time, and only the columns the
+     * three engines actually read.
+     */
+    const FEED_BATCH = 20;
+    for (let i = 0; i < fleet.length; i += FEED_BATCH) {
+      const batch = fleet.slice(i, i + FEED_BATCH);
+      const batchIds = batch.map((m) => m.id);
+      const readings = await app.db
+        .select({
+          equipmentId: equipmentTelematicsReadings.equipmentId,
+          recordedAt: equipmentTelematicsReadings.recordedAt,
+          latitude: equipmentTelematicsReadings.latitude,
+          longitude: equipmentTelematicsReadings.longitude,
+          engineRunning: equipmentTelematicsReadings.engineRunning,
+          fuelUsedLitres: equipmentTelematicsReadings.fuelUsedLitres,
+          faultCodes: equipmentTelematicsReadings.faultCodes,
+        })
+        .from(equipmentTelematicsReadings)
+        .where(
+          and(
+            eq(equipmentTelematicsReadings.companyId, companyId),
+            inArray(equipmentTelematicsReadings.equipmentId, batchIds),
+            gte(equipmentTelematicsReadings.recordedAt, `${from}T00:00:00.000Z`),
+            lte(equipmentTelematicsReadings.recordedAt, `${to}T23:59:59.999Z`),
+          ),
+        );
+      const fuelFills = await app.db
+        .select({
+          equipmentId: equipmentReadings.equipmentId,
+          value: equipmentReadings.value,
+          readAt: equipmentReadings.readAt,
+        })
+        .from(equipmentReadings)
+        .where(
+          and(
+            eq(equipmentReadings.companyId, companyId),
+            inArray(equipmentReadings.equipmentId, batchIds),
+            eq(equipmentReadings.readingType, "fuel_fill"),
+            gte(equipmentReadings.readAt, `${from}T00:00:00.000Z`),
+            lte(equipmentReadings.readAt, `${to}T23:59:59.999Z`),
+          ),
+        );
+
+      for (const machine of batch) {
+        const projectId = projectOf.get(machine.id) ?? null;
+        const site = projectId ? (siteOf.get(projectId) ?? null) : null;
+        const own = readings.filter((r) => r.equipmentId === machine.id);
+        const key = `${machine.id}|${from}`;
+
+        const geofence = checkGeofence({
+          site,
+          readings: own
+            .filter((r) => r.latitude !== null && r.longitude !== null)
+            .map((r) => ({
+              latitude: r.latitude as number,
+              longitude: r.longitude as number,
+              recordedAt: r.recordedAt,
+              engineRunning: r.engineRunning,
+            })),
+        });
+        if (geofence.breaches.length > 0) {
+          const id = await raiseSignalOnce({
+            companyId,
+            projectId,
+            detector: "equipment_off_site_use",
+            key,
+            severity: "high",
+            title: `Plant worked off site — ${machine.reference} ${machine.name}`,
+            explanation:
+              `${machine.reference} ${machine.name} reported ${geofence.breaches.length} reading(s) ` +
+              `with the engine RUNNING more than the site radius from the project it is hired to, ` +
+              `up to ${geofence.maxDistanceMetres} m away, between ${from} and ${to}` +
+              `${geofence.spanHours !== null ? ` — the breaching readings span ${geofence.spanHours} hours` : ""}. ` +
+              "Hire is being charged to this job for hours the machine spent somewhere else: either " +
+              "the plant sheet is wrong, the machine was lent out, or it is being used privately. " +
+              (geofence.reasons.length > 0 ? geofence.reasons.join(" ") : ""),
+            refs: {
+              equipmentId: machine.id,
+              from,
+              to,
+              breaches: geofence.breaches.length,
+              maxDistanceMetres: geofence.maxDistanceMetres,
+              spanHours: geofence.spanHours,
+            },
+            seen: seenOffSite,
+          });
+          if (id) signalsRaised += 1;
+        }
+
+        const fuel = reconcileFuel({
+          telematicsFuelUsedLitres: own.map((r) => r.fuelUsedLitres),
+          fills: fuelFills
+            .filter((f) => f.equipmentId === machine.id && (f.value ?? 0) > 0)
+            .map((f) => ({ litres: f.value as number, at: f.readAt })),
+        });
+        if (fuel.unexplained) {
+          const id = await raiseSignalOnce({
+            companyId,
+            projectId,
+            detector: "equipment_fuel_unaccounted",
+            key,
+            severity: "high",
+            title: `Fuel unaccounted for — ${machine.reference} ${machine.name}`,
+            explanation: `${from} → ${to}. ${fuel.reasons.join(" ")}`,
+            refs: {
+              equipmentId: machine.id,
+              from,
+              to,
+              filledLitres: fuel.filledLitres,
+              burnLitres: fuel.burnLitres,
+              differenceLitres: fuel.differenceLitres,
+              ratio: fuel.ratio,
+            },
+            seen: seenFuel,
+          });
+          if (id) signalsRaised += 1;
+        }
+
+        const faults = assessFaults(
+          own.flatMap((r) => (r.faultCodes as TelematicsFault[] | null) ?? []),
+        );
+        if (faults.actionable.length > 0) {
+          const stopped =
+            faults.stopWork &&
+            (STOPPABLE_STATUSES as readonly string[]).includes(machine.status);
+          const id = await raiseSignalOnce({
+            companyId,
+            projectId,
+            detector: "equipment_fault_active",
+            key,
+            severity: faults.stopWork ? "critical" : "medium",
+            title:
+              `${faults.stopWork ? "Critical" : "Active"} fault reported by ` +
+              `${machine.reference} ${machine.name}`,
+            explanation:
+              `${faults.reason ?? "The machine reports active fault codes."} ` +
+              (stopped
+                ? `${machine.reference} has been moved to "breakdown" by this sweep and is off the ` +
+                  "available fleet until somebody looks at it. Raising the maintenance record with " +
+                  "returnToService set is what puts it back to work — the platform will not do that " +
+                  "on a fault code clearing itself."
+                : faults.stopWork
+                  ? `${machine.reference} was left at "${machine.status}": the sweep does not take a ` +
+                    "machine that is already off-hired, quarantined, disposed or in the workshop and " +
+                    "restate its status."
+                  : "Book the work before the fault becomes the breakdown."),
+            refs: {
+              equipmentId: machine.id,
+              from,
+              to,
+              worst: faults.worst,
+              stopWork: faults.stopWork,
+              codes: faults.actionable.map((f) => f.code),
+              statusChangedTo: stopped ? "breakdown" : null,
+            },
+            seen: seenFault,
+          });
+          if (id) signalsRaised += 1;
+          if (id && stopped) {
+            await app.db
+              .update(equipment)
+              .set({ status: "breakdown", updatedAt: now })
+              .where(eq(equipment.id, machine.id));
+            await appendLedger(app.db, {
+              companyId,
+              actorId: null,
+              action: "state_change",
+              objectType: "equipment",
+              objectId: machine.id,
+              projectId,
+              payload: {
+                from: machine.status,
+                to: "breakdown",
+                derived: true,
+                reason: "critical fault code on the telematics feed",
+                codes: faults.actionable.map((f) => f.code),
+                signalId: id,
+              },
+              storePayload: true,
+            });
+            takenOutOfService.push(machine.reference);
+          }
+        }
+      }
+    }
+
+    return {
+      from,
+      to,
+      machinesAssessed: fleet.length,
+      signalsRaised,
+      takenOutOfService,
+      reasons,
+    };
+  }
+
+  /** Run the telematics detectors on demand — operators and tests. */
+  app.post(
+    "/projects/:projectId/equipment-telematics/intelligence/run",
+    { preHandler: standardGate },
+    async (req) => sweepTelematicsIntelligence(req.companyId!, req.projectId!),
+  );
+
+  /* ================================================================ */
+  /* SCHEDULED JOBS (plan §6.1)                                        */
+  /* ================================================================ */
+
+  app.scheduler.register({
+    name: "equipment.sweep",
+    description:
+      "Expire equipment certificates, move maintenance schedules to due and overdue, and raise " +
+      "the critical signal for statutory plant working out of certificate",
+    everyMs: 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db }) =>
+      forEachCompany(db, async (companyId) => {
+        await sweepEquipment(companyId, null);
+        return { companyId };
+      }),
+  });
+
+  app.scheduler.register({
+    name: "equipment.telematics-intelligence",
+    description:
+      "Plant worked outside the site boundary, fuel booked in that the machine never burned, and " +
+      "active fault codes — with a critical fault taking the machine off the available fleet",
+    everyMs: 6 * 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db }) =>
+      forEachCompany(db, async (companyId) => {
+        const out = await sweepTelematicsIntelligence(companyId, null);
+        return { companyId, signalsRaised: out.signalsRaised };
+      }),
+  });
+
+  app.scheduler.register({
+    name: "equipment.materials-supply",
+    description:
+      "Long-lead items past their order-by date, forecast shortages inside the lead time, and " +
+      "deliveries booked for a day that has passed",
+    everyMs: 12 * 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db }) => forEachCompany(db, (companyId) => sweepMaterialSupply(companyId)),
   });
 };

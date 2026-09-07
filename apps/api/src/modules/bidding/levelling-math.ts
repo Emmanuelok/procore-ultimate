@@ -592,7 +592,22 @@ export function scoreSubmission(input: {
       maxScore !== null &&
       Number.isFinite(maxScore) &&
       maxScore > 0;
-    const normalised = usable ? round4(score / maxScore) : null;
+    /*
+     * CLAMPED TO ITS OWN MAXIMUM. The scoring route validates this on the way
+     * in, but a stored score above its maximum — from an older write, or a
+     * maxScore lowered afterwards — would normalise above 1 and produce a
+     * weighted total over 100 that outranks correctly scored bids. A score
+     * cannot be worth more than the criterion it is against, so it is capped
+     * and the cap is stated rather than silently applied.
+     */
+    const rawNormalised = usable ? score / maxScore : null;
+    const clamped =
+      rawNormalised === null ? null : round4(Math.min(1, Math.max(0, rawNormalised)));
+    const clampedNote =
+      rawNormalised !== null && (rawNormalised > 1 || rawNormalised < 0)
+        ? `Score ${score} is outside the range 0..${maxScore} declared for this criterion and ` +
+          "has been capped at its maximum: a criterion cannot contribute more than its weight."
+        : null;
     return {
       key: c.key,
       label: c.label,
@@ -600,10 +615,10 @@ export function scoreSubmission(input: {
       weight: c.weight,
       score,
       maxScore,
-      normalised,
-      weighted: normalised === null ? null : round4(normalised * c.weight),
+      normalised: clamped,
+      weighted: clamped === null ? null : round4(clamped * c.weight),
       missing: !usable,
-      note: given?.note ?? null,
+      note: clampedNote ?? given?.note ?? null,
     };
   });
 

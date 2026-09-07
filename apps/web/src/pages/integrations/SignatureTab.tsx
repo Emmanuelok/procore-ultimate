@@ -397,8 +397,13 @@ def verify(raw: bytes, headers, secret: str) -> bool:
               <strong>rotating the master key invalidates every existing endpoint secret</strong>:
               the fingerprint stops matching, the endpoint's{" "}
               <code className="font-mono">secretFingerprintMatches</code> flag goes false, and the
-              Webhooks tab raises it as an actionable warning. The remedy is to re-create the
-              endpoint and install the new secret — there is no re-issue.
+              Webhooks tab raises it as an actionable warning. The remedy is{" "}
+              <strong>POST /integrations/webhooks/:endpointId/rotate-secret</strong>, which derives
+              the next secret version under the current master key and shows it once; with{" "}
+              <code className="font-mono">graceMinutes</code> both the old and the new signature
+              are sent (<code className="font-mono">x-constructos-signature</code> and{" "}
+              <code className="font-mono">x-constructos-signature-alt</code>) while the receiver is
+              updated. The endpoint, its subscription and its delivery history survive.
             </p>
           </div>
           {live ? (

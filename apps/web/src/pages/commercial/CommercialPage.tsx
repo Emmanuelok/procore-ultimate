@@ -24,6 +24,7 @@ import {
 import BoqTab from "./BoqTab";
 import ValuationsTab from "./ValuationsTab";
 import CertificatesTab from "./CertificatesTab";
+import RetentionTab from "./RetentionTab";
 import VariationsTab from "./VariationsTab";
 import DayworksTab from "./DayworksTab";
 import MeasureTab from "./MeasureTab";
@@ -37,6 +38,7 @@ const TABS = [
   { key: "dayworks", label: "Dayworks" },
   { key: "valuations", label: "Valuations" },
   { key: "certificates", label: "Certificates" },
+  { key: "retention", label: "Retention" },
   { key: "variations", label: "Variations" },
   { key: "analysis", label: "Rates & fluctuations" },
   { key: "cvr", label: "CVR & cash flow" },
@@ -186,6 +188,9 @@ export default function CommercialPage() {
       {tab === "certificates" ? (
         <CertificatesTab projectId={projectId} boqs={boqs} onMutate={load} />
       ) : null}
+      {tab === "retention" ? (
+        <RetentionTab projectId={projectId} boqs={boqs} onMutate={load} />
+      ) : null}
       {tab === "variations" ? (
         <VariationsTab
           projectId={projectId}
@@ -198,7 +203,11 @@ export default function CommercialPage() {
         <AnalysisTab projectId={projectId} boqs={boqs} currency={displayCurrency} />
       ) : null}
       {tab === "cvr" ? (
-        <CvrTab projectId={projectId} currencies={positions.map((p) => p.currency)} />
+        <CvrTab
+          projectId={projectId}
+          currencies={positions.map((p) => p.currency)}
+          boqs={boqs}
+        />
       ) : null}
       {tab === "final" ? <FinalAccountTab projectId={projectId} onMutate={load} /> : null}
     </div>

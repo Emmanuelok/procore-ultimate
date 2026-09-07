@@ -29,6 +29,7 @@ import { IconPlus } from "../../ui/icons";
 import { api } from "../../lib/api";
 import {
   CountTile,
+  EditModal,
   LoadError,
   NothingHere,
   ReasonList,
@@ -39,7 +40,9 @@ import {
   num,
   plural,
   useAction,
+  useReason,
   useResource,
+  type EditFieldSpec,
   type Resource,
 } from "./qualityShared";
 import type {
@@ -61,6 +64,50 @@ const AUDIT_TYPES = [
   "certification",
   "regulatory",
 ];
+
+/*
+ * The audit and its findings as they are DESCRIBED — scope, clauses, dates,
+ * the requirement and the evidence behind a finding. An audit programme is
+ * planned weeks ahead and re-planned constantly, and a register that cannot
+ * absorb a moved date is a register kept in a spreadsheet instead. What is
+ * absent is deliberate: the status, the response, the verification and the
+ * closure are acts, and each has its own route and its own signature.
+ */
+const AUDIT_EDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "title", label: "Title", kind: "text", nullable: false, wide: true },
+  {
+    key: "auditType",
+    label: "Type",
+    kind: "select",
+    nullable: false,
+    options: AUDIT_TYPES.map((value) => ({ value, label: labelize(value) })),
+  },
+  { key: "standard", label: "Standard", kind: "text", placeholder: "ISO 9001:2015" },
+  { key: "auditedFunction", label: "Function audited", kind: "text" },
+  { key: "leadAuditorName", label: "Lead auditor (by name)", kind: "text" },
+  { key: "leadAuditorOrganisation", label: "Lead auditor's organisation", kind: "text" },
+  { key: "plannedDate", label: "Planned date", kind: "date" },
+  { key: "responseDueDate", label: "Responses due", kind: "date" },
+  { key: "nextAuditDueDate", label: "Next audit due", kind: "date" },
+  { key: "scope", label: "Scope", kind: "textarea" },
+  { key: "objectives", label: "Objectives", kind: "textarea" },
+  { key: "clauseReferences", label: "Clauses", kind: "list", hint: "Comma separated." },
+];
+
+const FINDING_EDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "description", label: "Finding", kind: "textarea", nullable: false },
+  {
+    key: "requirement",
+    label: "Requirement",
+    kind: "textarea",
+    hint: "What was required. A non-conformity without it is an opinion.",
+  },
+  { key: "evidence", label: "Evidence", kind: "textarea", hint: "What was seen." },
+  { key: "clauseReference", label: "Clause", kind: "text" },
+  { key: "dueDate", label: "Close-out due", kind: "date" },
+  { key: "responseDueDate", label: "Response due", kind: "date" },
+];
+
 
 const FINDING_TYPES = [
   "major_nonconformity",
@@ -457,7 +504,9 @@ function AuditModal({
   onMutated: () => void;
 }) {
   const { busy, refusal, clear, run } = useAction();
+  const { ask, dialog } = useReason();
   const [addOpen, setAddOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
   const base = `/api/v1/projects/${projectId}/quality-audits/${auditId ?? ""}`;
   const audit = useResource<QualityAuditDetail>(
     (signal) => api.get<QualityAuditDetail>(base, { signal }),
@@ -481,6 +530,9 @@ function AuditModal({
           </Button>
           {a && a.status !== "closed" ? (
             <>
+              <Button size="sm" variant="secondary" onClick={() => setEditOpen(true)}>
+                Correct the record
+              </Button>
               <Button size="sm" variant="secondary" icon={IconPlus} onClick={() => setAddOpen(true)}>
                 Add a finding
               </Button>
@@ -500,19 +552,41 @@ function AuditModal({
               >
                 Issue the report
               </Button>
+              {/*
+                Closing over open non-conformities is a decision, not a
+                default: the API refuses it unless the closure states why, and
+                asking for the reason here is how that refusal stops being a
+                dead end.
+              */}
               <Button
                 size="sm"
-                variant="primary"
+                variant={a.openFindingCount > 0 ? "danger" : "primary"}
                 loading={busy === "close"}
                 onClick={async () => {
-                  const done = await run("close", () => api.post(`${base}/close`, {}));
+                  let note: string | null = null;
+                  if (a.openFindingCount > 0) {
+                    note = await ask({
+                      title: `Close ${a.reference} over ${a.openFindingCount} open ${a.openFindingCount === 1 ? "finding" : "findings"}`,
+                      description:
+                        "Closing an audit over open non-conformities is how they stop being tracked. Say what happened to them — the note is written into the record and the ledger, and it is what the next auditor reads.",
+                      label: "Why is it being closed with findings open?",
+                      confirmLabel: "Close it anyway",
+                      destructive: true,
+                    });
+                    if (!note) return;
+                  }
+                  const done = await run("close", () =>
+                    api.post(`${base}/close`, note ? { force: true, note } : {}),
+                  );
                   if (done) {
                     audit.reload();
                     onMutated();
                   }
                 }}
               >
-                Close the audit
+                {a.openFindingCount > 0
+                  ? `Close over ${a.openFindingCount} open ${a.openFindingCount === 1 ? "finding" : "findings"}`
+                  : "Close the audit"}
               </Button>
             </>
           ) : null}
@@ -525,6 +599,7 @@ function AuditModal({
         <p className="text-meta text-content-muted">Loading…</p>
       ) : (
         <div className="space-y-3 text-meta">
+          {dialog}
           <RefusalNotice refusal={refusal} onDismiss={clear} />
           <div className="flex flex-wrap gap-1.5">
             <Badge tone="neutral" size="xs" dot>
@@ -579,6 +654,20 @@ function AuditModal({
               onMutated();
             }}
           />
+
+          <EditModal
+            open={editOpen}
+            onClose={() => setEditOpen(false)}
+            title={`Correct ${a.reference}`}
+            description="The audit as it is planned and scoped. Issuing the report, closing the audit and every finding's own lifecycle are acts with their own record and are not editable here."
+            url={base}
+            fields={AUDIT_EDIT_FIELDS}
+            record={a as unknown as Record<string, unknown>}
+            onSaved={() => {
+              audit.reload();
+              onMutated();
+            }}
+          />
         </div>
       )}
     </Modal>
@@ -600,6 +689,7 @@ function FindingCard({
   const [response, setResponse] = useState("");
   const [rootCause, setRootCause] = useState("");
   const [evidence, setEvidence] = useState("");
+  const [editOpen, setEditOpen] = useState(false);
   const base = `/api/v1/projects/${projectId}/audit-findings/${finding.id}`;
   const open = finding.status !== "closed" && finding.status !== "verified";
 
@@ -619,7 +709,20 @@ function FindingCard({
         {finding.dueDate ? (
           <span className="text-2xs text-content-subtle">due {isoDate(finding.dueDate)}</span>
         ) : null}
+        <Button size="xs" variant="ghost" className="ml-auto" onClick={() => setEditOpen(true)}>
+          Edit
+        </Button>
       </div>
+      <EditModal
+        open={editOpen}
+        onClose={() => setEditOpen(false)}
+        title={`Correct ${finding.reference}`}
+        description="The finding as it is written: what was required, what was seen, and when it must be closed out. The response, the verification and the status are not editable here."
+        url={base}
+        fields={FINDING_EDIT_FIELDS}
+        record={finding as unknown as Record<string, unknown>}
+        onSaved={onMutated}
+      />
       <p className="mt-1 whitespace-pre-wrap text-content">{finding.description}</p>
       {finding.requirement ? (
         <p className="mt-1 text-2xs text-content-muted">

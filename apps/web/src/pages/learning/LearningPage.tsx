@@ -13,6 +13,25 @@
  *                rule registry that says what fires capture and why.
  *   · Capture  — the lesson lifecycle, retrieval bound to the moment, and
  *                post-project reviews with metrics read from real records.
+ *   · Pushed   — the lessons the ranker sent AT this project (#985-986), and
+ *                the answer each one got: read, applied with the record that
+ *                proves it, or dismissed with the reason it does not apply.
+ *   · Onboarding — the pack a starting team is handed (#994): lessons from the
+ *                projects that looked like this one, each with the reason it
+ *                was selected, and an optional cited introduction.
+ *   · Libraries — the feedback loop (#981-984): what elements actually cost
+ *                and what activities actually took, measured from certified
+ *                valuations and completed activities, with the company's own
+ *                estimating bias stated as a percentage. Proposals only: an
+ *                entry enters the library when a named person accepts it.
+ *   · Clauses & routes — the contract half of the same idea (#987-988): which
+ *                clause the company actually argues about, under which form,
+ *                for how much and with what recovery; and what each
+ *                procurement route cost it in change and in disputes.
+ *   · Suppliers — the same idea pointed at vendors (#987-989): a supplier's
+ *                record on one job is an anecdote, across eleven it is
+ *                knowledge. Assembled from certificates, owned actions and
+ *                NCRs, worst first, with the arithmetic on every score.
  *   · Search   — natural language over the published register, honest about
  *                whether it is running in AI or deterministic mode.
  *
@@ -24,9 +43,14 @@ import { useSearchParams } from "react-router-dom";
 import { useAuth } from "../../lib/auth";
 import { EmptyState, ErrorAlert, Field, PageHeader, Select, Spinner } from "../../ui";
 import CaptureTab from "./CaptureTab";
+import ContractsTab from "./ContractsTab";
+import LibrariesTab from "./LibrariesTab";
+import OnboardingTab from "./OnboardingTab";
 import HealthTab from "./HealthTab";
 import RegisterTab from "./RegisterTab";
 import SearchTab from "./SearchTab";
+import SuppliersTab from "./SuppliersTab";
+import PushesPanel from "./PushesPanel";
 import TriggersTab from "./TriggersTab";
 import { TabBar, projectLabel, useProjects } from "./learningShared";
 
@@ -35,10 +59,15 @@ const TABS = [
   { key: "register", label: "Register" },
   { key: "triggers", label: "Triggers" },
   { key: "capture", label: "Capture & review" },
+  { key: "pushes", label: "Pushed here" },
+  { key: "onboarding", label: "Onboarding pack" },
+  { key: "libraries", label: "Libraries" },
+  { key: "suppliers", label: "Suppliers" },
+  { key: "contracts", label: "Clauses & routes" },
   { key: "search", label: "Search" },
 ];
 
-const PROJECT_TABS = new Set(["triggers", "capture"]);
+const PROJECT_TABS = new Set(["triggers", "capture", "pushes", "onboarding"]);
 
 export default function LearningPage() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -161,6 +190,34 @@ export default function LearningPage() {
           />
         ) : null
       ) : null}
+
+      {tab === "pushes" ? (
+        projectId ? (
+          <PushesPanel projectId={projectId} onInspectLesson={inspectLesson} />
+        ) : projects && projects.length > 0 ? (
+          <EmptyState
+            title="Pick a project"
+            hint="A push is a lesson the ranker says applies to one project, sent to it rather than waiting to be searched for. Answering a push — read, applied, or does not apply and here is why — is what closes the loop."
+          />
+        ) : null
+      ) : null}
+
+      {tab === "onboarding" ? (
+        projectId ? (
+          <OnboardingTab projectId={projectId} onInspect={inspectLesson} />
+        ) : projects && projects.length > 0 ? (
+          <EmptyState
+            title="Pick a project"
+            hint="An onboarding pack is assembled FOR a project: from the projects that looked like it, at the phase it is in."
+          />
+        ) : null
+      ) : null}
+
+      {tab === "libraries" ? <LibrariesTab canAdmin={canAdmin} /> : null}
+
+      {tab === "suppliers" ? <SuppliersTab /> : null}
+
+      {tab === "contracts" ? <ContractsTab /> : null}
 
       {tab === "search" ? <SearchTab projects={projects} canSupersede={canAdmin} /> : null}
     </div>

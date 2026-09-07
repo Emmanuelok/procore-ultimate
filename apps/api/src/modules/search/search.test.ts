@@ -150,6 +150,23 @@ describe("GET /search", () => {
     expect(items.every((i) => i.projectId === projectA)).toBe(true);
   });
 
+  it("does not let a named projectId widen the caller's scope", async () => {
+    // The member is on project A only. Naming project B must narrow their own
+    // scope to nothing, not hand them project B's records.
+    const res = await search(memberHeaders, `q=riverside&types=rfi,project&projectId=${projectB}`);
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { items: Array<{ projectId: string | null }>; coverage: string[] };
+    expect(body.items).toEqual([]);
+    expect(body.coverage).toEqual([]);
+  });
+
+  it("still narrows for a caller who IS on the named project", async () => {
+    const res = await search(memberHeaders, `q=riverside&types=rfi&projectId=${projectA}`);
+    const items = res.json().items as Array<{ projectId: string | null }>;
+    expect(items.length).toBe(1);
+    expect(items[0]!.projectId).toBe(projectA);
+  });
+
   it("never crosses a tenant boundary", async () => {
     const res = await search(outsider.headers, "q=riverside");
     const items = res.json().items as Array<{ type: string; id: string }>;

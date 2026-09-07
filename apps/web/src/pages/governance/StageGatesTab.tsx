@@ -33,6 +33,7 @@ import {
   WarnBanner,
   type GateCriterion,
   type GateReview,
+  type LessonsReadiness,
   type ListResponse,
   type OpenCondition,
   type StageGateDetail,
@@ -49,6 +50,14 @@ const DECISION_OPTIONS = [
 ];
 
 const RAG_OPTIONS = ["green", "amber_green", "amber", "amber_red", "red"];
+
+/** Split a free-text list of ids into a clean array (space or comma separated). */
+function splitIds(raw: string): string[] {
+  return raw
+    .split(/[\s,]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
 
 function gateStatusTone(status: string): string {
   if (status === "decided") return "green";
@@ -171,6 +180,7 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
   const [gCriteria, setGCriteria] = useState<{ text: string; evidenceRequired: boolean }[]>([
     { text: "", evidenceRequired: false },
   ]);
+  const [gLessons, setGLessons] = useState(false);
 
   function openCreate() {
     const taken = new Set((gates ?? []).map((g) => g.gateNumber));
@@ -181,6 +191,7 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
     setGDescription("");
     setGPlanned("");
     setGCriteria([{ text: "", evidenceRequired: false }]);
+    setGLessons(false);
     setCreateOpen(true);
   }
 
@@ -201,6 +212,7 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
         name: gName.trim(),
         description: gDescription.trim() || null,
         plannedDate: gPlanned || null,
+        lessonsRequired: gLessons,
         criteria,
       });
       setCreateOpen(false);
@@ -220,17 +232,35 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
   const [rRag, setRRag] = useState("amber");
   const [rDecision, setRDecision] = useState("proceed");
   const [rNarrative, setRNarrative] = useState("");
-  const [rFindings, setRFindings] = useState<Record<string, { met?: boolean; note: string }>>({});
+  const [rFindings, setRFindings] = useState<
+    Record<string, { met?: boolean; note: string; evidence: string }>
+  >({});
   const [rConditions, setRConditions] = useState<{ text: string; dueDate: string }[]>([]);
+
+  /**
+   * The lessons closure gate is checked server-side; the review modal reads
+   * it first so the reviewer sees WHY a proceed will be refused before
+   * filling the form in, rather than losing the work to a 409.
+   */
+  const [lessons, setLessons] = useState<LessonsReadiness | null>(null);
+  const [lessonsError, setLessonsError] = useState<string | null>(null);
 
   function openReview(gate: StageGateDetail) {
     setReviewError(null);
+    setLessons(null);
+    setLessonsError(null);
+    void api
+      .get<LessonsReadiness>(`${base}/stage-gates/${gate.id}/lessons-readiness`)
+      .then(setLessons)
+      .catch(() =>
+        setLessonsError("Lessons readiness could not be read; the server still enforces it."),
+      );
     setRDate(todayIso());
     setRRag("amber");
     setRDecision("proceed");
     setRNarrative("");
-    const seed: Record<string, { met?: boolean; note: string }> = {};
-    for (const c of gate.criteria) seed[c.id] = { note: "" };
+    const seed: Record<string, { met?: boolean; note: string; evidence: string }> = {};
+    for (const c of gate.criteria) seed[c.id] = { note: "", evidence: "" };
     setRFindings(seed);
     setRConditions([]);
     setReviewGate(gate);
@@ -249,6 +279,18 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
       );
       return;
     }
+    // #410: a criterion that requires evidence must cite it. The server
+    // refuses without it; saying so here saves a round trip.
+    const unevidenced = reviewGate.criteria.filter(
+      (c) => c.evidenceRequired && splitIds(rFindings[c.id]?.evidence ?? "").length === 0,
+    );
+    if (unevidenced.length > 0) {
+      setReviewError(
+        `Evidence is required for: ${unevidenced.map((c) => c.text).join("; ")}. ` +
+          "A gate decision has to be reproducible from the artefacts the reviewer actually saw.",
+      );
+      return;
+    }
     setReviewError(null);
     setBusy(true);
     try {
@@ -257,11 +299,15 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
         rag: rRag,
         decision: rDecision,
         narrative: rNarrative.trim() || null,
-        findings: reviewGate.criteria.map((c) => ({
-          criterionId: c.id,
-          met: rFindings[c.id]?.met === true,
-          ...(rFindings[c.id]?.note.trim() ? { note: rFindings[c.id]!.note.trim() } : {}),
-        })),
+        findings: reviewGate.criteria.map((c) => {
+          const ids = splitIds(rFindings[c.id]?.evidence ?? "");
+          return {
+            criterionId: c.id,
+            met: rFindings[c.id]?.met === true,
+            ...(rFindings[c.id]?.note.trim() ? { note: rFindings[c.id]!.note.trim() } : {}),
+            ...(ids.length > 0 ? { evidenceIds: ids } : {}),
+          };
+        }),
         conditions: rConditions
           .map((c) => ({ ...c, text: c.text.trim() }))
           .filter((c) => c.text !== "")
@@ -348,6 +394,11 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
                         </div>
                       </div>
                       <div className="flex items-center gap-2">
+                        {gate.lessonsRequired ? (
+                          <Badge tone="violet" title="Proceed is blocked while lessons are unvalidated">
+                            Lessons gate
+                          </Badge>
+                        ) : null}
                         <Badge tone={gateStatusTone(gate.status)}>{humanize(gate.status)}</Badge>
                         <Button size="sm" variant="secondary" onClick={() => openReview(gate)}>
                           Hold review
@@ -415,6 +466,19 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
                             {latest.conditions.filter((c) => !c.closed).length} of{" "}
                             {latest.conditions.length} condition
                             {latest.conditions.length === 1 ? "" : "s"} still open
+                          </div>
+                        ) : null}
+                        {/* The pack is frozen at review time so the decision
+                            stays reproducible from the artefacts seen (#411). */}
+                        {latest.evidencePackRoot ? (
+                          <div
+                            className="mt-1 truncate font-mono text-[11px] text-ink-400"
+                            title={latest.evidencePackRoot}
+                          >
+                            evidence pack {latest.evidencePackRoot.slice(0, 16)}…
+                            {latest.evidencePack?.items?.length
+                              ? ` · ${latest.evidencePack.items.length} item${latest.evidencePack.items.length === 1 ? "" : "s"}`
+                              : ""}
                           </div>
                         ) : null}
                       </div>
@@ -512,6 +576,20 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
               className="min-h-14"
             />
           </Field>
+          <label className="flex items-start gap-2 rounded-md bg-ink-50 px-3 py-2 text-xs text-ink-700">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={gLessons}
+              onChange={(e) => setGLessons(e.target.checked)}
+            />
+            <span>
+              <span className="font-medium text-ink-800">Lessons closure gate</span> — refuse a
+              proceed decision while lessons captured on this project are still awaiting
+              validation. A stage boundary is the last moment the organisation can still learn
+              from the stage that is ending.
+            </span>
+          </label>
           <div>
             <div className="mb-1 flex items-center justify-between">
               <span className="text-xs font-medium text-ink-600">Review criteria</span>
@@ -616,13 +694,55 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
               </Field>
             </div>
 
+            {/* lessons closure gate (#415) — shown before the form is filled in */}
+            {lessonsError ? (
+              <div className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                {lessonsError}
+              </div>
+            ) : lessons && lessons.required ? (
+              <div
+                className={`rounded-md px-3 py-2 text-xs ${
+                  lessons.ready
+                    ? "bg-emerald-50 text-emerald-800"
+                    : "bg-red-50 text-red-800"
+                }`}
+              >
+                <div className="font-medium">
+                  Lessons closure gate — {lessons.ready ? "satisfied" : "not satisfied"}
+                </div>
+                <div className="mt-0.5">{lessons.reasons.join(" ")}</div>
+                {lessons.outstanding.length > 0 ? (
+                  <ul className="mt-1 list-disc space-y-0.5 pl-5">
+                    {lessons.outstanding.map((l) => (
+                      <li key={l.id}>
+                        <span className="font-mono">{l.number}</span> {l.title} —{" "}
+                        {humanize(l.status)}
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+                {!lessons.ready ? (
+                  <div className="mt-1">
+                    A <span className="font-medium">stop</span> or{" "}
+                    <span className="font-medium">hold</span> decision is not blocked by this.
+                  </div>
+                ) : null}
+              </div>
+            ) : lessons && lessons.capturedCount > 0 ? (
+              <div className="rounded-md bg-ink-50 px-3 py-2 text-xs text-ink-600">
+                {lessons.capturedCount} lesson{lessons.capturedCount === 1 ? "" : "s"} captured on
+                this project, {lessons.outstanding.length} still awaiting validation. This gate
+                does not require closure, so they are shown for information.
+              </div>
+            ) : null}
+
             <div>
               <span className="mb-1 block text-xs font-medium text-ink-600">
                 Findings — every criterion must be assessed
               </span>
               <div className="space-y-2">
                 {reviewGate.criteria.map((c) => {
-                  const f = rFindings[c.id] ?? { note: "" };
+                  const f = rFindings[c.id] ?? { note: "", evidence: "" };
                   return (
                     <div key={c.id} className="rounded-md bg-ink-50 px-3 py-2">
                       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -672,6 +792,25 @@ export default function StageGatesTab({ projectId }: { projectId: string }) {
                         }
                         placeholder="Note (optional)"
                         className="mt-1.5 py-1 text-xs"
+                      />
+                      <Input
+                        value={f.evidence}
+                        onChange={(e) =>
+                          setRFindings((prev) => ({
+                            ...prev,
+                            [c.id]: { ...f, evidence: e.target.value },
+                          }))
+                        }
+                        placeholder={
+                          c.evidenceRequired
+                            ? "Evidence ids — REQUIRED for this criterion (space or comma separated)"
+                            : "Evidence ids (optional)"
+                        }
+                        className={`mt-1.5 py-1 text-xs ${
+                          c.evidenceRequired && splitIds(f.evidence).length === 0
+                            ? "ring-1 ring-amber-300"
+                            : ""
+                        }`}
                       />
                     </div>
                   );

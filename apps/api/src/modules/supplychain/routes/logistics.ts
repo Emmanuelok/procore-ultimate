@@ -22,6 +22,7 @@ import {
   TRANSPORT_MODES,
   VEHICLE_TYPES,
 } from "@constructos/shared";
+import type { Db } from "../../../lib/db.js";
 import { badRequest, conflict, notFound } from "../../../lib/errors.js";
 import { newId } from "../../../lib/ids.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
@@ -133,10 +134,10 @@ export const logisticsRoutes: FastifyPluginAsync = async (app) => {
   }
 
   /** Bookings on a gate that could overlap [startsAt, endsAt] — one day either side. */
-  async function neighbours(gateId: string, startsAt: string, endsAt: string): Promise<SlotWindow[]> {
+  async function neighbours(db: Db, gateId: string, startsAt: string, endsAt: string): Promise<SlotWindow[]> {
     const lo = new Date(Date.parse(startsAt) - 86_400_000).toISOString();
     const hi = new Date(Date.parse(endsAt) + 86_400_000).toISOString();
-    const rows = await app.db
+    const rows = await db
       .select({ id: deliverySlots.id, reference: deliverySlots.reference, startsAt: deliverySlots.startsAt, endsAt: deliverySlots.endsAt, craneRequired: deliverySlots.craneRequired, status: deliverySlots.status })
       .from(deliverySlots)
       .where(and(eq(deliverySlots.gateId, gateId), gte(deliverySlots.startsAt, lo), lte(deliverySlots.startsAt, hi)));
@@ -159,6 +160,24 @@ export const logisticsRoutes: FastifyPluginAsync = async (app) => {
       const [r] = await app.db.select({ id: materialDeliveries.id }).from(materialDeliveries).where(and(eq(materialDeliveries.id, body.materialDeliveryId), eq(materialDeliveries.projectId, projectId))).limit(1);
       if (!r) throw badRequest(`Material delivery ${body.materialDeliveryId} not found in this project.`);
     }
+  }
+
+  /**
+   * Take the gate row FOR UPDATE inside a transaction. Two planners booking
+   * the same bay or the same crane window would otherwise both read zero
+   * clashes and both rows would be written — the one thing slot booking
+   * exists to prevent. Serialising on the gate row makes the read, the
+   * validation and the insert one atomic decision (plan §6.2).
+   */
+  async function lockGate(tx: Db, companyId: string, projectId: string, gateId: string) {
+    const [row] = await tx
+      .select()
+      .from(siteGates)
+      .where(and(eq(siteGates.id, gateId), eq(siteGates.companyId, companyId), eq(siteGates.projectId, projectId)))
+      .limit(1)
+      .for("update");
+    if (!row) throw notFound("Site gate not found");
+    return row;
   }
 
   function checkBooking(gate: typeof siteGates.$inferSelect, existing: SlotWindow[], request: { startsAt: string; endsAt: string; craneRequired: boolean; vehicleType: string; laydownArea?: string | null; excludeSlotId?: string | null }) {
@@ -247,7 +266,7 @@ export const logisticsRoutes: FastifyPluginAsync = async (app) => {
     const gate = await loadGate(req.companyId!, projectId, gateId);
     const dayStart = `${q.date}T00:00:00.000Z`;
     const dayEnd = `${q.date}T23:59:59.999Z`;
-    const existing = await neighbours(gateId, dayStart, dayEnd);
+    const existing = await neighbours(app.db, gateId, dayStart, dayEnd);
     const booked = existing.filter((s) => s.startsAt.slice(0, 10) === q.date);
     return {
       gate,
@@ -289,55 +308,62 @@ export const logisticsRoutes: FastifyPluginAsync = async (app) => {
     const { projectId } = req.params as { projectId: string };
     const body = slotBodySchema.parse(req.body);
     const companyId = req.companyId!;
-    const gate = await loadGate(companyId, projectId, body.gateId);
+    await loadGate(companyId, projectId, body.gateId);
     await validateRefs(companyId, projectId, body);
     const startsAt = new Date(body.startsAt).toISOString();
     const endsAt = new Date(body.endsAt).toISOString();
-    checkBooking(gate, await neighbours(gate.id, startsAt, endsAt), { startsAt, endsAt, craneRequired: body.craneRequired, vehicleType: body.vehicleType, laydownArea: body.laydownArea ?? null });
-    const { number, reference } = await allocateReference(app.db, projectId, "delivery_slot", "DEL");
     const preview = estimateTransportCarbon({ transportMode: body.transportMode, vehicleType: body.vehicleType, transportKm: body.transportKm ?? null, loadTonnes: body.loadTonnes ?? null });
     const id = newId("dsl");
-    const [row] = await app.db
-      .insert(deliverySlots)
-      .values({
-        id,
-        companyId,
-        projectId,
-        number,
-        reference,
-        gateId: gate.id,
-        startsAt,
-        endsAt,
-        description: body.description,
-        supplierNodeId: body.supplierNodeId ?? null,
-        vendorId: body.vendorId ?? null,
-        longLeadItemId: body.longLeadItemId ?? null,
-        offsiteUnitId: body.offsiteUnitId ?? null,
-        materialDeliveryId: body.materialDeliveryId ?? null,
-        scheduleTaskId: body.scheduleTaskId ?? null,
-        vehicleType: body.vehicleType,
-        vehicleRegistration: body.vehicleRegistration ?? null,
-        haulierName: body.haulierName ?? null,
-        driverName: body.driverName ?? null,
-        driverPhone: body.driverPhone ?? null,
-        craneRequired: body.craneRequired ? 1 : 0,
-        craneMinutes: body.craneMinutes ?? null,
-        laydownArea: body.laydownArea ?? null,
-        transportMode: body.transportMode,
-        originText: body.originText ?? null,
-        originCountry: body.originCountry ?? null,
-        transportKm: body.transportKm ?? null,
-        loadTonnes: body.loadTonnes ?? null,
-        carbonKgCo2e: preview.kgCo2e,
-        carbonBasis: preview.kgCo2e === null ? preview.reasons.join(" ") : `${preview.basis} (estimate; booked in the carbon register on completion)`,
-        bookedBy: req.user!.id,
-      })
-      .returning();
-    if (body.offsiteUnitId) {
-      await app.db.update(offsiteUnits).set({ deliverySlotId: id, updatedAt: nowISO() }).where(eq(offsiteUnits.id, body.offsiteUnitId));
-    }
-    await ledger(app.db, { companyId, projectId, actorId: req.user!.id, action: "create", objectType: "delivery_slot", objectId: id, payload: { reference, gateId: gate.id, startsAt, endsAt, vehicleType: body.vehicleType, craneRequired: body.craneRequired, longLeadItemId: body.longLeadItemId ?? null, offsiteUnitId: body.offsiteUnitId ?? null } });
-    return reply.code(201).send({ ...wireSlot(row!), gateName: gate.name });
+    // Read the neighbours, decide, and write — all inside one transaction
+    // holding the gate row FOR UPDATE, so two planners cannot both be told
+    // their 08:00 bay is free.
+    const { row, gate } = await app.db.transaction(async (tx) => {
+      const locked = await lockGate(tx, companyId, projectId, body.gateId);
+      checkBooking(locked, await neighbours(tx, locked.id, startsAt, endsAt), { startsAt, endsAt, craneRequired: body.craneRequired, vehicleType: body.vehicleType, laydownArea: body.laydownArea ?? null });
+      const { number, reference } = await allocateReference(tx, projectId, "delivery_slot", "DEL");
+      const [inserted] = await tx
+        .insert(deliverySlots)
+        .values({
+          id,
+          companyId,
+          projectId,
+          gateId: locked.id,
+          startsAt,
+          endsAt,
+          description: body.description,
+          supplierNodeId: body.supplierNodeId ?? null,
+          vendorId: body.vendorId ?? null,
+          longLeadItemId: body.longLeadItemId ?? null,
+          offsiteUnitId: body.offsiteUnitId ?? null,
+          materialDeliveryId: body.materialDeliveryId ?? null,
+          scheduleTaskId: body.scheduleTaskId ?? null,
+          vehicleType: body.vehicleType,
+          vehicleRegistration: body.vehicleRegistration ?? null,
+          haulierName: body.haulierName ?? null,
+          driverName: body.driverName ?? null,
+          driverPhone: body.driverPhone ?? null,
+          craneRequired: body.craneRequired ? 1 : 0,
+          craneMinutes: body.craneMinutes ?? null,
+          laydownArea: body.laydownArea ?? null,
+          transportMode: body.transportMode,
+          originText: body.originText ?? null,
+          originCountry: body.originCountry ?? null,
+          transportKm: body.transportKm ?? null,
+          loadTonnes: body.loadTonnes ?? null,
+          carbonKgCo2e: preview.kgCo2e,
+          carbonBasis: preview.kgCo2e === null ? preview.reasons.join(" ") : `${preview.basis} (estimate; booked in the carbon register on completion)`,
+          number,
+          reference,
+          bookedBy: req.user!.id,
+        })
+        .returning();
+      if (body.offsiteUnitId) {
+        await tx.update(offsiteUnits).set({ deliverySlotId: id, updatedAt: nowISO() }).where(eq(offsiteUnits.id, body.offsiteUnitId));
+      }
+      return { row: inserted!, gate: locked };
+    });
+    await ledger(app.db, { companyId, projectId, actorId: req.user!.id, action: "create", objectType: "delivery_slot", objectId: id, payload: { reference: row.reference, gateId: gate.id, startsAt, endsAt, vehicleType: body.vehicleType, craneRequired: body.craneRequired, longLeadItemId: body.longLeadItemId ?? null, offsiteUnitId: body.offsiteUnitId ?? null } });
+    return reply.code(201).send({ ...wireSlot(row), gateName: gate.name });
   });
 
   app.get(`${base}/slots/:slotId`, { preHandler: readGate }, async (req) => {
@@ -360,26 +386,32 @@ export const logisticsRoutes: FastifyPluginAsync = async (app) => {
     if (timingChanged && !EDITABLE.has(current.status)) throw badRequest(`A ${current.status.replace(/_/g, " ")} booking's time, gate, vehicle or crane cannot change.`);
     if (current.status === "cancelled") throw badRequest("A cancelled booking is read-only.");
     await validateRefs(companyId, projectId, body);
-    const gate = await loadGate(companyId, projectId, body.gateId ?? current.gateId);
+    await loadGate(companyId, projectId, body.gateId ?? current.gateId);
     const startsAt = body.startsAt ? new Date(body.startsAt).toISOString() : (isoTs(current.startsAt) ?? current.startsAt);
     const endsAt = body.endsAt ? new Date(body.endsAt).toISOString() : (isoTs(current.endsAt) ?? current.endsAt);
-    if (timingChanged) {
-      checkBooking(gate, await neighbours(gate.id, startsAt, endsAt), {
-        startsAt,
-        endsAt,
-        craneRequired: body.craneRequired ?? current.craneRequired === 1,
-        vehicleType: body.vehicleType ?? current.vehicleType,
-        laydownArea: body.laydownArea === undefined ? current.laydownArea : body.laydownArea,
-        excludeSlotId: current.id,
-      });
-    }
     const set = patchSet(body as Record<string, unknown>, [
       "gateId", "description", "supplierNodeId", "vendorId", "longLeadItemId", "offsiteUnitId", "materialDeliveryId", "scheduleTaskId", "vehicleType", "vehicleRegistration", "haulierName", "driverName", "driverPhone", "craneMinutes", "laydownArea", "transportMode", "originText", "originCountry", "transportKm", "loadTonnes",
     ]);
     if (body.startsAt) set["startsAt"] = startsAt;
     if (body.endsAt) set["endsAt"] = endsAt;
     if (body.craneRequired !== undefined) set["craneRequired"] = body.craneRequired ? 1 : 0;
-    const [updated] = await app.db.update(deliverySlots).set(set).where(eq(deliverySlots.id, slotId)).returning();
+    // A reschedule is the same read-then-check-then-write as a new booking,
+    // so it takes the same lock on the gate row.
+    const { updated, gate } = await app.db.transaction(async (tx) => {
+      const locked = await lockGate(tx, companyId, projectId, body.gateId ?? current.gateId);
+      if (timingChanged) {
+        checkBooking(locked, await neighbours(tx, locked.id, startsAt, endsAt), {
+          startsAt,
+          endsAt,
+          craneRequired: body.craneRequired ?? current.craneRequired === 1,
+          vehicleType: body.vehicleType ?? current.vehicleType,
+          laydownArea: body.laydownArea === undefined ? current.laydownArea : body.laydownArea,
+          excludeSlotId: current.id,
+        });
+      }
+      const [changed] = await tx.update(deliverySlots).set(set).where(eq(deliverySlots.id, slotId)).returning();
+      return { updated: changed, gate: locked };
+    });
     let row: SlotRow = updated!;
     if (row.status === "completed") {
       await syncSlotCarbon(app.db, row, req.user!.id);

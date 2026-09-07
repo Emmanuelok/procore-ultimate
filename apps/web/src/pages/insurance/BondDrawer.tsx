@@ -35,6 +35,7 @@ import {
   type BondCallResult,
   type BondCallRow,
   type BondDetail,
+  type FacilityOption,
   type OutOfTimeDetails,
   type VendorLite,
 } from "./insuranceShared";
@@ -72,6 +73,35 @@ export default function BondDrawer({
   useEffect(() => {
     void load();
   }, [load]);
+
+  /* The lines this bond could draw on. A failure here only disables the
+     picker; nothing else in the drawer depends on it. */
+  const [facilities, setFacilities] = useState<FacilityOption[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await api.get<{ items: FacilityOption[] }>(
+          "/api/v1/insurance/facilities?pageSize=100",
+        );
+        if (!cancelled) {
+          setFacilities(
+            res.items.filter(
+              (f) =>
+                f.status !== "closed" &&
+                f.status !== "expired" &&
+                (f.projectId === null || f.projectId === projectId),
+            ),
+          );
+        }
+      } catch {
+        // the picker degrades to "outside any facility" only
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
 
   /* ------------------------------- transitions ------------------------------- */
 
@@ -214,6 +244,7 @@ export default function BondDrawer({
     issuedAt: "",
     expiryAt: "",
     demandDeadline: "",
+    facilityId: "",
   });
 
   function openEdit() {
@@ -229,6 +260,7 @@ export default function BondDrawer({
       issuedAt: bond.issuedAt ?? "",
       expiryAt: bond.expiryAt ?? "",
       demandDeadline: bond.demandDeadline ?? "",
+      facilityId: bond.facilityId ?? "",
     });
     setEditError(null);
     setEditOpen(true);
@@ -249,6 +281,7 @@ export default function BondDrawer({
         issuedAt: edit.issuedAt || null,
         expiryAt: edit.expiryAt || null,
         demandDeadline: edit.demandDeadline || null,
+        facilityId: edit.facilityId || null,
       });
       setEditOpen(false);
       await load();
@@ -551,7 +584,75 @@ export default function BondDrawer({
             {bond.releasedAt ? (
               <DetailRow label="Released at">{formatDate(bond.releasedAt)}</DetailRow>
             ) : null}
+            <DetailRow label="Bonding line">
+              {bond.facility ? (
+                <span>
+                  {bond.facility.number} · {bond.facility.provider}
+                </span>
+              ) : (
+                <span
+                  className="text-ink-400"
+                  title="This bond names no facility, so nothing nets it off a line and headroom cannot account for it."
+                >
+                  Outside any facility
+                </span>
+              )}
+            </DetailRow>
           </div>
+
+          {bond.facility ? (
+            <div className="mt-3 rounded-lg bg-ink-50 p-3 text-xs leading-relaxed text-ink-700">
+              <div className="font-medium text-ink-800">
+                {bond.facility.number} — {bond.facility.name}
+              </div>
+              <div className="mt-1 grid grid-cols-3 gap-2 tabular-nums">
+                <div>
+                  <div className="text-[11px] uppercase tracking-wide text-ink-400">Limit</div>
+                  <div>{fmtMoney(bond.facility.limitAmount, bond.facility.currency, 0)}</div>
+                </div>
+                <div>
+                  <div className="text-[11px] uppercase tracking-wide text-ink-400">Drawn</div>
+                  <div>
+                    {fmtMoney(
+                      bond.facility.utilisation.drawnAmount,
+                      bond.facility.currency,
+                      0,
+                    )}{" "}
+                    <span className="text-ink-400">
+                      ({bond.facility.utilisation.bondCount} bond
+                      {bond.facility.utilisation.bondCount === 1 ? "" : "s"})
+                    </span>
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[11px] uppercase tracking-wide text-ink-400">Headroom</div>
+                  <div
+                    className={
+                      bond.facility.utilisation.headroom !== null &&
+                      bond.facility.utilisation.headroom < 0
+                        ? "font-semibold text-red-700"
+                        : ""
+                    }
+                  >
+                    {bond.facility.utilisation.headroom === null
+                      ? "—"
+                      : fmtMoney(
+                          bond.facility.utilisation.headroom,
+                          bond.facility.currency,
+                          0,
+                        )}
+                  </div>
+                </div>
+              </div>
+              {bond.facility.utilisation.reasons.length > 0 ? (
+                <ul className="mt-2 list-disc space-y-1 pl-4 text-amber-800">
+                  {bond.facility.utilisation.reasons.map((r) => (
+                    <li key={r}>{r}</li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          ) : null}
 
           {["draft", "issued", "active"].includes(bond.status) ? (
             editOpen ? (
@@ -622,6 +723,25 @@ export default function BondDrawer({
                       value={edit.demandDeadline}
                       onChange={(e) => setEdit({ ...edit, demandDeadline: e.target.value })}
                     />
+                  </Field>
+                  <Field
+                    label="Bonding line"
+                    hint="Moving a live bond between lines is checked against the destination's headroom before it is written."
+                  >
+                    <Select
+                      value={edit.facilityId}
+                      onChange={(e) => setEdit({ ...edit, facilityId: e.target.value })}
+                    >
+                      <option value="">Outside any facility</option>
+                      {facilities.map((f) => (
+                        <option key={f.id} value={f.id}>
+                          {f.number} · {f.provider} · {f.currency}{" "}
+                          {f.utilisation.headroom === null
+                            ? "(no limit recorded)"
+                            : `(${fmtMoney(f.utilisation.headroom, f.currency, 0)} left)`}
+                        </option>
+                      ))}
+                    </Select>
                   </Field>
                 </div>
                 <label className="flex items-center gap-2 text-sm text-ink-700">

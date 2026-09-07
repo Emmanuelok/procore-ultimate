@@ -14,7 +14,7 @@
  * approval the award creates the COMMITMENT in the commitments module, with
  * `bid_awards.commitmentId` as the seam.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Alert,
   Badge,
@@ -48,7 +48,15 @@ import {
   useReason,
   useResource,
 } from "./biddingShared";
-import type { BidAward, ListResponse, PackageDetail, Tabulation, TabulationRow } from "./types";
+import type {
+  BidAward,
+  BudgetLineOptions,
+  LevellingGrid,
+  ListResponse,
+  PackageDetail,
+  Tabulation,
+  TabulationRow,
+} from "./types";
 
 interface Candidate {
   submissionId: string;
@@ -60,6 +68,16 @@ interface Candidate {
   basis: "levelled" | "as_bid";
   inContention: boolean;
   blockedReason: string | null;
+}
+
+/** One levelling scope row, as a partial award may name it. */
+interface ScopeRow {
+  id: string;
+  itemCode: string | null;
+  description: string;
+  isMandatory: boolean;
+  /** the id of a live award already holding this row, if any */
+  heldBy: string | null;
 }
 
 export default function AwardTab({
@@ -84,10 +102,22 @@ export default function AwardTab({
       ? `/api/v1/projects/${projectId}/bid-packages/${packageId}/tabulation?_v=${version}`
       : null,
   );
+  /*
+   * The buyer's own scope rows. A partial award is defined by them and by
+   * nothing else, so the modal needs them before it can offer a split. The
+   * grid failing does not fail the tab: the award simply becomes
+   * whole-package only, and says so.
+   */
+  const grid = useResource<LevellingGrid>(
+    packageId
+      ? `/api/v1/projects/${projectId}/bid-packages/${packageId}/levelling/grid?_v=${version}`
+      : null,
+  );
   const action = useAction();
   const { ask, dialog } = useReason();
   const nameOf = useNames();
   const [recommendOpen, setRecommendOpen] = useState(false);
+  const [approving, setApproving] = useState<BidAward | null>(null);
 
   function refresh() {
     setVersion((n) => n + 1);
@@ -145,9 +175,26 @@ export default function AwardTab({
   if (awards.error) return <LoadError message={awards.error} onRetry={awards.reload} />;
 
   const items = awards.data?.items ?? [];
-  const live = items.find(
+  const liveAwards = items.filter(
     (a) => !["rejected", "withdrawn", "cancelled"].includes(a.status),
   );
+  /*
+   * A package with a live PARTIAL award is not finished: the remaining scope
+   * still needs a winner, so the Recommend button stays available. Only a
+   * whole-package award closes the door.
+   */
+  const live = liveAwards.find((a) => (a.scopeLevellingItemIds ?? []).length === 0) ?? null;
+  const heldRows = new Map<string, string>();
+  for (const award of liveAwards) {
+    for (const id of award.scopeLevellingItemIds ?? []) heldRows.set(id, award.reference);
+  }
+  const scopeItems: ScopeRow[] = (grid.data?.items ?? []).map((i) => ({
+    id: i.id,
+    itemCode: i.itemCode,
+    description: i.description,
+    isMandatory: i.isMandatory,
+    heldBy: heldRows.get(i.id) ?? null,
+  }));
 
   if (seal?.amountsWithheld) {
     return (
@@ -261,6 +308,24 @@ export default function AwardTab({
         </Card>
       ) : null}
 
+      {liveAwards.some((a) => (a.scopeLevellingItemIds ?? []).length > 0) ? (
+        <Alert tone="info" title="This package is being awarded in parts">
+          <p>
+            {liveAwards
+              .filter((a) => (a.scopeLevellingItemIds ?? []).length > 0)
+              .map(
+                (a) =>
+                  `${a.reference} holds ${(a.scopeLevellingItemIds ?? []).length} scope row(s)`,
+              )
+              .join("; ")}
+            .{" "}
+            {scopeItems.filter((i) => i.isMandatory && !i.heldBy).length > 0
+              ? `${scopeItems.filter((i) => i.isMandatory && !i.heldBy).length} mandatory scope row(s) still have no winner. The other bids stay in contention until they do.`
+              : "Every mandatory scope row now has a winner."}
+          </p>
+        </Alert>
+      ) : null}
+
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="max-w-3xl text-meta leading-relaxed text-content-muted">
           A recommendation that is not the lowest comparable bid requires a written justification.
@@ -299,10 +364,22 @@ export default function AwardTab({
               busy={action.busy}
               onAct={act}
               onAsk={ask}
+              onApprove={() => setApproving(award)}
             />
           ))}
         </div>
       )}
+
+      <ApproveModal
+        award={approving}
+        projectId={projectId}
+        packageBudgetLineIds={pkg?.budgetLineItemIds ?? []}
+        onClose={() => setApproving(null)}
+        onDone={() => {
+          setApproving(null);
+          refresh();
+        }}
+      />
 
       <RecommendModal
         open={recommendOpen}
@@ -311,6 +388,7 @@ export default function AwardTab({
         candidates={comparison.candidates}
         lowest={comparison.lowest}
         basis={comparison.basis}
+        scopeItems={scopeItems}
         onClose={() => setRecommendOpen(false)}
         onDone={() => {
           setRecommendOpen(false);
@@ -324,6 +402,188 @@ export default function AwardTab({
 }
 
 /* ================================================================== */
+/* Approval — and the budget line the commitment charges                */
+/* ================================================================== */
+
+/**
+ * APPROVAL IS WHERE THE MONEY BECOMES REAL, SO IT NAMES WHERE IT LANDS.
+ *
+ * Approving an award creates the commitment, writes its schedule-of-values
+ * line and runs `syncBudgetCommitted` — but only against a budget line. The
+ * API resolves one from `bid_packages.budgetLineItemIds` or from an explicit
+ * `budgetLineItemId` on this call; approving with an empty body on a package
+ * that names no line produced a commitment with nowhere to land, and the
+ * awarded value never reached the project budget's committed cost. Nobody
+ * saw that happen, which is the worst property a money bug can have.
+ *
+ * So the approver chooses the line, with the package's own choice preselected
+ * and the consequence of leaving it blank stated rather than implied.
+ */
+function ApproveModal({
+  award,
+  projectId,
+  packageBudgetLineIds,
+  onClose,
+  onDone,
+}: {
+  award: BidAward | null;
+  projectId: string;
+  packageBudgetLineIds: string[];
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const action = useAction();
+  const [lines, setLines] = useState<BudgetLineOptions | null>(null);
+  const [linesError, setLinesError] = useState<string | null>(null);
+  const [budgetLineItemId, setBudgetLineItemId] = useState("");
+  const [approvalAuthority, setApprovalAuthority] = useState("");
+  const [approvalReference, setApprovalReference] = useState("");
+  const [contractDate, setContractDate] = useState("");
+  const [note, setNote] = useState("");
+
+  const open = award !== null;
+
+  useEffect(() => {
+    if (!open) return;
+    setBudgetLineItemId(packageBudgetLineIds[0] ?? "");
+    setApprovalAuthority("");
+    setApprovalReference("");
+    setContractDate("");
+    setNote("");
+    let live = true;
+    setLinesError(null);
+    api
+      .get<BudgetLineOptions>(`/api/v1/projects/${projectId}/bidding/budget-lines`)
+      .then((res) => {
+        if (live) setLines(res);
+      })
+      .catch((e: unknown) => {
+        if (live) setLinesError(e instanceof Error ? e.message : "Budget lines unavailable.");
+      });
+    return () => {
+      live = false;
+    };
+    // packageBudgetLineIds is a fresh array each render; its first entry is
+    // the only part this effect reads.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, projectId, packageBudgetLineIds[0]]);
+
+  async function submit() {
+    if (!award) return;
+    const body: Record<string, unknown> = {};
+    if (budgetLineItemId) body["budgetLineItemId"] = budgetLineItemId;
+    if (approvalAuthority.trim()) body["approvalAuthority"] = approvalAuthority.trim();
+    if (approvalReference.trim()) body["approvalReference"] = approvalReference.trim();
+    if (contractDate) body["contractDate"] = contractDate;
+    if (note.trim()) body["note"] = note.trim();
+    const done = await action.run("approve", () =>
+      api.post(`/api/v1/bid-awards/${award.id}/approve`, body),
+    );
+    if (done) onDone();
+  }
+
+  const chosen = (lines?.items ?? []).find((l) => l.id === budgetLineItemId) ?? null;
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      size="md"
+      title={award ? `Approve ${award.reference}` : "Approve the award"}
+      description="Approval creates the commitment. It is given by somebody who is neither the author nor the recommender, and it is subject to that person's own delegated limit."
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button onClick={() => void submit()} loading={action.busy === "approve"}>
+            Approve and commit
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-4">
+        <RefusalPanel refusal={action.refusal} onDismiss={action.clear} />
+
+        {award ? (
+          <div className="rounded-lg border border-border bg-surface-sunken p-3 text-meta">
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="text-content-muted">Contract sum</span>
+              <span className="font-semibold tabular-nums">
+                {money(award.awardAmount, award.currency)}
+              </span>
+            </div>
+            <p className="mt-1 text-2xs leading-snug text-content-subtle">
+              {award.audit.awardAmountBasis ??
+                "The figure the commitment will be raised for."}
+            </p>
+          </div>
+        ) : null}
+
+        <Field
+          label="Budget line this charges to"
+          hint={
+            chosen
+              ? `${chosen.budgetName}${chosen.isActiveBudget ? " (active budget)" : ""} · revised ${money(chosen.revisedBudget, chosen.currency)} · committed ${money(chosen.committedCost, chosen.currency)}`
+              : "Without one, the commitment is still created but the project budget will not see the committed value."
+          }
+        >
+          <Select
+            value={budgetLineItemId}
+            onChange={(e) => setBudgetLineItemId(e.target.value)}
+            disabled={(lines?.items ?? []).length === 0}
+          >
+            <option value="">— none: the budget will not see this commitment —</option>
+            {(lines?.items ?? []).map((line) => (
+              <option key={line.id} value={line.id}>
+                {line.label}
+                {line.isActiveBudget ? "" : ` (${line.budgetName})`}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        {linesError ? (
+          <Alert tone="warning">
+            The project's budget lines could not be read ({linesError}). The approval will use
+            whatever the package already names.
+          </Alert>
+        ) : lines && lines.items.length === 0 ? (
+          <Alert tone="warning" title="This project has no budget lines">
+            {lines.note}
+          </Alert>
+        ) : null}
+
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Approval authority" optional hint="Recorded automatically where a delegation covers you.">
+            <Input
+              value={approvalAuthority}
+              onChange={(e) => setApprovalAuthority(e.target.value)}
+              placeholder="Board minute, delegation, scheme of authority"
+            />
+          </Field>
+          <Field label="Approval reference" optional>
+            <Input
+              value={approvalReference}
+              onChange={(e) => setApprovalReference(e.target.value)}
+            />
+          </Field>
+          <Field label="Contract date" optional hint="Carried onto the commitment.">
+            <Input
+              type="date"
+              value={contractDate}
+              onChange={(e) => setContractDate(e.target.value)}
+            />
+          </Field>
+        </div>
+        <Field label="Note" optional>
+          <Textarea rows={2} value={note} onChange={(e) => setNote(e.target.value)} />
+        </Field>
+      </div>
+    </Modal>
+  );
+}
+
+/* ================================================================== */
 /* One award                                                           */
 /* ================================================================== */
 
@@ -333,11 +593,14 @@ function AwardCard({
   busy,
   onAct,
   onAsk,
+  onApprove,
 }: {
   award: BidAward;
   nameOf: (id: string | null | undefined) => string;
   busy: string | null;
   onAct: (key: string, awardId: string, path: string, body?: unknown) => Promise<void>;
+  /** opens the approval dialog — approval names the budget line it charges */
+  onApprove: () => void;
   onAsk: (req: {
     title: string;
     description?: string;
@@ -383,19 +646,28 @@ function AwardCard({
               ? "This was the lowest comparable bid."
               : "This was NOT the lowest comparable bid."}
           </p>
+          {award.audit.comparableAmountsNote ? (
+            <p className="mt-1 text-2xs leading-snug text-content-subtle">
+              {award.audit.comparableAmountsNote}
+            </p>
+          ) : null}
           <dl className="mt-1.5 grid gap-x-6 gap-y-1 text-meta sm:grid-cols-2">
+            {/*
+              THREE DIFFERENT NUMBERS, LABELLED AS THREE DIFFERENT NUMBERS.
+              The contract sum is as-bid; the comparison — and therefore
+              "lowest" — is on the levelled figure wherever the package was
+              levelled. Showing the first next to the third as though they
+              were the same kind of thing made a levelled-lowest award look
+              like an award above the lowest bid.
+            */}
             <div className="flex justify-between gap-3">
-              <dt className="text-content-subtle">Recommended amount</dt>
+              <dt className="text-content-subtle" title={award.audit.awardAmountBasis ?? undefined}>
+                {(award.scopeLevellingItemIds ?? []).length > 0
+                  ? "Contract sum (levelled, this scope)"
+                  : "Contract sum (as bid)"}
+              </dt>
               <dd className="font-medium tabular-nums">
                 {money(award.awardAmount, award.currency)}
-              </dd>
-            </div>
-            <div className="flex justify-between gap-3">
-              <dt className="text-content-subtle">Lowest bid amount</dt>
-              <dd className="font-medium tabular-nums">
-                {award.audit.lowestBidAmount === null
-                  ? "not recorded"
-                  : money(award.audit.lowestBidAmount, award.currency)}
               </dd>
             </div>
             <div className="flex justify-between gap-3">
@@ -407,7 +679,24 @@ function AwardCard({
               </dd>
             </div>
             <div className="flex justify-between gap-3">
-              <dt className="text-content-subtle">Against the estimate</dt>
+              <dt className="text-content-subtle">Recommended, compared</dt>
+              <dd className="font-medium tabular-nums">
+                {award.audit.recommendedComparableAmount === null ||
+                award.audit.recommendedComparableAmount === undefined
+                  ? "not recorded"
+                  : money(award.audit.recommendedComparableAmount, award.currency)}
+              </dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-content-subtle">Lowest, compared</dt>
+              <dd className="font-medium tabular-nums">
+                {award.audit.lowestBidAmount === null
+                  ? "not recorded"
+                  : money(award.audit.lowestBidAmount, award.currency)}
+              </dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-content-subtle">Estimate less contract sum</dt>
               <dd className="font-medium tabular-nums">
                 {award.audit.savingAgainstEstimate === null
                   ? "no estimate on record"
@@ -426,6 +715,24 @@ function AwardCard({
             </div>
           ) : null}
         </div>
+
+        {(award.scopeLevellingItemIds ?? []).length > 0 ? (
+          <div className="rounded-md border border-border bg-surface-raised p-2">
+            <p className="text-label uppercase text-content-subtle">
+              A partial award — {(award.scopeLevellingItemIds ?? []).length} scope row(s)
+            </p>
+            <p className="mt-0.5 text-2xs leading-snug text-content-muted">
+              {typeof award.detail["partialScopeNote"] === "string"
+                ? (award.detail["partialScopeNote"] as string)
+                : "This award covers part of the package's levelling scope only."}
+            </p>
+            {Array.isArray(award.detail["partialScopeLabels"]) ? (
+              <p className="mt-1 font-mono text-2xs text-content-subtle">
+                {(award.detail["partialScopeLabels"] as string[]).join(" · ")}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
 
         {award.recommendationBasis ? (
           <div>
@@ -521,11 +828,7 @@ function AwardCard({
         <div className="flex flex-wrap gap-2 border-t border-border pt-3">
           {award.status === "recommended" || award.status === "pending_approval" ? (
             <>
-              <Button
-                size="sm"
-                loading={busy === `approve:${award.id}`}
-                onClick={() => void onAct("approve", award.id, "approve")}
-              >
+              <Button size="sm" loading={busy === `approve:${award.id}`} onClick={onApprove}>
                 Approve — and create the commitment
               </Button>
               <Button
@@ -548,6 +851,39 @@ function AwardCard({
                 Reject
               </Button>
             </>
+          ) : null}
+
+          {["recommended", "pending_approval", "approved", "letter_of_intent"].includes(
+            award.status,
+          ) ? (
+            /*
+             * UNWINDING AN AWARD IS A RECORDED ACT.
+             *
+             * A recommendation withdrawn, or an approval reversed before the
+             * contract issued, voids the draft commitment, puts the other bids
+             * back into contention and leaves a reason in the ledger — so a
+             * later re-award is a second decision on the record rather than a
+             * quiet edit of the first. Not by the person who recommended it.
+             */
+            <Button
+              size="sm"
+              variant="danger"
+              loading={busy === `withdraw:${award.id}`}
+              onClick={() => {
+                void (async () => {
+                  const reason = await onAsk({
+                    title: "Withdraw this award",
+                    description:
+                      "The draft commitment is voided, the other bids go back into contention and the reason is ledgered. A contract that has been issued or executed is unwound through the commitment instead.",
+                    confirmLabel: "Withdraw",
+                    destructive: true,
+                  });
+                  if (reason) await onAct("withdraw", award.id, "withdraw", { reason });
+                })();
+              }}
+            >
+              Withdraw the award
+            </Button>
           ) : null}
 
           {award.status === "approved" && !award.unsuccessfulNotifiedAt ? (
@@ -655,6 +991,7 @@ function RecommendModal({
   candidates,
   lowest,
   basis,
+  scopeItems,
   onClose,
   onDone,
 }: {
@@ -664,6 +1001,7 @@ function RecommendModal({
   candidates: Candidate[];
   lowest: Candidate | null;
   basis: "levelled" | "as_bid";
+  scopeItems: ScopeRow[];
   onClose: () => void;
   onDone: () => void;
 }) {
@@ -673,6 +1011,16 @@ function RecommendModal({
   const [justification, setJustification] = useState("");
   const [standstillDays, setStandstillDays] = useState("10");
   const [authority, setAuthority] = useState("");
+  const [integrityAck, setIntegrityAck] = useState("");
+  /**
+   * PARTIAL AWARDS. Empty selection = the whole package, which is the
+   * ordinary case and stays one click. Naming rows turns this into an award
+   * over that scope only: the value becomes the winner's levelled sum over
+   * those rows and the lowest-bid test is re-run on the same subset, because
+   * the cheapest bidder for the frame is rarely the cheapest for the package.
+   */
+  const [partial, setPartial] = useState(false);
+  const [scopeIds, setScopeIds] = useState<string[]>([]);
 
   const chosen = candidates.find((c) => c.submissionId === submissionId) ?? null;
   const isLowest =
@@ -681,7 +1029,11 @@ function RecommendModal({
     chosen.comparableAmount !== null &&
     lowest.comparableAmount !== null &&
     chosen.comparableAmount <= lowest.comparableAmount + 0.005;
-  const needsJustification = chosen !== null && !isLowest;
+  // With a scope subset the server decides the comparison, so the modal does
+  // not pretend to know whether this is the lowest for it: the justification
+  // field is offered rather than demanded, and the refusal (if any) is shown
+  // in the API's own words.
+  const needsJustification = chosen !== null && !isLowest && !partial;
 
   async function submit() {
     const body: Record<string, unknown> = {
@@ -689,8 +1041,10 @@ function RecommendModal({
       recommendationBasis: recommendationBasis.trim(),
       standstillDays: Number(standstillDays) || 0,
     };
-    if (needsJustification) body["notLowestJustification"] = justification.trim();
+    if (justification.trim().length >= 20) body["notLowestJustification"] = justification.trim();
     if (authority.trim()) body["approvalAuthority"] = authority.trim();
+    if (integrityAck.trim().length >= 20) body["integrityAcknowledgement"] = integrityAck.trim();
+    if (partial && scopeIds.length > 0) body["scopeLevellingItemIds"] = scopeIds;
     const done = await action.run("recommend", () =>
       api.post(
         `/api/v1/projects/${projectId}/bid-packages/${packageId}/award/recommend`,
@@ -703,7 +1057,8 @@ function RecommendModal({
   const blocked =
     !submissionId ||
     recommendationBasis.trim().length < 20 ||
-    (needsJustification && justification.trim().length < 20);
+    (needsJustification && justification.trim().length < 20) ||
+    (partial && scopeIds.length === 0);
 
   return (
     <Modal
@@ -792,6 +1147,83 @@ function RecommendModal({
           </Alert>
         )}
 
+        {/* ------------------------ partial award ------------------------ */}
+        {scopeItems.length > 0 ? (
+          <div className="rounded-lg border border-border p-3">
+            <label className="flex items-start gap-2 text-sm">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={partial}
+                onChange={(e) => {
+                  setPartial(e.target.checked);
+                  if (!e.target.checked) setScopeIds([]);
+                }}
+              />
+              <span>
+                <span className="font-semibold">Award part of this package only</span>
+                <span className="mt-0.5 block text-2xs text-content-muted">
+                  Name the scope rows this award buys. Its value becomes this bidder&rsquo;s
+                  levelled sum over those rows — not their package total — and the lowest-bid test
+                  is re-run on the same subset. A row already held by a live award cannot be
+                  awarded again.
+                </span>
+              </span>
+            </label>
+            {partial ? (
+              <div className="mt-3 max-h-56 space-y-1 overflow-y-auto rounded-md border border-border p-2">
+                {scopeItems.map((row) => {
+                  const taken = row.heldBy !== null;
+                  return (
+                    <label
+                      key={row.id}
+                      className={cx(
+                        "flex items-center gap-2 rounded px-2 py-1.5 text-sm",
+                        taken ? "opacity-60" : "cursor-pointer hover:bg-surface-hover",
+                      )}
+                    >
+                      <input
+                        type="checkbox"
+                        disabled={taken}
+                        checked={scopeIds.includes(row.id)}
+                        onChange={() =>
+                          setScopeIds((prev) =>
+                            prev.includes(row.id)
+                              ? prev.filter((x) => x !== row.id)
+                              : [...prev, row.id],
+                          )
+                        }
+                      />
+                      <span className="flex-1 truncate">
+                        {row.itemCode ? (
+                          <span className="font-mono text-2xs text-content-subtle">
+                            {row.itemCode}{" "}
+                          </span>
+                        ) : null}
+                        {row.description}
+                      </span>
+                      {taken ? (
+                        <Badge tone="neutral" size="xs">
+                          held by {row.heldBy}
+                        </Badge>
+                      ) : row.isMandatory ? null : (
+                        <Badge tone="neutral" size="xs">
+                          optional
+                        </Badge>
+                      )}
+                    </label>
+                  );
+                })}
+              </div>
+            ) : null}
+            {partial && scopeIds.length === 0 ? (
+              <p className="mt-2 text-2xs text-warning-fg">
+                Choose at least one scope row, or turn the split off to award the whole package.
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+
         <Field
           label="Why this bid"
           required
@@ -827,6 +1259,38 @@ function RecommendModal({
             </Field>
           </div>
         ) : null}
+
+        {partial ? (
+          <Field
+            label="Why the lowest bid for this scope was not taken"
+            optional
+            hint="Only needed if this bidder is not the cheapest for the rows named above. The API will say so and refuse without it."
+          >
+            <Textarea
+              rows={3}
+              value={justification}
+              onChange={(e) => setJustification(e.target.value)}
+            />
+          </Field>
+        ) : null}
+
+        {/*
+          THE INTEGRITY FINDINGS ARE ANSWERED HERE, NOT AFTERWARDS. The API
+          refuses a recommendation while an open high or critical bid-integrity
+          finding bears on the package and nothing has been written about it.
+          Without this field the refusal was a dead end in the browser.
+        */}
+        <Field
+          label="Bid-integrity acknowledgement"
+          optional
+          hint="Required when an open high or critical finding bears on this package (the Integrity tab lists them). Say what was checked and what the explanation was — a finding is a question, and the ordinary answer is an innocent one recorded next to it."
+        >
+          <Textarea
+            rows={3}
+            value={integrityAck}
+            onChange={(e) => setIntegrityAck(e.target.value)}
+          />
+        </Field>
 
         <div className="grid gap-3 sm:grid-cols-2">
           <Field

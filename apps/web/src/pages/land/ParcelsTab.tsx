@@ -36,6 +36,7 @@ import {
   type ListResponse,
   type ParcelDetail,
   type ParcelRow,
+  type ParcelSummary,
 } from "./landShared";
 
 interface FormState {
@@ -107,6 +108,13 @@ export default function ParcelsTab({
   const [statusFilter, setStatusFilter] = useState("");
   const [tenureFilter, setTenureFilter] = useState("");
   const [selected, setSelected] = useState<ParcelDetail | null>(null);
+  /*
+   * The pipeline is counted over the WHOLE register, not the filtered page:
+   * "12 under negotiation" has to keep meaning the same thing while you are
+   * looking at one status. It fails alone — the register still renders when
+   * the aggregate does not.
+   */
+  const [pipeline, setPipeline] = useState<ParcelSummary | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -119,6 +127,11 @@ export default function ParcelsTab({
     } catch (err) {
       setParcels([]);
       setError(err instanceof Error ? err.message : "Failed to load the parcel register");
+    }
+    try {
+      setPipeline(await api.get<ParcelSummary>(`${base}/land/parcel-summary`));
+    } catch {
+      setPipeline(null);
     }
   }, [base, statusFilter, tenureFilter]);
 
@@ -225,6 +238,22 @@ export default function ParcelsTab({
   const [compAmount, setCompAmount] = useState("");
   const [compPaidAt, setCompPaidAt] = useState("");
   const [compEvidence, setCompEvidence] = useState<string[]>([]);
+  /*
+   * Correcting a paid figure is a different act from paying more, so it is a
+   * different form: it restates the total, and it needs a reason and its own
+   * evidence (the revised valuation, the corrected receipt, the audit
+   * finding). The server is admin-gated and ledgers both figures.
+   */
+  const [corrOpen, setCorrOpen] = useState(false);
+  const [corrAmount, setCorrAmount] = useState("");
+  const [corrReason, setCorrReason] = useState("");
+  const [corrEvidence, setCorrEvidence] = useState<string[]>([]);
+  /* Acquisition (#551-552): the basis on which title actually passed. */
+  const [acqOpen, setAcqOpen] = useState(false);
+  const [acqBasis, setAcqBasis] = useState("purchase");
+  const [acqDate, setAcqDate] = useState("");
+  const [acqEvidence, setAcqEvidence] = useState<string[]>([]);
+  const [acqNote, setAcqNote] = useState("");
 
   async function advance(status: string) {
     if (!selected) return;
@@ -266,8 +295,68 @@ export default function ParcelsTab({
     }
   }
 
-  const compensable =
-    selected !== null && ["under_negotiation", "agreed", "disputed"].includes(selected.status);
+  async function onCorrect(e: FormEvent) {
+    e.preventDefault();
+    if (!selected) return;
+    setActError(null);
+    setBusy(true);
+    try {
+      await api.post(`${base}/parcels/${selected.id}/compensation-correction`, {
+        correctedAmount: Number(corrAmount),
+        reason: corrReason.trim(),
+        evidenceIds: corrEvidence,
+      });
+      setCorrOpen(false);
+      await openParcel(selected.id);
+      await load();
+      onChanged();
+    } catch (err) {
+      setActError(
+        err instanceof ApiClientError ? err.message : "Failed to correct the compensation figure.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onAcquire(e: FormEvent) {
+    e.preventDefault();
+    if (!selected) return;
+    setActError(null);
+    setBusy(true);
+    try {
+      await api.post(`${base}/parcels/${selected.id}/acquire`, {
+        acquisitionBasis: acqBasis,
+        acquiredAt: acqDate,
+        evidenceIds: acqEvidence,
+        note: acqNote.trim() === "" ? null : acqNote.trim(),
+      });
+      setAcqOpen(false);
+      await openParcel(selected.id);
+      await load();
+      onChanged();
+    } catch (err) {
+      setActError(
+        err instanceof ApiClientError ? err.message : "Failed to record the acquisition.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /*
+   * The server decides — including for an already-compensated or acquired
+   * parcel, where a further payment is a SUPPLEMENT that adds to the total.
+   * Hard-coding the three pre-payment statuses here is what left a revised
+   * valuation with nowhere to go.
+   */
+  const compensable = selected?.compensable === true;
+  const alreadyPaid = selected?.compensationPaidAt != null;
+  /* Bases that need a payment on file first — the server enforces it too. */
+  const acqNeedsPayment =
+    selected !== null &&
+    (selected.cashAcquisitionBases ?? []).includes(acqBasis) &&
+    !selected.compensationPaidAt;
   const coords = selected ? fmtLatLng(selected.latitude, selected.longitude) : null;
 
   /* --------------------------------- render --------------------------------- */
@@ -305,11 +394,40 @@ export default function ParcelsTab({
           {parcels ? (
             <span className="text-xs tabular-nums text-ink-400">
               {parcels.length} parcel{parcels.length === 1 ? "" : "s"}
+              {pipeline && pipeline.total !== parcels.length ? (
+                <> of {pipeline.total}</>
+              ) : null}
             </span>
           ) : null}
         </div>
         <Button onClick={openCreate}>Register parcel</Button>
       </div>
+
+      {/* Acquisition pipeline over the whole register — also the filter. */}
+      {pipeline && pipeline.total > 0 ? (
+        <div className="mb-3 flex flex-wrap items-center gap-1.5">
+          {PARCEL_STATUSES.filter((s) => (pipeline.byStatus[s] ?? 0) > 0).map((s) => {
+            const active = statusFilter === s;
+            return (
+              <button
+                key={s}
+                type="button"
+                onClick={() => setStatusFilter(active ? "" : s)}
+                aria-pressed={active}
+                className={`rounded-full px-2.5 py-1 text-xs ring-1 transition ${
+                  active
+                    ? "bg-brand-600 text-white ring-brand-600"
+                    : "bg-white text-ink-600 ring-ink-200 hover:bg-ink-50"
+                }`}
+                title={`${pipeline.byStatus[s]} parcel(s) ${humanize(s).toLowerCase()} — click to filter`}
+              >
+                {humanize(s)}{" "}
+                <span className="tabular-nums font-medium">{pipeline.byStatus[s]}</span>
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
 
       <ErrorAlert message={error} />
 
@@ -534,6 +652,43 @@ export default function ParcelsTab({
               )}
             </div>
 
+            {selected.compensationPayments.length > 0 ? (
+              <div>
+                <div className="mb-1 text-xs uppercase tracking-wide text-ink-400">
+                  Compensation history · total{" "}
+                  {fmtMoney(selected.compensationAmount, selected.currency)}
+                </div>
+                <ul className="space-y-1 text-sm">
+                  {selected.compensationPayments.map((pay) => (
+                    <li
+                      key={pay.id}
+                      className="flex flex-wrap items-baseline justify-between gap-2 rounded-md bg-ink-50 px-2 py-1"
+                    >
+                      <span className="flex items-center gap-2">
+                        <Badge tone={pay.kind === "correction" ? "amber" : "green"}>
+                          {humanize(pay.kind)}
+                        </Badge>
+                        <span className="text-ink-700">{formatDate(pay.paidAt)}</span>
+                      </span>
+                      <span className="tabular-nums text-ink-800">
+                        {pay.delta >= 0 ? "+" : "−"}
+                        {fmtMoney(Math.abs(pay.delta), selected.currency)} → total{" "}
+                        {fmtMoney(pay.amount, selected.currency)}
+                      </span>
+                      {pay.reason ? (
+                        <span className="w-full text-xs text-ink-500">{pay.reason}</span>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+                <p className="mt-1 text-xs text-ink-400">
+                  Payments accumulate: the total is their sum, and the compensated date stays the
+                  date the first payment reached the beneficiary. A correction restates the total
+                  and carries its own reason and evidence.
+                </p>
+              </div>
+            ) : null}
+
             <div className="flex flex-wrap items-center gap-2 border-t border-ink-100 pt-3">
               {selected.allowedTransitions.length === 0 ? (
                 <span className="text-xs text-ink-400">
@@ -555,44 +710,170 @@ export default function ParcelsTab({
               {compensable ? (
                 <Button
                   size="sm"
+                  variant={alreadyPaid ? "secondary" : "primary"}
                   onClick={() => {
                     setActError(null);
+                    // a supplement is a NEW payment, so the field starts
+                    // empty rather than pre-filled with the running total
                     setCompAmount(
-                      String(selected.compensationAmount ?? selected.valuationAmount ?? ""),
+                      alreadyPaid ? "" : String(selected.valuationAmount ?? ""),
                     );
                     setCompPaidAt(new Date().toISOString().slice(0, 10));
                     setCompEvidence([]);
                     setCompOpen(true);
                   }}
                 >
-                  Record compensation
+                  {alreadyPaid ? "Record a further payment" : "Record compensation"}
+                </Button>
+              ) : null}
+              {selected.correctable ? (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => {
+                    setActError(null);
+                    setCorrAmount(String(selected.compensationAmount ?? ""));
+                    setCorrReason("");
+                    setCorrEvidence([]);
+                    setCorrOpen(true);
+                  }}
+                >
+                  Correct the figure
+                </Button>
+              ) : null}
+              {selected.acquirable ? (
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    setActError(null);
+                    setAcqBasis(
+                      selected.compensationPaidAt
+                        ? "purchase"
+                        : selected.tenureType === "state"
+                          ? "state_allocation"
+                          : "donation",
+                    );
+                    setAcqDate(new Date().toISOString().slice(0, 10));
+                    setAcqEvidence([]);
+                    setAcqNote("");
+                    setAcqOpen(true);
+                  }}
+                >
+                  Record acquisition
                 </Button>
               ) : null}
             </div>
             <p className="text-xs text-ink-400">
               A parcel only becomes <span className="font-medium">compensated</span> through the
-              evidenced payment route — the status control cannot set it, so a payment can never be
-              recorded without proof it reached the beneficiary (#554).
+              evidenced payment route, and only becomes{" "}
+              <span className="font-medium">acquired</span> through the evidenced acquisition
+              route, which records the basis on which title passed — purchase, donation, state
+              allocation, lease or court order. Neither can be set from the status control, so a
+              payment can never be recorded without proof it reached the beneficiary (#554), and a
+              state-owned or donated parcel never has to be routed through a fictitious dispute to
+              be marked acquired (#551-552).
             </p>
           </div>
         ) : null}
       </Modal>
 
+      {/* ---------------------------- acquisition modal -------------------------- */}
+      <Modal
+        open={acqOpen}
+        title={selected ? `Record acquisition of ${selected.reference}` : "Record acquisition"}
+        onClose={() => setAcqOpen(false)}
+        wide
+      >
+        <form onSubmit={onAcquire} className="space-y-4">
+          <ErrorAlert message={actError} />
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <Field
+              label="Basis on which title passed"
+              hint="Purchase and expropriation require compensation to have been paid first (IFC PS5 para 20)."
+            >
+              <Select value={acqBasis} onChange={(e) => setAcqBasis(e.target.value)}>
+                {(selected?.acquisitionBases ?? []).map((b) => (
+                  <option key={b} value={b}>
+                    {humanize(b)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Title passed on">
+              <Input
+                type="date"
+                required
+                value={acqDate}
+                onChange={(e) => setAcqDate(e.target.value)}
+              />
+            </Field>
+          </div>
+          <Field
+            label="Title evidence"
+            hint="Transfer deed, lease, donation deed, government allocation letter or court order."
+          >
+            <EvidencePicker
+              projectId={projectId}
+              selected={acqEvidence}
+              onChange={setAcqEvidence}
+            />
+          </Field>
+          <Field label="Note (optional)">
+            <Textarea
+              value={acqNote}
+              onChange={(e) => setAcqNote(e.target.value)}
+              className="min-h-16"
+              maxLength={10000}
+            />
+          </Field>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {acqNeedsPayment ? (
+              <p className="mr-auto max-w-sm text-xs text-amber-700">
+                No compensation payment is on file. A purchase or expropriation cannot take
+                possession before payment — record the payment first, or state the non-cash basis
+                on which title passed.
+              </p>
+            ) : acqEvidence.length === 0 ? (
+              <p className="mr-auto max-w-sm text-xs text-amber-700">
+                Select at least one title document — an acquisition with no evidence is an
+                assertion, not a record.
+              </p>
+            ) : null}
+            <Button variant="secondary" onClick={() => setAcqOpen(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={busy || acqEvidence.length === 0 || acqNeedsPayment}>
+              {busy ? "Recording…" : "Record acquisition"}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+
       {/* ---------------------------- compensate modal --------------------------- */}
       <Modal
         open={compOpen}
-        title="Record compensation payment"
+        title={alreadyPaid ? "Record a further compensation payment" : "Record compensation payment"}
         onClose={() => setCompOpen(false)}
         wide
       >
         <form onSubmit={onCompensate} className="space-y-4">
+          {alreadyPaid && selected ? (
+            <p className="rounded-md bg-ink-50 px-3 py-2 text-sm text-ink-700">
+              {fmtMoney(selected.compensationAmount, selected.currency)} has already been paid
+              against this parcel. This payment is <span className="font-medium">added</span> to
+              that total with its own date and evidence — it does not replace it. If the figure on
+              the register is simply wrong, close this and use “Correct the figure” instead.
+            </p>
+          ) : null}
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <Field
-              label="Amount paid"
+              label={alreadyPaid ? "Amount of this payment" : "Amount paid"}
               hint={
-                selected?.valuationAmount
-                  ? `Valued at ${fmtMoney(selected.valuationAmount, selected.currency)}.`
-                  : undefined
+                alreadyPaid
+                  ? "The amount going out now, not the running total."
+                  : selected?.valuationAmount
+                    ? `Valued at ${fmtMoney(selected.valuationAmount, selected.currency)}.`
+                    : undefined
               }
             >
               <Input
@@ -643,6 +924,74 @@ export default function ParcelsTab({
               }
             >
               {busy ? "Recording…" : "Record payment"}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+      {/* --------------------------- correction modal ---------------------------- */}
+      <Modal
+        open={corrOpen}
+        title={selected ? `Correct the compensation on ${selected.reference}` : "Correct compensation"}
+        onClose={() => setCorrOpen(false)}
+        wide
+      >
+        <form onSubmit={onCorrect} className="space-y-4">
+          <p className="rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-900">
+            A correction restates what the register says was paid; it does not record money going
+            out. Both figures, the movement and your reason go to the ledger, and the act needs
+            administrator rights on the land register.
+          </p>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <Field
+              label="Corrected total"
+              hint={
+                selected
+                  ? `Currently ${fmtMoney(selected.compensationAmount, selected.currency)}.`
+                  : undefined
+              }
+            >
+              <Input
+                type="number"
+                min="0"
+                step="any"
+                required
+                value={corrAmount}
+                onChange={(e) => setCorrAmount(e.target.value)}
+              />
+            </Field>
+            <Field label="Reason" hint="At least a sentence — this is the audit trail.">
+              <Input
+                required
+                value={corrReason}
+                onChange={(e) => setCorrReason(e.target.value)}
+                placeholder="Second instalment keyed twice; the bank statement shows one transfer"
+              />
+            </Field>
+          </div>
+          <Field
+            label="Evidence for the corrected figure"
+            hint="The revised valuation, the corrected receipt or the audit finding."
+          >
+            <EvidencePicker
+              projectId={projectId}
+              selected={corrEvidence}
+              onChange={setCorrEvidence}
+            />
+          </Field>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <Button variant="secondary" onClick={() => setCorrOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              disabled={busy || corrEvidence.length === 0 || corrReason.trim().length < 10}
+              title={
+                corrEvidence.length === 0
+                  ? "A correction needs the document that establishes the right figure"
+                  : undefined
+              }
+            >
+              {busy ? "Correcting…" : "Restate the figure"}
             </Button>
           </div>
         </form>

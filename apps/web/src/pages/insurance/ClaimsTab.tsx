@@ -129,6 +129,14 @@ export default function ClaimsTab({
   /* -------------------------------- create -------------------------------- */
 
   const [createOpen, setCreateOpen] = useState(false);
+  /*
+   * The commonest reason a claim is notified late is that nobody connected the
+   * incident to the policy at all. `POST /claims/from-incident` exists to close
+   * that gap — it defaults the aware date to the date the incident was
+   * REPORTED, not to today, and refuses a second claim against the same
+   * incident — but nothing in the app could call it.
+   */
+  const [fromIncidentOpen, setFromIncidentOpen] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [created, setCreated] = useState<ClaimCreated | null>(null);
@@ -333,6 +341,9 @@ export default function ClaimsTab({
             </Select>
           </label>
           <div className="grow" />
+          <Button variant="secondary" onClick={() => setFromIncidentOpen(true)}>
+            From a safety incident…
+          </Button>
           <Button onClick={openCreate}>Record a claim</Button>
         </CardBody>
       </Card>
@@ -585,6 +596,20 @@ export default function ClaimsTab({
         </form>
       </Modal>
 
+      <FromIncidentModal
+        open={fromIncidentOpen}
+        projectId={projectId}
+        policies={policies}
+        onClose={() => setFromIncidentOpen(false)}
+        onCreated={(claim) => {
+          setFromIncidentOpen(false);
+          setCreated(claim);
+          setPage(1);
+          void load();
+          void loadSummary();
+        }}
+      />
+
       {selectedId ? (
         <ClaimDrawer
           projectId={projectId}
@@ -597,5 +622,209 @@ export default function ClaimsTab({
         />
       ) : null}
     </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Raising a claim FROM a recorded safety incident (#784)              */
+/*                                                                     */
+/* The aware date defaults to the date the incident was REPORTED. That */
+/* is the whole point: opening this form three weeks later and letting */
+/* the clock start today would silently buy back days the wording does */
+/* not give, and the notification period is usually a condition        */
+/* precedent to liability.                                             */
+/* ------------------------------------------------------------------ */
+
+interface IncidentRow {
+  id: string;
+  reference: string;
+  title: string;
+  severity: string;
+  occurredAt: string | null;
+  reportedAt: string | null;
+}
+
+function FromIncidentModal({
+  open,
+  projectId,
+  policies,
+  onClose,
+  onCreated,
+}: {
+  open: boolean;
+  projectId: string;
+  policies: PolicyRow[];
+  onClose: () => void;
+  onCreated: (claim: ClaimCreated) => void;
+}) {
+  const [incidents, setIncidents] = useState<IncidentRow[] | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [incidentId, setIncidentId] = useState("");
+  const [policyId, setPolicyId] = useState("");
+  const [reserve, setReserve] = useState("");
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setLoadError(null);
+    setIncidents(null);
+    api
+      .get<ListResponse<IncidentRow>>(
+        `/api/v1/projects/${projectId}/safety/incidents?page=1&pageSize=100`,
+      )
+      .then((res) => {
+        if (!cancelled) setIncidents(res.items);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setIncidents([]);
+        /* The safety register belongs to another tool. Failing to read it is
+           reported as what it is — no permission, or no register — rather than
+           rendered as "no incidents", which would be a lie. */
+        setLoadError(errMsg(err, "The safety incident register could not be read"));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, projectId]);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await api.post<ClaimCreated>(
+        `/api/v1/projects/${projectId}/insurance/claims/from-incident`,
+        {
+          incidentId,
+          policyId,
+          reserve: reserve === "" ? undefined : Number(reserve),
+        },
+      );
+      setIncidentId("");
+      setPolicyId("");
+      setReserve("");
+      onCreated(res);
+    } catch (err) {
+      setError(errMsg(err, "The claim could not be raised from that incident"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const incident = incidents?.find((i) => i.id === incidentId) ?? null;
+  const policy = policies.find((p) => p.id === policyId) ?? null;
+  const awareDefault = incident ? (incident.reportedAt ?? incident.occurredAt) : null;
+
+  return (
+    <Modal open={open} title="Raise a claim from a safety incident" onClose={onClose} wide>
+      <ErrorAlert message={error} />
+      <form onSubmit={submit} className="space-y-4">
+        <Disclosure label="Why this is a separate route" tone="brand">
+          The claim is created with the incident&apos;s own dates and linked to it, and a second
+          claim against the same incident is refused — two claims for one loss would double the
+          reserve. The aware date defaults to the date the incident was <strong>reported</strong>,
+          not today, because that is when the insured actually knew.
+        </Disclosure>
+
+        {loadError ? (
+          <div className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-900 ring-1 ring-amber-200">
+            {loadError}. Record the claim manually instead, using the incident&apos;s dates.
+          </div>
+        ) : null}
+
+        <Field label="Incident">
+          {incidents === null ? (
+            <Spinner />
+          ) : (
+            <Select
+              required
+              value={incidentId}
+              onChange={(e) => setIncidentId(e.target.value)}
+              disabled={incidents.length === 0}
+            >
+              <option value="">
+                {incidents.length === 0
+                  ? "No incident is available to raise a claim from"
+                  : "Choose the incident…"}
+              </option>
+              {incidents.map((i) => (
+                <option key={i.id} value={i.id}>
+                  {i.reference} · {i.title} · {i.severity}
+                  {i.occurredAt ? ` · ${formatDate(i.occurredAt.slice(0, 10))}` : ""}
+                </option>
+              ))}
+            </Select>
+          )}
+        </Field>
+
+        <Field label="Policy on risk" hint="A draft or cancelled policy cannot carry a claim.">
+          <Select required value={policyId} onChange={(e) => setPolicyId(e.target.value)}>
+            <option value="">Choose the policy…</option>
+            {policies.map((p) => {
+              const blocked = p.status === "draft" || p.status === "cancelled";
+              return (
+                <option key={p.id} value={p.id} disabled={blocked}>
+                  {p.number} · {policyTypeLabel(p.policyType)} · {p.insurer}
+                  {p.notificationDays === null
+                    ? " · no notification period recorded"
+                    : ` · notify within ${p.notificationDays}d`}
+                  {blocked ? ` · ${p.status} — cannot carry a claim` : ""}
+                </option>
+              );
+            })}
+          </Select>
+        </Field>
+
+        <Field
+          label={`Reserve${policy ? ` (${policy.currency})` : ""}`}
+          hint="Optional. Leave blank rather than guessing — an invented reserve distorts the loss ratio the renewal turns on."
+        >
+          <Input
+            type="number"
+            min="0"
+            step="0.01"
+            value={reserve}
+            onChange={(e) => setReserve(e.target.value)}
+          />
+        </Field>
+
+        {incident ? (
+          <div className="rounded-md bg-white px-3 py-2 text-xs leading-relaxed text-ink-700 ring-1 ring-ink-100">
+            The claim will be dated from {incident.reference}:{" "}
+            {incident.occurredAt ? formatDate(incident.occurredAt.slice(0, 10)) : "no incident date recorded"}{" "}
+            as the incident date, and{" "}
+            <strong>
+              {awareDefault ? formatDate(awareDefault.slice(0, 10)) : "the incident date"}
+            </strong>{" "}
+            as the aware date.
+            {policy && policy.notificationDays !== null && awareDefault ? (
+              <>
+                {" "}
+                On {policy.number} that puts notification due by{" "}
+                <strong>
+                  {formatDate(addDaysIso(awareDefault.slice(0, 10), policy.notificationDays) ?? "")}
+                </strong>
+                .
+              </>
+            ) : null}
+            {policy && policy.notificationDays === null ? (
+              <> {policy.number} records no notification period, so no deadline will be computed.</>
+            ) : null}
+          </div>
+        ) : null}
+
+        <div className="flex justify-end gap-2">
+          <Button type="button" variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" disabled={busy || !incidentId || !policyId}>
+            {busy ? "Raising…" : "Raise the claim"}
+          </Button>
+        </div>
+      </form>
+    </Modal>
   );
 }

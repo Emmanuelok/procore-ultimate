@@ -629,3 +629,24 @@ export interface CostCodeRef {
   costType: string | null;
   isActive: number;
 }
+
+/**
+ * The AIA G702/G703 export payload (#514) exactly as
+ * `GET /prime-contracts/:id/billings/:billingId/export` returns it: the two
+ * forms as ordered key/value data, so the page can show what would be handed
+ * to the lender or architect before it downloads the CSV of the same figures.
+ */
+export interface AiaExportPayload {
+  primeContractId: string;
+  applicationId: string;
+  form: string;
+  g702: Record<string, string | number | null>;
+  changeOrderSummary: {
+    additions: number;
+    deductions: number;
+    net: number;
+    rows: Array<{ reference: string; additions: number; deductions: number; executedDate: string | null }>;
+  };
+  g703: Array<Record<string, string | number | null>>;
+  g703Totals: Record<string, number>;
+}

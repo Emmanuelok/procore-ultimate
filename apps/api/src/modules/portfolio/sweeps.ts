@@ -14,7 +14,7 @@
  * a condition that clears closes its own signal.
  */
 import type { FastifyInstance } from "fastify";
-import { and, eq, inArray, isNotNull, isNull, lt, ne } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, lt } from "drizzle-orm";
 import {
   auditRightsExecutions,
   disallowedCosts,
@@ -33,6 +33,7 @@ import { appendLedger } from "../../lib/ledger.js";
 import { forEachCompany } from "../../lib/scheduler.js";
 import { pushNotifications } from "../notifications/service.js";
 import {
+  UNRESOLVED_DISALLOWED_STATUSES,
   closeSignalByKey,
   loadAllocations,
   loadCallOffs,
@@ -43,7 +44,6 @@ import {
   affordability,
   appropriationPosition,
   fundingSourcePosition,
-  round2,
   type AppropriationRow,
   type EnvelopeRow,
 } from "./rollup.js";
@@ -609,7 +609,7 @@ export async function sweepCommercialStructures(
     .where(
       and(
         eq(disallowedCosts.companyId, companyId),
-        inArray(disallowedCosts.status, ["raised", "under_review", "disputed"]),
+        inArray(disallowedCosts.status, UNRESOLVED_DISALLOWED_STATUSES),
         isNotNull(disallowedCosts.responseDueAt),
         lt(disallowedCosts.responseDueAt, today),
       ),
@@ -741,5 +741,3 @@ export function registerPortfolioJobs(app: FastifyInstance): void {
     run: async ({ db, now }) => forEachCompany(db, (companyId) => sweepCommercialStructures(db, companyId, now)),
   });
 }
-
-export { round2, ne };

@@ -7,6 +7,7 @@
  */
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { ASSET_CLASSES } from "@constructos/shared";
+import { toast } from "sonner";
 import { ApiClientError, api } from "../../lib/api";
 import { Badge, Button, Card, CardBody, EmptyState, Field, Input, Select, Spinner } from "../../ui";
 import { formatDateTime } from "../format";
@@ -23,7 +24,7 @@ import {
   fmtPercentile,
   label,
 } from "./benchmarksShared";
-import type { CompareResponse, MetricDef } from "./benchmarksShared";
+import type { CompareResponse, EvaluateResponse, MetricDef } from "./benchmarksShared";
 import { PercentileStrip } from "./charts";
 
 export default function CompareTab({
@@ -42,6 +43,8 @@ export default function CompareTab({
   const [error, setError] = useState<string | null>(null);
   /** 404 (no snapshot) and 400 (no cell) are guidance, not failures */
   const [guidance, setGuidance] = useState<string | null>(null);
+  const [evaluating, setEvaluating] = useState(false);
+  const [evaluateNote, setEvaluateNote] = useState<string | null>(null);
 
   const load = useCallback(
     async (m: string, ac: string, rg: string) => {
@@ -77,11 +80,39 @@ export default function CompareTab({
     setData(null);
     setError(null);
     setGuidance(null);
+    setEvaluateNote(null);
   }, [projectId]);
 
   function submit(e: FormEvent) {
     e.preventDefault();
     void load(metric, assetClass, region);
+  }
+
+  /**
+   * Raise the signal. This is the ONLY caller of the evaluate route in the app
+   * apart from the scheduler sweep — moving signal-raising off the GET was
+   * right, but it left the capability with no door until this button existed.
+   */
+  async function raiseSignal() {
+    if (!data) return;
+    setEvaluating(true);
+    setEvaluateNote(null);
+    try {
+      const out = await api.post<EvaluateResponse>(
+        `/api/v1/projects/${projectId}/benchmarks/snapshots/${data.snapshotId}/evaluate`,
+        { ...(assetClass ? { assetClass } : {}), ...(region.trim() ? { region: region.trim() } : {}) },
+      );
+      if (out.signalRaised) {
+        toast.success("Benchmark outlier signal raised");
+      } else {
+        setEvaluateNote(out.reason ?? "No signal was raised.");
+      }
+      await load(metric, assetClass, region);
+    } catch (err) {
+      setEvaluateNote(errorMessage(err, "Could not evaluate this snapshot"));
+    } finally {
+      setEvaluating(false);
+    }
   }
 
   const dist = data?.distribution ?? null;
@@ -177,10 +208,29 @@ export default function CompareTab({
               </p>
               <p className="mt-1 text-xs text-red-700">
                 {data.outlier.signalRaised
-                  ? "A medium-severity benchmark_outlier signal has been raised for this snapshot and will appear in Assurance."
-                  : data.accessLevel === "contributed" && dist && dist.n >= data.minSampleN
-                    ? "A benchmark_outlier signal for this snapshot already exists (signals are idempotent per snapshot)."
-                    : "No signal was raised: outlier signals require a contributed distribution with at least the minimum sample count."}
+                  ? `A medium-severity benchmark_outlier signal is recorded against this snapshot${
+                      data.outlier.signalId ? ` (${data.outlier.signalId})` : ""
+                    } and appears in Assurance.`
+                  : data.outlier.wouldRaise
+                    ? "No signal has been raised for this snapshot yet. This cell supports one: raising it records a medium-severity benchmark_outlier signal in Assurance, citing n, the contributor count and the threshold."
+                    : "No signal was raised: outlier signals require a contributed distribution that satisfies the anonymity rules."}
+              </p>
+              {evaluateNote ? (
+                <p className="mt-1 text-xs text-red-700">{evaluateNote}</p>
+              ) : null}
+              {data.outlier.wouldRaise ? (
+                <Button
+                  variant="secondary"
+                  className="mt-2"
+                  disabled={evaluating}
+                  onClick={() => void raiseSignal()}
+                >
+                  {evaluating ? "Raising…" : "Raise outlier signal"}
+                </Button>
+              ) : null}
+              <p className="mt-2 text-xs text-red-600">
+                A signal is never raised by looking at this page. It is raised here, or by the
+                benchmarks.outlier-evaluation sweep, and at most once per snapshot.
               </p>
             </div>
           ) : null}

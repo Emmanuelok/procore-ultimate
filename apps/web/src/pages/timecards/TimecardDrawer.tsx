@@ -24,6 +24,7 @@ import {
   DescriptionList,
   Drawer,
   EmptyState,
+  Field,
   Input,
   NumberInput,
   Select,
@@ -773,6 +774,11 @@ function ApprovalBlock({
   onDone: () => void;
 }) {
   const [comment, setComment] = useState("");
+  /** the server's "approved 1 of 2 tiers" message, cleared when the card moves */
+  const [approvalProgress, setApprovalProgress] = useState<string | null>(null);
+  useEffect(() => {
+    setApprovalProgress(null);
+  }, [card.id, card.status]);
 
   const items = useMemo<TimelineItem[]>(
     () =>
@@ -821,6 +827,19 @@ function ApprovalBlock({
 
   const canSubmit = card.status === "draft" || card.status === "rejected";
   const canApprove = card.status === "submitted";
+  /** The API allows an adjustment only against a card that is already fixed —
+   *  and only once, so a chain stays readable where a fan would not. */
+  const canRevise =
+    ["approved", "locked", "exported"].includes(card.status) && !card.detail?.revisedBy;
+  const [adjustHours, setAdjustHours] = useState<number | null>(card.totalHours);
+  const [adjustDate, setAdjustDate] = useState("");
+  const [adjustReason, setAdjustReason] = useState("");
+  /**
+   * A weekly overtime rule reprices the WHOLE week when an adjustment lands in
+   * it, and the foreman has to be told which other days moved — otherwise the
+   * cards silently disagree with the rule they were classified under.
+   */
+  const [adjustWeekNote, setAdjustWeekNote] = useState<string | null>(null);
 
   return (
     <div>
@@ -866,6 +885,12 @@ function ApprovalBlock({
         </Alert>
       ) : null}
 
+      {approvalProgress ? (
+        <Alert tone="info" size="sm" title="Approval progress" className="mb-3">
+          {approvalProgress}
+        </Alert>
+      ) : null}
+
       {canSubmit || canApprove ? (
         <Card className="mb-3">
           <CardBody className="space-y-2">
@@ -907,14 +932,29 @@ function ApprovalBlock({
                     size="sm"
                     loading={busy === "approve"}
                     onClick={async () => {
-                      const result = await onRun("approve", () =>
-                        api.post(`/api/v1/projects/${projectId}/timecards/${card.id}/approve`, {
-                          decision: "approved",
-                          comment: comment.trim() || null,
-                        }),
+                      /*
+                       * A CREW CONFIGURED FOR TWO TIERS NEEDS TWO DIFFERENT
+                       * APPROVERS, and the card stays "submitted" after the
+                       * first. The server says so in `approvalProgress`
+                       * ("approved 1 of 2 tiers — tier 2 still has to sign");
+                       * without rendering it, the approver pressed Approve,
+                       * nothing visible happened, and there was no message
+                       * anywhere explaining why.
+                       */
+                      const result = await onRun<{ approvalProgress?: string | null }>(
+                        "approve",
+                        () =>
+                          api.post(
+                            `/api/v1/projects/${projectId}/timecards/${card.id}/approve`,
+                            {
+                              decision: "approved",
+                              comment: comment.trim() || null,
+                            },
+                          ),
                       );
                       if (result) {
                         setComment("");
+                        setApprovalProgress(result.approvalProgress ?? null);
                         onDone();
                       }
                     }}
@@ -975,6 +1015,88 @@ function ApprovalBlock({
       ) : (
         <Timeline items={items} timeFormat="absolute" aria-label="Approval trail" />
       )}
+
+      {canRevise ? (
+        <Card className="mt-3">
+          <CardBody className="space-y-2">
+            <SectionHeading
+              title="Correct it"
+              hint="An approved, locked or exported card is never edited. The correction is a NEW dated card that references this one, so what was paid and what should have been paid both stay readable."
+            />
+            <div className="grid gap-2 sm:grid-cols-3">
+              <Field label="Corrected total hours" required>
+                <NumberInput
+                  value={adjustHours}
+                  onChange={setAdjustHours}
+                  min={0}
+                  max={24}
+                  step={0.25}
+                />
+              </Field>
+              <Field label="Adjustment date" hint="Not before the day being corrected">
+                <Input
+                  type="date"
+                  value={adjustDate}
+                  onChange={(event) => setAdjustDate(event.target.value)}
+                />
+              </Field>
+              <Field label="Reason" required>
+                <Input
+                  value={adjustReason}
+                  onChange={(event) => setAdjustReason(event.target.value)}
+                  placeholder="Two hours omitted from Tuesday"
+                />
+              </Field>
+            </div>
+            <Button
+              size="sm"
+              loading={busy === "revise"}
+              disabled={adjustHours === null || !adjustReason.trim()}
+              onClick={async () => {
+                const result = await onRun("revise", () =>
+                  api.post<{
+                    weekReclassified?: Array<{ reference?: string; skipped?: string }>;
+                  }>(`/api/v1/projects/${projectId}/timecards/${card.id}/revise`, {
+                    workedHours: adjustHours,
+                    adjustmentDate: adjustDate || undefined,
+                    reason: adjustReason.trim(),
+                  }),
+                );
+                if (result) {
+                  const moved = result.weekReclassified ?? [];
+                  const repriced = moved.filter((m) => !m.skipped);
+                  const skipped = moved.filter((m) => m.skipped);
+                  setAdjustWeekNote(
+                    moved.length === 0
+                      ? null
+                      : [
+                          repriced.length > 0
+                            ? `${repriced.length} other card(s) in the same pay week were ` +
+                              `repriced (${repriced
+                                .map((m) => m.reference ?? "?")
+                                .join(", ")}): a weekly overtime rule reprices the whole week ` +
+                              "when any day in it changes."
+                            : null,
+                          ...skipped.map((m) => m.skipped as string),
+                        ]
+                          .filter(Boolean)
+                          .join(" "),
+                  );
+                  setAdjustReason("");
+                  onDone();
+                }
+              }}
+            >
+              Raise the adjustment
+            </Button>
+            {adjustWeekNote ? (
+              <Alert tone="warning" size="sm" title="The pay week was repriced" className="mt-3">
+                {adjustWeekNote}
+              </Alert>
+            ) : null}
+          </CardBody>
+        </Card>
+      ) : null}
 
       {card.revisesTimecardId ? (
         <Alert tone="info" size="sm" title="This card is a dated adjustment" className="mt-3">

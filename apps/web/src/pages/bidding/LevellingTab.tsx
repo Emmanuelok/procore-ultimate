@@ -34,7 +34,7 @@ import {
 } from "../../ui";
 import type { DataColumns } from "../../ui";
 import { cx } from "../../ui/cx";
-import { IconLock, IconPlus, IconTarget, IconWarning, IconZap } from "../../ui/icons";
+import { IconAi, IconLock, IconPlus, IconTarget, IconWarning, IconZap } from "../../ui/icons";
 import { api } from "../../lib/api";
 import {
   INCLUSION_LABEL,
@@ -71,6 +71,33 @@ interface GridRow {
   cells: Record<string, LevelledCell | undefined>;
 }
 
+/** One cited draft from the AI levelling assistant. Never applied by itself. */
+interface AiProposal {
+  levellingItemId: string;
+  itemCode: string | null;
+  itemDescription: string;
+  submissionId: string;
+  submissionReference: string;
+  vendorName: string;
+  includedStatus: string;
+  adjustmentAmount: number | null;
+  adjustmentReason: string | null;
+  sourceQuote: string;
+  rationale: string;
+  clarificationQuestion: string | null;
+  confidence: number;
+  apply: Record<string, unknown>;
+}
+
+interface AiProposalResponse {
+  runId: string | null;
+  openCells: number;
+  proposals: AiProposal[];
+  complianceNotes: Array<{ submissionId: string; reference: string; note: string; sourceQuote: string }>;
+  dropped: Array<{ reason: string; detail: string }>;
+  note: string;
+}
+
 export default function LevellingTab({
   projectId,
   packageId,
@@ -90,6 +117,8 @@ export default function LevellingTab({
   );
   const action = useAction();
   const [addOpen, setAddOpen] = useState(false);
+  const [manageOpen, setManageOpen] = useState(false);
+  const [proposals, setProposals] = useState<AiProposalResponse | null>(null);
   const [editing, setEditing] = useState<{
     submission: ComparisonSubmission;
     cell: LevelledCell | undefined;
@@ -237,9 +266,14 @@ export default function LevellingTab({
           description of the work and contain no bidder's price. {data.submissions.length} bid(s)
           are waiting behind the seal.
         </Alert>
-        <Button icon={IconPlus} onClick={() => setAddOpen(true)}>
-          Add scope rows
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          <Button icon={IconPlus} onClick={() => setAddOpen(true)}>
+            Add scope rows
+          </Button>
+          <Button variant="ghost" onClick={() => setManageOpen(true)}>
+            Manage rows
+          </Button>
+        </div>
         <AddItemsModal
           open={addOpen}
           projectId={projectId}
@@ -250,6 +284,12 @@ export default function LevellingTab({
             setAddOpen(false);
             refresh();
           }}
+        />
+        <ManageRowsModal
+          open={manageOpen}
+          items={data.items}
+          onClose={() => setManageOpen(false)}
+          onDone={refresh}
         />
       </div>
     );
@@ -271,6 +311,50 @@ export default function LevellingTab({
       api.post(`/api/v1/projects/${projectId}/bid-packages/${packageId}/levelling/complete`, {}),
     );
     if (done) refresh();
+  }
+
+  /**
+   * THE ASSISTANT PROPOSES; THIS SCREEN STILL DECIDES.
+   *
+   * Nothing here writes a levelling entry. The response is a list of drafts,
+   * each carrying the sentence from the bidder's own text that produced it
+   * and the exact body that applies it. Accepting one is a separate click
+   * that goes through the ordinary entries route, so the adjustment reason,
+   * the segregation and the ledger entry are the same as if it had been
+   * typed. With no API key the API answers 503 and the refusal panel says
+   * so — levelling by hand is unaffected.
+   */
+  async function propose() {
+    const res = await action.run("propose", () =>
+      api.post<AiProposalResponse>(
+        `/api/v1/projects/${projectId}/bid-packages/${packageId}/evaluation/propose`,
+        {},
+      ),
+    );
+    if (res) setProposals(res);
+  }
+
+  async function acceptProposal(p: AiProposal) {
+    const done = await action.run(`accept:${p.levellingItemId}:${p.submissionId}`, () =>
+      api.post(
+        `/api/v1/projects/${projectId}/bid-packages/${packageId}/levelling/entries`,
+        p.apply,
+      ),
+    );
+    if (done) {
+      setProposals((prev) =>
+        prev === null
+          ? prev
+          : {
+              ...prev,
+              proposals: prev.proposals.filter(
+                (x) =>
+                  !(x.levellingItemId === p.levellingItemId && x.submissionId === p.submissionId),
+              ),
+            },
+      );
+      refresh();
+    }
   }
 
   return (
@@ -321,6 +405,18 @@ export default function LevellingTab({
             <Button size="sm" variant="secondary" icon={IconPlus} onClick={() => setAddOpen(true)}>
               Add scope rows
             </Button>
+            <Button size="sm" variant="ghost" onClick={() => setManageOpen(true)}>
+              Manage rows
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={IconAi}
+              onClick={() => void propose()}
+              loading={action.busy === "propose"}
+            >
+              Suggest entries from the bidders&rsquo; text
+            </Button>
             <Button
               size="sm"
               onClick={() => void completeLevelling()}
@@ -351,6 +447,110 @@ export default function LevellingTab({
           </>
         )}
       </Alert>
+
+      {/* ------------------------------------------------------------ */}
+      {/* AI proposals — drafts, with the sentence each came from        */}
+      {/* ------------------------------------------------------------ */}
+      {proposals !== null ? (
+        <Card>
+          <CardBody className="space-y-3">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div>
+                <p className="text-meta font-semibold">
+                  {proposals.proposals.length} proposed entr
+                  {proposals.proposals.length === 1 ? "y" : "ies"} — nothing has been written
+                </p>
+                <p className="mt-0.5 text-2xs leading-snug text-content-muted">
+                  {proposals.note}
+                </p>
+              </div>
+              <Button size="sm" variant="ghost" onClick={() => setProposals(null)}>
+                Dismiss
+              </Button>
+            </div>
+
+            {proposals.proposals.length === 0 ? (
+              <p className="text-meta text-content-subtle">
+                Nothing survived verification. A proposal that cannot quote the sentence it came
+                from is discarded rather than shown.
+              </p>
+            ) : (
+              <ul className="space-y-2">
+                {proposals.proposals.map((p) => (
+                  <li
+                    key={`${p.levellingItemId}:${p.submissionId}`}
+                    className="rounded-lg border border-border p-3"
+                  >
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="text-meta font-semibold">
+                          {p.itemCode ? (
+                            <span className="font-mono text-2xs text-content-subtle">
+                              {p.itemCode}{" "}
+                            </span>
+                          ) : null}
+                          {p.itemDescription} — {p.vendorName}
+                        </p>
+                        <p className="mt-0.5 text-2xs text-content-muted">
+                          {INCLUSION_LABEL[p.includedStatus] ?? titleCase(p.includedStatus)}
+                          {p.adjustmentAmount !== null && p.adjustmentAmount !== 0
+                            ? ` · adjustment ${money(p.adjustmentAmount, currency)} (${titleCase(p.adjustmentReason ?? "")})`
+                            : " · no adjustment"}
+                          {` · confidence ${Math.round(p.confidence * 100)}%`}
+                        </p>
+                      </div>
+                      <Button
+                        size="sm"
+                        loading={action.busy === `accept:${p.levellingItemId}:${p.submissionId}`}
+                        onClick={() => void acceptProposal(p)}
+                      >
+                        Accept this cell
+                      </Button>
+                    </div>
+                    <blockquote className="mt-2 border-l-2 border-border pl-2 text-2xs italic text-content-muted">
+                      &ldquo;{p.sourceQuote}&rdquo;
+                    </blockquote>
+                    {p.rationale ? (
+                      <p className="mt-1 text-2xs text-content-subtle">{p.rationale}</p>
+                    ) : null}
+                    {p.clarificationQuestion ? (
+                      <p className="mt-1 text-2xs text-warning-fg">
+                        Ask the bidder: {p.clarificationQuestion}
+                      </p>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            {proposals.complianceNotes.length > 0 ? (
+              <div>
+                <p className="text-label uppercase text-content-subtle">Compliance notes</p>
+                <ul className="mt-1 space-y-1 text-2xs text-content-muted">
+                  {proposals.complianceNotes.map((n, i) => (
+                    <li key={i}>
+                      <span className="font-semibold">{n.reference}</span> — {n.note}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+
+            {proposals.dropped.length > 0 ? (
+              <details>
+                <summary className="cursor-pointer text-2xs text-content-subtle">
+                  {proposals.dropped.length} suggestion(s) were discarded — why
+                </summary>
+                <ReasonList
+                  reasons={proposals.dropped.map((d) => d.detail)}
+                  tone="neutral"
+                  className="mt-1"
+                />
+              </details>
+            ) : null}
+          </CardBody>
+        </Card>
+      ) : null}
 
       {/* ------------------------------------------------------------ */}
       {/* The grid                                                      */}
@@ -423,6 +623,13 @@ export default function LevellingTab({
           setAddOpen(false);
           refresh();
         }}
+      />
+
+      <ManageRowsModal
+        open={manageOpen}
+        items={data?.items ?? []}
+        onClose={() => setManageOpen(false)}
+        onDone={refresh}
       />
     </div>
   );
@@ -937,6 +1144,111 @@ function AddItemsModal({
           </span>
         </label>
       </div>
+    </Modal>
+  );
+}
+
+/* ================================================================== */
+/* Managing the scope rows the buyer wrote                             */
+/* ================================================================== */
+
+/**
+ * A scope row is the buyer's own words, and buyers mistype. Rows could be
+ * written and never corrected or removed, so a row added to the wrong package
+ * stayed on the grid forever — blocking completion when it was mandatory and
+ * inviting an adjustment against scope nobody meant to ask for. Renaming and
+ * deleting are refused once a live award exists; the API says so and this
+ * panel shows the refusal rather than hiding the buttons.
+ */
+function ManageRowsModal({
+  open,
+  items,
+  onClose,
+  onDone,
+}: {
+  open: boolean;
+  items: LevellingGrid["items"];
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const action = useAction();
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+
+  async function rename(id: string, current: string) {
+    const next = (drafts[id] ?? current).trim();
+    if (next.length === 0 || next === current) return;
+    const done = await action.run(`rename:${id}`, () =>
+      api.patch(`/api/v1/bid-levelling-items/${id}`, { description: next }),
+    );
+    if (done) onDone();
+  }
+
+  async function remove(id: string) {
+    /* DELETE answers 204 with no body, so the call must report its own success. */
+    const done = await action.run(`delete:${id}`, async () => {
+      await api.del(`/api/v1/bid-levelling-items/${id}`);
+      return { deleted: id };
+    });
+    if (done) onDone();
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Scope rows"
+      size="lg"
+      description="Correct or remove a row. A row a bidder has already answered cannot be deleted — that would erase what they said about the scope; make it non-mandatory instead."
+      footer={
+        <div className="flex justify-end">
+          <Button variant="ghost" onClick={onClose}>
+            Close
+          </Button>
+        </div>
+      }
+    >
+      <RefusalPanel refusal={action.refusal} onDismiss={action.clear} />
+      {items.length === 0 ? (
+        <p className="text-meta text-content-subtle">No scope rows have been written yet.</p>
+      ) : (
+        <ul className="divide-y divide-border-subtle">
+          {items.map((item) => (
+            <li key={item.id} className="flex flex-wrap items-center gap-2 py-2">
+              {item.itemCode ? (
+                <code className="font-mono text-2xs text-content-subtle">{item.itemCode}</code>
+              ) : null}
+              <Input
+                size="sm"
+                className="min-w-[16rem] flex-1"
+                value={drafts[item.id] ?? item.description}
+                onChange={(e) =>
+                  setDrafts((d) => ({ ...d, [item.id]: e.currentTarget.value }))
+                }
+              />
+              <Badge tone={item.isMandatory ? "warning" : "neutral"} size="xs" variant="subtle">
+                {item.isMandatory ? "mandatory" : "optional"}
+              </Badge>
+              <Button
+                size="xs"
+                variant="secondary"
+                loading={action.busy === `rename:${item.id}`}
+                disabled={(drafts[item.id] ?? item.description).trim() === item.description}
+                onClick={() => void rename(item.id, item.description)}
+              >
+                Rename
+              </Button>
+              <Button
+                size="xs"
+                variant="danger"
+                loading={action.busy === `delete:${item.id}`}
+                onClick={() => void remove(item.id)}
+              >
+                Delete
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
     </Modal>
   );
 }

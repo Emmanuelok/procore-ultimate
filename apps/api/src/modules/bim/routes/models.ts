@@ -24,6 +24,7 @@ import {
   bimModelVersions,
   bimModels,
   bimVersionDiffs,
+  clashResults,
   coordinationIssues,
   federationMembers,
   fileAccessLog,
@@ -261,6 +262,18 @@ export const modelRoutes: FastifyPluginAsync = async (app) => {
         await tx
           .delete(federationMembers)
           .where(inArray(federationMembers.modelVersionId, versionIds));
+        // A clash result whose two elements came from versions that no longer
+        // exist is not "still open" — it is unverifiable. Leaving it behind
+        // kept inflating openClashes on the coordination summary and the
+        // bim_open_clashes health input until somebody re-ran the test.
+        await tx
+          .delete(clashResults)
+          .where(
+            or(
+              inArray(clashResults.modelVersionIdA, versionIds),
+              inArray(clashResults.modelVersionIdB, versionIds),
+            ),
+          );
         await tx
           .update(coordinationIssues)
           .set({ modelVersionId: null })
@@ -461,14 +474,51 @@ export const modelRoutes: FastifyPluginAsync = async (app) => {
     return { ...version, model };
   });
 
-  /** Re-run extraction (a failed parse, a fixed file, or a queued big model). */
+  /**
+   * Re-run extraction (a failed parse, a fixed file, or a queued big model).
+   *
+   * Honours the SAME size threshold the upload path does: a container the
+   * upload route deliberately refused to parse in-request must not become
+   * parseable in-request just because somebody pressed Reprocess. Anything
+   * over the inline limit goes back on the queue and the scheduler picks it
+   * up, so a handful of Reprocess clicks cannot hold several requests open
+   * for the length of a full extraction each.
+   */
   app.post(
     "/bim/versions/:versionId/process",
     { preHandler: gates.companyGate },
     async (req, reply) => {
       const { versionId } = req.params as { versionId: string };
-      const { model } = await getVersion(versionId, req.companyId!);
+      const { version, model } = await getVersion(versionId, req.companyId!);
       await gates.requireToolFor(req, reply, model.projectId, "standard");
+      if ((version.sizeBytes ?? 0) > INLINE_PARSE_MAX_BYTES) {
+        await app.db
+          .update(bimModelVersions)
+          .set({ processing: "queued", processingError: null })
+          .where(eq(bimModelVersions.id, versionId));
+        await ledger(app.db, {
+          companyId: req.companyId!,
+          projectId: model.projectId,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "bim_model_version",
+          objectId: versionId,
+          payload: { processing: "queued", sizeBytes: version.sizeBytes, reason: "over_inline_limit" },
+        });
+        const fresh = await app.db
+          .select()
+          .from(bimModelVersions)
+          .where(eq(bimModelVersions.id, versionId))
+          .limit(1);
+        return reply.status(202).send({
+          ...fresh[0]!,
+          queued: true,
+          locationsCreated: 0,
+          reason: `This container is ${Math.round((version.sizeBytes ?? 0) / 1_048_576)} MiB, over the ${Math.round(
+            INLINE_PARSE_MAX_BYTES / 1_048_576,
+          )} MiB inline limit — the ingest worker will process it`,
+        });
+      }
       return processVersion(app, versionId, req.user!.id);
     },
   );
@@ -775,8 +825,12 @@ export const modelRoutes: FastifyPluginAsync = async (app) => {
       .limit(1000);
     const affected = issuesAffectedByDiff(openIssues, diff);
 
+    // Two people pressing Compare on the same uncached pair both miss the
+    // read above; bim_version_diffs is unique on (base, target), so the loser
+    // used to surface an unmapped 23505 as a 500. The insert yields instead
+    // and the winner's row is read back — the same answer, from the cache.
     const id = newId("bvd");
-    const [stored] = await app.db
+    const insertResult = await app.db
       .insert(bimVersionDiffs)
       .values({
         id,
@@ -795,7 +849,32 @@ export const modelRoutes: FastifyPluginAsync = async (app) => {
         sampleModified: diff.modified.slice(0, 500),
         computedBy: req.user!.id,
       })
+      .onConflictDoNothing({
+        target: [bimVersionDiffs.baseVersionId, bimVersionDiffs.targetVersionId],
+      })
       .returning();
+    let stored = insertResult[0];
+    if (!stored) {
+      const raced = await app.db
+        .select()
+        .from(bimVersionDiffs)
+        .where(
+          and(
+            eq(bimVersionDiffs.baseVersionId, baseVersionId),
+            eq(bimVersionDiffs.targetVersionId, versionId),
+          ),
+        )
+        .limit(1);
+      if (!raced[0]) throw conflict("The diff for this version pair is still being computed");
+      return {
+        baseVersionId,
+        targetVersionId: versionId,
+        baseVersion: base.version.version,
+        targetVersion: version.version,
+        cached: true,
+        diff: raced[0],
+      };
+    }
 
     await ledger(app.db, {
       companyId: req.companyId!,

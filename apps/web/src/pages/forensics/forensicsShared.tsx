@@ -37,8 +37,14 @@ export interface DelayEventRow {
   startDate: string;
   durationDays: number;
   contractEventId: string | null;
+  noticeDueDate?: string | null;
+  party?: string;
+  statusReason?: string | null;
+  pacingOfEventId?: string | null;
   evidenceIds: string[];
   tiaResult: TiaResult | null;
+  /** staleness verdict from the API — present on list and detail responses */
+  tia?: TiaStatus;
   raisedBy: string;
   createdAt: string;
   updatedAt: string;
@@ -50,6 +56,13 @@ export interface EvidenceLite {
   source: string;
   capturedAt: string | null;
   independenceScore?: number;
+}
+
+export interface TiaStatus {
+  stale: boolean;
+  deltaDays: number | null;
+  computedAt: string | null;
+  reason: string | null;
 }
 
 export interface DelayEventDetail extends DelayEventRow {
@@ -100,6 +113,18 @@ export interface ClaimRow {
   createdBy: string;
   createdAt: string;
   updatedAt: string;
+  currency?: string;
+  quantumBest?: number | null;
+  quantumLikely?: number | null;
+  quantumWorst?: number | null;
+  successProbability?: number | null;
+  provisionAmount?: number | null;
+  sufficiency?: { overallScore?: number } | null;
+  sufficiencyAt?: string | null;
+  scottSchedule?: unknown[] | null;
+  revisionCount?: number;
+  statusReason?: string | null;
+  decidedBy?: string | null;
 }
 
 export interface ClaimEventLite {
@@ -113,10 +138,24 @@ export interface ClaimEventLite {
   startDate: string;
   durationDays: number;
   tiaResult: TiaResult | null;
+  /** staleness verdict from the API — the claim detail stamps every event */
+  tia?: TiaStatus;
 }
 
 export interface ClaimDetail extends ClaimRow {
   delayEvents: ClaimEventLite[];
+  totals?: {
+    liveEvents: number;
+    withdrawnEvents: number;
+    compensableDays: number;
+    excusableDays: number;
+    /** null when no linked event carries a current TIA — never 0 */
+    tiaDeltaDays: number | null;
+    tiaMeasuredEvents: number;
+    tiaUnmeasuredEvents: number;
+    staleTia: number;
+    tiaBasis: string;
+  };
 }
 
 export interface ScheduleRow {
@@ -192,6 +231,9 @@ export interface WindowEvent {
   startDate: string;
   durationDays: number;
   tiaDeltaDays: number | null;
+  /** the cached TIA predates the schedule's last recompute */
+  tiaStale?: boolean;
+  party?: string;
 }
 
 export interface AnalysisWindow {
@@ -204,6 +246,7 @@ export interface AnalysisWindow {
     compensableDays: number;
     nonExcusableDays: number;
     tiaDeltaDays: number;
+    staleTia?: number;
   };
 }
 
@@ -213,6 +256,8 @@ export interface WindowsResponse {
   projectStart: string;
   boundaries: string[];
   method: string;
+  /** delay-event statuses included in the totals */
+  statuses?: string[];
   unattributedEvents: number;
   windows: AnalysisWindow[];
 }
@@ -304,10 +349,16 @@ export function claimKindTone(kind: string): string {
 }
 
 /** Legal state machine mirrored from the API (draft→submitted→assessed→…). */
+/**
+ * `draft` from submitted/assessed is the REVISE transition: it clears the
+ * assessment, so a changed claim can never carry an assessment that never
+ * considered the changed figures. Everything defining the claim is frozen
+ * until it is taken back to draft.
+ */
 export const CLAIM_NEXT_STATUSES: Record<string, string[]> = {
   draft: ["submitted", "withdrawn"],
-  submitted: ["assessed", "withdrawn"],
-  assessed: ["agreed", "rejected", "withdrawn"],
+  submitted: ["assessed", "draft", "withdrawn"],
+  assessed: ["agreed", "rejected", "draft", "withdrawn"],
   agreed: [],
   rejected: [],
   withdrawn: [],
@@ -316,7 +367,24 @@ export const CLAIM_NEXT_STATUSES: Record<string, string[]> = {
 /* ------------------------------ Components ---------------------------------- */
 
 /** TIA completion-delta chip: "+Nd" red when the completion moves out. */
-export function TiaChip({ deltaDays }: { deltaDays: number | null | undefined }) {
+export function TiaChip({
+  deltaDays,
+  stale,
+}: {
+  deltaDays: number | null | undefined;
+  /** the schedule moved after this delta was computed — withhold the number */
+  stale?: boolean;
+}) {
+  if (stale) {
+    return (
+      <span
+        className="inline-flex items-center rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800"
+        title="The programme has been recomputed since this analysis ran — re-run the TIA"
+      >
+        out of date
+      </span>
+    );
+  }
   if (deltaDays === null || deltaDays === undefined) {
     return <span className="text-xs text-ink-300">not run</span>;
   }
@@ -455,4 +523,39 @@ export function SectionTitle({ children }: { children: ReactNode }) {
       {children}
     </div>
   );
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Record sufficiency (#307-309)                                       */
+/* ------------------------------------------------------------------ */
+
+export interface SufficiencyLimb {
+  key: string;
+  present: boolean;
+  wordCount: number;
+  evidenceCount: number;
+  independenceScore: number | null;
+  score: number;
+  reasons: string[];
+}
+
+export interface SufficiencyEvent {
+  eventId: string;
+  title: string;
+  score: number;
+  logCoveragePercent: number;
+  noticeServed: boolean;
+  noticeInTimeBar: boolean | null;
+  reasons: string[];
+}
+
+export interface SufficiencyResult {
+  overallScore: number;
+  limbs: SufficiencyLimb[];
+  events: SufficiencyEvent[];
+  gaps: { eventId: string; title: string; from: string; to: string; days: number; kind: string }[];
+  missingNotices: { eventId: string; title: string; reason: string }[];
+  reasons: string[];
+  scoredAt: string;
 }

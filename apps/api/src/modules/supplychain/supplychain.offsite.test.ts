@@ -5,7 +5,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
-import { companyMemberships, locations, projectMemberships, projects, signals } from "@constructos/db";
+import { companyMemberships, locations, offsiteUnits, projectMemberships, projects, signals } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
 import { newId } from "../../lib/ids.js";
 import { addDaysISO, todayISO } from "../field/dates.js";
@@ -223,5 +223,84 @@ describe("offsite units and stages", () => {
     expect((await get(`${base()}/units/${unitId}`, stranger.headers)).statusCode).toBe(403);
     expect((await post(`${base()}/units/${unitId}/transition`, { status: "rejected", note: "x" }, stranger.headers)).statusCode).toBe(403);
     expect((await get(`${base()}/inspections`, stranger.headers)).statusCode).toBe(403);
+  });
+});
+
+/* ================================================================== */
+/* Correcting what an inspector recorded                               */
+/* ================================================================== */
+
+describe("verified-for-payment is correctable", () => {
+  let correctableId: string;
+
+  it("lets a later, lower inspection correct an over-stated one", async () => {
+    const unit = await post(`${base()}/units`, { name: "Riser module R1", unitType: "mep_module", value: 1_000_000, currency: "GBP" });
+    expect(unit.statusCode).toBe(201);
+    correctableId = unit.json().id;
+
+    const first = await post(`${base()}/inspections`, { unitId: correctableId, kind: "witness", title: "Witness 1", scheduledFor: addDaysISO(today, -2) });
+    const over = await post(`${base()}/inspections/${first.json().id}/record`, { result: "passed", percentVerified: 90, performedAt: addDaysISO(today, -2) }, verifier.headers);
+    expect(over.statusCode).toBe(200);
+    expect(over.json().unit.percentVerifiedForPayment).toBe(90);
+    expect(over.json().unit.verifiedForPaymentBy).toBe(verifier.userId);
+
+    // A second inspector finds the true figure. Under a max() rule this was
+    // accepted with 200 and then silently ignored — the unit still said 90.
+    const second = await post(`${base()}/inspections`, { unitId: correctableId, kind: "surveillance", title: "Corrective survey", scheduledFor: today });
+    const corrected = await post(`${base()}/inspections/${second.json().id}/record`, { result: "passed", percentVerified: 40, performedAt: today, findings: "Earlier 90% was a typo; 40% of the module is built." });
+    expect(corrected.statusCode).toBe(200);
+    expect(corrected.json().unit.percentVerifiedForPayment).toBe(40);
+    expect(corrected.json().unit.verifiedForPaymentBy).toBe(owner.userId);
+    expect(corrected.json().unit.verifiedForPayment.reasons.join(" ")).toMatch(/superseded/);
+
+    const detail = await get(`${base()}/units/${correctableId}`);
+    expect(detail.json().percentVerifiedForPayment).toBe(40);
+    expect(detail.json().verifiedForPayment.source.inspectorId).toBe(owner.userId);
+  });
+
+  it("voids a mis-recorded inspection only through a second person, and falls back to what still stands", async () => {
+    const list = await get(`${base()}/inspections?unitId=${correctableId}`);
+    const corrective = list.json().items.find((i: { title: string }) => i.title === "Corrective survey");
+    expect(corrective.inspectorId).toBe(owner.userId);
+
+    // The inspector of record may not withdraw their own inspection.
+    const self = await post(`${base()}/inspections/${corrective.id}/void`, { reason: "I made a mistake recording this" });
+    expect(self.statusCode).toBe(403);
+    expect((await post(`${base()}/inspections/${corrective.id}/void`, { reason: "short" }, verifier.headers)).statusCode).toBe(400);
+
+    const voided = await post(`${base()}/inspections/${corrective.id}/void`, { reason: "Recorded against the wrong unit reference." }, verifier.headers);
+    expect(voided.statusCode).toBe(200);
+    expect(voided.json().result).toBe("voided");
+    expect(voided.json().findings).toMatch(/VOIDED by a second person/);
+    // With the corrective inspection withdrawn, the earlier one stands again.
+    expect(voided.json().unit.percentVerifiedForPayment).toBe(90);
+    expect(voided.json().unit.verifiedForPaymentBy).toBe(verifier.userId);
+    expect((await post(`${base()}/inspections/${corrective.id}/void`, { reason: "Trying to void it twice." }, verifier.headers)).statusCode).toBe(400);
+
+    const scheduled = await post(`${base()}/inspections`, { unitId: correctableId, kind: "witness", title: "Not yet held", scheduledFor: addDaysISO(today, 7) });
+    expect((await post(`${base()}/inspections/${scheduled.json().id}/void`, { reason: "Nothing recorded yet at all." }, verifier.headers)).statusCode).toBe(400);
+    expect((await post(`${base()}/inspections/${corrective.id}/void`, { reason: "Another tenant cannot reach this." }, stranger.headers)).statusCode).toBe(403);
+  });
+
+  it("does not write to the unit on a read", async () => {
+    const before = await get(`${base()}/units/${correctableId}`);
+    expect(before.statusCode).toBe(200);
+    const stamp = before.json().updatedAt;
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    const after = await get(`${base()}/units/${correctableId}`);
+    // A GET behind the read gate must not mutate the row: `updatedAt` still
+    // means "last modified", not "last looked at".
+    expect(after.json().updatedAt).toBe(stamp);
+    expect((await get(`${base()}/units/${correctableId}`, viewerHeaders)).statusCode).toBe(200);
+    const [row] = await app.db.select().from(offsiteUnits).where(eq(offsiteUnits.id, correctableId));
+    expect(row!.updatedAt).toBe(stamp);
+  });
+
+  it("refuses a hand-set QA hold instead of accepting it and reverting it", async () => {
+    const detail = await get(`${base()}/units/${correctableId}`);
+    expect(detail.json().allowedTransitions).not.toContain("qa_hold");
+    const held = await post(`${base()}/units/${correctableId}/transition`, { status: "qa_hold" });
+    expect(held.statusCode).toBe(400);
+    expect(held.json().message).toMatch(/not set by hand/);
   });
 });

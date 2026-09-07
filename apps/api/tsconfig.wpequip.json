@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true },
+  "include": [
+    "src/modules/equipment/**/*.ts",
+    "src/modules/timecards/**/*.ts",
+    "src/modules/workforce/**/*.ts",
+    "src/types/**/*.ts"
+  ],
+  "exclude": []
+}

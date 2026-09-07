@@ -34,6 +34,9 @@ import {
   type BusinessCaseRow,
   type ListResponse,
 } from "./governanceShared";
+import OptimismPanel from "./OptimismPanel";
+import SensitivityPanel from "./SensitivityPanel";
+import LogicModelPanel from "./LogicModelPanel";
 
 const FIVE_CASES: { key: string; label: string; hint: string }[] = [
   { key: "strategic", label: "Strategic case", hint: "The case for change and strategic fit." },
@@ -613,6 +616,14 @@ export default function BusinessCasesTab({ projectId }: { projectId: string }) {
                   </Table>
                 )}
               </div>
+
+              {/* -------------------- optimism bias & sensitivity (#402-406) -------------------- */}
+              <OptimismPanel base={base} bc={detail} onChanged={() => void loadDetail()} />
+
+              {detail.options.length > 0 ? <SensitivityPanel options={detail.options} /> : null}
+
+              {/* -------------------------- logic model (#418) -------------------------- */}
+              <LogicModelPanel base={base} bc={detail} onChanged={() => void loadDetail()} />
 
               {/* --------------------------- five-case editor ------------------------- */}
               <div>

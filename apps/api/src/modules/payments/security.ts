@@ -112,8 +112,6 @@ export async function reconcileAccountRow(db: Db, account: typeof paymentSecurit
     .select({ amount: paymentSecurityMovements.amount })
     .from(paymentSecurityMovements)
     .where(eq(paymentSecurityMovements.accountId, account.id));
-  const clauses = [eq(paymentSecurityAccounts.projectId, account.projectId)];
-  void clauses;
   const commitmentRows = await db
     .select({ id: commitments.id, reference: commitments.reference, currency: commitments.currency, retainageHeld: commitments.retainageHeld, vendorId: commitments.vendorId, status: commitments.status })
     .from(commitments)
@@ -195,50 +193,81 @@ export const securityAccountRoutes: FastifyPluginAsync = async (app) => {
       if (p[0].currency.toUpperCase() !== account.currency.toUpperCase()) throw badRequest(`The payment is in ${p[0].currency}; the account is in ${account.currency}`);
     }
     const amount = signedAmount(body.kind, body.amount);
-    const before = await reconcileAccountRow(app.db, account);
-    if (amount < 0 && before.balance + amount < -CENT) {
-      throw badRequest(`This ${body.kind} of ${body.amount} ${account.currency} exceeds the ${before.balance} ${account.currency} in the account.`);
-    }
     const id = newId("psm");
-    await app.db.insert(paymentSecurityMovements).values({
-      id,
-      companyId: req.companyId!,
-      projectId: req.projectId!,
-      accountId,
-      kind: body.kind,
-      amount,
-      beneficiaryVendorId: body.beneficiaryVendorId ?? null,
-      relatedPaymentId: body.relatedPaymentId ?? null,
-      relatedInvoiceId: body.relatedInvoiceId ?? null,
-      reference: body.reference ?? null,
-      occurredAt: body.occurredAt ?? todayISO(),
-      notes: body.notes ?? null,
-      createdBy: req.user!.id,
-    });
-    const after = await reconcileAccountRow(app.db, account);
-    /* an under-funded trust is a signal, raised when the shortfall APPEARS */
-    if (!after.funded && before.funded) {
-      await app.db.insert(signals).values({
-        id: newId("sig"),
+    /*
+     * A movement on a statutory trust is a money move (plan §6.2): the balance
+     * is READ, CHECKED and WRITTEN inside one transaction with the account row
+     * locked `for update`, so two concurrent releases of the whole balance
+     * cannot both see the money and both take it. Everything derived from the
+     * movements — the headroom check and the reconciliation the signal is
+     * raised from — is computed on the transaction, never on a snapshot taken
+     * before it.
+     */
+    const after = await app.db.transaction(async (tx) => {
+      const locked = (
+        await tx
+          .select()
+          .from(paymentSecurityAccounts)
+          .where(eq(paymentSecurityAccounts.id, accountId))
+          .for("update")
+      )[0];
+      if (!locked) throw notFound("Account not found");
+      if (locked.status !== "active") throw conflict("A closed account takes no movements");
+      const beforeRec = await reconcileAccountRow(tx, locked);
+      if (amount < 0 && beforeRec.balance + amount < -CENT) {
+        throw badRequest(
+          `This ${body.kind} of ${body.amount} ${locked.currency} exceeds the ${beforeRec.balance} ${locked.currency} in the account.`,
+        );
+      }
+      await tx.insert(paymentSecurityMovements).values({
+        id,
         companyId: req.companyId!,
         projectId: req.projectId!,
-        detector: "retention_trust_underfunded",
-        severity: "high",
-        confidence: 1,
-        title: `${account.name} is under-funded by ${after.shortfall} ${account.currency}`,
-        explanation: `${after.basis} Balance ${after.balance} ${account.currency} against ${after.retainageHeld} ${account.currency} of retainage the commitments say is held.`,
+        accountId,
+        kind: body.kind,
+        amount,
+        beneficiaryVendorId: body.beneficiaryVendorId ?? null,
+        relatedPaymentId: body.relatedPaymentId ?? null,
+        relatedInvoiceId: body.relatedInvoiceId ?? null,
+        reference: body.reference ?? null,
+        occurredAt: body.occurredAt ?? todayISO(),
+        notes: body.notes ?? null,
+        createdBy: req.user!.id,
       });
-    }
+      const afterRec = await reconcileAccountRow(tx, locked);
+      /* an under-funded trust is a signal, raised when the shortfall APPEARS */
+      if (!afterRec.funded && beforeRec.funded) {
+        await tx.insert(signals).values({
+          id: newId("sig"),
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          detector: "retention_trust_underfunded",
+          severity: "high",
+          confidence: 1,
+          title: `${locked.name} is under-funded by ${afterRec.shortfall} ${locked.currency}`,
+          explanation: `${afterRec.basis} Balance ${afterRec.balance} ${locked.currency} against ${afterRec.retainageHeld} ${locked.currency} of retainage the commitments say is held.`,
+        });
+      }
+      return afterRec;
+    });
     await appendLedger(app.db, { companyId: req.companyId!, actorId: req.user!.id, action: "create", objectType: "payment_security_movement", objectId: id, projectId: req.projectId!, payload: { accountId, kind: body.kind, amount, balanceAfter: after.balance }, storePayload: true });
     return reply.status(201).send({ movementId: id, reconciliation: after });
   });
 
   app.post("/projects/:projectId/payment-security-accounts/:accountId/close", { preHandler: standardGate }, async (req) => {
     const { accountId } = req.params as { accountId: string };
-    const account = await fetchAccount(accountId, req.companyId!, req.projectId!);
-    const rec = await reconcileAccountRow(app.db, account);
-    if (Math.abs(rec.balance) > CENT) throw conflict(`The account still holds ${rec.balance} ${account.currency}; release or withdraw it before closing.`);
-    await app.db.update(paymentSecurityAccounts).set({ status: "closed", closedAt: todayISO(), updatedAt: new Date().toISOString() }).where(eq(paymentSecurityAccounts.id, accountId));
+    await fetchAccount(accountId, req.companyId!, req.projectId!);
+    /* closing is checked against the balance INSIDE the lock, so a movement racing the close cannot slip past it */
+    await app.db.transaction(async (tx) => {
+      const locked = (
+        await tx.select().from(paymentSecurityAccounts).where(eq(paymentSecurityAccounts.id, accountId)).for("update")
+      )[0];
+      if (!locked) throw notFound("Account not found");
+      if (locked.status !== "active") throw conflict(`This account is already ${locked.status}`);
+      const rec = await reconcileAccountRow(tx, locked);
+      if (Math.abs(rec.balance) > CENT) throw conflict(`The account still holds ${rec.balance} ${locked.currency}; release or withdraw it before closing.`);
+      await tx.update(paymentSecurityAccounts).set({ status: "closed", closedAt: todayISO(), updatedAt: new Date().toISOString() }).where(and(eq(paymentSecurityAccounts.id, accountId), eq(paymentSecurityAccounts.status, "active")));
+    });
     await appendLedger(app.db, { companyId: req.companyId!, actorId: req.user!.id, action: "state_change", objectType: "payment_security_account", objectId: accountId, projectId: req.projectId!, payload: { status: "closed" } });
     return fetchAccount(accountId, req.companyId!, req.projectId!);
   });

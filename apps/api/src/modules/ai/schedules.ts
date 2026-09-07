@@ -11,11 +11,15 @@
  *   · A schedule whose agent is disabled by policy, or whose tenant has no
  *     API key, is SKIPPED with the reason recorded — never failed, and never
  *     silently retried in a hot loop.
- *   · Due-ness is computed from `nextRunAt`, which is set forward before the
- *     run starts, so a long run cannot be started twice by two ticks.
+ *   · Due-ness is computed from `nextRunAt`, and the row is CLAIMED before the
+ *     run starts by a conditional `UPDATE … WHERE next_run_at <= now
+ *     RETURNING` that moves `nextRunAt` forward. A schedule two callers pick
+ *     up at once — a scheduler tick and an operator pressing "Run now" — is
+ *     claimed by exactly one of them; the loser is skipped with
+ *     "Already running or not yet due" and no second paid model call happens.
  */
 import type { FastifyInstance } from "fastify";
-import { and, asc, eq, isNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, isNull, lt, lte, ne, or, sql } from "drizzle-orm";
 import { agentSchedules } from "@constructos/db";
 import { forEachCompany } from "../../lib/scheduler.js";
 import { newId } from "../../lib/ids.js";
@@ -106,10 +110,67 @@ export interface ScheduleOutcome {
  * and the next tick tries again, exactly like the platform scheduler's own
  * contract.
  */
+/**
+ * How long a claim is honoured before another runner may take the schedule.
+ * A process that dies mid-run must not park a monitor forever, and no agent
+ * run on this platform takes anywhere near an hour.
+ */
+export const SCHEDULE_LEASE_MS = 60 * 60_000;
+
+/**
+ * Claim a schedule for one runner, atomically.
+ *
+ * The claim marks the row `running`, stamps `lastRunAt` and moves `nextRunAt`
+ * forward in ONE conditional statement, so of two callers that read the same
+ * due row exactly one gets it back. `force` is the operator's "Run now": it
+ * ignores due-ness (a schedule created five minutes ago is not due yet) but
+ * NOT the running lease, which is the half that stops the duplicate paid call.
+ */
+export async function claimSchedule(
+  db: Db,
+  row: ScheduleRow,
+  now: Date,
+  opts: { force?: boolean } = {},
+): Promise<ScheduleRow | null> {
+  const leaseCutoff = new Date(now.getTime() - SCHEDULE_LEASE_MS).toISOString();
+  const notRunning = or(
+    isNull(agentSchedules.lastStatus),
+    ne(agentSchedules.lastStatus, "running"),
+    isNull(agentSchedules.lastRunAt),
+    lt(agentSchedules.lastRunAt, leaseCutoff),
+  );
+  const claimed = await db
+    .update(agentSchedules)
+    .set({
+      nextRunAt: nextRunAt(now, row.everyMinutes),
+      lastRunAt: now.toISOString(),
+      lastStatus: "running",
+      updatedAt: now.toISOString(),
+    })
+    .where(
+      and(
+        eq(agentSchedules.id, row.id),
+        notRunning,
+        opts.force
+          ? undefined
+          : and(
+              eq(agentSchedules.enabled, 1),
+              or(
+                isNull(agentSchedules.nextRunAt),
+                lte(agentSchedules.nextRunAt, now.toISOString()),
+              ),
+            ),
+      ),
+    )
+    .returning();
+  return claimed[0] ?? null;
+}
+
 export async function runSchedule(
   app: FastifyInstance,
   row: ScheduleRow,
   now: Date,
+  opts: { force?: boolean } = {},
 ): Promise<ScheduleOutcome> {
   const base = { scheduleId: row.id, agentKind: row.agentKind };
   const finish = async (
@@ -122,6 +183,9 @@ export async function runSchedule(
       .update(agentSchedules)
       .set({
         lastRunAt: now.toISOString(),
+        // nextRunAt was already moved forward by the claim; recomputing it
+        // from the same `now` is idempotent and keeps a long run from
+        // shortening the following interval.
         nextRunAt: nextRunAt(now, row.everyMinutes),
         lastStatus: status,
         lastError: status === "failed" ? detail.slice(0, 2000) : null,
@@ -136,6 +200,20 @@ export async function runSchedule(
       .where(eq(agentSchedules.id, row.id));
     return { ...base, status, detail, runId, proposals };
   };
+
+  // THE CLAIM. Nothing above this line may call the model.
+  const claimed = await claimSchedule(app.db, row, now, opts);
+  if (!claimed) {
+    return {
+      ...base,
+      status: "skipped",
+      detail: opts.force
+        ? "Already running: another caller claimed this schedule"
+        : "Already running or not yet due: another caller claimed this schedule",
+      runId: null,
+      proposals: 0,
+    };
+  }
 
   const def = getAgentDefinition(row.agentKind);
   if (!def) return finish("skipped", `No runnable agent named "${row.agentKind}"`, null, 0);

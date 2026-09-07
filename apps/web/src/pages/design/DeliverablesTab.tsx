@@ -22,6 +22,7 @@ import { api } from "../../lib/api";
 import {
   DELIVERABLE_STATUS_TONE,
   EM_DASH,
+  EditPanel,
   FigureCell,
   KeyValue,
   LoadError,
@@ -493,6 +494,35 @@ function ConsultantsPanel({
                     Verify cover
                   </Button>
                 ) : null}
+                <div className="w-full">
+                  <EditPanel
+                    title={`Correct ${consultant.name}`}
+                    hint="Changing the cover, the requirement or the expiry clears the previous verification: cover that moved has not been checked."
+                    path={`${base}/consultants/${consultant.id}`}
+                    initial={consultant as unknown as Record<string, unknown>}
+                    onSaved={onChanged}
+                    fields={[
+                      { key: "name", label: "Name", kind: "text", maxLength: 200, nullable: false },
+                      { key: "role", label: "Role", kind: "text", maxLength: 120 },
+                      {
+                        key: "discipline",
+                        label: "Discipline",
+                        kind: "select",
+                        options: DESIGN_DISCIPLINES.map((d) => ({ value: d, label: labelize(d) })),
+                      },
+                      { key: "appointmentRef", label: "Appointment ref", kind: "text", maxLength: 80 },
+                      { key: "contactName", label: "Contact", kind: "text", maxLength: 160 },
+                      { key: "contactEmail", label: "Contact email", kind: "text", maxLength: 200 },
+                      { key: "piRequiredAmount", label: "PI required", kind: "number", hint: "Without this the adequacy check reports unknown, never adequate." },
+                      { key: "piCoverAmount", label: "PI cover", kind: "number" },
+                      { key: "piCurrency", label: "PI currency", kind: "text", maxLength: 3, placeholder: "GBP" },
+                      { key: "piExpiresOn", label: "PI expires", kind: "date" },
+                      { key: "piInsurerName", label: "Insurer", kind: "text", maxLength: 200 },
+                      { key: "piPolicyNumber", label: "Policy number", kind: "text", maxLength: 120 },
+                      { key: "notes", label: "Notes", kind: "textarea" },
+                    ]}
+                  />
+                </div>
               </li>
             ))}
           </ul>
@@ -901,10 +931,44 @@ function DeliverableDrawer({
                     <Button size="sm" variant="ghost" loading={action.busy === "reject"} onClick={() => void reject()}>
                       Reject
                     </Button>
+                    <span className="w-full text-2xs text-content-subtle">
+                      Acceptance is refused to whoever issued it: someone else has to test the assertion.
+                    </span>
                   </div>
                 )}
               </div>
             ) : null}
+
+            <EditPanel
+              title="Correct this deliverable"
+              hint="Moving the planned date closes the obligation that pointed at the old one and opens a new one."
+              path={`${base}/deliverables/${row.id}`}
+              initial={row as unknown as Record<string, unknown>}
+              disabled={row.status === "accepted"}
+              disabledReason="An accepted deliverable is a record. Register the next revision instead of editing it."
+              onSaved={onChanged}
+              fields={[
+                { key: "title", label: "Title", kind: "text", maxLength: 200, nullable: false, wide: true },
+                { key: "description", label: "Description", kind: "textarea" },
+                {
+                  key: "deliverableType",
+                  label: "Type",
+                  kind: "select",
+                  options: DESIGN_DELIVERABLE_TYPES.map((t) => ({ value: t, label: labelize(t) })),
+                },
+                {
+                  key: "discipline",
+                  label: "Discipline",
+                  kind: "select",
+                  options: DESIGN_DISCIPLINES.map((d) => ({ value: d, label: labelize(d) })),
+                },
+                { key: "plannedIssueDate", label: "Planned issue", kind: "date", hint: "The date the obligation is measured against." },
+                { key: "forecastIssueDate", label: "Forecast issue", kind: "date" },
+                { key: "requiredOnSite", label: "Required on site", kind: "date" },
+                { key: "revision", label: "Revision", kind: "text", maxLength: 20 },
+                { key: "notes", label: "Notes", kind: "textarea" },
+              ]}
+            />
           </>
         ) : null}
       </div>

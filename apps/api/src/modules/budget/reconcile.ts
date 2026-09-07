@@ -67,13 +67,21 @@ export const PENDING_COMMITMENT_STATUSES = ["draft", "out_for_bid", "out_for_sig
 /** Subcontractor invoice statuses that represent cost actually incurred. */
 export const INCURRED_INVOICE_STATUSES = ["approved", "approved_as_noted", "paid"] as const;
 /** Payment statuses under which money has actually left. */
-export const SETTLED_PAYMENT_STATUSES = ["issued", "cleared", "paid"] as const;
+export const SETTLED_PAYMENT_STATUSES = ["issued", "cleared"] as const;
+/**
+ * Payment statuses whose allocation must never count as paid, whatever stamp
+ * the payments module left behind. These are the real values of
+ * `commitment_payments.status` (PAYMENT_STATUSES in @constructos/shared).
+ */
+export const UNSETTLED_PAYMENT_STATUSES: readonly string[] = ["voided", "failed"];
 
 /* ------------------------------------------------------------------ */
 /* Pure arithmetic                                                     */
 /* ------------------------------------------------------------------ */
 
 export interface InvoiceLineRead {
+  /** The invoice LINE's own id — the posting coordinate for a loose line. */
+  lineId: string;
   invoiceId: string;
   invoiceNumber: number;
   invoiceReference: string;
@@ -141,7 +149,10 @@ export interface PaidAllocation {
 export function paidCommitmentAllocations(payments: readonly PaymentRead[]): PaidAllocation[] {
   const out: PaidAllocation[] = [];
   for (const p of payments) {
-    if (p.status === "void" || p.status === "cancelled") continue;
+    // PAYMENT_STATUSES: scheduled | on_hold | issued | cleared | failed | voided.
+    // "void"/"cancelled" are not values this column ever holds, so the guard
+    // has to name the real ones or it defends nothing.
+    if (UNSETTLED_PAYMENT_STATUSES.includes(p.status)) continue;
     const detail = (p.detail && typeof p.detail === "object" ? p.detail : {}) as Record<string, unknown>;
     if (typeof detail["budgetPostedAt"] !== "string") continue;
     const allocations = detail["budgetAllocation"];
@@ -357,6 +368,7 @@ export async function readInvoicedSources(db: Db, budget: BudgetRow): Promise<So
   const relevant = rows.filter((r) => r.kind === "subcontractor_invoice" && (INCURRED_INVOICE_STATUSES as readonly string[]).includes(r.status));
   const chosen = latestInvoiceLinePerSovLine(
     relevant.map((r) => ({
+      lineId: r.lineId,
       invoiceId: r.invoiceId,
       invoiceNumber: r.invoiceNumber,
       invoiceReference: r.invoiceReference,
@@ -369,14 +381,20 @@ export async function readInvoicedSources(db: Db, budget: BudgetRow): Promise<So
       currency: r.currency,
     })),
   );
-  const byInvoiceLine = new Map(relevant.map((r) => [`${r.invoiceId}:${r.commitmentSovLineId ?? r.lineId}`, r]));
+  // Both sides of this lookup use ONE coordinate shape. Keying a loose line
+  // (no commitment SOV line) by anything the chosen row cannot reproduce sent
+  // two such lines on the same invoice to the same posting id, and the second
+  // overwrote the first in budget_postings.
+  const coordinateOf = (r: { invoiceId: string; commitmentSovLineId: string | null; lineId: string }): string =>
+    r.commitmentSovLineId ? `${r.invoiceId}:sov:${r.commitmentSovLineId}` : `${r.invoiceId}:line:${r.lineId}`;
+  const byInvoiceLine = new Map(relevant.map((r) => [coordinateOf(r), r]));
   const supersededCount = relevant.length - chosen.length;
   const folded = foldRows(
     chosen.map((c) => {
-      const raw = byInvoiceLine.get(`${c.invoiceId}:${c.commitmentSovLineId ?? ""}`) ?? relevant.find((r) => r.invoiceId === c.invoiceId && r.budgetLineItemId === c.budgetLineItemId);
+      const raw = byInvoiceLine.get(coordinateOf(c));
       return {
         sourceType: "invoice_line" as const,
-        sourceId: c.commitmentSovLineId ? `sov:${c.commitmentSovLineId}` : `line:${raw?.lineId ?? c.invoiceId}`,
+        sourceId: c.commitmentSovLineId ? `sov:${c.commitmentSovLineId}` : `line:${c.lineId}`,
         reference: c.invoiceReference,
         description: raw?.description ?? "Invoice line",
         status: c.invoiceStatus,
@@ -760,9 +778,16 @@ function lineAmounts(l: LineRow) {
 
 export interface ComponentExplanation {
   component: BudgetPostingComponent;
-  stored: number;
+  /**
+   * The figure the budget line stores for this component — null when the
+   * line carries no such column (invoiced and paid to date are read from
+   * their sources, never stored), because printing 0 there would invent a
+   * drift equal to the whole figure.
+   */
+  stored: number | null;
   /** what the sources say right now; null when the sources are unknown */
   value: number | null;
+  /** null when either side is unknown — a drift needs two known figures */
   drift: number | null;
   rows: SourceRowOut[];
   reasons: string[];
@@ -802,13 +827,25 @@ export async function explainLine(db: Db, budget: BudgetRow, line: LineRow): Pro
         }));
       });
   const sum = (rows: SourceRowOut[]): number => round2(rows.filter((r) => !r.excluded).reduce((s, r) => s + r.amount, 0));
-  const from = (component: BudgetPostingComponent, stored: number, src: SourceComponent, basis: string): ComponentExplanation => {
+  const from = (component: BudgetPostingComponent, stored: number | null, src: SourceComponent, basis: string): ComponentExplanation => {
     const rows = src.rowsByLine.get(line.id) ?? [];
     const value = src.component.value === null ? null : (src.byLine.get(line.id) ?? 0);
-    return { component, stored: round2(stored), value, drift: value === null ? null : round2(value - stored), rows, reasons: src.component.value === null ? src.component.reasons : [], basis };
+    return {
+      component,
+      stored: stored === null ? null : round2(stored),
+      value,
+      drift: value === null || stored === null ? null : round2(value - stored),
+      rows,
+      reasons: src.component.value === null ? src.component.reasons : [],
+      basis,
+    };
   };
-  const invoicedC = from("invoicedToDate", 0, invoiced, "Latest approved subcontractor invoice per commitment SOV line (cumulative to date) plus approved non-SOV invoice lines.");
-  const paidC = from("paidToDate", 0, paid, "Commitment payment allocations the payments module posted to this line.");
+  // Invoiced and paid to date have no column on the budget line: they are
+  // read from their sources and folded into jobToDateCosts. Reporting a
+  // stored 0 for them would show a drift equal to the entire figure on
+  // every line that has ever been invoiced.
+  const invoicedC = from("invoicedToDate", null, invoiced, "Latest approved subcontractor invoice per commitment SOV line (cumulative to date) plus approved non-SOV invoice lines. The budget line stores no invoiced-to-date column; this figure feeds job-to-date cost below.");
+  const paidC = from("paidToDate", null, paid, "Commitment payment allocations the payments module posted to this line. The budget line stores no paid-to-date column; this figure feeds job-to-date cost below.");
   const jtd = computeJobToDate({ invoicedToDate: invoiced.component.value === null ? null : (invoiced.byLine.get(line.id) ?? 0), paidToDate: paid.byLine.get(line.id) ?? 0, directCosts: line.directCosts });
   const modificationRows = legRows("approved").filter((r) => r.detail["kind"] !== "owner_change");
   const ownerRows = legRows("approved").filter((r) => r.detail["kind"] === "owner_change");

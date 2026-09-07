@@ -1,0 +1,262 @@
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { and, eq } from "drizzle-orm";
+import type { FastifyInstance } from "fastify";
+import { authSecurityEvents, authSessions, users } from "@constructos/db";
+import bcrypt from "bcryptjs";
+import type { BuiltApp } from "../../app.js";
+import { buildTestApp } from "../../test/helpers.js";
+
+/**
+ * WHAT A RED SUITE HERE MUST MEAN.
+ *
+ * `buildTestApp()` boots PGlite (WASM Postgres) and replays every migration
+ * from 0000, and nearly every test registers an account — a bcrypt hash plus a
+ * company, a membership and a project. On an idle machine that is seconds. On
+ * the shared machine this wave runs on, a single run measured 878 seconds of
+ * module IMPORT alone, and vitest's 30-second defaults then fail suites for a
+ * reason that has nothing to do with the code under test. "Hook timed out" and
+ * "Test timed out" are the two failures that teach people to ignore red.
+ *
+ * Raising the ceilings changes no assertion: a test that is going to pass
+ * still passes, and one that is going to fail still fails on its assertion.
+ */
+const HOOK_TIMEOUT_MS = 300_000;
+vi.setConfig({ testTimeout: 120_000, hookTimeout: HOOK_TIMEOUT_MS });
+
+
+/**
+ * REGRESSION — POST /auth/mfa/login is the route the SPA calls, and it used to
+ * go around every defence /auth/login has.
+ *
+ * The audit finding, in full: the handler ran `bcrypt.compare` and recorded a
+ * `login_failure` row, and never called `guardLoginAttempt` or
+ * `noteLoginFailure`. So an attacker could guess passwords against one address
+ * indefinitely — no account lockout, no per-IP lockout, no doubling delay, no
+ * `account_locked` event — while `/auth/login`, which no browser used, had all
+ * of them. It also skipped `completeLogin`, so a sign-in through the SPA got
+ * no transparent bcrypt rehash, no new-device message and no `newDevice`
+ * metadata in the trail.
+ *
+ * Every test below fails against the old handler.
+ */
+
+const PASSWORD = "scaffold-tower-brick";
+let counter = 0;
+
+async function signUp(app: FastifyInstance): Promise<{ email: string; userId: string }> {
+  counter += 1;
+  const email = `mfalock${counter}-${Date.now()}@test.dev`;
+  const res = await app.inject({
+    method: "POST",
+    url: "/api/v1/auth/register",
+    payload: {
+      email,
+      password: PASSWORD,
+      name: `MFA Lock ${counter}`,
+      companyName: `MFA Lock Co ${counter}`,
+    },
+  });
+  expect(res.statusCode).toBe(201);
+  return { email, userId: (res.json() as { user: { id: string } }).user.id };
+}
+
+/**
+ * One sign-in attempt, FROM A NAMED ADDRESS.
+ *
+ * The address matters: the per-IP scope of the lockout engine is deliberately
+ * NOT reset by a success (a sprayer usually holds a valid account of their
+ * own), so several tests hammering the same default 127.0.0.1 arm the IP lock
+ * and the next test is refused before its own assertion is reached — a red
+ * suite that says nothing about the code. Each test that drives failures to
+ * the threshold therefore uses its own address, which is also closer to what
+ * the rule is for.
+ */
+const attempt = (
+  app: FastifyInstance,
+  email: string,
+  password: string,
+  remoteAddress = "127.0.0.1",
+) =>
+  app.inject({
+    method: "POST",
+    url: "/api/v1/auth/mfa/login",
+    payload: { email, password },
+    remoteAddress,
+  });
+
+describe("POST /auth/mfa/login obeys the lockout engine", () => {
+  let built: BuiltApp;
+  let app: FastifyInstance;
+
+  beforeAll(async () => {
+    built = await buildTestApp();
+    app = built.app;
+  }, HOOK_TIMEOUT_MS);
+  afterAll(async () => {
+    await built.close();
+  });
+
+  it("locks the account at the fifth failure and then refuses the CORRECT password", async () => {
+    const { email } = await signUp(app);
+    const from = "198.51.100.11";
+    for (let i = 0; i < 5; i += 1) {
+      expect((await attempt(app, email, `wrong-${i}`, from)).statusCode, `attempt ${i + 1}`).toBe(
+        401,
+      );
+    }
+    const locked = await attempt(app, email, PASSWORD, from);
+    expect(locked.statusCode).toBe(429);
+    const body = locked.json() as {
+      message: string;
+      details: { retryAfterSeconds: number; scope: string };
+    };
+    expect(body.message).toContain("Too many failed sign-in attempts");
+    expect(body.details.scope).toBe("account");
+    // The refusal names no account — a locked address and a locked unknown
+    // address answer identically.
+    expect(body.message).not.toContain(email);
+  });
+
+  it("writes account_locked, and keeps a policy refusal apart from a guess", async () => {
+    const { email } = await signUp(app);
+    const from = "198.51.100.12";
+    for (let i = 0; i < 5; i += 1) await attempt(app, email, `wrong-${i}`, from);
+    await attempt(app, email, PASSWORD, from);
+
+    const locked = await app.db
+      .select()
+      .from(authSecurityEvents)
+      .where(
+        and(eq(authSecurityEvents.email, email), eq(authSecurityEvents.kind, "account_locked")),
+      );
+    expect(locked).toHaveLength(1);
+    expect(locked[0]!.outcome).toBe("blocked");
+    expect(locked[0]!.metadata).toMatchObject({ attempts: 5 });
+
+    const blocked = await app.db
+      .select()
+      .from(authSecurityEvents)
+      .where(
+        and(
+          eq(authSecurityEvents.email, email),
+          eq(authSecurityEvents.kind, "login_blocked_locked"),
+        ),
+      );
+    expect(blocked.length).toBeGreaterThan(0);
+    expect(blocked[0]!.outcome).toBe("blocked");
+  });
+
+  it("an unknown address is locked out exactly like a known one", async () => {
+    const unknown = `nobody-${Date.now()}@test.dev`;
+    const from = "198.51.100.13";
+    for (let i = 0; i < 5; i += 1) {
+      expect((await attempt(app, unknown, `wrong-${i}`, from)).statusCode).toBe(401);
+    }
+    const locked = await attempt(app, unknown, "anything-at-all", from);
+    expect(locked.statusCode).toBe(429);
+  });
+
+  it("honours the tenant's own lockout threshold", async () => {
+    const { email } = await signUp(app);
+    const from = "198.51.100.14";
+    // Sign in to read the company id, then tighten the policy to three.
+    const login = await attempt(app, email, PASSWORD, from);
+    expect(login.statusCode).toBe(200);
+    const me = await app.inject({
+      method: "GET",
+      url: "/api/v1/me",
+      headers: { authorization: `Bearer ${(login.json() as { accessToken: string }).accessToken}` },
+    });
+    const companyId = (me.json() as { companies: Array<{ id: string }> }).companies[0]!.id;
+    const put = await app.inject({
+      method: "PUT",
+      url: "/api/v1/company/security-policy",
+      headers: {
+        authorization: `Bearer ${(login.json() as { accessToken: string }).accessToken}`,
+        "x-company-id": companyId,
+      },
+      payload: { lockoutMaxAttempts: 3 },
+    });
+    expect(put.statusCode).toBe(200);
+
+    for (let i = 0; i < 3; i += 1) {
+      expect((await attempt(app, email, `bad-${i}`, from)).statusCode).toBe(401);
+    }
+    // Three, not five: the tenant said so.
+    expect((await attempt(app, email, PASSWORD, from)).statusCode).toBe(429);
+  });
+});
+
+describe("POST /auth/mfa/login runs completeLogin", () => {
+  let built: BuiltApp;
+  let app: FastifyInstance;
+
+  beforeAll(async () => {
+    built = await buildTestApp();
+    app = built.app;
+  }, HOOK_TIMEOUT_MS);
+  afterAll(async () => {
+    await built.close();
+  });
+
+  it("upgrades a stale bcrypt hash on a correct sign-in", async () => {
+    const { email, userId } = await signUp(app);
+    // Rewrite the stored hash at an obsolete work factor, as an account
+    // created years ago would carry.
+    await app.db
+      .update(users)
+      .set({ passwordHash: await bcrypt.hash(PASSWORD, 6) })
+      .where(eq(users.id, userId));
+
+    const res = await attempt(app, email, PASSWORD);
+    expect(res.statusCode).toBe(200);
+    const [row] = await app.db.select().from(users).where(eq(users.id, userId));
+    expect(bcrypt.getRounds(row!.passwordHash)).toBeGreaterThan(6);
+  });
+
+  it("records the sign-in with newDevice metadata and opens a session row", async () => {
+    const { email, userId } = await signUp(app);
+    const res = await attempt(app, email, PASSWORD);
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { sessionId: string; session: { id: string } };
+    expect(body.session.id).toBe(body.sessionId);
+
+    const [session] = await app.db
+      .select()
+      .from(authSessions)
+      .where(eq(authSessions.id, body.sessionId));
+    expect(session?.userId).toBe(userId);
+    expect(session?.authMethod).toBe("password");
+
+    const successes = await app.db
+      .select()
+      .from(authSecurityEvents)
+      .where(
+        and(
+          eq(authSecurityEvents.userId, userId),
+          eq(authSecurityEvents.kind, "login_success"),
+          eq(authSecurityEvents.outcome, "success"),
+        ),
+      );
+    expect(successes.length).toBeGreaterThan(0);
+    expect(successes.some((e) => "newDevice" in (e.metadata as Record<string, unknown>))).toBe(true);
+  });
+
+  it("refuses a deactivated account and records it as blocked, not as a guess", async () => {
+    const { email, userId } = await signUp(app);
+    await app.db.update(users).set({ isActive: false }).where(eq(users.id, userId));
+    const res = await attempt(app, email, PASSWORD);
+    expect(res.statusCode).toBe(401);
+    const rows = await app.db
+      .select()
+      .from(authSecurityEvents)
+      .where(
+        and(
+          eq(authSecurityEvents.userId, userId),
+          eq(authSecurityEvents.kind, "login_blocked_inactive"),
+        ),
+      );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.outcome).toBe("blocked");
+  });
+});

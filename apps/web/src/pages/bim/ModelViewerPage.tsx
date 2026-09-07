@@ -65,6 +65,22 @@ async function fetchModelBuffer(fileId: string): Promise<ArrayBuffer> {
   return fetchAuthedBuffer(`/api/v1/bim/files/${fileId}/model`);
 }
 
+/**
+ * The viewer downloads the whole container and parses it with wasm on the
+ * main thread, so a very large model does not degrade — it freezes the tab
+ * after a long download. The server already refuses to parse anything over
+ * 8 MiB in-request and queues it instead; the browser gets a more generous
+ * budget than that but still a real one, and above it the page says so and
+ * offers the element browser rather than pretending.
+ */
+const VIEWER_MAX_BYTES = 64 * 1024 * 1024;
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  if (bytes >= 1024 * 1024) return `${Math.round(bytes / 1024 ** 2)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
 export default function ModelViewerPage() {
   const { projectId, modelId } = useParams<{ projectId: string; modelId: string }>();
 
@@ -78,6 +94,9 @@ export default function ModelViewerPage() {
   const [viewerError, setViewerError] = useState<string | null>(null);
   const [viewerTypes, setViewerTypes] = useState<TypeBucket[]>([]);
   const [loadNote, setLoadNote] = useState<string | null>(null);
+  /** version ids the user explicitly chose to load past the size guard */
+  const [forceLoadIds, setForceLoadIds] = useState<Set<string>>(new Set());
+  const [oversizeVersionId, setOversizeVersionId] = useState<string | null>(null);
 
   const [panelOpen, setPanelOpen] = useState(true);
   const [tab, setTab] = useState<PanelTab>("properties");
@@ -149,10 +168,24 @@ export default function ModelViewerPage() {
     setViewerTypes([]);
     setLoadNote(null);
 
+    setOversizeVersionId(null);
+
     if (model.format !== "ifc") {
       setViewerState("unsupported");
       setViewerError(
         `3D parsing is available for IFC models only (this model is ${model.format.toUpperCase()}). The element browser below remains available.`,
+      );
+      return;
+    }
+
+    const sizeBytes = v.sizeBytes ?? null;
+    if (sizeBytes !== null && sizeBytes > VIEWER_MAX_BYTES && !forceLoadIds.has(v.id)) {
+      setOversizeVersionId(v.id);
+      setViewerState("unsupported");
+      setViewerError(
+        `This container is ${formatBytes(sizeBytes)}, above the ${formatBytes(
+          VIEWER_MAX_BYTES,
+        )} in-browser limit. Downloading and parsing it here would lock up this tab, so the 3D view is off by default — the element browser below has every element, property set and clash reference from the server's extraction.`,
       );
       return;
     }
@@ -204,7 +237,7 @@ export default function ModelViewerPage() {
         /* teardown is best-effort */
       }
     };
-  }, [model, selectedVersionId]);
+  }, [model, selectedVersionId, forceLoadIds]);
 
   /* --------------------------- twin element map --------------------------- */
 
@@ -597,6 +630,18 @@ export default function ModelViewerPage() {
                   {viewerError ??
                     "The in-browser IFC engine could not start. Element data remains available in the panel."}
                 </p>
+                {oversizeVersionId && (
+                  <Button
+                    variant="secondary"
+                    className="mt-3"
+                    onClick={() => {
+                      const id = oversizeVersionId;
+                      setForceLoadIds((prev) => new Set(prev).add(id));
+                    }}
+                  >
+                    Load anyway
+                  </Button>
+                )}
               </div>
             </div>
           )}

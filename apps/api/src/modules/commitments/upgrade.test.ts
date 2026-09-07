@@ -695,6 +695,15 @@ describe("contract documents", () => {
     expect(commitment.json().commitment.status).toBe("out_for_signature");
   });
 
+  it("refuses an unparseable signedAt with a 400, not a 500", async () => {
+    const res = await inject("POST", `/api/v1/contract-documents/${docId}/sign`, owner.headers, {
+      order: 1,
+      method: "wet_ink",
+      signedAt: "today",
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
   it("refuses signature out of order", async () => {
     const res = await inject("POST", `/api/v1/contract-documents/${docId}/sign`, owner.headers, {
       order: 2,
@@ -731,6 +740,56 @@ describe("contract documents", () => {
     const commitment = await inject("GET", `/api/v1/commitments/${commitmentId}`, owner.headers);
     expect(commitment.json().commitment.executed).toBe(1);
     expect(commitment.json().commitment.signedContractReceivedDate).toBeTruthy();
+  });
+
+  it("refuses an OUT-OF-ORDER signature through the webhook too", async () => {
+    /*
+     * The manual route already refused it; the webhook used to resolve the
+     * signer by order and record the signature with no ordering check, so a
+     * provider posting #2 first executed the commitment out of sequence. The
+     * refusal is a 200 so the provider stops retrying.
+     */
+    const three = await inject(
+      "POST",
+      `/api/v1/commitments/${commitmentId}/documents/generate`,
+      owner.headers,
+      { templateKey: "subcontract_standard" },
+    );
+    const id = three.json().id as string;
+    const routed = await inject("POST", `/api/v1/contract-documents/${id}/route`, owner.headers, {
+      signers: [
+        { name: "Us Ltd", email: "contracts@us.test", role: "Contractor" },
+        { name: "Northgate Steel", email: "signing@northgate.test", role: "Subcontractor" },
+      ],
+    });
+    const path = routed.json().webhookPath as string;
+    const early = await built.app.inject({
+      method: "POST",
+      url: path,
+      payload: { event: "signed", signerOrder: 2, method: "e_signature" },
+    });
+    expect(early.statusCode).toBe(200);
+    expect(early.json().accepted).toBe(false);
+    expect(early.json().reason).toBe("out of order");
+    const doc = await inject("GET", `/api/v1/contract-documents/${id}`, owner.headers);
+    expect(doc.json().status).toBe("out_for_signature");
+    expect((doc.json().signers as Array<{ signedAt: string | null }>).every((x) => !x.signedAt)).toBe(
+      true,
+    );
+    /* in order, it lands */
+    const first = await built.app.inject({
+      method: "POST",
+      url: path,
+      payload: { event: "signed", signerOrder: 1, method: "e_signature" },
+    });
+    expect(first.json().accepted).toBe(true);
+    const second = await built.app.inject({
+      method: "POST",
+      url: path,
+      payload: { event: "signed", signerOrder: 2, method: "e_signature" },
+    });
+    expect(second.json().accepted).toBe(true);
+    expect(second.json().complete).toBe(true);
   });
 
   it("refuses an unknown webhook token", async () => {
@@ -898,6 +957,67 @@ describe("payment runs", () => {
       outsider.headers,
     );
     expect([403, 404]).toContain(res.statusCode);
+  });
+
+  /*
+   * REGRESSION (verifier): the run issue route stamps `acknowledgedWarnings`
+   * on every member it issues. The run detail therefore has to CARRY the
+   * warnings, named to their payment, or the client has nothing to show
+   * before ticking the box — and a blanket acknowledgement of warnings nobody
+   * saw is an audited claim about something that never happened.
+   */
+  it("carries every member's compliance position on the run detail, named to the payment", async () => {
+    const warned = await inject("POST", `/api/v1/projects/${proj}/commitments`, owner.headers, {
+      kind: "subcontract",
+      title: "Uninsured trade",
+      vendorId: vendor,
+      compliance: {
+        strictness: "warn",
+        requiredPolicyTypes: ["professional_indemnity"],
+      },
+      sovLines: [{ description: "Design work", scheduledValue: 20000 }],
+    });
+    const warnedId = warned.json().commitment.id as string;
+    await inject("POST", `/api/v1/commitments/${warnedId}/approve`, secondH, {});
+    const pay = await inject("POST", `/api/v1/commitments/${warnedId}/payments`, owner.headers, {
+      amount: 5000,
+      method: "ach",
+    });
+    const payId = pay.json().payment.id as string;
+    await inject("POST", `/api/v1/commitment-payments/${payId}/approve`, secondH, {});
+    const created = await inject("POST", `/api/v1/projects/${proj}/payment-runs`, owner.headers, {
+      name: "Run with a warning on it",
+      scheduledDate: isoDaysFromNow(3),
+      currency: "USD",
+      paymentIds: [payId],
+    });
+    const warnRunId = created.json().id as string;
+
+    const detail = await inject(
+      "GET",
+      `/api/v1/projects/${proj}/payment-runs/${warnRunId}`,
+      owner.headers,
+    );
+    expect(detail.statusCode).toBe(200);
+    const warnings = detail.json().complianceWarnings as Array<{
+      paymentReference: string;
+      finding: { code: string; message: string };
+    }>;
+    expect(warnings.length).toBeGreaterThanOrEqual(1);
+    expect(warnings[0]!.paymentReference).toBeTruthy();
+    expect(warnings[0]!.finding.message).toBeTruthy();
+    expect(detail.json().payments[0].compliance.status).toBe("warning");
+
+    /* and the run still refuses to go out until they are acknowledged */
+    await inject("POST", `/api/v1/projects/${proj}/payment-runs/${warnRunId}/approve`, secondH, {});
+    const refused = await inject(
+      "POST",
+      `/api/v1/projects/${proj}/payment-runs/${warnRunId}/issue`,
+      thirdH,
+      {},
+    );
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().details.failure.message).toContain("acknowledged");
   });
 });
 
@@ -1295,5 +1415,134 @@ describe("regression: replacing a schedule of values is all or nothing", () => {
     expect(sov.json().lines).toHaveLength(1);
     expect(sov.json().lines[0].description).toBe("Original");
     expect(sov.json().identity.reconciles).toBe(true);
+  });
+});
+
+/* ================================================================== */
+/* Verifier regressions — the backcharge that was reserved twice       */
+/* ================================================================== */
+
+describe("a DISPUTED backcharge is settled when its negative change order is approved", () => {
+  let commitmentId: string;
+  let backchargeId: string;
+  let changeId: string;
+
+  beforeAll(async () => {
+    const c = await makeCommitment({
+      title: "Cladding — disputed backcharge",
+      lines: [{ description: "Cladding", budgetLineItemId: budgetLine, scheduledValue: 100000 }],
+    });
+    commitmentId = c.id;
+    const raised = await inject(
+      "POST",
+      `/api/v1/commitments/${commitmentId}/backcharges`,
+      owner.headers,
+      {
+        reasonCode: "damage_to_others_work",
+        title: "Damaged the finished floor",
+        amount: 5000,
+        evidence: [{ type: "punch_item", id: "pnc-99", label: "Gouged slab, bay 2" }],
+      },
+    );
+    expect(raised.statusCode).toBe(201);
+    backchargeId = raised.json().id;
+    const issued = await inject(
+      "POST",
+      `/api/v1/backcharges/${backchargeId}/issue`,
+      owner.headers,
+      {},
+    );
+    expect(issued.statusCode).toBe(200);
+    changeId = issued.json().commitmentChangeId as string;
+    const disputed = await inject(
+      "POST",
+      `/api/v1/backcharges/${backchargeId}/dispute`,
+      owner.headers,
+      { reason: "Sub says the damage predates them" },
+    );
+    expect(disputed.statusCode).toBe(200);
+    expect(disputed.json().status).toBe("disputed");
+  });
+
+  it("reserves the disputed amount against payment while the change order is pending", async () => {
+    const res = await inject(
+      "POST",
+      `/api/v1/commitments/${commitmentId}/payments`,
+      owner.headers,
+      { amount: 99_000 },
+    );
+    expect(res.statusCode).toBe(400);
+    expect(res.json().details.reservedForBackcharges).toBe(5000);
+  });
+
+  it("settles the DISPUTED backcharge when the change order is approved", async () => {
+    const approved = await inject(
+      "POST",
+      `/api/v1/commitment-changes/${changeId}/approve`,
+      secondH,
+      {},
+    );
+    expect(approved.statusCode).toBe(200);
+    const row = (
+      await built.app.db.select().from(backcharges).where(eq(backcharges.id, backchargeId)).limit(1)
+    )[0]!;
+    /* the old guard was `status = 'issued'`, so a disputed one stayed disputed for ever */
+    expect(row.status).toBe("settled");
+    expect(row.settledAt).not.toBeNull();
+  });
+
+  it("stops reserving it once the sum itself has come down — no double count", async () => {
+    const detail = await inject("GET", `/api/v1/commitments/${commitmentId}`, owner.headers);
+    expect(detail.json().commitment.revisedCommitmentSum).toBe(95_000);
+    /* 95,000 is now payable in full: the recovery is inside the sum, not on top of it */
+    const res = await inject(
+      "POST",
+      `/api/v1/commitments/${commitmentId}/payments`,
+      owner.headers,
+      { amount: 95_000 },
+    );
+    expect(res.statusCode).toBe(201);
+    expect((res.json().warnings as string[]).join(" ")).not.toContain("backcharges are open");
+  });
+
+  it("refuses to re-settle an applied backcharge at a different figure", async () => {
+    /*
+     * An ISSUED backcharge follows the same road: approving the negative change
+     * order settles it, and the settle route will not then rewrite the figure
+     * the commitment sum has already moved by.
+     */
+    const other = await inject(
+      "POST",
+      `/api/v1/commitments/${commitmentId}/backcharges`,
+      owner.headers,
+      {
+        reasonCode: "cleanup",
+        title: "Second recovery",
+        amount: 1000,
+        evidence: [{ type: "punch_item", id: "pnc-100" }],
+      },
+    );
+    const id = other.json().id as string;
+    const issued = await inject("POST", `/api/v1/backcharges/${id}/issue`, owner.headers, {});
+    const cid = issued.json().commitmentChangeId as string;
+    const approved = await inject(
+      "POST",
+      `/api/v1/commitment-changes/${cid}/approve`,
+      secondH,
+      {},
+    );
+    expect(approved.statusCode).toBe(200);
+    const row = (
+      await built.app.db.select().from(backcharges).where(eq(backcharges.id, id)).limit(1)
+    )[0]!;
+    expect(row.status).toBe("settled");
+    const res = await inject("POST", `/api/v1/backcharges/${id}/settle`, owner.headers, {
+      agreedAmount: 400,
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("settled backcharge cannot be settled");
+    /* and the applied figure stands: 100,000 less 5,000 less 1,000 */
+    const detail = await inject("GET", `/api/v1/commitments/${commitmentId}`, owner.headers);
+    expect(detail.json().commitment.revisedCommitmentSum).toBe(94_000);
   });
 });

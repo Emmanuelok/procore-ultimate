@@ -32,6 +32,7 @@ import {
 } from "../../ui";
 import { IconMeeting, IconPlus } from "../../ui/icons";
 import { api } from "../../lib/api";
+import SeriesEditor from "./SeriesEditor";
 import {
   LoadError,
   MEETING_TYPES,
@@ -66,6 +67,7 @@ export default function SeriesTab({
   const { busy, refusal, clear, run } = useAction();
   const { confirm, dialog } = useConfirm();
   const [createOpen, setCreateOpen] = useState(false);
+  const [editing, setEditing] = useState<string | null>(null);
   const [generated, setGenerated] = useState<GenerateResult | null>(null);
 
   const rows = series.data?.items ?? [];
@@ -299,6 +301,11 @@ export default function SeriesTab({
           onRowClick={({ row }) => onOpenSeries(row.id)}
           rowActions={(row) => [
             {
+              id: "edit",
+              label: "Standing agenda, invitees and distribution",
+              onSelect: () => setEditing(row.id),
+            },
+            {
               id: "occurrences",
               label: "Show its occurrences",
               onSelect: () => onOpenOccurrences(row.id),
@@ -343,11 +350,29 @@ export default function SeriesTab({
         open={createOpen}
         projectId={projectId}
         onClose={() => setCreateOpen(false)}
-        onCreated={() => {
+        onCreated={(seriesId) => {
           setCreateOpen(false);
           onChanged();
+          /*
+           * Straight into the editor. The standing agenda, the invitee roll and
+           * the distribution list are what make a series more than a repeating
+           * calendar entry, and a create form that cannot set them produced
+           * occurrences with an empty agenda, nobody on the roll and a
+           * distribution list of nobody — while the page said the opposite.
+           */
+          setEditing(seriesId);
         }}
       />
+
+      {editing ? (
+        <SeriesEditor
+          projectId={projectId}
+          seriesId={editing}
+          open
+          onClose={() => setEditing(null)}
+          onSaved={onChanged}
+        />
+      ) : null}
     </div>
   );
 }
@@ -389,7 +414,7 @@ function CreateSeriesModal({
   open: boolean;
   projectId: string;
   onClose: () => void;
-  onCreated: () => void;
+  onCreated: (seriesId: string) => void;
 }) {
   const { busy, refusal, clear, run } = useAction();
   const [form, setForm] = useState<SeriesForm>(EMPTY_SERIES);
@@ -399,7 +424,7 @@ function CreateSeriesModal({
     const duration = form.durationMinutes.trim() === "" ? null : Number(form.durationMinutes);
     const day = form.dayOfWeek === "" ? null : Number(form.dayOfWeek);
     const done = await run("create", () =>
-      api.post(`/api/v1/projects/${projectId}/meeting-series`, {
+      api.post<{ id: string }>(`/api/v1/projects/${projectId}/meeting-series`, {
         title: form.title.trim(),
         description: form.description.trim() || null,
         meetingType: form.meetingType,
@@ -415,7 +440,7 @@ function CreateSeriesModal({
     );
     if (done !== null) {
       setForm(EMPTY_SERIES);
-      onCreated();
+      onCreated(done.id);
     }
   }
 
@@ -446,6 +471,12 @@ function CreateSeriesModal({
             <p className="whitespace-pre-wrap">{refusal.message}</p>
           </Alert>
         ) : null}
+        <Alert tone="info" variant="subtle" size="sm" title="The standing arrangements come next">
+          Creating the series opens its standing agenda, invitee roll and minutes distribution
+          straight away. Those three are what an occurrence inherits; a series without them
+          generates meetings with an empty agenda, nobody on the roll, and an issue that notifies
+          nobody.
+        </Alert>
         <Alert tone="info" variant="subtle" size="sm" title="An unsupported rule is refused, not approximated">
           A recurrence this platform cannot compute exactly is rejected outright. Silently
           downgrading "every Monday, Wednesday and Friday" to "every Monday" would put two-thirds of

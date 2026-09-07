@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, desc, eq, gte, inArray, lte } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, lte, or } from "drizzle-orm";
 import { z } from "zod";
 import { commitmentPayments, invoices, supplyChainPaymentReports } from "@constructos/db";
 import { SUPPLY_CHAIN_REPORT_REGIMES } from "@constructos/shared";
@@ -83,6 +83,15 @@ export function computeMetrics(currency: string, sample: readonly PaidInvoiceSam
 
 /** Company-wide sample: subcontractor invoices whose FIRST issued payment falls in the window. */
 export async function buildSample(db: Db, companyId: string, periodStart: string, periodEnd: string) {
+  /*
+   * BOUNDED BY THE WINDOW (plan §6.4). Deciding whether an invoice's FIRST
+   * payment falls inside the period only needs the payments made ON OR BEFORE
+   * the period end: a later one cannot make an earlier one earlier. Everything
+   * after the window is left in the database rather than pulled into memory,
+   * so a preview on a company with years of history is a windowed index scan
+   * and not a full read of the payment register.
+   */
+  const windowEnd = `${periodEnd}T23:59:59.999Z`;
   const payments = await db
     .select({
       invoiceId: commitmentPayments.invoiceId,
@@ -92,7 +101,16 @@ export async function buildSample(db: Db, companyId: string, periodStart: string
       status: commitmentPayments.status,
     })
     .from(commitmentPayments)
-    .where(and(eq(commitmentPayments.companyId, companyId), inArray(commitmentPayments.status, ["issued", "cleared"])));
+    .where(
+      and(
+        eq(commitmentPayments.companyId, companyId),
+        inArray(commitmentPayments.status, ["issued", "cleared"]),
+        or(
+          lte(commitmentPayments.paymentDate, periodEnd),
+          and(isNull(commitmentPayments.paymentDate), lte(commitmentPayments.issuedAt, windowEnd)),
+        ),
+      ),
+    );
   const firstPaid = new Map<string, { paidAt: string; amount: number }>();
   for (const p of payments) {
     if (!p.invoiceId) continue;
@@ -131,7 +149,7 @@ export async function buildSample(db: Db, companyId: string, periodStart: string
   const outstandingRows = await db
     .select({ id: invoices.id, currency: invoices.currency, status: invoices.status, billingDate: invoices.billingDate, paidDate: invoices.paidDate })
     .from(invoices)
-    .where(and(eq(invoices.companyId, companyId), eq(invoices.kind, "subcontractor_invoice"), inArray(invoices.status, ["approved", "approved_as_noted", "paid"]), lte(invoices.billingDate, periodEnd), gte(invoices.billingDate, "0000-01-01")));
+    .where(and(eq(invoices.companyId, companyId), eq(invoices.kind, "subcontractor_invoice"), inArray(invoices.status, ["approved", "approved_as_noted", "paid"]), isNotNull(invoices.billingDate), lte(invoices.billingDate, periodEnd)));
   const outstandingBy = new Map<string, number>();
   for (const r of outstandingRows) {
     const paidBefore = r.status === "paid" && r.paidDate !== null && r.paidDate <= periodEnd;

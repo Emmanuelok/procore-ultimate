@@ -4,9 +4,10 @@
  * The flow has TWO shapes and the difference is the security of the whole
  * thing, so the page asks the server which one applies rather than guessing:
  *
- *  - The invitation CREATED the account (a new hire). The invitee sets their
- *    own password here; every session opened with the temporary password the
- *    administrator was handed is destroyed, and they are signed in.
+ *  - The invitation CREATED the account (a new hire). The invite route left it
+ *    unusable — inactive, with a hash no password can verify against — and the
+ *    password chosen HERE is the first one it has ever had. The administrator
+ *    was never handed a temporary credential for it.
  *  - The address ALREADY had an account. The invitation may NOT set a password;
  *    the current one has to be presented. Otherwise an administrator holding an
  *    undispatched accept link could take over a stranger's account by inviting
@@ -68,6 +69,7 @@ export default function AcceptInvitationPage() {
   const [loading, setLoading] = useState(Boolean(token));
   const [name, setName] = useState("");
   const [password, setPassword] = useState("");
+  const [currentPassword, setCurrentPassword] = useState("");
   const [accepted, setAccepted] = useState<Accepted | null>(null);
 
   useEffect(() => {
@@ -94,7 +96,16 @@ export default function AcceptInvitationPage() {
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
     const body: Record<string, unknown> = { token };
-    if (password) body["password"] = password;
+    // ONE FIELD, TWO MEANINGS, and the server tells us which. For a new
+    // account `password` is the one being chosen; for an address that already
+    // has an account it is the CURRENT password, presented as proof — an
+    // invitation that could set the password of an existing address would let
+    // whoever holds an undispatched accept link take over that account.
+    if (preview?.requires?.currentPassword === true && currentPassword) {
+      body["password"] = currentPassword;
+    } else if (password) {
+      body["password"] = password;
+    }
     if (name.trim()) body["name"] = name.trim();
     const res = await action.run("accept", () =>
       api.post<Accepted>("/api/v1/auth/invitations/accept", body),
@@ -229,12 +240,36 @@ export default function AcceptInvitationPage() {
         <Alert tone="info" size="sm" className="mb-4" title="This address already has an account">
           Accepting will add it to {invitation.companyName ?? "the company"}. It will not set a new
           password: an invitation that could change the password of an address that already exists
-          would be a way to take over somebody else&rsquo;s account. Sign in first if you are not
-          already.
+          would be a way to take over somebody else&rsquo;s account. Confirm the password you
+          already use below.
         </Alert>
       ) : null}
 
       <form onSubmit={onSubmit} className="space-y-4">
+        {/*
+          The field this branch used to omit. The server answers
+          `requires: { currentPassword: true }` for an address that already has
+          an account and then REFUSES the accept with 401 unless that password
+          is presented — so with no input on the form, every existing user
+          invited into a second company was stuck on an enabled button that
+          could not succeed.
+        */}
+        {needsCurrent ? (
+          <Field
+            label="Your current password"
+            required
+            hint={`The password you already use for ${invitation.email}. It proves the account is yours; it is not changed.`}
+          >
+            <Input
+              type="password"
+              autoComplete="current-password"
+              required
+              value={currentPassword}
+              onChange={(e) => setCurrentPassword(e.target.value)}
+              autoFocus
+            />
+          </Field>
+        ) : null}
         {needsNew ? (
           <>
             <Field label="Your name">
@@ -263,7 +298,9 @@ export default function AcceptInvitationPage() {
           type="submit"
           fullWidth
           loading={action.busy === "accept"}
-          disabled={needsNew && password.length === 0}
+          disabled={
+            (needsNew && password.length === 0) || (needsCurrent && currentPassword.length === 0)
+          }
         >
           Accept the invitation
         </Button>

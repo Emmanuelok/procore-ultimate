@@ -15,6 +15,8 @@ import { correspondenceLetters, correspondenceRecipients, signals } from "@const
 import { CORRESPONDENCE_DETECTORS } from "@constructos/shared";
 import { assessLetter } from "../engines/tracking.js";
 import {
+  SUMMARY_ACTIVITY_CAP,
+  SUMMARY_ROW_CAP,
   correspondenceHealthInputs,
   correspondenceSummary,
   runAllSweeps,
@@ -78,7 +80,7 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
         and(eq(correspondenceLetters.companyId, companyId), eq(correspondenceLetters.projectId, projectId)),
       )
       .orderBy(asc(correspondenceLetters.reference))
-      .limit(20_000);
+      .limit(SUMMARY_ROW_CAP + 1);
     const recipientRows = await app.db
       .select({
         recordId: correspondenceRecipients.recordId,
@@ -93,7 +95,11 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
           eq(correspondenceRecipients.recordType, "letter"),
         ),
       )
-      .limit(50_000);
+      .limit(SUMMARY_ACTIVITY_CAP + 1);
+    // A partial export that looks complete is worse than no export: say so in
+    // the file itself and in a header the caller can read without parsing it.
+    const truncated = rows.length > SUMMARY_ROW_CAP || recipientRows.length > SUMMARY_ACTIVITY_CAP;
+    const letters = rows.slice(0, SUMMARY_ROW_CAP);
     const byLetter = new Map<string, string[]>();
     for (const r of recipientRows) {
       const list = byLetter.get(r.recordId) ?? [];
@@ -120,7 +126,7 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
       "thread",
     ];
     const lines = [header.join(",")];
-    for (const row of rows) {
+    for (const row of letters) {
       const a = assessLetter(toLetterInput(row), today);
       lines.push(
         [
@@ -145,9 +151,18 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
           .join(","),
       );
     }
+    if (truncated) {
+      lines.push("");
+      lines.push(
+        csvCell(
+          `PARTIAL EXPORT: this project holds more than ${SUMMARY_ROW_CAP.toLocaleString("en-GB")} letters. Only the first ${letters.length.toLocaleString("en-GB")} by reference are listed above.`,
+        ),
+      );
+    }
     return reply
       .header("content-type", "text/csv; charset=utf-8")
       .header("content-disposition", 'attachment; filename="correspondence-register.csv"')
+      .header("x-register-complete", truncated ? "false" : "true")
       .send(lines.join("\n"));
   });
 

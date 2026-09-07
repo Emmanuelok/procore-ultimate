@@ -15,7 +15,7 @@
  *              whether the quorum was met when it was taken.
  *   Actions    the point of the whole thing.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Alert,
   Badge,
@@ -34,12 +34,16 @@ import {
   Tabs,
   Textarea,
   Tooltip,
+  UserPicker,
   useConfirm,
   type DescriptionItem,
+  type UserOption,
 } from "../../ui";
 import { cx } from "../../ui/cx";
 import { IconHistory, IconMeeting, IconPlus, IconUsers } from "../../ui/icons";
 import { api } from "../../lib/api";
+import { MinutesDocumentPanel, ObjectionsPanel } from "./MinutesPanels";
+import { MeetingEditor, useCompanyUsers } from "./SeriesEditor";
 import ActionItemCard from "./ActionItemCard";
 import {
   ACTION_PRIORITIES,
@@ -90,6 +94,7 @@ export default function MeetingDrawer({
   const { busy, refusal, clear, run } = useAction();
   const { confirm, dialog } = useConfirm();
   const [carryResult, setCarryResult] = useState<CarryForwardResult | null>(null);
+  const [editOpen, setEditOpen] = useState(false);
 
   const meeting = detail.data;
 
@@ -176,13 +181,32 @@ export default function MeetingDrawer({
       }
       headerActions={
         meeting ? (
-          <Badge tone={MEETING_STATUS_TONE[meeting.status] ?? "neutral"} dot>
-            {titleCase(meeting.status)}
-          </Badge>
+          <div className="flex items-center gap-2">
+            <Badge tone={MEETING_STATUS_TONE[meeting.status] ?? "neutral"} dot>
+              {titleCase(meeting.status)}
+            </Badge>
+            {meeting.status !== "cancelled" ? (
+              <Button size="xs" variant="ghost" onClick={() => setEditOpen(true)}>
+                Edit
+              </Button>
+            ) : null}
+          </div>
         ) : null
       }
     >
       {dialog}
+      {meeting && editOpen ? (
+        <MeetingEditor
+          projectId={projectId}
+          meeting={meeting}
+          open={editOpen}
+          onClose={() => setEditOpen(false)}
+          onSaved={() => {
+            setEditOpen(false);
+            reload();
+          }}
+        />
+      ) : null}
       {detail.loading && !meeting ? (
         <div className="space-y-3 py-4">
           <Skeleton className="h-20 w-full" />
@@ -339,6 +363,11 @@ function AgendaPanel({
   const [addOpen, setAddOpen] = useState(false);
   const [closing, setClosing] = useState<AgendaItem | null>(null);
   const [discussion, setDiscussion] = useState("");
+  /** the item being raised into an RFI, change event or risk (#424) */
+  const [raising, setRaising] = useState<AgendaItem | null>(null);
+  const [raiseTarget, setRaiseTarget] = useState<"rfi" | "change_event" | "risk">("rfi");
+  const [raiseCloses, setRaiseCloses] = useState(true);
+  const [raised, setRaised] = useState<{ reference: string; target: string } | null>(null);
 
   async function close() {
     if (!closing) return;
@@ -350,6 +379,30 @@ function AgendaPanel({
     if (done !== null) {
       setClosing(null);
       setDiscussion("");
+      onMutated();
+    }
+  }
+
+  /**
+   * Raise the item into the record that actually carries it forward (#424).
+   *
+   * The linkage is validated on the server: the created record is written in
+   * this project and linked back through record_links, so the agenda row shows
+   * the RFI's live status and the RFI shows the meeting where it was tabled.
+   * A free-text "raised as RFI-014" is a note that looks like a link and
+   * nothing downstream can verify it.
+   */
+  async function raise() {
+    if (!raising) return;
+    const out = await run(`raise:${raising.id}`, () =>
+      api.post<{ reference: string; target: string }>(
+        `/api/v1/projects/${projectId}/meeting-agenda-items/${raising.id}/raise`,
+        { target: raiseTarget, closeItem: raiseCloses },
+      ),
+    );
+    if (out) {
+      setRaised(out);
+      setRaising(null);
       onMutated();
     }
   }
@@ -457,6 +510,17 @@ function AgendaPanel({
                           size="xs"
                           variant="secondary"
                           onClick={() => {
+                            setRaiseTarget("rfi");
+                            setRaiseCloses(true);
+                            setRaising(item);
+                          }}
+                        >
+                          Raise…
+                        </Button>
+                        <Button
+                          size="xs"
+                          variant="secondary"
+                          onClick={() => {
                             setClosing(item);
                             setDiscussion(item.discussion ?? "");
                           }}
@@ -474,6 +538,16 @@ function AgendaPanel({
                   <p className="mt-2 whitespace-pre-wrap text-meta text-content">
                     {item.discussion}
                   </p>
+                ) : null}
+                {/*
+                  THE LIVE STATUS OF WHAT WAS RAISED FROM THIS ITEM.
+                  The raise dialog promises it; without this it was a promise
+                  the page did not keep. Only fetched for items that actually
+                  point at another record, so an agenda of twenty items does
+                  not make twenty requests.
+                */}
+                {item.originId ? (
+                  <AgendaItemLinks projectId={projectId} itemId={item.id} />
                 ) : null}
                 {item.carryCount > 0 ? (
                   <p className="mt-2 text-2xs text-content-subtle">
@@ -494,6 +568,60 @@ function AgendaPanel({
           })}
         </ul>
       )}
+
+      {raised ? (
+        <Alert
+          tone="success"
+          size="sm"
+          title={`${raised.reference} raised`}
+          onDismiss={() => setRaised(null)}
+        >
+          The new record is linked back to this agenda item, so its live status shows on the row
+          and the record itself shows the meeting where it was tabled.
+        </Alert>
+      ) : null}
+
+      <Modal
+        open={raising !== null}
+        onClose={() => setRaising(null)}
+        title={raising ? `Raise "${raising.title}" into a record` : "Raise"}
+        footer={
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" onClick={() => setRaising(null)}>
+              Cancel
+            </Button>
+            <Button disabled={busy !== null} onClick={() => void raise()}>
+              Raise it
+            </Button>
+          </div>
+        }
+      >
+        <div className="space-y-3">
+          <p className="text-meta text-content-muted">
+            An agenda item that needs an answer, a price or a mitigation belongs in the register
+            that tracks those, not in next week's minutes. The new record is created in this
+            project, pre-filled from the item, and linked both ways.
+          </p>
+          <Field label="Raise it as">
+            <Select
+              value={raiseTarget}
+              onChange={(e) =>
+                setRaiseTarget(e.target.value as "rfi" | "change_event" | "risk")
+              }
+            >
+              <option value="rfi">An RFI — somebody must answer a question</option>
+              <option value="change_event">A change event — this may cost money or time</option>
+              <option value="risk">A risk — this may happen and we should plan for it</option>
+            </Select>
+          </Field>
+          <Checkbox
+            checked={raiseCloses}
+            onChange={(e) => setRaiseCloses(e.target.checked)}
+            label="Close the agenda item"
+            description="Closing it stops it carrying into the next occurrence — the new record is now where it lives. Leave it open to keep discussing it while the record runs."
+          />
+        </div>
+      </Modal>
 
       <Modal
         open={closing !== null}
@@ -912,6 +1040,7 @@ function MinutesPanel({
   );
   const [aiDrafted, setAiDrafted] = useState(meeting.aiDrafted === 1);
   const [objection, setObjection] = useState("");
+  const [correction, setCorrection] = useState("");
 
   const base = `/api/v1/projects/${projectId}/meetings/${meeting.id}/minutes`;
   const issued = meeting.minutesIssuedAt !== null;
@@ -951,6 +1080,25 @@ function MinutesPanel({
     }
   }
 
+  async function correct() {
+    if (!correction.trim()) return;
+    const ok = await confirm({
+      title: `Withdraw the issued minutes for ${meeting.reference}?`,
+      description:
+        "This is a ledgered re-issue, not an edit. The version is bumped, the issue stamps are cleared, live objections move into the history, and everyone who received the withdrawn version is told. The document already delivered keeps its own hash, so a later dispute compares two versions rather than one that quietly changed.",
+      confirmLabel: "Withdraw for correction",
+      tone: "warning",
+    });
+    if (!ok) return;
+    const done = await run("correct", () =>
+      api.post(`${base}/correct`, { reason: correction.trim() }),
+    );
+    if (done !== null) {
+      setCorrection("");
+      onMutated();
+    }
+  }
+
   async function approve() {
     const ok = await confirm({
       title: "Sign the minutes off?",
@@ -981,6 +1129,17 @@ function MinutesPanel({
         <Alert tone="success" variant="subtle" size="sm" title="Signed off">
           Approved {dateTime(meeting.approvedAt)} by somebody who neither wrote nor issued them.
         </Alert>
+      ) : null}
+
+      {!issued && !approved ? (
+        <AiDraftPanel
+          projectId={projectId}
+          meeting={meeting}
+          onAccept={(text) => {
+            setBody(text);
+            setAiDrafted(true);
+          }}
+        />
       ) : null}
 
       <Card>
@@ -1027,7 +1186,14 @@ function MinutesPanel({
           <div className="flex flex-wrap gap-2">
             <Button
               size="sm"
-              disabled={approved || body.trim().length === 0 || busy !== null}
+              /*
+               * Refused once issued. Saving a draft over issued minutes used to
+               * regress the status while minutesIssuedAt stayed set, after
+               * which neither /issue nor /approve would accept the meeting and
+               * it could never reach minutes_accepted — a deadlock this button
+               * actively invited. Correction is now an explicit, ledgered act.
+               */
+              disabled={approved || issued || body.trim().length === 0 || busy !== null}
               loading={busy === "draft"}
               onClick={() => void draft()}
             >
@@ -1058,6 +1224,44 @@ function MinutesPanel({
           </div>
         </CardBody>
       </Card>
+
+      {issued && !approved ? (
+        <Card>
+          <CardBody className="space-y-2">
+            <p className="text-sm font-semibold text-content">Withdraw and correct</p>
+            <p className="text-meta text-content-muted">
+              Issued minutes cannot be redrafted in place. A correction bumps the version, clears
+              the issue stamps, moves the live objections into the history and tells the previous
+              recipients that what they received has been withdrawn — because a correction nobody is
+              told about is a rewrite.
+            </p>
+            <Field label="Why are these minutes being withdrawn?">
+              <Textarea
+                rows={2}
+                value={correction}
+                onChange={(e) => setCorrection(e.target.value)}
+              />
+            </Field>
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={correction.trim().length === 0 || busy !== null}
+              loading={busy === "correct"}
+              onClick={() => void correct()}
+            >
+              Withdraw for correction
+            </Button>
+          </CardBody>
+        </Card>
+      ) : null}
+
+      <ObjectionsPanel
+        projectId={projectId}
+        meeting={meeting}
+        onMutated={onMutated}
+      />
+
+      <MinutesDocumentPanel projectId={projectId} meeting={meeting} onMutated={onMutated} />
 
       {issued && !approved ? (
         <Card>
@@ -1107,6 +1311,17 @@ function DecisionsPanel({
   const { busy, refusal, clear, run } = useAction();
   const { confirm, dialog } = useConfirm();
   const [addOpen, setAddOpen] = useState(false);
+  /*
+   * DISPUTE AND SUPERSEDE were API-only.
+   *
+   * Both routes have always existed and the card already RENDERED their
+   * consequences (the dispute note, the "superseded by" line) — but nothing
+   * in the app could produce either, so the only way out of a decision
+   * somebody disagreed with was to leave it standing. Ratification without a
+   * way to object is not a control, it is a rubber stamp.
+   */
+  const [disputing, setDisputing] = useState<Decision | null>(null);
+  const [superseding, setSuperseding] = useState<Decision | null>(null);
 
   async function ratify(decision: Decision) {
     const ok = await confirm({
@@ -1173,16 +1388,31 @@ function DecisionsPanel({
                     ) : null}
                   </div>
                 </div>
-                {d.status === "recorded" ? (
-                  <Button
-                    size="xs"
-                    variant="secondary"
-                    disabled={busy !== null}
-                    onClick={() => void ratify(d)}
-                  >
-                    Ratify
-                  </Button>
-                ) : null}
+                <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+                  {d.status === "recorded" ? (
+                    <Button
+                      size="xs"
+                      variant="secondary"
+                      disabled={busy !== null}
+                      onClick={() => void ratify(d)}
+                    >
+                      Ratify
+                    </Button>
+                  ) : null}
+                  {/* The server allows a dispute only while the decision is
+                      still the live answer (recorded or ratified); a
+                      superseded or rescinded one is a closed record. */}
+                  {d.status === "recorded" || d.status === "ratified" ? (
+                    <Button size="xs" variant="ghost" onClick={() => setDisputing(d)}>
+                      Dispute…
+                    </Button>
+                  ) : null}
+                  {d.status !== "superseded" ? (
+                    <Button size="xs" variant="ghost" onClick={() => setSuperseding(d)}>
+                      Supersede…
+                    </Button>
+                  ) : null}
+                </div>
               </div>
               <p className="mt-2 whitespace-pre-wrap text-meta text-content">{d.decision}</p>
               {d.rationale ? (
@@ -1218,7 +1448,213 @@ function DecisionsPanel({
           onMutated();
         }}
       />
+      <DisputeDecisionModal
+        projectId={projectId}
+        decision={disputing}
+        onClose={() => setDisputing(null)}
+        onDone={() => {
+          setDisputing(null);
+          onMutated();
+        }}
+      />
+      <SupersedeDecisionModal
+        projectId={projectId}
+        meetingId={meeting.id}
+        decision={superseding}
+        agendaItems={meeting.agendaItems}
+        onClose={() => setSuperseding(null)}
+        onDone={() => {
+          setSuperseding(null);
+          onMutated();
+        }}
+      />
     </div>
+  );
+}
+
+/**
+ * DISPUTING A DECISION — recorded once, against a named objector.
+ *
+ * The API refuses a second dispute rather than letting the note be
+ * overwritten: the first objection is the one that was made at the time, and
+ * a register that keeps only the latest objection cannot show that two people
+ * disagreed. Settling a dispute means superseding the decision, not deleting
+ * the objection.
+ */
+function DisputeDecisionModal({
+  projectId,
+  decision,
+  onClose,
+  onDone,
+}: {
+  projectId: string;
+  decision: Decision | null;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [note, setNote] = useState("");
+
+  async function submit() {
+    if (!decision) return;
+    const done = await run("dispute", () =>
+      api.post(`/api/v1/projects/${projectId}/meeting-decisions/${decision.id}/dispute`, {
+        note: note.trim(),
+      }),
+    );
+    if (done !== null) {
+      setNote("");
+      onDone();
+    }
+  }
+
+  return (
+    <Modal
+      open={decision !== null}
+      onClose={onClose}
+      title={decision ? `Dispute ${decision.reference}` : "Dispute"}
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            disabled={note.trim().length === 0 || busy !== null}
+            loading={busy === "dispute"}
+            onClick={() => void submit()}
+          >
+            Record the dispute
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {refusal ? (
+          <Alert tone="danger" size="sm" title="Refused" onDismiss={clear}>
+            <p className="whitespace-pre-wrap">{refusal.message}</p>
+          </Alert>
+        ) : null}
+        <Alert tone="info" variant="subtle" size="sm" title="A dispute does not undo the decision">
+          The decision stands as recorded and keeps its number; the dispute is recorded beside it
+          with your name and the date. That is what a later reader needs — that the decision was
+          taken AND that it was objected to at the time. To change the answer, supersede it.
+        </Alert>
+        <Field label="What is disputed, and on what basis?" required>
+          <Textarea
+            rows={4}
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            placeholder="The cost basis was not tabled and the figure minuted is not the one discussed…"
+          />
+        </Field>
+      </div>
+    </Modal>
+  );
+}
+
+/**
+ * SUPERSEDING — a new decision, recorded in both directions.
+ *
+ * This is the only honest way to change an answer that has already been
+ * minuted: the old decision keeps its number and its history and is marked
+ * superseded by the new one, so "what was agreed on the day" stays readable
+ * whatever was agreed later.
+ */
+function SupersedeDecisionModal({
+  projectId,
+  meetingId,
+  decision,
+  agendaItems,
+  onClose,
+  onDone,
+}: {
+  projectId: string;
+  meetingId: string;
+  decision: Decision | null;
+  agendaItems: AgendaItem[];
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [title, setTitle] = useState("");
+  const [text, setText] = useState("");
+  const [rationale, setRationale] = useState("");
+  const [agendaItemId, setAgendaItemId] = useState("");
+
+  async function submit() {
+    if (!decision) return;
+    const done = await run("supersede", () =>
+      api.post(`/api/v1/projects/${projectId}/meeting-decisions/${decision.id}/supersede`, {
+        meetingId,
+        title: title.trim(),
+        decision: text.trim(),
+        rationale: rationale.trim() || null,
+        agendaItemId: agendaItemId || null,
+      }),
+    );
+    if (done !== null) {
+      setTitle("");
+      setText("");
+      setRationale("");
+      setAgendaItemId("");
+      onDone();
+    }
+  }
+
+  return (
+    <Modal
+      open={decision !== null}
+      onClose={onClose}
+      size="lg"
+      title={decision ? `Supersede ${decision.reference}` : "Supersede"}
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            disabled={title.trim().length === 0 || text.trim().length === 0 || busy !== null}
+            loading={busy === "supersede"}
+            onClick={() => void submit()}
+          >
+            Record the new decision
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {refusal ? (
+          <Alert tone="danger" size="sm" title="Refused" onDismiss={clear}>
+            <p className="whitespace-pre-wrap">{refusal.message}</p>
+          </Alert>
+        ) : null}
+        <Alert tone="warning" variant="subtle" size="sm" title="Both decisions survive">
+          {decision ? `${decision.reference} keeps its number, its text and its impacts` : "The old decision keeps its record"},
+          and is marked superseded by the new one. Nothing is edited and nothing is deleted, so the
+          decision that was in force on any given day stays answerable — which is the question
+          asked in every dispute about a change of mind.
+        </Alert>
+        <Field label="What is decided now?" required>
+          <Input value={title} onChange={(e) => setTitle(e.target.value)} autoFocus />
+        </Field>
+        <Field label="The decision" required>
+          <Textarea rows={4} value={text} onChange={(e) => setText(e.target.value)} />
+        </Field>
+        <Field label="Why it changed" hint="The reason the earlier decision no longer holds.">
+          <Textarea rows={3} value={rationale} onChange={(e) => setRationale(e.target.value)} />
+        </Field>
+        <Field label="Against which agenda item?">
+          <Select value={agendaItemId} onChange={(e) => setAgendaItemId(e.target.value)}>
+            <option value="">Not tied to an item</option>
+            {agendaItems.map((i) => (
+              <option key={i.id} value={i.id}>
+                {i.title}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      </div>
+    </Modal>
   );
 }
 
@@ -1452,13 +1888,34 @@ function AddActionModal({
   onCreated: () => void;
 }) {
   const { busy, refusal, clear, run } = useAction();
+  const users = useCompanyUsers();
   const [title, setTitle] = useState("");
+  /*
+   * OWNER IS A PERSON, NOT A STRING.
+   *
+   * This form used to post `ownerName` alone, so `ownerId` was never set from
+   * the UI at all: GET /meeting-action-items/mine (which filters on ownerId)
+   * was permanently empty, the assignment notification never fired, and the
+   * overdue-by-owner report grouped typed names. Picking the user is the
+   * default; a typed name remains available for somebody outside the tenant,
+   * and the form says what that costs.
+   */
+  const [ownerId, setOwnerId] = useState<string | null>(null);
   const [ownerName, setOwnerName] = useState("");
   const [dueDate, setDueDate] = useState("");
   const [priority, setPriority] = useState("medium");
   const [agendaItemId, setAgendaItemId] = useState("");
   const [description, setDescription] = useState("");
   const [sourceClause, setSourceClause] = useState("");
+
+  /* An attendee of THIS meeting is the likely owner, so they come first. */
+  const candidates = useMemo<UserOption[]>(() => {
+    const attending = meeting.attendees
+      .filter((a) => a.userId)
+      .map((a) => ({ id: a.userId as string, name: a.name, role: a.jobTitle ?? a.organisation }));
+    const seen = new Set(attending.map((a) => a.id));
+    return [...attending, ...users.filter((u) => !seen.has(u.id))];
+  }, [meeting.attendees, users]);
 
   async function submit() {
     const done = await run("create", () =>
@@ -1468,6 +1925,7 @@ function AddActionModal({
         meetingId: meeting.id,
         agendaItemId: agendaItemId || null,
         priority,
+        ownerId,
         ownerName: ownerName.trim() || null,
         dueDate: dueDate || null,
         sourceClause: sourceClause.trim() || null,
@@ -1475,6 +1933,7 @@ function AddActionModal({
     );
     if (done !== null) {
       setTitle("");
+      setOwnerId(null);
       setOwnerName("");
       setDueDate("");
       setDescription("");
@@ -1519,12 +1978,32 @@ function AddActionModal({
           <Input value={title} onChange={(e) => setTitle(e.target.value)} autoFocus />
         </Field>
         <div className="grid gap-3 sm:grid-cols-3">
-          <Field label="Owner" required>
-            <Input
-              value={ownerName}
-              onChange={(e) => setOwnerName(e.target.value)}
-              placeholder="Name"
-            />
+          <Field
+            label="Owner"
+            required
+            className="sm:col-span-3"
+            hint={
+              ownerId
+                ? "Linked to a platform user: this action appears in their list, they are notified, and the overdue report groups by person rather than by spelling."
+                : "A typed name still appears in the minutes, but it produces no notification, never shows in the owner's own list, and groups by spelling in the overdue report."
+            }
+          >
+            <div className="grid gap-2 sm:grid-cols-2">
+              <UserPicker
+                users={candidates}
+                value={ownerId}
+                placeholder="Pick the person who owns this…"
+                onChange={(id, user) => {
+                  setOwnerId(id);
+                  if (user) setOwnerName(user.name);
+                }}
+              />
+              <Input
+                value={ownerName}
+                onChange={(e) => setOwnerName(e.target.value)}
+                placeholder="…or type a name"
+              />
+            </div>
           </Field>
           <Field label="Due">
             <Input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
@@ -1570,4 +2049,326 @@ function AddActionModal({
       </div>
     </Modal>
   );
+}
+
+/* ------------------------------------------------------------------ */
+/* AI MINUTES DRAFTING (#418-421)                                      */
+/*                                                                     */
+/* A PROPOSAL, never an issue. The model reads a transcript and         */
+/* proposes discussion per agenda item, decisions and actions with an   */
+/* owner drawn from the attendance roll; the minute taker reads it      */
+/* against the transcript and accepts what is right. Every weakness the */
+/* API counted — citations the transcript does not contain, owners not  */
+/* on the roll, agenda ids that do not exist — is printed rather than   */
+/* smoothed over, because a draft that reads as finished is the danger. */
+/* ------------------------------------------------------------------ */
+
+interface DraftCitation {
+  ref: string;
+  excerpt: string;
+  grounded: boolean;
+}
+interface DraftProposal {
+  summary: string | null;
+  items: Array<{
+    agendaItemId: string;
+    known: boolean;
+    title: string | null;
+    discussion: string;
+    movedSinceLast: boolean | null;
+    whatChanged: string | null;
+    carryCount: number;
+    citations: DraftCitation[];
+  }>;
+  decisions: Array<{
+    title: string;
+    decision: string;
+    impactsCost: boolean;
+    impactsSchedule: boolean;
+    citations: DraftCitation[];
+  }>;
+  actions: Array<{
+    title: string;
+    owner: { ownerId: string | null; ownerName: string | null; matched: boolean };
+    dueDate: string | null;
+    priority: string;
+    citations: DraftCitation[];
+  }>;
+  confidence: number | null;
+  ungroundedCitations: number;
+  unknownAgendaItems: number;
+  unmatchedOwners: number;
+  stalledCarriedItems: string[];
+}
+interface DraftResponse {
+  runId: string;
+  proposal: DraftProposal | null;
+  suggestedMinutesBody: string | null;
+  note: string;
+}
+
+function AiDraftPanel({
+  projectId,
+  meeting,
+  onAccept,
+}: {
+  projectId: string;
+  meeting: MeetingDetail;
+  onAccept: (minutesBody: string) => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [open, setOpen] = useState(false);
+  const [transcript, setTranscript] = useState("");
+  const [result, setResult] = useState<DraftResponse | null>(null);
+
+  async function draftIt() {
+    const res = await run("ai-draft", () =>
+      api.post<DraftResponse>(
+        `/api/v1/projects/${projectId}/meetings/${meeting.id}/minutes/draft-ai`,
+        { transcript },
+      ),
+    );
+    if (res !== null) setResult(res);
+  }
+
+  const p = result?.proposal ?? null;
+
+  return (
+    <Card>
+      <CardBody className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <p className="text-sm font-semibold text-content">Draft from a transcript</p>
+            <p className="text-meta text-content-muted">
+              The model proposes; it never issues. Nothing is written until you accept it, and
+              issuing minutes stays a human act because it starts a clock against real people.
+            </p>
+          </div>
+          <Button size="sm" variant="secondary" onClick={() => setOpen((v) => !v)}>
+            {open ? "Hide" : "Open"}
+          </Button>
+        </div>
+
+        {open ? (
+          <>
+            <RefusalPanel refusal={refusal} onDismiss={clear} />
+            <Field
+              label="Transcript or meeting notes"
+              hint="Every proposed sentence must quote this. Quotes that are not in it are flagged below rather than trusted."
+            >
+              <Textarea
+                rows={6}
+                value={transcript}
+                onChange={(e) => setTranscript(e.target.value)}
+              />
+            </Field>
+            <Button
+              size="sm"
+              disabled={transcript.trim().length < 50 || busy !== null}
+              loading={busy === "ai-draft"}
+              onClick={() => void draftIt()}
+            >
+              Propose minutes
+            </Button>
+
+            {result && p === null ? (
+              <Alert tone="warning" variant="subtle" size="sm" title="Nothing usable came back">
+                {result.note}
+              </Alert>
+            ) : null}
+
+            {p ? (
+              <div className="space-y-3">
+                <div className="flex flex-wrap gap-2">
+                  <Badge tone={p.ungroundedCitations > 0 ? "danger" : "success"}>
+                    {p.ungroundedCitations} quote(s) not found in the transcript
+                  </Badge>
+                  <Badge tone={p.unmatchedOwners > 0 ? "warning" : "success"}>
+                    {p.unmatchedOwners} owner(s) not on the roll
+                  </Badge>
+                  <Badge tone={p.unknownAgendaItems > 0 ? "warning" : "neutral"}>
+                    {p.unknownAgendaItems} unknown agenda item(s)
+                  </Badge>
+                  <Badge tone="neutral">
+                    confidence{" "}
+                    {p.confidence === null ? "—" : `${Math.round(p.confidence * 100)}%`}
+                  </Badge>
+                </div>
+
+                {p.stalledCarriedItems.length > 0 ? (
+                  <Alert
+                    tone="warning"
+                    variant="subtle"
+                    size="sm"
+                    title="Carried items the draft says did not move"
+                  >
+                    {p.stalledCarriedItems.join("; ")}. An item carried repeatedly without movement
+                    is an undecided question, not an agenda item.
+                  </Alert>
+                ) : null}
+
+                <div className="space-y-2">
+                  {p.items.map((item, i) => (
+                    <div key={i} className="rounded-md border border-line p-2">
+                      <p className="text-sm font-medium text-content">
+                        {item.title ?? item.agendaItemId}
+                        {item.known ? null : (
+                          <Badge tone="warning" size="xs" className="ml-2">
+                            unknown item
+                          </Badge>
+                        )}
+                      </p>
+                      <p className="whitespace-pre-wrap text-meta text-content-muted">
+                        {item.discussion}
+                      </p>
+                      {item.citations.map((c, j) => (
+                        <p
+                          key={j}
+                          className={cx(
+                            "mt-1 text-[11px] italic",
+                            c.grounded ? "text-content-muted" : "text-red-600",
+                          )}
+                        >
+                          {c.grounded ? "“" : "NOT IN THE TRANSCRIPT: “"}
+                          {c.excerpt}”
+                        </p>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+
+                {p.decisions.length > 0 ? (
+                  <div>
+                    <p className="text-sm font-semibold text-content">Proposed decisions</p>
+                    <ul className="list-disc pl-4 text-meta text-content-muted">
+                      {p.decisions.map((d, i) => (
+                        <li key={i}>
+                          <span className="font-medium">{d.title}</span>: {d.decision}
+                          {d.impactsCost ? " (cost impact)" : ""}
+                          {d.impactsSchedule ? " (schedule impact)" : ""}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
+                {p.actions.length > 0 ? (
+                  <div>
+                    <p className="text-sm font-semibold text-content">Proposed actions</p>
+                    <ul className="list-disc pl-4 text-meta text-content-muted">
+                      {p.actions.map((a, i) => (
+                        <li key={i}>
+                          {a.title} —{" "}
+                          {a.owner.matched ? (
+                            a.owner.ownerName
+                          ) : (
+                            <span className="text-amber-700">
+                              {a.owner.ownerName ?? "unassigned"} (not on the roll — add them
+                              yourself)
+                            </span>
+                          )}
+                          {a.dueDate ? ` by ${a.dueDate}` : " with no date"}
+                        </li>
+                      ))}
+                    </ul>
+                    <p className="mt-1 text-[11px] text-content-muted">
+                      Decisions and actions are proposals only. Add the ones you accept on the
+                      Decisions and Actions tabs, where the segregation rules apply.
+                    </p>
+                  </div>
+                ) : null}
+
+                {result?.suggestedMinutesBody ? (
+                  <Button
+                    size="sm"
+                    onClick={() => onAccept(result.suggestedMinutesBody as string)}
+                  >
+                    Put this in the minutes box
+                  </Button>
+                ) : null}
+                <p className="text-[11px] text-content-muted">{result?.note}</p>
+              </div>
+            ) : null}
+          </>
+        ) : null}
+      </CardBody>
+    </Card>
+  );
+}
+
+/**
+ * The records raised from one agenda item, with the status they hold NOW.
+ *
+ * A copy of the status taken at raise time would be wrong the moment the RFI
+ * was answered, and an item carried forward because "the RFI is still open"
+ * when it was closed three weeks ago is exactly the failure this module exists
+ * to stop. The API resolves each edge against the record's own table, and says
+ * so when it cannot: an unresolvable pointer is shown as a finding, never
+ * hidden.
+ */
+function AgendaItemLinks({ projectId, itemId }: { projectId: string; itemId: string }) {
+  const [data, setData] = useState<AgendaLinks | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get<AgendaLinks>(`/api/v1/projects/${projectId}/meeting-agenda-items/${itemId}/links`)
+      .then((res) => {
+        if (!cancelled) setData(res);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, itemId]);
+
+  if (failed) {
+    return (
+      <p className="mt-2 text-2xs text-content-subtle">
+        The linked records could not be read, so their status is not shown here rather than shown
+        as stale.
+      </p>
+    );
+  }
+  if (!data || (data.items.length === 0 && data.unresolved.length === 0)) return null;
+
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-1.5">
+      <span className="text-2xs text-content-subtle">Raised from this item:</span>
+      {data.items.map((l) => (
+        <Tooltip
+          key={`${l.type}:${l.id}`}
+          content={`${l.title} — status read from the ${l.type.replace(/_/g, " ")} register just now, not copied when it was raised.`}
+        >
+          <span>
+            <Badge tone="accent" size="xs" variant="outline">
+              {l.reference} · {titleCase(l.status)}
+            </Badge>
+          </span>
+        </Tooltip>
+      ))}
+      {data.unresolved.map((l) => (
+        <Tooltip
+          key={`u:${l.type}:${l.id}`}
+          content="This link points at a record the platform cannot resolve — it may have been deleted, or it belongs to a type the resolver does not know. Shown rather than hidden: a broken pointer is a finding."
+        >
+          <span>
+            <Badge tone="warning" size="xs" variant="outline">
+              {l.type.replace(/_/g, " ")} · unresolved
+            </Badge>
+          </span>
+        </Tooltip>
+      ))}
+    </div>
+  );
+}
+
+interface AgendaLinks {
+  agendaItemId: string;
+  items: Array<{ type: string; id: string; reference: string; title: string; status: string }>;
+  unresolved: Array<{ type: string; id: string }>;
+  total: number;
 }

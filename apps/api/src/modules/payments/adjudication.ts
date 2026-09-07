@@ -319,7 +319,7 @@ export const adjudicationRoutes: FastifyPluginAsync = async (app) => {
     if (referralStep?.obligationId) {
       await app.db.update(obligations).set({ status: referralAt <= referralStep.dueAt ? "satisfied" : "breached" }).where(and(eq(obligations.id, referralStep.obligationId), eq(obligations.status, "open")));
     }
-    await app.db
+    const referred = await app.db
       .update(paymentAdjudications)
       .set({
         status: "referred",
@@ -330,7 +330,9 @@ export const adjudicationRoutes: FastifyPluginAsync = async (app) => {
         timetable: recomputed,
         updatedAt: new Date().toISOString(),
       })
-      .where(eq(paymentAdjudications.id, caseId));
+      .where(and(eq(paymentAdjudications.id, caseId), eq(paymentAdjudications.status, "notice")))
+      .returning({ id: paymentAdjudications.id });
+    if (referred.length === 0) throw conflict("This case moved before it could be referred.");
     await materialiseObligations(await fetchCase(caseId, req.companyId!, req.projectId!), req.user!.id);
     await appendLedger(app.db, { companyId: req.companyId!, actorId: req.user!.id, action: "state_change", objectType: "payment_adjudication", objectId: caseId, projectId: req.projectId!, payload: { from: "notice", to: "referred", referralAt, timetable: recomputed }, storePayload: true });
     return fetchCase(caseId, req.companyId!, req.projectId!);
@@ -347,7 +349,12 @@ export const adjudicationRoutes: FastifyPluginAsync = async (app) => {
     if (step?.obligationId) {
       await app.db.update(obligations).set({ status: late ? "breached" : "satisfied" }).where(and(eq(obligations.id, step.obligationId), eq(obligations.status, "open")));
     }
-    await app.db.update(paymentAdjudications).set({ status: "responded", responseAt, detail: { ...(c.detail ?? {}), responseSummary: body.summary ?? null, responseLate: late }, updatedAt: new Date().toISOString() }).where(eq(paymentAdjudications.id, caseId));
+    const responded = await app.db
+      .update(paymentAdjudications)
+      .set({ status: "responded", responseAt, detail: { ...(c.detail ?? {}), responseSummary: body.summary ?? null, responseLate: late }, updatedAt: new Date().toISOString() })
+      .where(and(eq(paymentAdjudications.id, caseId), eq(paymentAdjudications.status, "referred")))
+      .returning({ id: paymentAdjudications.id });
+    if (responded.length === 0) throw conflict("This case moved before the response could be recorded.");
     await appendLedger(app.db, { companyId: req.companyId!, actorId: req.user!.id, action: "state_change", objectType: "payment_adjudication", objectId: caseId, projectId: req.projectId!, payload: { from: "referred", to: "responded", responseAt, late }, storePayload: true });
     return fetchCase(caseId, req.companyId!, req.projectId!);
   });
@@ -363,7 +370,12 @@ export const adjudicationRoutes: FastifyPluginAsync = async (app) => {
     if (step?.obligationId) {
       await app.db.update(obligations).set({ status: late ? "breached" : "satisfied" }).where(and(eq(obligations.id, step.obligationId), eq(obligations.status, "open")));
     }
-    await app.db.update(paymentAdjudications).set({ status: "decided", decisionAt, decisionAmount: body.decisionAmount, decisionSummary: body.decisionSummary, updatedAt: new Date().toISOString() }).where(eq(paymentAdjudications.id, caseId));
+    const decided = await app.db
+      .update(paymentAdjudications)
+      .set({ status: "decided", decisionAt, decisionAmount: body.decisionAmount, decisionSummary: body.decisionSummary, updatedAt: new Date().toISOString() })
+      .where(and(eq(paymentAdjudications.id, caseId), inArray(paymentAdjudications.status, ["referred", "responded"])))
+      .returning({ id: paymentAdjudications.id });
+    if (decided.length === 0) throw conflict("This case moved before it could be decided.");
     await appendLedger(app.db, { companyId: req.companyId!, actorId: req.user!.id, action: "state_change", objectType: "payment_adjudication", objectId: caseId, projectId: req.projectId!, payload: { from: c.status, to: "decided", decisionAt, decisionAmount: body.decisionAmount, late }, storePayload: true });
     return fetchCase(caseId, req.companyId!, req.projectId!);
   });
@@ -379,20 +391,32 @@ export const adjudicationRoutes: FastifyPluginAsync = async (app) => {
       const c = await fetchCase(caseId, req.companyId!, req.projectId!);
       if (!(from as readonly string[]).includes(c.status)) throw conflict(`Cannot ${action} a ${c.status} case`);
       const now = new Date().toISOString();
-      await app.db
-        .update(paymentAdjudications)
-        .set({
-          status: to,
-          ...(to === "enforced" ? { enforcedAt: todayISO() } : {}),
-          detail: { ...(c.detail ?? {}), [`${to}Note`]: body.note ?? null, ...(body.amount !== undefined ? { settledAmount: body.amount } : {}) },
-          updatedAt: now,
-        })
-        .where(eq(paymentAdjudications.id, caseId));
-      /* a closed case moots its open deadlines */
-      const openIds = (c.timetable as TimetableStep[]).map((s) => s.obligationId).filter((x): x is string => !!x);
-      if (to !== "enforced" && openIds.length > 0) {
-        await app.db.update(obligations).set({ status: "satisfied" }).where(and(inArray(obligations.id, openIds), eq(obligations.status, "open")));
-      }
+      /*
+       * One guarded write inside a transaction: `WHERE status IN (from)
+       * RETURNING` so a settle and a withdraw racing each other cannot both
+       * write, leaving two contradictory state_change entries and the
+       * timetable's obligations closed by whichever ran second.
+       */
+      await app.db.transaction(async (tx) => {
+        const moved = await tx
+          .update(paymentAdjudications)
+          .set({
+            status: to,
+            ...(to === "enforced" ? { enforcedAt: todayISO() } : {}),
+            detail: { ...(c.detail ?? {}), [`${to}Note`]: body.note ?? null, ...(body.amount !== undefined ? { settledAmount: body.amount } : {}) },
+            updatedAt: now,
+          })
+          .where(and(eq(paymentAdjudications.id, caseId), inArray(paymentAdjudications.status, [...from])))
+          .returning({ id: paymentAdjudications.id });
+        if (moved.length === 0) {
+          throw conflict(`This case moved before it could be ${to}. Reload it — nothing was applied twice.`);
+        }
+        /* a closed case moots its open deadlines */
+        const openIds = (c.timetable as TimetableStep[]).map((s) => s.obligationId).filter((x): x is string => !!x);
+        if (to !== "enforced" && openIds.length > 0) {
+          await tx.update(obligations).set({ status: "satisfied" }).where(and(inArray(obligations.id, openIds), eq(obligations.status, "open")));
+        }
+      });
       await appendLedger(app.db, { companyId: req.companyId!, actorId: req.user!.id, action: "state_change", objectType: "payment_adjudication", objectId: caseId, projectId: req.projectId!, payload: { from: c.status, to, ...body }, storePayload: true });
       return fetchCase(caseId, req.companyId!, req.projectId!);
     });

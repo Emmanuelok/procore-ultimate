@@ -10,6 +10,10 @@ import {
   budgetLineItems,
   companyMemberships,
   costCodes,
+  distributionGroupMembers,
+  distributionGroups,
+  ledgerEntries,
+  notifications,
   projectMemberships,
   projects,
   recordLinks,
@@ -283,6 +287,18 @@ describe("project deletion is recoverable", () => {
   });
 
   it("purges only what the substrate owns, and only for an owner", async () => {
+    // A notification deep-linking at the doomed project: leaving it behind
+    // produces an inbox item that can never be opened and a badge that can
+    // never be cleared (audit: project delete orphaned every child row).
+    await app.db.insert(notifications).values({
+      id: newId("ntf"),
+      companyId: owner.companyId,
+      userId: owner.userId,
+      projectId: doomed,
+      kind: "status_change",
+      title: "Something happened on the doomed project",
+    });
+
     const asMember = await app.inject({
       method: "DELETE",
       url: `/api/v1/recycle-bin/projects/${doomed}`,
@@ -297,8 +313,31 @@ describe("project deletion is recoverable", () => {
     });
     expect(purge.statusCode).toBe(200);
     expect(purge.json().purged).toBe(true);
+    expect(purge.json().removed.notifications).toBe(1);
     const rows = await app.db.select().from(projects).where(eq(projects.id, doomed));
     expect(rows).toHaveLength(0);
+    const left = await app.db
+      .select()
+      .from(notifications)
+      .where(eq(notifications.projectId, doomed));
+    expect(left).toHaveLength(0);
+
+    // The purge and its ledger entry are one transaction: a purge that
+    // committed without a ledger row would be the unledgered mutation the
+    // ledger exists to make impossible.
+    const trail = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(
+        and(
+          eq(ledgerEntries.companyId, owner.companyId),
+          eq(ledgerEntries.objectId, doomed),
+          eq(ledgerEntries.action, "delete"),
+        ),
+      );
+    expect(
+      trail.some((e) => (e.payload as { event?: string } | null)?.event === "purged"),
+    ).toBe(true);
   });
 });
 
@@ -645,10 +684,40 @@ describe("DELETE /links/:linkId", () => {
 /* ------------------------------------------------------------------ */
 
 describe("comments and mentions", () => {
+  /*
+   * Real RFI rows, not invented ids: the comment route now proves the record
+   * belongs to the project in the URL before writing anything under it.
+   */
+  const mentionRfiB = newId("rfi");
+  const mentionRfiA = newId("rfi");
+
+  beforeAll(async () => {
+    await app.db.insert(rfis).values([
+      {
+        id: mentionRfiB,
+        companyId: owner.companyId,
+        projectId: projectB,
+        number: 8801,
+        subject: "Mention target B",
+        question: "?",
+        createdBy: owner.userId,
+      },
+      {
+        id: mentionRfiA,
+        companyId: owner.companyId,
+        projectId: projectA,
+        number: 8802,
+        subject: "Mention target A",
+        question: "?",
+        createdBy: owner.userId,
+      },
+    ]);
+  });
+
   it("does not notify a company member who cannot open the project", async () => {
     const res = await app.inject({
       method: "POST",
-      url: `/api/v1/projects/${projectB}/records/rfi/r-mention/comments`,
+      url: `/api/v1/projects/${projectB}/records/rfi/${mentionRfiB}/comments`,
       headers: owner.headers,
       payload: { body: "Commercially sensitive detail", mentions: [guest.userId] },
     });
@@ -667,7 +736,7 @@ describe("comments and mentions", () => {
   it("notifies a mention who IS on the project", async () => {
     const res = await app.inject({
       method: "POST",
-      url: `/api/v1/projects/${projectA}/records/rfi/r-mention-2/comments`,
+      url: `/api/v1/projects/${projectA}/records/rfi/${mentionRfiA}/comments`,
       headers: owner.headers,
       payload: { body: "Please look at this", mentions: [member.userId] },
     });
@@ -884,5 +953,149 @@ describe("CSV import", () => {
       payload: { csv: "path\nA" },
     });
     expect(res.statusCode).toBe(400);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Comments belong to the project in the URL                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The watchers and custom-value routes proved the record belonged to the
+ * project before writing; the comment route did not. It stamped the URL's
+ * companyId/projectId onto any client-supplied (recordType, recordId), and its
+ * #70 fan-out selected watchers by (companyId, recordType, recordId) with no
+ * project predicate — so a comment written in project A reached the watchers
+ * of a record in project B, carrying its first 280 characters.
+ */
+describe("POST /projects/:projectId/records/:type/:id/comments", () => {
+  it("refuses a record that lives in another project of the same tenant", async () => {
+    const rfiId = newId("rfi");
+    await app.db.insert(rfis).values({
+      id: rfiId,
+      companyId: owner.companyId,
+      projectId: projectB,
+      number: 9001,
+      subject: "B's RFI",
+      question: "?",
+      createdBy: owner.userId,
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectA}/records/rfi/${rfiId}/comments`,
+      headers: owner.headers,
+      payload: { body: "Filed under the wrong project" },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("in this project");
+  });
+
+  it("notifies only the watchers of THIS project's record", async () => {
+    const rfiId = newId("rfi");
+    await app.db.insert(rfis).values({
+      id: rfiId,
+      companyId: owner.companyId,
+      projectId: projectA,
+      number: 9002,
+      subject: "A's RFI",
+      question: "?",
+      createdBy: owner.userId,
+    });
+    // A watcher row with the SAME record id filed under project B: the shape
+    // a colliding id produces.
+    await app.db.insert(watchers).values({
+      id: newId("wch"),
+      companyId: owner.companyId,
+      projectId: projectB,
+      recordType: "rfi",
+      recordId: rfiId,
+      userId: guest.userId,
+    });
+    // …and a legitimate watcher on project A.
+    await app.db.insert(watchers).values({
+      id: newId("wch"),
+      companyId: owner.companyId,
+      projectId: projectA,
+      recordType: "rfi",
+      recordId: rfiId,
+      userId: member.userId,
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectA}/records/rfi/${rfiId}/comments`,
+      headers: owner.headers,
+      payload: { body: "Commercially sensitive detail" },
+    });
+    expect(res.statusCode).toBe(201);
+
+    const sent = await app.db
+      .select()
+      .from(notifications)
+      .where(
+        and(
+          eq(notifications.companyId, owner.companyId),
+          eq(notifications.recordType, "rfi"),
+          eq(notifications.recordId, rfiId),
+        ),
+      );
+    const recipients = sent.map((n) => n.userId);
+    expect(recipients).toContain(member.userId);
+    expect(recipients).not.toContain(guest.userId);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Cloning carries the recipients, not just the group names            */
+/* ------------------------------------------------------------------ */
+
+describe("POST /projects/:projectId/clone — distribution groups", () => {
+  it("copies the members of each group, not only the group row", async () => {
+    const source = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: owner.headers,
+      payload: { name: "Clone source" },
+    });
+    const sourceId = source.json().id as string;
+    const group = await app.inject({
+      method: "POST",
+      url: "/api/v1/distribution-groups",
+      headers: owner.headers,
+      payload: { name: "Minutes list", projectId: sourceId },
+    });
+    expect(group.statusCode).toBe(201);
+    const added = await app.inject({
+      method: "POST",
+      url: `/api/v1/distribution-groups/${group.json().id}/members`,
+      headers: owner.headers,
+      payload: { email: "site@example.test" },
+    });
+    expect(added.statusCode).toBe(201);
+
+    const cloned = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${sourceId}/clone`,
+      headers: owner.headers,
+      payload: { name: "Clone target", include: ["distributionGroups"] },
+    });
+    expect(cloned.statusCode).toBe(201);
+    expect(cloned.json().copied.distributionGroups).toBe(1);
+    // The count that used to read as confirmation while every group arrived
+    // empty.
+    expect(cloned.json().copied.distributionGroupMembers).toBe(1);
+
+    const groups = await app.db
+      .select()
+      .from(distributionGroups)
+      .where(eq(distributionGroups.projectId, cloned.json().id));
+    expect(groups).toHaveLength(1);
+    const members = await app.db
+      .select()
+      .from(distributionGroupMembers)
+      .where(eq(distributionGroupMembers.groupId, groups[0]!.id));
+    expect(members).toHaveLength(1);
+    expect(members[0]!.email).toBe("site@example.test");
   });
 });

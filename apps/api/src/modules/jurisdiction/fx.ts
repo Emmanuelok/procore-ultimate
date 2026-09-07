@@ -181,17 +181,59 @@ const key = (from: string, to: string): string => `${from}>${to}`;
  * ordered oldest-first and the map holds the latest quote per ordered
  * pair — which is exactly "the rate as at the as-of date".
  */
-export function buildRateLookup(rows: RateQuote[]): RateLookup {
+export function buildRateLookup(
+  rows: RateQuote[],
+  opts?: { sourcePriority?: readonly string[] },
+): RateLookup {
+  const priority = opts?.sourcePriority ?? null;
+  const rank = (source: string): number => {
+    if (!priority) return 0;
+    // `sourcePriority` is stated LEAST-preferred first, so the index IS the
+    // rank: manual < market < central_bank. Inverting it (as an earlier
+    // version did) made a hand-keyed figure outrank a central-bank fixing,
+    // which is the opposite of what every caller documents wanting.
+    const i = priority.indexOf(source);
+    // an unranked source sits BELOW every ranked one
+    return i === -1 ? -1 : i;
+  };
   const map = new Map<string, RateQuote>();
   for (const r of rows) {
-    map.set(key(normalizeCurrency(r.fromCurrency), normalizeCurrency(r.toCurrency)), {
+    const k = key(normalizeCurrency(r.fromCurrency), normalizeCurrency(r.toCurrency));
+    const candidate: RateQuote = {
       ...r,
       fromCurrency: normalizeCurrency(r.fromCurrency),
       toCurrency: normalizeCurrency(r.toCurrency),
-    });
+    };
+    const incumbent = map.get(k);
+    if (!incumbent) {
+      map.set(k, candidate);
+      continue;
+    }
+    // A later quote always wins on date. On the SAME date the source decides:
+    // a central-bank fixing beats a broker mark beats a hand-keyed figure.
+    // Without this, "latest wins" made the ordering of two same-day rows
+    // decide which rate every conversion in the platform used.
+    if (candidate.rateDate > incumbent.rateDate) {
+      map.set(k, candidate);
+    } else if (candidate.rateDate === incumbent.rateDate) {
+      if (rank(candidate.source) >= rank(incumbent.source)) map.set(k, candidate);
+    }
   }
   return (from, to) => map.get(key(normalizeCurrency(from), normalizeCurrency(to))) ?? null;
 }
+
+/**
+ * Source preference for a MARKET valuation. `contractual` is deliberately
+ * absent: a contractual base-date rate recorded in the register is the thing
+ * the market is being compared AGAINST, so letting it answer "what is the
+ * market rate?" reports every exposure as zero. Callers valuing at market
+ * exclude it outright; this ordering only breaks ties between the rest.
+ */
+export const MARKET_SOURCE_PRIORITY: readonly string[] = ["manual", "market", "central_bank"];
+// (stated least-preferred first — see `rank` in buildRateLookup)
+
+/** Sources that must never stand in for a market quote (#599). */
+export const NON_MARKET_SOURCES: readonly string[] = ["contractual"];
 
 /** Direct quote, else the reciprocal of the opposite quote. Never pivots. */
 function resolveLeg(from: string, to: string, lookup: RateLookup): ResolvedRate | null {
@@ -288,6 +330,8 @@ export interface SplitLine {
   marketRate: number | null;
   marketRateDate: string | null;
   marketRatePath: ConversionPath | null;
+  /** which register source the market rate came from — never "contractual" */
+  marketRateSource: string | null;
   /** what the same base share would buy today; null when unquoted */
   marketAmount: number | null;
   /** marketAmount − contractualAmount, in this currency; null when unquoted */
@@ -373,6 +417,7 @@ export function splitPayment(
         marketRate: null,
         marketRateDate: null,
         marketRatePath: null,
+        marketRateSource: null,
         marketAmount: null,
         fxVariance: null,
         contractualBaseEquivalent: null,
@@ -392,6 +437,7 @@ export function splitPayment(
       marketRate: market.rate,
       marketRateDate: market.rateDate,
       marketRatePath: market.path,
+      marketRateSource: market.legs[0]?.source ?? (market.path === "identity" ? "identity" : null),
       marketAmount,
       fxVariance: round2(marketAmount - contractualAmount),
       contractualBaseEquivalent,

@@ -107,6 +107,19 @@ function ScheduleRiskBanner({ risk }: { risk: ScheduleRiskResponse }) {
           </>
         ) : null}
       </p>
+      {risk.summary.startedUnconsented > 0 ? (
+        <p className="mt-1 text-xs font-semibold">
+          {risk.summary.startedUnconsented} of them have already started on site without the
+          consent in hand — that one cannot be fixed by re-planning.
+        </p>
+      ) : null}
+      {risk.summary.projectedSlipDays !== null && risk.summary.projectedSlipDays > 0 ? (
+        <p className="mt-1 text-xs">
+          Projected slip if determinations take as long as they typically have:{" "}
+          <span className="font-semibold tabular-nums">{risk.summary.projectedSlipDays}</span> day
+          {risk.summary.projectedSlipDays === 1 ? "" : "s"}.
+        </p>
+      ) : null}
       <ul className="mt-2 space-y-1 text-xs">
         {blocked.slice(0, 6).map((i) => (
           <li key={`${i.permitId}-${i.taskId}`} className="flex flex-wrap items-baseline gap-x-2">
@@ -122,6 +135,18 @@ function ScheduleRiskBanner({ risk }: { risk: ScheduleRiskResponse }) {
             <span className="tabular-nums font-medium">
               starts {countdownLabel(i.daysUntilStart)}
             </span>
+            {i.daysAtRisk !== null && i.daysAtRisk > 0 ? (
+              <span
+                className="tabular-nums"
+                title={`Expected to be determined by ${i.expectedResolutionDate ?? "—"}, ${
+                  i.estimateSource === "observed_median"
+                    ? `from the median of ${i.estimateSampleSize ?? 0} comparable determinations on this company's own record`
+                    : "from the documented default for this state — no history yet"
+                }`}
+              >
+                · {i.daysAtRisk}d at risk
+              </span>
+            ) : null}
             {i.isCritical ? (
               <span className="rounded bg-red-100 px-1 text-[10px] font-semibold uppercase">
                 critical
@@ -147,6 +172,17 @@ function ScheduleRiskBanner({ risk }: { risk: ScheduleRiskResponse }) {
 }
 
 /* ================================== Tab =================================== */
+
+/** Statuses from which "applied" is a RE-application, not a first one. */
+const PERMIT_REAPPLY_FROM: readonly string[] = ["refused", "expired"];
+
+const TRANSITION_HINTS: Record<string, string> = {
+  applied: "Starts the statutory determination clock and opens the determination obligation.",
+  in_review: "The authority has the application and is considering it.",
+  refused:
+    "A determination: it discharges the determination obligation. The programme consequence shows in the consent view.",
+  expired: "A granted consent that has lapsed. Any dependent work is now unauthorised.",
+};
 
 export default function PermitsTab({ projectId }: { projectId: string }) {
   const base = `/api/v1/projects/${projectId}`;
@@ -870,25 +906,40 @@ export default function PermitsTab({ projectId }: { projectId: string }) {
             <div className="mb-4 rounded-md bg-ink-50 p-3">
               <p className="mb-2 text-xs font-medium text-ink-600">Record a determination</p>
               <div className="flex flex-wrap gap-2">
-                <Button size="sm" disabled={detailBusy} onClick={openGrant}>
-                  Grant…
-                </Button>
-                {PERMIT_STATUSES.filter((s) => s !== "granted").map((s) => (
-                  <Button
-                    key={s}
-                    size="sm"
-                    variant="secondary"
-                    disabled={detailBusy || detail.status === s}
-                    onClick={() => void setStatus(s)}
-                  >
-                    {PERMIT_STATUS_LABELS[s] ?? s}
+                {(detail.allowedTransitions ?? []).includes("granted") ? (
+                  <Button size="sm" disabled={detailBusy} onClick={openGrant}>
+                    Grant…
                   </Button>
-                ))}
+                ) : null}
+                {(detail.allowedTransitions ?? [])
+                  .filter((s) => s !== "granted")
+                  .map((s) => (
+                    <Button
+                      key={s}
+                      size="sm"
+                      variant="secondary"
+                      disabled={detailBusy}
+                      onClick={() => void setStatus(s)}
+                      title={TRANSITION_HINTS[s]}
+                    >
+                      {s === "applied" && PERMIT_REAPPLY_FROM.includes(detail.status)
+                        ? "Re-apply"
+                        : (PERMIT_STATUS_LABELS[s] ?? s)}
+                    </Button>
+                  ))}
+                {(detail.allowedTransitions ?? []).length === 0 ? (
+                  <span className="text-xs text-ink-400">
+                    No determination can be recorded from{" "}
+                    {PERMIT_STATUS_LABELS[detail.status] ?? detail.status}.
+                  </span>
+                ) : null}
               </div>
               <p className="mt-2 text-[11px] leading-relaxed text-ink-400">
-                A refusal is a determination too — it discharges the determination obligation, and
-                the programme consequence surfaces in the consent-to-programme view rather than
-                being buried in the status.
+                Only the transitions the statutory process actually allows are offered. A refusal
+                is a determination too — it discharges the determination obligation, and the
+                programme consequence surfaces in the consent-to-programme view rather than being
+                buried in the status. Re-applying after a refusal or a lapse opens a FRESH
+                determination clock and a new obligation.
               </p>
             </div>
 

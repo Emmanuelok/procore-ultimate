@@ -39,6 +39,7 @@ import { formatDateTime } from "../format";
 import {
   ActivityPanel,
   AttentionDrawer,
+  AttentionStatusFilter,
   AttentionTable,
   BriefingCard,
   DIMENSION_META,
@@ -47,13 +48,17 @@ import {
   LEVEL_META,
   LevelBadge,
   PanelSkeleton,
+  READ_ONLY_HINT,
   RefreshButton,
   ScoreRing,
   TrendSparkline,
+  attentionEmpty,
   errorMessage,
+  statusHint,
   type ActivityResponse,
   type AttentionItem,
   type AttentionList,
+  type AttentionStatus,
   type BriefingLatest,
   type BriefingView,
   type HealthDimension,
@@ -207,6 +212,7 @@ export default function IntelligencePage() {
   const { projectId = "" } = useParams<{ projectId: string }>();
   const base = `/api/v1/projects/${projectId}`;
   const [tab, setTab] = useState<TabKey>("health");
+  const [attentionStatus, setAttentionStatus] = useState<AttentionStatus>("open");
   const [dimension, setDimension] = useState<HealthDimension | null>(null);
   const [selected, setSelected] = useState<AttentionItem | null>(null);
   const [busy, setBusy] = useState(false);
@@ -214,7 +220,18 @@ export default function IntelligencePage() {
   const [generating, setGenerating] = useState(false);
 
   const health = useResource<ProjectHealth>(`${base}/health`);
-  const attention = useResource<AttentionList>(`${base}/attention?limit=200`);
+  // The open feed drives the counters whatever the table is showing; the
+  // other two states are their own request, so a dismissal stays findable and
+  // the reopen route is reachable.
+  const openAttention = useResource<AttentionList>(`${base}/attention?limit=200&status=open`);
+  const otherAttention = useResource<AttentionList>(
+    attentionStatus === "open" ? null : `${base}/attention?limit=200&status=${attentionStatus}`,
+  );
+  const attention = attentionStatus === "open" ? openAttention : otherAttention;
+  const reloadAttention = useCallback(() => {
+    openAttention.reload();
+    otherAttention.reload();
+  }, [openAttention, otherAttention]);
   const history = useResource<HealthHistory>(`${base}/health/history?days=30`);
   const activity = useResource<ActivityResponse>(`${base}/intelligence/activity?limit=20`);
   const briefing = useResource<BriefingLatest>(`${base}/intelligence/briefing`);
@@ -230,14 +247,14 @@ export default function IntelligencePage() {
       );
       health.reload();
       history.reload();
-      attention.reload();
+      reloadAttention();
     } catch (err) {
       if (err instanceof ApiClientError && err.status === 403) toast.error("Recomputing needs standard access to intelligence on this project.");
       else toast.error(errorMessage(err, "The recompute failed."));
     } finally {
       setRecomputing(false);
     }
-  }, [base, health, history, attention]);
+  }, [base, health, history, reloadAttention]);
 
   const generate = useCallback(async () => {
     setGenerating(true);
@@ -263,7 +280,7 @@ export default function IntelligencePage() {
         await api.post(`${base}/attention/${item.id}/dismiss`, reason ? { reason } : {});
         toast.success("Set aside — recorded on the ledger.");
         setSelected(null);
-        attention.reload();
+        reloadAttention();
       } catch (err) {
         if (err instanceof ApiClientError && err.status === 403) toast.error("Dismissing needs standard access to intelligence on this project.");
         else toast.error(errorMessage(err, "Could not dismiss the item."));
@@ -271,7 +288,7 @@ export default function IntelligencePage() {
         setBusy(false);
       }
     },
-    [base, attention],
+    [base, reloadAttention],
   );
 
   const reopen = useCallback(
@@ -281,31 +298,37 @@ export default function IntelligencePage() {
         await api.post(`${base}/attention/${item.id}/reopen`, {});
         toast.success("Reopened.");
         setSelected(null);
-        attention.reload();
+        reloadAttention();
       } catch (err) {
         toast.error(errorMessage(err, "Could not reopen the item."));
       } finally {
         setBusy(false);
       }
     },
-    [base, attention],
+    [base, reloadAttention],
   );
 
   const h = health.data;
   const items = attention.data?.items ?? [];
-  const critical = items.filter((i) => i.severity === "critical").length;
-  const overdue = items.filter((i) => i.dueAt !== null && Date.parse(i.dueAt) < Date.now()).length;
+  // the counters always describe the OPEN feed, whichever state the table shows
+  const openItems = openAttention.data?.items ?? [];
+  const critical = openItems.filter((i) => i.severity === "critical").length;
+  const overdue = openItems.filter((i) => i.dueAt !== null && Date.parse(i.dueAt) < Date.now()).length;
   const aiEnabled = briefing.data?.aiEnabled ?? activity.data?.aiEnabled ?? false;
   const offTrackDims = h ? h.dimensions.filter((d) => d.level === "off_track").length : null;
+  // The project attention route resolves the caller's level once for the whole
+  // page; until it has answered we assume they may act, so the buttons do not
+  // flicker for the people who can.
+  const canAct = openAttention.data?.canAct ?? true;
 
   const tabs = useMemo(
     () => [
       { value: "health" as const, label: "Health", icon: IconTarget },
-      { value: "attention" as const, label: "Attention", icon: IconWarning, count: attention.data?.total, tone: critical > 0 ? ("danger" as const) : undefined },
+      { value: "attention" as const, label: "Attention", icon: IconWarning, count: openAttention.data?.total, tone: critical > 0 ? ("danger" as const) : undefined },
       { value: "history" as const, label: "History", icon: IconHistory, count: history.data?.items.length },
       { value: "agents" as const, label: "Agents", icon: IconActivity, count: activity.data?.pendingProposals || undefined },
     ],
-    [attention.data, critical, history.data, activity.data],
+    [openAttention.data, critical, history.data, activity.data],
   );
 
   return (
@@ -316,8 +339,24 @@ export default function IntelligencePage() {
         subtitle="How healthy this project is and why, what needs a decision, and what the agents have found. Every score carries its basis and inputs."
         actions={
           <>
-            <RefreshButton onClick={() => void recompute()} loading={recomputing} label="Recompute health" />
-            <Button size="sm" icon={IconAi} loading={generating} disabled={!aiEnabled} title={aiEnabled ? undefined : "AI is not configured on this server"} onClick={() => void generate()}>
+            {/* both writes need `standard` on intelligence for this project;
+                the feed answers that once, so a read-only member is told why
+                rather than handed a button that 403s. */}
+            <RefreshButton
+              onClick={() => void recompute()}
+              loading={recomputing}
+              label="Recompute health"
+              disabled={!canAct}
+              title={canAct ? undefined : READ_ONLY_HINT}
+            />
+            <Button
+              size="sm"
+              icon={IconAi}
+              loading={generating}
+              disabled={!aiEnabled || !canAct}
+              title={!canAct ? READ_ONLY_HINT : aiEnabled ? undefined : "AI is not configured on this server"}
+              onClick={() => void generate()}
+            >
               Write project briefing
             </Button>
           </>
@@ -329,7 +368,7 @@ export default function IntelligencePage() {
       <section aria-label="Intelligence indicators" className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <Stat label="Health score" value={h ? (h.score === null ? "—" : `${h.score}/100`) : "—"} tone={h ? LEVEL_META[h.level].tone : "neutral"} hint={h ? (h.score === null ? "unrated — no inputs held" : LEVEL_META[h.level].label) : undefined} loading={health.loading} />
         <Stat label="Dimensions off track" value={offTrackDims === null ? "—" : formatNumber(offTrackDims)} tone={offTrackDims ? "danger" : "neutral"} hint={h ? `${h.dimensions.filter((d) => d.level === "watch").length} on watch · ${h.dimensions.filter((d) => d.score === null).length} unrated` : undefined} loading={health.loading} />
-        <Stat label="Open attention" value={attention.data ? formatNumber(attention.data.total) : "—"} tone={critical > 0 ? "danger" : "neutral"} hint={attention.data ? `${critical} critical · ${overdue} past a deadline` : attention.error ? "not available" : undefined} loading={attention.loading} />
+        <Stat label="Open attention" value={openAttention.data ? formatNumber(openAttention.data.total) : "—"} tone={critical > 0 ? "danger" : "neutral"} hint={openAttention.data ? `${critical} critical · ${overdue} past a deadline` : openAttention.error ? "not available" : undefined} loading={openAttention.loading} />
         <Stat label="Agent proposals" value={activity.data ? formatNumber(activity.data.pendingProposals) : "—"} tone={activity.data?.pendingProposals ? "accent" : "neutral"} hint={activity.data ? (activity.data.aiEnabled ? "waiting for a person" : "AI not configured") : undefined} loading={activity.loading} />
       </section>
 
@@ -346,7 +385,11 @@ export default function IntelligencePage() {
 
       {tab === "attention" ? (
         <Card>
-          <CardHeader title="What needs a decision on this project" subtitle="Ranked by severity × urgency × money. Click a row for the basis, the record, and to set it aside with a reason." />
+          <CardHeader
+            title="What needs a decision on this project"
+            subtitle={statusHint(attentionStatus)}
+            actions={<AttentionStatusFilter value={attentionStatus} onChange={setAttentionStatus} />}
+          />
           <CardBody flush>
             <AttentionTable
               items={items}
@@ -355,8 +398,9 @@ export default function IntelligencePage() {
               onRetry={attention.reload}
               onSelect={setSelected}
               showProject={false}
-              emptyTitle="Nothing needs attention on this project"
-              tableId={`project-attention-${projectId}`}
+              emptyTitle={attentionEmpty(attentionStatus, "project").title}
+              emptyHint={attentionEmpty(attentionStatus, "project").hint}
+              tableId={`project-attention-${projectId}-${attentionStatus}`}
             />
           </CardBody>
         </Card>
@@ -384,7 +428,16 @@ export default function IntelligencePage() {
       ) : null}
 
       <DimensionDrawer dimension={dimension} onClose={() => setDimension(null)} />
-      <AttentionDrawer item={selected} onClose={() => setSelected(null)} canAct onDismiss={dismiss} onReopen={reopen} busy={busy} />
+      {/* the API answers canAct for this project once per page (read-only
+          members get the explanation, not a button that 403s) */}
+      <AttentionDrawer
+        item={selected}
+        onClose={() => setSelected(null)}
+        canAct={selected?.canAct ?? attention.data?.canAct ?? false}
+        onDismiss={dismiss}
+        onReopen={reopen}
+        busy={busy}
+      />
     </div>
   );
 }

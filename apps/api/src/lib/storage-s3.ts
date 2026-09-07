@@ -103,5 +103,22 @@ export function createS3Storage(cfg: Config): StorageService {
         new DeleteObjectCommand({ Bucket: bucket, Key: storageKey.replaceAll("\\", "/") }),
       );
     },
+    async probe(storageKey) {
+      // A 404/NotFound means the bucket answered and the key is simply not
+      // there — healthy. A 403, a bad endpoint or a signature failure throws,
+      // which is exactly the case readiness exists to catch.
+      try {
+        await client.send(
+          new HeadObjectCommand({ Bucket: bucket, Key: storageKey.replaceAll("\\", "/") }),
+        );
+        return true;
+      } catch (err) {
+        const status = (err as { $metadata?: { httpStatusCode?: number } }).$metadata
+          ?.httpStatusCode;
+        const name = (err as { name?: string }).name;
+        if (status === 404 || name === "NotFound" || name === "NoSuchKey") return false;
+        throw err;
+      }
+    },
   };
 }

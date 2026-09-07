@@ -84,6 +84,10 @@ export interface RuleView {
   failureCount: number;
   lastRunAt: string | null;
   lastScanAt: string | null;
+  lastScanCandidates: number;
+  /** 1 = the last scan hit the row cap, so some live records were not evaluated */
+  lastScanTruncated: number;
+  lastScanOrderedBy: string | null;
   lastError: string | null;
   createdBy: string;
   createdAt: string;
@@ -223,8 +227,21 @@ export interface EngineHealth {
   runsFailed: number;
   runsThrottled: number;
   hookFailures: number;
+  /** schedule scans that hit the row cap since boot: a partial scan, not a clean one */
+  scansTruncated: number;
   lastError: string | null;
   lastErrorAt: string | null;
+}
+
+/** A schedule rule whose last scan could not look at every live record. */
+export interface CappedScanView {
+  id: string;
+  name: string;
+  objectType: string;
+  projectId: string | null;
+  lastScanAt: string | null;
+  candidates: number;
+  orderedBy: string | null;
 }
 
 export interface SchedulerJobView {
@@ -244,6 +261,7 @@ export interface SchedulerJobView {
 
 export interface StatusView {
   engine: EngineHealth;
+  scan: { limit: number; cappedRules: CappedScanView[] };
   options: {
     maxActionsPerMinute: number;
     maxChainDepth: number;
@@ -256,10 +274,31 @@ export interface StatusView {
   scheduler: { enabled: boolean };
 }
 
+export interface ScanResult {
+  rulesScanned: number;
+  candidates: number;
+  matched: number;
+  deduped: number;
+  executed: number;
+  truncated: Array<{ ruleId: string; ruleName: string; objectType: string; limit: number; orderedBy: string }>;
+}
+
+export interface DrainResult {
+  executed: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+  deferred: number;
+  throttled: number;
+  /** the drain did nothing because another one was in flight — zeroes mean "not attempted" */
+  busy: boolean;
+  reason: string | null;
+}
+
 export interface CycleResult {
   at: string;
-  scan: { rulesScanned: number; candidates: number; matched: number; deduped: number; executed: number } | null;
-  drain: { executed: number; succeeded: number; failed: number; skipped: number; deferred: number; throttled: number } | null;
+  scan: ScanResult | null;
+  drain: DrainResult | null;
   health: EngineHealth;
 }
 

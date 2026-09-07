@@ -31,14 +31,38 @@ import {
   type SignalRow,
 } from "./assuranceShared";
 
-const DETECTORS = [
+/**
+ * The project-scope detectors this tab can run.
+ *
+ * Read from the REGISTRY (`GET /detectors`), not from a list kept by hand: the
+ * run route executes exactly what it is asked for, so a detector missing from
+ * this list is a detector that never runs on a project at all — which is
+ * precisely what happened to `backdated_record`, implemented and then
+ * unreachable because nobody remembered to add it here. A hardcoded fallback
+ * keeps the tab usable for a caller the registry route refuses, but the
+ * registry is the source of truth. Company-scope detectors are run from the
+ * company Detectors tab.
+ */
+const FALLBACK_DETECTORS = [
   "benford_first_digit",
   "duplicate_assertions",
   "round_number_clustering",
   "approval_velocity",
   "segregation_of_duties",
   "contradicted_claimant",
+  "backdated_record",
 ] as const;
+
+interface DetectorDescriptorRow {
+  id: string;
+  name: string;
+  scope: string;
+  description: string;
+  enabled: boolean;
+  passive: boolean;
+  suppressed: boolean;
+  suppressionReason: string | null;
+}
 
 interface RunResult {
   runId?: string;
@@ -77,7 +101,8 @@ export default function SignalsTab({ projectId }: { projectId: string }) {
   const [sodWarning, setSodWarning] = useState<string | null>(null);
   const [dispError, setDispError] = useState<string | null>(null);
 
-  const [checked, setChecked] = useState<Set<string>>(new Set(DETECTORS));
+  const [registry, setRegistry] = useState<DetectorDescriptorRow[] | null>(null);
+  const [checked, setChecked] = useState<Set<string>>(new Set(FALLBACK_DETECTORS));
   const [running, setRunning] = useState(false);
   const [runResult, setRunResult] = useState<RunResult | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
@@ -99,6 +124,33 @@ export default function SignalsTab({ projectId }: { projectId: string }) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get<{ items: DetectorDescriptorRow[] }>("/api/v1/detectors")
+      .then((res) => {
+        if (cancelled) return;
+        const runnable = res.items.filter(
+          (d) => d.scope === "project" && !d.passive && d.enabled && !d.suppressed,
+        );
+        setRegistry(runnable);
+        setChecked(new Set(runnable.map((d) => d.id)));
+      })
+      .catch(() => {
+        // No assurance reach on the registry route: fall back to the built-in
+        // list rather than leaving the tab with no way to run anything.
+        if (!cancelled) setRegistry(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const runnableDetectors: Array<{ id: string; label: string; title?: string }> =
+    registry !== null
+      ? registry.map((d) => ({ id: d.id, label: d.name, title: d.description }))
+      : FALLBACK_DETECTORS.map((d) => ({ id: d, label: humanize(d) }));
 
   const counts: Record<string, number> = {};
   for (const s of items ?? []) counts[s.severity] = (counts[s.severity] ?? 0) + 1;
@@ -165,21 +217,25 @@ export default function SignalsTab({ projectId }: { projectId: string }) {
         <CardBody>
           <div className="mb-2 text-sm font-semibold text-ink-900">Run detectors</div>
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-            {DETECTORS.map((d) => (
-              <label key={d} className="flex items-center gap-1.5 text-sm text-ink-700">
+            {runnableDetectors.map((d) => (
+              <label
+                key={d.id}
+                className="flex items-center gap-1.5 text-sm text-ink-700"
+                title={d.title}
+              >
                 <input
                   type="checkbox"
-                  checked={checked.has(d)}
+                  checked={checked.has(d.id)}
                   onChange={(e) => {
                     setChecked((prev) => {
                       const next = new Set(prev);
-                      if (e.target.checked) next.add(d);
-                      else next.delete(d);
+                      if (e.target.checked) next.add(d.id);
+                      else next.delete(d.id);
                       return next;
                     });
                   }}
                 />
-                {humanize(d)}
+                {d.label}
               </label>
             ))}
             <Button size="sm" onClick={() => void runDetectors()} disabled={running || checked.size === 0}>

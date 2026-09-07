@@ -310,9 +310,10 @@ export default function DashboardsTab({ projectId }: { projectId: string }) {
 
       <div className="mb-3 flex items-center justify-between gap-3">
         <p className="max-w-2xl text-xs text-ink-400">
-          Dashboards for this project. Every widget executes under your own project reach, and
-          seeded reports are ordinary shared definitions — open, edit or copy them from the
-          Reports tab.
+          Dashboards for this project, plus the company-wide ones, which are marked as such.
+          (A company-wide dashboard created through the API used to be invisible in every screen
+          the app has.) Every widget executes under your own project reach, and seeded reports are
+          ordinary shared definitions — open, edit or copy them from the Reports tab.
         </p>
         <Button onClick={() => void onSeed()} disabled={seedBusy}>
           {seedBusy ? "Seeding…" : "Seed role dashboards"}
@@ -337,7 +338,14 @@ export default function DashboardsTab({ projectId }: { projectId: string }) {
                 <CardBody>
                   <div className="flex items-start justify-between gap-2">
                     <p className="font-medium text-ink-900">{d.name}</p>
-                    {d.isDefault === 1 ? <Badge tone="blue">Prebuilt</Badge> : null}
+                    <div className="flex shrink-0 gap-1">
+                      {d.projectId === null ? (
+                        <Badge tone="gray" title="Runs across every project you can open">
+                          Company-wide
+                        </Badge>
+                      ) : null}
+                      {d.isDefault === 1 ? <Badge tone="blue">Prebuilt</Badge> : null}
+                    </div>
                   </div>
                   <div className="mt-1 flex items-center gap-2 text-xs text-ink-400">
                     {d.audience ? (

@@ -15,7 +15,7 @@
  *    which is what makes the rework multiple (#900) a measured figure.
  */
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, notInArray } from "drizzle-orm";
 import { z } from "zod";
 import {
   designComments,
@@ -44,6 +44,7 @@ import {
   assertSpecSection,
   assertUser,
   assertVendor,
+  boolQuerySchema,
   buildGates,
   idSchema,
   isoTimestampSchema,
@@ -164,16 +165,21 @@ export const reviewRoutes: FastifyPluginAsync = async (app) => {
         status: z.enum(DESIGN_REVIEW_STATUSES).optional(),
         packageId: idSchema.optional(),
         code: z.enum(DESIGN_REVIEW_CODES).optional(),
-        open: z.coerce.boolean().optional(),
+        open: boolQuerySchema.optional(),
       })
       .parse(req.query);
+    const OPEN_CYCLE = ["open", "in_review", "consolidating"] as const;
     const where = and(
       eq(designReviews.companyId, req.companyId!),
       eq(designReviews.projectId, projectId),
       q.status ? eq(designReviews.status, q.status) : undefined,
       q.packageId ? eq(designReviews.packageId, q.packageId) : undefined,
       q.code ? eq(designReviews.consolidatedCode, q.code) : undefined,
-      q.open ? inArray(designReviews.status, ["open", "in_review", "consolidating"]) : undefined,
+      q.open === undefined
+        ? undefined
+        : q.open
+          ? inArray(designReviews.status, [...OPEN_CYCLE])
+          : notInArray(designReviews.status, [...OPEN_CYCLE]),
     );
     const [rows, [total]] = await Promise.all([
       app.db
@@ -357,7 +363,7 @@ export const reviewRoutes: FastifyPluginAsync = async (app) => {
     if (review.status === "closed" || review.status === "cancelled") {
       throw conflict("Reviewers cannot be added to a closed cycle.");
     }
-    if (body.userId) await assertUser(app.db, body.userId);
+    if (body.userId) await assertUser(app.db, companyId, body.userId);
     if (body.vendorId) await assertVendor(app.db, companyId, body.vendorId);
     if (body.userId) {
       const [existing] = await app.db
@@ -682,11 +688,44 @@ export const reviewRoutes: FastifyPluginAsync = async (app) => {
     const companyId = req.companyId!;
     const review = await loadReview(companyId, projectId, reviewId);
     if (review.status === "closed") throw conflict("A closed cycle cannot be cancelled.");
+    if (review.status === "cancelled") throw conflict("This review cycle is already cancelled.");
+    const now = nowISO();
     const [updated] = await app.db
       .update(designReviews)
-      .set({ status: "cancelled", closedAt: nowISO(), closedBy: req.user!.id, notes: body.reason, updatedAt: nowISO() })
+      .set({
+        status: "cancelled",
+        closedAt: now,
+        closedBy: req.user!.id,
+        // Append rather than overwrite: the reason a cycle was withdrawn does
+        // not replace what the cycle recorded on its way there.
+        notes: [review.notes, `Cancelled ${now.slice(0, 10)}: ${body.reason}`].filter(Boolean).join("\n"),
+        updatedAt: now,
+      })
       .where(eq(designReviews.id, reviewId))
       .returning();
+
+    // Opening a cycle moves a planned/in-progress package to "in review".
+    // Cancelling the cycle has to put that back, or the package sits in review
+    // for ever with nothing under review — but only when this was the
+    // package's ONLY cycle: a package that reached "in review" through an
+    // earlier CLOSED cycle keeps the standing that cycle gave it.
+    const [otherCycles] = await app.db
+      .select({ n: count() })
+      .from(designReviews)
+      .where(
+        and(
+          eq(designReviews.packageId, review.packageId),
+          notInArray(designReviews.id, [reviewId]),
+          notInArray(designReviews.status, ["cancelled"]),
+        ),
+      );
+    if ((otherCycles?.n ?? 0) === 0) {
+      await app.db
+        .update(designPackages)
+        .set({ status: "in_progress", updatedAt: now })
+        .where(and(eq(designPackages.id, review.packageId), eq(designPackages.status, "in_review")));
+    }
+    await refreshPackageCounters(review.packageId);
     await ledger(app.db, {
       companyId,
       projectId,
@@ -694,7 +733,7 @@ export const reviewRoutes: FastifyPluginAsync = async (app) => {
       action: "state_change",
       objectType: "design_review",
       objectId: reviewId,
-      payload: { to: "cancelled", reason: body.reason },
+      payload: { to: "cancelled", reason: body.reason, packageReturnedToInProgress: (otherCycles?.n ?? 0) === 0 },
     });
     return updated;
   });
@@ -712,9 +751,10 @@ export const reviewRoutes: FastifyPluginAsync = async (app) => {
         status: z.enum(DESIGN_COMMENT_STATUSES).optional(),
         category: z.enum(DESIGN_COMMENT_CATEGORIES).optional(),
         discipline: z.enum(DESIGN_DISCIPLINES).optional(),
-        open: z.coerce.boolean().optional(),
+        open: boolQuerySchema.optional(),
       })
       .parse(req.query);
+    const OPEN_COMMENT = ["open", "responded"] as const;
     const where = and(
       eq(designComments.companyId, req.companyId!),
       eq(designComments.projectId, projectId),
@@ -723,7 +763,11 @@ export const reviewRoutes: FastifyPluginAsync = async (app) => {
       q.status ? eq(designComments.status, q.status) : undefined,
       q.category ? eq(designComments.category, q.category) : undefined,
       q.discipline ? eq(designComments.discipline, q.discipline) : undefined,
-      q.open ? inArray(designComments.status, ["open", "responded"]) : undefined,
+      q.open === undefined
+        ? undefined
+        : q.open
+          ? inArray(designComments.status, [...OPEN_COMMENT])
+          : notInArray(designComments.status, [...OPEN_COMMENT]),
     );
     const [rows, [total]] = await Promise.all([
       app.db
@@ -911,7 +955,7 @@ export const reviewRoutes: FastifyPluginAsync = async (app) => {
     const companyId = req.companyId!;
     const row = await loadComment(companyId, projectId, commentId);
     if (row.issueId) throw conflict("This comment has already been escalated to the issue register.");
-    if (body.assignedToUserId) await assertUser(app.db, body.assignedToUserId);
+    if (body.assignedToUserId) await assertUser(app.db, companyId, body.assignedToUserId);
     const { number, reference } = await allocateReference(app.db, projectId, "design_issue", "DI");
     const id = newId("dis");
     const [issue] = await app.db

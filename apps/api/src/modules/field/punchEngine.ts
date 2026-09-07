@@ -266,7 +266,11 @@ export function completionStats(
 
 function csvCell(value: unknown): string {
   const s = value === null || value === undefined ? "" : String(value);
-  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  // A punch title is user text and this file is opened in a spreadsheet:
+  // neutralise leading formula characters (same rule as modules/twin/shared.ts)
+  // so an exported defect cannot execute when the register is opened.
+  const neutralised = /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
+  return /[",\n\r]/.test(neutralised) ? `"${neutralised.replace(/"/g, '""')}"` : neutralised;
 }
 
 export function toCsv(

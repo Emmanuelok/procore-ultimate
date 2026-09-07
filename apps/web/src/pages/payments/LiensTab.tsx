@@ -79,7 +79,7 @@ interface LienSummary {
   total: number;
 }
 
-const OPEN_STATUSES = new Set(["noticed", "filed", "disputed"]);
+const OPEN_STATUSES = new Set(["noticed", "served", "filed", "disputed"]);
 
 function statusTone(status: string): "neutral" | "warning" | "danger" | "success" | "info" {
   switch (status) {
@@ -88,6 +88,8 @@ function statusTone(status: string): "neutral" | "warning" | "danger" | "success
     case "bonded_off":
       return "info";
     case "disputed":
+      return "warning";
+    case "served":
       return "warning";
     case "filed":
     case "noticed":
@@ -339,15 +341,21 @@ export default function LiensTab({ projectId }: { projectId: string }) {
           }
           rowActions={(row) => [
             {
+              id: "serve",
+              label: "Record as served",
+              disabled: busy || row.status !== "noticed",
+              onSelect: () => void act(row, "serve", {}),
+            },
+            {
               id: "file",
               label: "Record as filed",
-              disabled: busy || row.status !== "noticed",
+              disabled: busy || !["noticed", "served"].includes(row.status),
               onSelect: () => void act(row, "file"),
             },
             {
               id: "dispute",
               label: "Dispute…",
-              disabled: busy || !["noticed", "filed"].includes(row.status),
+              disabled: busy || !["noticed", "served", "filed"].includes(row.status),
               onSelect: () => {
                 const reason = window.prompt(`On what grounds is ${row.reference} disputed?`);
                 if (reason?.trim()) void act(row, "dispute", { reason: reason.trim() });
@@ -365,8 +373,7 @@ export default function LiensTab({ projectId }: { projectId: string }) {
             {
               id: "release",
               label: "Record the release",
-              disabled:
-                busy || !["noticed", "filed", "disputed", "bonded_off"].includes(row.status),
+              disabled: busy || !(OPEN_STATUSES.has(row.status) || row.status === "bonded_off"),
               onSelect: () => void act(row, "release", {}),
             },
             {
@@ -376,6 +383,18 @@ export default function LiensTab({ projectId }: { projectId: string }) {
               onSelect: () => {
                 const reason = window.prompt(`Why has ${row.reference} expired?`);
                 if (reason?.trim()) void act(row, "expire", { reason: reason.trim() });
+              },
+            },
+            {
+              id: "void",
+              label: "Void the record…",
+              tone: "danger",
+              disabled: busy || !OPEN_STATUSES.has(row.status),
+              onSelect: () => {
+                const reason = window.prompt(
+                  `Voiding ${row.reference} says the claim should never have been recorded — not that it was resolved. Why?`,
+                );
+                if (reason?.trim()) void act(row, "void", { reason: reason.trim() });
               },
             },
           ]}

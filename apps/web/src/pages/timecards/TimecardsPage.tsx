@@ -27,7 +27,7 @@
  */
 import { useCallback, useMemo, useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { Alert, Badge, PageHeader, Tabs } from "../../ui";
+import { Alert, Badge, Button, PageHeader, Tabs } from "../../ui";
 import { IconWorkforce } from "../../ui/icons";
 import BatchesTab from "./BatchesTab";
 import CardsTab from "./CardsTab";
@@ -37,6 +37,15 @@ import ReconcileTab from "./ReconcileTab";
 import TicketDrawer from "./TicketDrawer";
 import TicketsTab from "./TicketsTab";
 import TimecardDrawer from "./TimecardDrawer";
+import {
+  BatchCreateModal,
+  CrewCreateModal,
+  CrewMemberModal,
+  TicketCreateModal,
+  TicketSourceModal,
+  TimecardCreateModal,
+  type WorkerOption,
+} from "./TimecardForms";
 import {
   hoursText,
   shiftDays,
@@ -52,6 +61,7 @@ import {
   useTicketDetail,
   useTickets,
   useTimecardDetail,
+  useResource,
   useTimecards,
   type CardFilters,
 } from "./timecardsShared";
@@ -104,6 +114,10 @@ export default function TimecardsPage() {
   );
 
   const users = useCompanyUsers();
+  /** which write form is open */
+  const [form, setForm] = useState<
+    "card" | "batch" | "ticket" | "source" | "crew" | "member" | null
+  >(null);
   const crews = useCrews(projectId);
   const cards = useTimecards(projectId, cardFilters, tab === "cards");
   const reconciliation = useReconciliation(projectId, reconcileFrom, to, tab === "reconcile");
@@ -114,7 +128,21 @@ export default function TimecardsPage() {
   const tickets = useTickets(projectId, tab === "tickets");
   const ticketDetail = useTicketDetail(projectId, openTicket);
   const cardDetail = useTimecardDetail(projectId, openCard);
-  const costCodes = useCostCodes(projectId, openCard !== null);
+  const costCodes = useCostCodes(projectId, openCard !== null || form !== null);
+  /** the worker register this module reads from and never duplicates */
+  const workerList = useResource<{ items: WorkerOption[] }>(
+    (form === "card" || form === "crew" || form === "member") && projectId
+      ? `/api/v1/projects/${projectId}/workers?page=1&pageSize=500&status=active`
+      : null,
+  );
+
+  const refresh = useCallback(() => {
+    cards.reload();
+    batches.reload();
+    batchDetail.reload();
+    costReport.reload();
+    reconciliation.reload();
+  }, [cards, batches, batchDetail, costReport, reconciliation]);
 
   const selectTab = useCallback(
     (next: TabKey) => {
@@ -205,6 +233,40 @@ export default function TimecardsPage() {
             ) : null}
           </span>
         }
+        actions={
+          <div className="flex flex-wrap items-center gap-2">
+            {tab === "crews" ? (
+              <>
+                <Button size="sm" variant="secondary" onClick={() => setForm("crew")}>
+                  Form a crew
+                </Button>
+                {crewId ? (
+                  <Button size="sm" variant="secondary" onClick={() => setForm("member")}>
+                    Add a member
+                  </Button>
+                ) : null}
+              </>
+            ) : null}
+            {tab === "tickets" ? (
+              <>
+                <Button size="sm" variant="secondary" onClick={() => setForm("ticket")}>
+                  Raise a T&amp;M ticket
+                </Button>
+                {openTicket ? (
+                  <Button size="sm" variant="secondary" onClick={() => setForm("source")}>
+                    Source lines
+                  </Button>
+                ) : null}
+              </>
+            ) : null}
+            <Button size="sm" variant="secondary" onClick={() => setForm("batch")}>
+              Start a week
+            </Button>
+            <Button size="sm" variant="primary" onClick={() => setForm("card")}>
+              Raise a timecard
+            </Button>
+          </div>
+        }
         tabs={
           <Tabs
             items={TABS.map((entry) => ({
@@ -252,6 +314,7 @@ export default function TimecardsPage() {
         />
       ) : tab === "cost" ? (
         <CostReportTab
+          projectId={projectId}
           report={costReport}
           windowDays={costDays}
           onWindowDays={setCostDays}
@@ -265,6 +328,8 @@ export default function TimecardsPage() {
           detail={batchDetail}
           users={users}
           onOpenCard={openCardDrawer}
+          projectId={projectId}
+          onChanged={refresh}
         />
       ) : tab === "crews" ? (
         <CrewsTab
@@ -295,6 +360,64 @@ export default function TimecardsPage() {
         detail={ticketDetail}
         onClose={() => openTicketDrawer(null)}
         onMutated={refreshAll}
+      />
+
+      <TimecardCreateModal
+        open={form === "card"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        projectId={projectId}
+        workers={workerList.data?.items ?? []}
+        crews={crews.data?.items ?? []}
+        costCodes={costCodes.data?.items ?? []}
+      />
+      <BatchCreateModal
+        open={form === "batch"}
+        onClose={() => setForm(null)}
+        onDone={refresh}
+        projectId={projectId}
+        crews={crews.data?.items ?? []}
+      />
+      <TicketCreateModal
+        open={form === "ticket"}
+        onClose={() => setForm(null)}
+        onDone={(ticketId) => {
+          tickets.reload();
+          openTicketDrawer(ticketId);
+        }}
+        projectId={projectId}
+        crews={crews.data?.items ?? []}
+      />
+      <CrewCreateModal
+        open={form === "crew"}
+        onClose={() => setForm(null)}
+        onDone={() => crews.reload()}
+        projectId={projectId}
+        workers={workerList.data?.items ?? []}
+        costCodes={costCodes.data?.items ?? []}
+      />
+      <CrewMemberModal
+        open={form === "member"}
+        onClose={() => setForm(null)}
+        onDone={() => {
+          crews.reload();
+          crewDetail.reload();
+        }}
+        projectId={projectId}
+        crew={(crews.data?.items ?? []).find((c) => c.id === crewId) ?? null}
+        workers={workerList.data?.items ?? []}
+        costCodes={costCodes.data?.items ?? []}
+      />
+      <TicketSourceModal
+        open={form === "source"}
+        onClose={() => setForm(null)}
+        onDone={() => {
+          tickets.reload();
+          ticketDetail.reload();
+        }}
+        projectId={projectId}
+        ticketId={openTicket}
+        ticketReference={ticketDetail.data?.reference ?? "this ticket"}
       />
     </div>
   );

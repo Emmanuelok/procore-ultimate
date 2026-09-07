@@ -44,6 +44,12 @@ export const projectHealthSnapshots = pgTable(
     ratedDimensions: integer("rated_dimensions").default(0).notNull(),
     /** Array<{ key, score, level, basis, inputs }> — the explainable breakdown */
     dimensions: jsonb("dimensions").$type<unknown[]>().default([]).notNull(),
+    /**
+     * The engine's own sentence explaining the overall verdict. Stored so a
+     * later read renders exactly the explanation the computation produced
+     * (including "held at watch because … is off track").
+     */
+    basis: text("basis").default("").notNull(),
     /** HealthRecomputeTrigger */
     trigger: text("trigger").default("interval").notNull(),
     computedAt: timestamp("computed_at", { withTimezone: true, mode: "string" }).notNull(),
@@ -113,6 +119,22 @@ export const pulseSnapshots = pgTable(
       .default({})
       .notNull(),
     openAttention: integer("open_attention").default(0).notNull(),
+    /**
+     * Per-project slice of this snapshot: `{ [projectId | "_company"]: { level,
+     * attention: { critical, high, … } } }`. It is what lets a caller who can
+     * only see some projects read an honest history instead of the company's
+     * totals (plan §6.3).
+     */
+    projectRollup: jsonb("project_rollup")
+      .$type<Record<string, { level: string; attention: Record<string, number> }>>()
+      .default({})
+      .notNull(),
+    /**
+     * Source types whose candidate query hit its row cap when this snapshot was
+     * taken — the feed is the top N of more, and nothing from a capped source
+     * may be reported as resolved.
+     */
+    truncatedSources: jsonb("truncated_sources").$type<string[]>().default([]).notNull(),
     /** what changed vs the snapshot ~a day earlier: { since, ... } */
     changes: jsonb("changes").$type<Record<string, unknown>>().default({}).notNull(),
     createdAt: createdAt(),

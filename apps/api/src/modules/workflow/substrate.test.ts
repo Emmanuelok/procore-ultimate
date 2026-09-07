@@ -83,12 +83,12 @@ afterAll(async () => {
   await built.close();
 });
 
-async function makeTemplate(steps: unknown[], name = "Template") {
+async function makeTemplate(steps: unknown[], name = "Template", isMandatory = false) {
   const res = await app.inject({
     method: "POST",
     url: "/api/v1/workflow-templates",
     headers: owner.headers,
-    payload: { name, recordType: "rfi", steps },
+    payload: { name, recordType: "rfi", steps, isMandatory },
   });
   expect(res.statusCode).toBe(201);
   return res.json().id as string;
@@ -453,6 +453,39 @@ describe("assignment, cancellation and recovery", () => {
     expect(second.json().id).toBe(first.json().id);
   });
 
+  /*
+   * The read-then-insert the idempotency check used to be is not idempotent
+   * under the double click it was written for: both requests observe nothing
+   * live and both insert. Concurrent starts now serialise on a
+   * transaction-scoped advisory lock and the existence check is repeated
+   * inside it, so the loser returns the winner's instance.
+   */
+  it("opens exactly one chain when two starts land together on one record", async () => {
+    const templateId = await makeTemplate(
+      [{ name: "One", type: "approval", assigneeIds: [pm.userId] }],
+      "Concurrent start",
+    );
+    const recordId = newId("rfi");
+    const [a, b] = await Promise.all([
+      start(templateId, recordId),
+      start(templateId, recordId),
+    ]);
+    expect([a.statusCode, b.statusCode].sort()).toEqual([200, 201]);
+    expect(a.json().id).toBe(b.json().id);
+
+    const rows = await app.db
+      .select()
+      .from(workflowInstances)
+      .where(
+        and(
+          eq(workflowInstances.companyId, owner.companyId),
+          eq(workflowInstances.recordType, "rfi"),
+          eq(workflowInstances.recordId, recordId),
+        ),
+      );
+    expect(rows).toHaveLength(1);
+  });
+
   it("cancels a stuck instance and withdraws its pending steps", async () => {
     const templateId = await makeTemplate(
       [{ name: "One", type: "approval", assigneeIds: [pm.userId] }],
@@ -683,6 +716,103 @@ describe("POST /workflow-templates/:id/apply-to-running", () => {
       ),
     ).toBe(true);
   });
+
+  /*
+   * A partially decided parallel group is precisely the situation retroactive
+   * migration exists for, and it was the one that broke it: the rebuild kept
+   * the decided row and re-inserted the whole group, violating
+   * `workflow_steps_uq (instance_id, position, assignee_id)`. The throw was
+   * not caught inside the loop, so the request 500'd and instances migrated
+   * earlier in the batch stayed migrated with nothing said about it.
+   */
+  it("migrates a partially decided parallel group instead of colliding with the decided row", async () => {
+    const templateId = await makeTemplate(
+      [
+        {
+          name: "Two approvers",
+          type: "approval",
+          assigneeIds: [pm.userId, reviewer.userId],
+          parallel: true,
+        },
+      ],
+      "Partially decided",
+    );
+    const started = await start(templateId, newId("rfi"));
+    const instanceId = started.json().id as string;
+    const steps = started.json().steps as Array<{ id: string; assigneeId: string }>;
+    const pmStep = steps.find((s) => s.assigneeId === pm.userId)!;
+
+    const decided = await app.inject({
+      method: "POST",
+      url: `/api/v1/workflow-steps/${pmStep.id}/decide`,
+      headers: pmHeaders,
+      payload: { decision: "approved" },
+    });
+    expect(decided.statusCode).toBe(200);
+
+    await app.inject({
+      method: "PATCH",
+      url: `/api/v1/workflow-templates/${templateId}`,
+      headers: owner.headers,
+      payload: { name: "Partially decided (renamed)" },
+    });
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/workflow-templates/${templateId}/apply-to-running`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().migrated).toBe(1);
+    expect(res.json().skippedItems).toEqual([]);
+
+    const after = await app.db
+      .select()
+      .from(workflowStepInstances)
+      .where(
+        and(
+          eq(workflowStepInstances.instanceId, instanceId),
+          eq(workflowStepInstances.position, 0),
+        ),
+      );
+    // Alice's approval survives; Bob's step was rebuilt from the new version.
+    expect(after).toHaveLength(2);
+    expect(after.find((s) => s.assigneeId === pm.userId)!.decision).toBe("approved");
+    expect(after.find((s) => s.assigneeId === reviewer.userId)!.decision).toBe("pending");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Reassignment collisions                                             */
+/* ------------------------------------------------------------------ */
+
+describe("POST /workflow-steps/:id/reassign", () => {
+  it("refuses a target who already holds a step in the same group, with a readable 409", async () => {
+    const templateId = await makeTemplate(
+      [
+        {
+          name: "Both of us",
+          type: "approval",
+          assigneeIds: [pm.userId, reviewer.userId],
+          parallel: true,
+        },
+      ],
+      "Reassign clash",
+    );
+    const started = await start(templateId, newId("rfi"));
+    const steps = started.json().steps as Array<{ id: string; assigneeId: string }>;
+    const pmStep = steps.find((s) => s.assigneeId === pm.userId)!;
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/workflow-steps/${pmStep.id}/reassign`,
+      headers: owner.headers,
+      payload: { toUserId: reviewer.userId },
+    });
+    // A raw unique-constraint 500 was the previous answer.
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("already an approver");
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -690,11 +820,59 @@ describe("POST /workflow-templates/:id/apply-to-running", () => {
 /* ------------------------------------------------------------------ */
 
 describe("GET /projects/:projectId/workflow-required", () => {
+  /*
+   * `isMandatory` used to be accepted, ledgered and discarded — the column did
+   * not exist — and `required` was computed as "any active template exists",
+   * so one optional template made every record of the type undeliverable.
+   */
+  it("does NOT require a workflow merely because an optional template exists", async () => {
+    await makeTemplate(
+      [{ name: "Optional review", type: "approval", assigneeIds: [pm.userId] }],
+      "Optional design review",
+      false,
+    );
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/workflow-required?recordType=rfi`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().required).toBe(false);
+    expect(res.json().templates.length).toBeGreaterThan(0);
+    expect(res.json().requiredBy).toEqual([]);
+  });
+
+  it("stores isMandatory and reads it back", async () => {
+    const templateId = await makeTemplate(
+      [{ name: "Gate", type: "approval", assigneeIds: [pm.userId] }],
+      "Persisted mandatory",
+      true,
+    );
+    const read = await app.inject({
+      method: "GET",
+      url: `/api/v1/workflow-templates/${templateId}`,
+      headers: owner.headers,
+    });
+    expect(read.statusCode).toBe(200);
+    expect(read.json().isMandatory).toBe(1);
+
+    // And it can be turned off again without losing the rest of the template.
+    const patched = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/workflow-templates/${templateId}`,
+      headers: owner.headers,
+      payload: { isMandatory: false },
+    });
+    expect(patched.statusCode).toBe(200);
+    expect(patched.json().isMandatory).toBe(0);
+  });
+
   it("answers whether a workflow exists for the record type and whether it is satisfied", async () => {
     const recordId = newId("rfi");
     const templateId = await makeTemplate(
       [{ name: "Gate", type: "approval", assigneeIds: [pm.userId] }],
       "Mandatory",
+      true,
     );
     const before = await app.inject({
       method: "GET",
@@ -759,5 +937,57 @@ describe("scheduler job workflow.escalations", () => {
     const second = await app.scheduler.runNow(WORKFLOW_ESCALATION_JOB);
     // Idempotent: raising the same escalation twice would be the bug.
     expect((second.lastResult as { escalated: number }).escalated).toBe(0);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Health inputs (cross-package contract §3.5)                         */
+/* ------------------------------------------------------------------ */
+
+describe("GET /projects/:projectId/workflow/health-inputs", () => {
+  it("counts what is running, pending, overdue and blocked — and refuses to invent a ratio", async () => {
+    const fresh = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: owner.headers,
+      payload: { name: "Health Inputs Project" },
+    });
+    const freshId = fresh.json().id;
+
+    const empty = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${freshId}/workflow/health-inputs`,
+      headers: owner.headers,
+    });
+    expect(empty.statusCode).toBe(200);
+    const emptyBody = empty.json();
+    expect(emptyBody.metrics.runningInstances).toBe(0);
+    expect(emptyBody.metrics.pendingSteps).toBe(0);
+    // No denominator: the ratio is unknowable, not zero.
+    expect(emptyBody.metrics.overdueRatio).toBeNull();
+    expect(emptyBody.reasons.join(" ")).toContain("No approval chain");
+
+    // A live chain on the main project produces real counts.
+    const live = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/workflow/health-inputs`,
+      headers: owner.headers,
+    });
+    expect(live.statusCode).toBe(200);
+    const body = live.json();
+    expect(body.metrics.pendingSteps).toBeGreaterThanOrEqual(0);
+    expect(typeof body.metrics.blockedInstances).toBe("number");
+    if (body.metrics.pendingSteps > 0) {
+      expect(typeof body.metrics.overdueRatio).toBe("number");
+    }
+  });
+
+  it("refuses a caller with no read access to the project", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/workflow/health-inputs`,
+      headers: strangerHeaders,
+    });
+    expect(res.statusCode).toBe(403);
   });
 });

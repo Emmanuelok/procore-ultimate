@@ -42,10 +42,14 @@ let app: FastifyInstance;
 
 const url = (p: string) => `/api/v1${p}`;
 
+// 120s, not the global 30s: this hook boots an embedded PGlite and applies the whole
+// migration set, which on a loaded build machine takes longer than the default hook
+// timeout — a worker that times out here reports every test in the file as skipped,
+// which looks exactly like a green run that tested nothing.
 beforeAll(async () => {
   built = await buildTestApp();
   app = built.app;
-});
+}, 120_000);
 
 afterAll(async () => {
   await built.close();
@@ -1547,19 +1551,44 @@ describe("REGRESSION: key rotation is not a cross-tenant act", () => {
     expect(untouched[0]!.retiredAt).toBeNull();
     expect(plain.json().note).toMatch(/were NOT retired/);
 
-    const deliberate = await app.inject({
+    // REGRESSION (verifier): asking is not authority. Platform-wide keys
+    // (companyId null) are read by every tenant, so retiring them is a
+    // platform-operator act. A tenant admin who asks is REFUSED, with the
+    // reason, unless the deployment has explicitly enabled it.
+    const asked = await app.inject({
       method: "POST",
       url: url("/ledger/keys/rotate"),
       headers: a.headers,
       payload: { retireOtherPlatformKeys: true },
     });
-    expect(deliberate.statusCode).toBe(200);
-    expect(deliberate.json().retiredOtherKeys).toBeGreaterThanOrEqual(1);
-    const retired = await app.db
+    expect(asked.statusCode).toBe(200);
+    expect(asked.json().retiredOtherKeys).toBe(0);
+    expect(asked.json().retirementRefused).toMatch(/platform-operator action/);
+    const stillUntouched = await app.db
       .select()
       .from(signingKeys)
       .where(eq(signingKeys.keyId, foreignKeyId));
-    expect(retired[0]!.retiredAt).not.toBeNull();
+    expect(stillUntouched[0]!.retiredAt).toBeNull();
+
+    process.env["ANCHOR_ALLOW_TENANT_KEY_RETIREMENT"] = "true";
+    try {
+      const deliberate = await app.inject({
+        method: "POST",
+        url: url("/ledger/keys/rotate"),
+        headers: a.headers,
+        payload: { retireOtherPlatformKeys: true },
+      });
+      expect(deliberate.statusCode).toBe(200);
+      expect(deliberate.json().retiredOtherKeys).toBeGreaterThanOrEqual(1);
+      expect(deliberate.json().retirementRefused).toBeNull();
+      const retired = await app.db
+        .select()
+        .from(signingKeys)
+        .where(eq(signingKeys.keyId, foreignKeyId));
+      expect(retired[0]!.retiredAt).not.toBeNull();
+    } finally {
+      delete process.env["ANCHOR_ALLOW_TENANT_KEY_RETIREMENT"];
+    }
   });
 });
 
@@ -1588,7 +1617,12 @@ describe("REGRESSION: reads no longer load payload snapshots", () => {
       .where(eq(chainWatermarks.companyId, actor.companyId));
     expect(marks).toHaveLength(1);
     expect(marks[0]!.deepVerifiedSeq).toBeGreaterThan(0);
-  });
+    // 120s: this one grows a chain, seals it, classifies it and then runs the
+    // deep-verify job over every stored snapshot. It is the most expensive
+    // test in the file and it exceeds the 30s default whenever the build
+    // machine is busy — and a timeout here reports as a failure of the code
+    // rather than of the clock.
+  }, 120_000);
 });
 
 describe("OpenTimestamps upgrade", () => {

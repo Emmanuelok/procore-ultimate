@@ -20,7 +20,8 @@ import {
   Td,
   Th,
 } from "../../ui";
-import { formatDate, formatDateTime } from "../format";
+import { BUNDLE_ITEM_PRIVILEGE } from "@constructos/shared";
+import { formatDate, formatDateTime, humanize } from "../format";
 import {
   bundleSourceLabel,
   isTerminal,
@@ -168,6 +169,42 @@ export default function BundleBuilder({
     void putItems(bundle.items.filter((_, idx) => idx !== i));
   }
 
+  /**
+   * Mark an item privileged (#340-342). A privileged item stays on the
+   * register — the tribunal is entitled to know it exists — but is withheld
+   * from the production and listed in the privilege log instead.
+   */
+  async function setPrivilege(item: BundleItem, privilege: string) {
+    if (!bundle) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const reason =
+        privilege === "none"
+          ? null
+          : (window.prompt(
+              `Reason for withholding "${item.title}" (shown in the privilege log):`,
+              item.privilegeReason ?? "",
+            ) ?? "");
+      await api.put(`${base}/dispute-bundles/${bundle.id}/privilege`, {
+        entries: [
+          {
+            itemId: item.id,
+            privilege,
+            ...(reason ? { reason } : {}),
+          },
+        ],
+      });
+      await onChanged();
+    } catch (err) {
+      setError(
+        err instanceof ApiClientError ? err.message : "Failed to update the privilege marking.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function sortChronological() {
     if (!bundle) return;
     setError(null);
@@ -225,6 +262,18 @@ export default function BundleBuilder({
       setError(err instanceof ApiClientError ? err.message : "Failed to issue the bundle.");
     } finally {
       setBusy(false);
+    }
+  }
+
+  /** Open the produced bundle (cover + hyperlinked index + snapshot sections). */
+  async function openDocument() {
+    if (!bundle) return;
+    setError(null);
+    try {
+      const url = await fetchBlobUrl(`${base}/dispute-bundles/${bundle.id}/document.html`);
+      window.open(url, "_blank", "noopener");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not open the produced bundle");
     }
   }
 
@@ -517,6 +566,25 @@ export default function BundleBuilder({
                   <span className="whitespace-nowrap text-xs text-ink-400">
                     {it.date ? formatDate(it.date) : "undated"}
                   </span>
+                  {/* Privilege (#340-342): a privileged item stays on the
+                      register and out of the production, with a reason. */}
+                  <select
+                    aria-label={`Privilege for item ${i + 1}`}
+                    value={it.privilege ?? "none"}
+                    disabled={busy}
+                    onChange={(e) => void setPrivilege(it, e.target.value)}
+                    className={`shrink-0 rounded border px-1.5 py-1 text-xs ${
+                      (it.privilege ?? "none") === "none"
+                        ? "border-ink-200 text-ink-500"
+                        : "border-amber-300 bg-amber-50 font-medium text-amber-800"
+                    }`}
+                  >
+                    {BUNDLE_ITEM_PRIVILEGE.map((p) => (
+                      <option key={p} value={p}>
+                        {p === "none" ? "produce" : humanize(p)}
+                      </option>
+                    ))}
+                  </select>
                   <span className="flex shrink-0 items-center gap-1">
                     <button
                       type="button"
@@ -587,9 +655,33 @@ export default function BundleBuilder({
                 </div>
               ) : null}
 
+              {bundle.manifest?.privilegeLog && bundle.manifest.privilegeLog.length > 0 ? (
+                <div className="mb-3 rounded-md bg-amber-50 px-3 py-2 ring-1 ring-amber-200">
+                  <div className="text-xs font-semibold text-amber-900">
+                    Privilege log — {bundle.manifest.privilegeLog.length} item
+                    {bundle.manifest.privilegeLog.length === 1 ? "" : "s"} withheld
+                  </div>
+                  <ul className="mt-1 space-y-0.5 text-xs text-amber-800">
+                    {bundle.manifest.privilegeLog.map((p) => (
+                      <li key={p.id}>
+                        <span className="font-medium">{p.title}</span> — {humanize(p.privilege)}
+                        {p.reason ? `: ${p.reason}` : ""}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+
+              {bundle.manifest?.statement ? (
+                <p className="mb-3 text-xs leading-5 text-ink-500">{bundle.manifest.statement}</p>
+              ) : null}
+
               <div className="flex flex-wrap gap-2">
                 <Button size="sm" variant="secondary" disabled={busy} onClick={() => void onVerify()}>
                   {busy ? "Checking…" : "Verify integrity"}
+                </Button>
+                <Button size="sm" variant="secondary" onClick={() => void openDocument()}>
+                  Open produced bundle
                 </Button>
                 <Button size="sm" variant="secondary" onClick={() => void downloadManifest()}>
                   Download manifest.csv
@@ -605,22 +697,48 @@ export default function BundleBuilder({
                 verify.intact ? (
                   <div className="mt-3 rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-800 ring-1 ring-emerald-200">
                     <strong>Bundle intact.</strong> All {verify.itemCount} content hashes match the
-                    frozen manifest and the Merkle root recomputes exactly.
+                    frozen manifest, every entry agrees with the snapshot taken at generation, and
+                    the Merkle root recomputes exactly.
                   </div>
                 ) : (
-                  <div className="mt-3 rounded-md bg-red-50 px-3 py-2 text-sm text-red-800 ring-1 ring-red-200">
-                    <strong>Integrity failure.</strong> {verify.mismatches.length} item
-                    {verify.mismatches.length === 1 ? "" : "s"} no longer match the frozen manifest:
+                  <div
+                    className={
+                      verify.manifestIntact
+                        ? "mt-3 rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-900 ring-1 ring-amber-200"
+                        : "mt-3 rounded-md bg-red-50 px-3 py-2 text-sm text-red-800 ring-1 ring-red-200"
+                    }
+                  >
+                    <strong>
+                      {verify.manifestIntact
+                        ? "Sources have moved on."
+                        : verify.rewrittenCount > 0
+                          ? "Manifest rewritten."
+                          : "Integrity failure."}
+                    </strong>{" "}
+                    {verify.statement}
                     <ul className="mt-1 space-y-1">
-                      {verify.mismatches.map((m) => (
-                        <li key={m.tab} className="text-xs">
-                          <span className="font-mono font-semibold">{m.tab}</span> {m.title} —
-                          expected <code className="font-mono">{shortHash(m.expected)}</code>, got{" "}
-                          <code className="font-mono">
-                            {m.actual ? shortHash(m.actual) : "missing"}
-                          </code>
-                        </li>
-                      ))}
+                      {verify.findings
+                        .filter((f) => f.state !== "intact")
+                        .map((f) => (
+                          <li key={f.tab} className="text-xs">
+                            <span className="font-mono font-semibold">{f.tab}</span> {f.title} —{" "}
+                            <span className="font-semibold">
+                              {f.state === "manifest_rewritten"
+                                ? "index entry disagrees with the generation snapshot"
+                                : f.state === "changed"
+                                  ? "source changed since production"
+                                  : f.state === "missing"
+                                    ? "source no longer resolves"
+                                    : "changed with no snapshot"}
+                            </span>{" "}
+                            (expected <code className="font-mono">{shortHash(f.expected)}</code>,
+                            got{" "}
+                            <code className="font-mono">
+                              {f.actual ? shortHash(f.actual) : "missing"}
+                            </code>
+                            ). <span className="text-ink-600">{f.note}</span>
+                          </li>
+                        ))}
                     </ul>
                   </div>
                 )

@@ -8,6 +8,7 @@ import { and, eq } from "drizzle-orm";
 import {
   bimElements,
   bimModelVersions,
+  clashResults,
   companyMemberships,
   fileAccessLog,
   files,
@@ -218,6 +219,75 @@ describe("bim module — models and ingestion", () => {
     expect(elements).toHaveLength(3);
   });
 
+  it("queues a reprocess instead of parsing a container over the inline limit in-request", async () => {
+    // the upload path defers anything over 8 MiB to the worker; Reprocess must
+    // obey the same rule or the exact containers the queue exists for get
+    // parsed synchronously on demand, holding a request open for the whole
+    // extraction
+    await built.app.db
+      .update(bimModelVersions)
+      .set({ sizeBytes: 32 * 1024 * 1024 })
+      .where(eq(bimModelVersions.id, versionId));
+    const res = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/bim/versions/${versionId}/process`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(202);
+    expect(res.json().processing).toBe("queued");
+    expect(res.json().queued).toBe(true);
+    expect(res.json().reason).toContain("inline limit");
+
+    // the scheduler picks it up and it lands ready with its elements intact
+    await built.app.db
+      .update(bimModelVersions)
+      .set({ sizeBytes: null })
+      .where(eq(bimModelVersions.id, versionId));
+    await built.app.scheduler.runNow("bim.ingest");
+    const [after] = await built.app.db
+      .select()
+      .from(bimModelVersions)
+      .where(eq(bimModelVersions.id, versionId));
+    expect(after?.processing).toBe("ready");
+    expect(after?.elementCount).toBe(3);
+  });
+
+  it("refuses a second concurrent pass over the same version", async () => {
+    // two passes would each delete then re-insert bim_elements for the same
+    // version, so the surviving element set would depend on interleaving
+    await built.app.db
+      .update(bimModelVersions)
+      .set({ processing: "processing", processingStartedAt: new Date().toISOString() })
+      .where(eq(bimModelVersions.id, versionId));
+    const res = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/bim/versions/${versionId}/process`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().processing).toBe("processing");
+    const elements = await built.app.db
+      .select()
+      .from(bimElements)
+      .where(eq(bimElements.modelVersionId, versionId));
+    expect(elements).toHaveLength(3); // untouched by the refused pass
+
+    // a genuinely stalled parse (start stamp older than the window) is
+    // requeued by the sweep and processed normally
+    await built.app.db
+      .update(bimModelVersions)
+      .set({
+        processingStartedAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+      })
+      .where(eq(bimModelVersions.id, versionId));
+    await built.app.scheduler.runNow("bim.ingest");
+    const [after] = await built.app.db
+      .select()
+      .from(bimModelVersions)
+      .where(eq(bimModelVersions.id, versionId));
+    expect(after?.processing).toBe("ready");
+  });
+
   it("drains the ingest queue from the scheduler job", async () => {
     // simulate a large upload that was queued rather than parsed inline
     await built.app.db
@@ -390,6 +460,41 @@ describe("bim module — models and ingestion", () => {
     expect(again.json().cached).toBe(true);
   });
 
+  it("answers both halves of a concurrent first diff from one cached row", async () => {
+    // bim_version_diffs is unique on (base, target): two people pressing
+    // Compare on the same uncached pair both miss the cache read, and the
+    // loser used to surface an unmapped 23505 as a 500
+    const modelRes = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/bim/models`,
+      payload: { name: "Race", format: "ifc" },
+      headers: owner.headers,
+    });
+    const raceId = modelRes.json().id;
+    await upload(raceId, IFC_FIXTURE, "race-v1.ifc", owner.headers);
+    const changed = IFC_FIXTURE.split("\n")
+      .filter((line) => !line.startsWith("#12=IFCDOOR"))
+      .join("\n");
+    const v2 = await upload(raceId, changed, "race-v2.ifc", owner.headers);
+
+    const [a, b] = await Promise.all([
+      built.app.inject({
+        method: "GET",
+        url: `/api/v1/bim/versions/${v2.json().id}/diff`,
+        headers: owner.headers,
+      }),
+      built.app.inject({
+        method: "GET",
+        url: `/api/v1/bim/versions/${v2.json().id}/diff`,
+        headers: owner.headers,
+      }),
+    ]);
+    expect(a!.statusCode).toBe(200);
+    expect(b!.statusCode).toBe(200);
+    expect(a!.json().diff.id).toBe(b!.json().diff.id);
+    expect(a!.json().diff.removedCount).toBe(1);
+  });
+
   it("explains that a first version has nothing to compare against", async () => {
     const modelRes = await built.app.inject({
       method: "POST",
@@ -535,5 +640,48 @@ describe("bim module — models and ingestion", () => {
       .from(files)
       .where(and(eq(files.id, tempFileId), eq(files.companyId, owner.companyId)));
     expect(remainingFiles).toHaveLength(0);
+  });
+
+  it("removes the clash results that pointed at the deleted versions", async () => {
+    const modelRes = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/bim/models`,
+      payload: { name: "Doomed", format: "ifc" },
+      headers: owner.headers,
+    });
+    const doomedId = modelRes.json().id;
+    const version = await upload(doomedId, IFC_FIXTURE, "doomed.ifc", owner.headers);
+    const doomedVersionId = version.json().id as string;
+
+    const resultId = newId("clr");
+    await built.app.db.insert(clashResults).values({
+      id: resultId,
+      companyId: owner.companyId,
+      projectId,
+      testId: newId("clt"),
+      fingerprint: "fp-doomed",
+      kind: "hard",
+      status: "new",
+      globalIdA: WALL_A_GUID,
+      globalIdB: DOOR_GUID,
+      modelVersionIdA: doomedVersionId,
+      modelVersionIdB: doomedVersionId,
+    });
+
+    const res = await built.app.inject({
+      method: "DELETE",
+      url: `/api/v1/bim/models/${doomedId}`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+
+    // a clash between two elements of versions that no longer exist is not
+    // "still open", it is unverifiable — leaving it inflated openClashes on
+    // the coordination summary and bim_open_clashes on the health inputs
+    const remaining = await built.app.db
+      .select()
+      .from(clashResults)
+      .where(eq(clashResults.id, resultId));
+    expect(remaining).toHaveLength(0);
   });
 });

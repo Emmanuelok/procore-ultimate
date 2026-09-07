@@ -2,7 +2,12 @@ import type { FastifyInstance } from "fastify";
 import { and, asc, count, eq, ne, sql } from "drizzle-orm";
 import { z } from "zod";
 import { affectedPersons, landParcels, projects } from "@constructos/db";
-import { DISPLACEMENT_TYPES, PAP_STATUSES, PARCEL_STATUSES } from "@constructos/shared";
+import {
+  DISPLACEMENT_TYPES,
+  PAP_STATUSES,
+  PARCEL_STATUSES,
+  type PapStatus,
+} from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, conflict, notFound } from "../../lib/errors.js";
@@ -10,11 +15,13 @@ import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { isoDateSchema, todayISO } from "../field/dates.js";
 import {
   LIVELIHOOD_REQUIRED_DISPLACEMENT,
+  PAP_TRANSITIONS,
   PARCEL_READY_STATUS,
   PHYSICAL_DISPLACEMENT,
   VULNERABILITY_FLAGS,
 } from "./reference.js";
 import { percentOf, round2, tallyBy, validateEvidence, zeroFilled } from "./shared.js";
+import { GRIEVANCE_OPEN_STATUS, effectivePapStatus } from "./pap-grievance.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -37,6 +44,13 @@ const papCreateSchema = z.object({
   baseline: z.record(z.string(), z.unknown()).optional(),
   censusDate: isoDateSchema.nullable().optional(),
   livelihoodProgramme: z.string().max(2000).nullable().optional(),
+  /** the currency the entitlement matrix is priced in (defaults to USD) */
+  currency: z
+    .string()
+    .trim()
+    .length(3)
+    .transform((c) => c.toUpperCase())
+    .optional(),
 });
 
 const papPatchSchema = papCreateSchema.partial().extend({
@@ -278,6 +292,7 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
         entitlements: [],
         censusDate: body.censusDate ?? null,
         livelihoodProgramme: body.livelihoodProgramme ?? null,
+        currency: body.currency ?? "USD",
         status: "registered",
         createdBy: req.user!.id,
       });
@@ -295,6 +310,7 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
           displacementType: body.displacementType,
           vulnerabilities: body.vulnerabilities ?? [],
           censusDate: body.censusDate ?? null,
+          currency: body.currency ?? "USD",
         },
         storePayload: true,
       });
@@ -331,6 +347,10 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
       vulnerable: r.vulnerabilities.length > 0,
       entitlementCount: (r.entitlements as unknown[]).length,
       livelihoodRequired: LIVELIHOOD_REQUIRED_DISPLACEMENT.includes(r.displacementType),
+      // both facts on every row: where the lifecycle really is, and whether a
+      // complaint is live against the household
+      effectiveStatus: effectivePapStatus(r),
+      underOpenGrievance: r.status === GRIEVANCE_OPEN_STATUS,
     }));
     return paginate(items, Number(totalRow?.n ?? 0), q);
   });
@@ -354,7 +374,20 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
         ...pap,
         vulnerable: pap.vulnerabilities.length > 0,
         livelihoodRequired: LIVELIHOOD_REQUIRED_DISPLACEMENT.includes(pap.displacementType),
+        physicalDisplacement: PHYSICAL_DISPLACEMENT.includes(pap.displacementType),
         parcel: parcel ?? null,
+        /*
+         * Where the lifecycle really stands, with the grievance overlay
+         * removed, and the flag reported separately. A household under an
+         * open complaint is still a compensated, resettled household.
+         */
+        effectiveStatus: effectivePapStatus(pap),
+        underOpenGrievance: pap.status === GRIEVANCE_OPEN_STATUS,
+        // the UI drives its buttons from this rather than offering every
+        // status and letting the server refuse (or, worse, accept)
+        allowedTransitions: (
+          PAP_TRANSITIONS[effectivePapStatus(pap) as PapStatus] ?? []
+        ).filter((next) => next !== "compensated" && next !== "grievance_open"),
       };
     },
   );
@@ -375,6 +408,24 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
       if (body.parcelId) {
         await assertParcelInProject(req.companyId!, req.projectId!, body.parcelId);
       }
+      /*
+       * Once the household has been paid, the currency is a fact about a
+       * transaction that happened. Re-denominating it afterwards would
+       * silently restate every figure the RAP dashboard and the lender pack
+       * were built from.
+       */
+      if (
+        pap.compensationPaidAt &&
+        body.currency !== undefined &&
+        body.currency !== pap.currency
+      ) {
+        throw conflict(
+          `Household ${pap.reference} was compensated on ${pap.compensationPaidAt}: the ` +
+            `currency cannot be changed afterwards.`,
+        );
+      }
+      const before: Record<string, unknown> = {};
+      const after: Record<string, unknown> = {};
       const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
       for (const key of [
         "reference",
@@ -387,8 +438,13 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
         "censusDate",
         "livelihoodProgramme",
         "livelihoodRestoredAt",
+        "currency",
       ] as const) {
-        if (body[key] !== undefined) set[key] = body[key];
+        if (body[key] !== undefined) {
+          set[key] = body[key];
+          before[key] = pap[key];
+          after[key] = body[key];
+        }
       }
       await app.db.update(affectedPersons).set(set).where(eq(affectedPersons.id, papId));
       await appendLedger(app.db, {
@@ -397,7 +453,10 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
         action: "update",
         objectType: "affected_person",
         objectId: papId,
-        payload: { changed: Object.keys(body) },
+        // values, not key names: a vulnerability flag or a displacement type
+        // that quietly changed decides which entitlements were owed
+        payload: { before, after },
+        storePayload: true,
       });
       return fetchPap(papId, req.companyId!, req.projectId!);
     },
@@ -428,15 +487,19 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
       }
       const entitlements = normaliseEntitlements(body);
       const compensationTotal = round2(entitlements.reduce((s, e) => s + e.amount, 0));
+      // determining entitlements moves a censused household forward — read
+      // and write through the grievance overlay so an open complaint neither
+      // blocks the advance nor is cleared by it
+      const current = effectivePapStatus(pap);
+      const advanced =
+        current === "registered" || current === "surveyed" ? "entitlement_agreed" : current;
+      const flagged = pap.status === GRIEVANCE_OPEN_STATUS;
       await app.db
         .update(affectedPersons)
         .set({
           entitlements,
           compensationTotal,
-          // determining entitlements moves a censused household forward
-          status: pap.status === "registered" || pap.status === "surveyed"
-            ? "entitlement_agreed"
-            : pap.status,
+          ...(flagged ? { statusBeforeGrievance: advanced } : { status: advanced }),
           updatedAt: new Date().toISOString(),
         })
         .where(eq(affectedPersons.id, papId));
@@ -451,6 +514,7 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
           reference: pap.reference,
           entitlements,
           compensationTotal,
+          currency: pap.currency,
           previousTotal: pap.compensationTotal,
         },
         storePayload: true,
@@ -475,11 +539,16 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
         throw badRequest(`Compensation was already recorded as paid on ${pap.compensationPaidAt}`);
       }
       await validateEvidence(app.db, req.companyId!, req.projectId!, body.evidenceIds);
+      // Paying a household under an open complaint advances its lifecycle
+      // without clearing the complaint (see pap-grievance.ts).
+      const flaggedForPayment = pap.status === GRIEVANCE_OPEN_STATUS;
       await app.db
         .update(affectedPersons)
         .set({
           compensationPaidAt: body.paidAt,
-          status: "compensated",
+          ...(flaggedForPayment
+            ? { statusBeforeGrievance: "compensated" }
+            : { status: "compensated" }),
           updatedAt: new Date().toISOString(),
         })
         .where(eq(affectedPersons.id, papId));
@@ -497,6 +566,7 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
           reference: pap.reference,
           householdHead: pap.householdHead,
           amount: pap.compensationTotal,
+          currency: pap.currency,
           paidAt: body.paidAt,
           evidenceIds: body.evidenceIds,
           note: body.note ?? null,
@@ -514,17 +584,74 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
       const { papId } = req.params as { papId: string };
       const body = papStatusSchema.parse(req.body);
       const pap = await fetchPap(papId, req.companyId!, req.projectId!);
-      if (body.status === pap.status) throw badRequest(`Household is already ${pap.status}`);
       if (body.status === "compensated") {
         throw badRequest(
           "A household is marked compensated only through the evidenced compensation route " +
             "(POST /affected-persons/:papId/compensate)",
         );
       }
-      const set: Record<string, unknown> = {
-        status: body.status,
-        updatedAt: new Date().toISOString(),
-      };
+      if (body.status === "grievance_open") {
+        throw badRequest(
+          "grievance_open is set by the grievance register when a grievance naming this " +
+            "household is opened, and cleared on verified closure — it is not a status anyone " +
+            "types in",
+        );
+      }
+      /*
+       * Transitions are evaluated from the SUBSTANTIVE status, not from the
+       * grievance overlay: resettlement does not stop because somebody logged
+       * a dust complaint, and a household stuck at `grievance_open` that
+       * could only move to the four statuses listed against it would have
+       * lost its real position in the lifecycle.
+       */
+      const current = effectivePapStatus(pap);
+      if (body.status === current) throw badRequest(`Household is already ${current}`);
+      const allowed = PAP_TRANSITIONS[current as PapStatus] ?? [];
+      if (!allowed.includes(body.status)) {
+        throw badRequest(
+          `A ${current} household cannot move to ${body.status} ` +
+            `(allowed: ${allowed.join(", ") || "none"})`,
+        );
+      }
+      /*
+       * `resettled` and `livelihood_restored` are claims about the household,
+       * not workflow steps. Under IFC PS5 para 20 a household is not moved
+       * before it is paid, and para 29 measures restoration against the
+       * pre-displacement baseline — so each has a precondition the register
+       * can actually check.
+       */
+      if (body.status === "resettled") {
+        if (!PHYSICAL_DISPLACEMENT.includes(pap.displacementType)) {
+          throw badRequest(
+            `Household ${pap.reference} is recorded as ${pap.displacementType} displacement, ` +
+              `so there is no physical move to record. Mark it resettled only where the ` +
+              `household is physically displaced.`,
+          );
+        }
+        if (!pap.compensationPaidAt) {
+          throw badRequest(
+            `Household ${pap.reference} has no compensation payment on file. IFC PS5 para 20 ` +
+              `requires compensation to be paid before the household is displaced; record the ` +
+              `evidenced payment first.`,
+          );
+        }
+      }
+      if (body.status === "livelihood_restored" && !pap.compensationPaidAt) {
+        throw badRequest(
+          `Household ${pap.reference} has no compensation payment on file, so there is no ` +
+            `displacement date to measure restoration from (IFC PS5 para 29)`,
+        );
+      }
+      /*
+       * While a grievance naming the household is open the flag stays on the
+       * row and the lifecycle move is written to the stash instead, so the
+       * complaint is not silently cleared by unrelated progress — the sweep
+       * would only put it straight back an hour later.
+       */
+      const flagged = pap.status === GRIEVANCE_OPEN_STATUS;
+      const set: Record<string, unknown> = flagged
+        ? { statusBeforeGrievance: body.status, updatedAt: new Date().toISOString() }
+        : { status: body.status, updatedAt: new Date().toISOString() };
       // Livelihood restoration is dated when it is declared (#561).
       if (body.status === "livelihood_restored" && !pap.livelihoodRestoredAt) {
         set["livelihoodRestoredAt"] = todayISO();
@@ -537,9 +664,12 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
         objectType: "affected_person",
         objectId: papId,
         payload: {
-          from: pap.status,
+          from: current,
           to: body.status,
+          heldUnderOpenGrievance: flagged,
           reference: pap.reference,
+          displacementType: pap.displacementType,
+          compensationPaidAt: pap.compensationPaidAt,
           note: body.note ?? null,
         },
         storePayload: true,
@@ -589,26 +719,96 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
     ).length;
     const vulnerableHouseholds = paps.filter((p) => p.vulnerabilities.length > 0).length;
 
-    const parcelCommitted = round2(
-      parcels.reduce((s, p) => s + (p.compensationAmount ?? p.valuationAmount ?? 0), 0),
+    /*
+     * Compensation is bucketed BY CURRENCY. A corridor scheme crossing a
+     * border holds parcels priced in two currencies, and adding them
+     * produces a figure that is not money. The flat totals below are
+     * therefore reported only when one currency is in play; when more than
+     * one is, they are null with the reason, and the per-currency breakdown
+     * carries the answer.
+     */
+    interface CompBucket {
+      currency: string;
+      parcelsCommitted: number;
+      parcelsPaid: number;
+      papsCommitted: number;
+      papsPaid: number;
+    }
+    const buckets = new Map<string, CompBucket>();
+    const bucketFor = (currency: string): CompBucket => {
+      const key = currency.toUpperCase();
+      const existing = buckets.get(key);
+      if (existing) return existing;
+      const fresh: CompBucket = {
+        currency: key,
+        parcelsCommitted: 0,
+        parcelsPaid: 0,
+        papsCommitted: 0,
+        papsPaid: 0,
+      };
+      buckets.set(key, fresh);
+      return fresh;
+    };
+    for (const p of parcels) {
+      const amount = p.compensationAmount ?? p.valuationAmount ?? 0;
+      if (amount === 0 && !p.compensationPaidAt) continue;
+      const b = bucketFor(p.currency);
+      b.parcelsCommitted += amount;
+      if (p.compensationPaidAt) b.parcelsPaid += p.compensationAmount ?? 0;
+    }
+    for (const p of paps) {
+      const amount = p.compensationTotal ?? 0;
+      if (amount === 0 && !p.compensationPaidAt) continue;
+      const b = bucketFor(p.currency);
+      b.papsCommitted += amount;
+      if (p.compensationPaidAt) b.papsPaid += amount;
+    }
+    const currencies = [...buckets.keys()].sort();
+    const mixedCurrency = currencies.length > 1;
+    const byCurrency = Object.fromEntries(
+      [...buckets.values()]
+        .sort((a, b) => a.currency.localeCompare(b.currency))
+        .map((b) => [
+          b.currency,
+          {
+            currency: b.currency,
+            committed: round2(b.parcelsCommitted + b.papsCommitted),
+            paid: round2(b.parcelsPaid + b.papsPaid),
+            outstanding: round2(
+              b.parcelsCommitted + b.papsCommitted - b.parcelsPaid - b.papsPaid,
+            ),
+            parcels: { committed: round2(b.parcelsCommitted), paid: round2(b.parcelsPaid) },
+            paps: { committed: round2(b.papsCommitted), paid: round2(b.papsPaid) },
+          },
+        ]),
     );
-    const parcelPaid = round2(
-      parcels
-        .filter((p) => p.compensationPaidAt)
-        .reduce((s, p) => s + (p.compensationAmount ?? 0), 0),
-    );
-    const papCommitted = round2(paps.reduce((s, p) => s + (p.compensationTotal ?? 0), 0));
-    const papPaid = round2(
-      paps.filter((p) => p.compensationPaidAt).reduce((s, p) => s + (p.compensationTotal ?? 0), 0),
-    );
-    const compensationCommitted = round2(parcelCommitted + papCommitted);
-    const compensationPaid = round2(parcelPaid + papPaid);
+    const only = mixedCurrency ? null : [...buckets.values()][0] ?? null;
+    const parcelCommitted = only ? round2(only.parcelsCommitted) : mixedCurrency ? null : 0;
+    const parcelPaid = only ? round2(only.parcelsPaid) : mixedCurrency ? null : 0;
+    const papCommitted = only ? round2(only.papsCommitted) : mixedCurrency ? null : 0;
+    const papPaid = only ? round2(only.papsPaid) : mixedCurrency ? null : 0;
+    const compensationCommitted = only
+      ? round2(only.parcelsCommitted + only.papsCommitted)
+      : mixedCurrency
+        ? null
+        : 0;
+    const compensationPaid = only
+      ? round2(only.parcelsPaid + only.papsPaid)
+      : mixedCurrency
+        ? null
+        : 0;
 
     const livelihoodRequired = economicallyDisplaced;
+    /*
+     * Read through the grievance overlay: a household whose livelihood WAS
+     * restored and which later attracted a complaint still counts as
+     * restored. Counting it as unrestored would let a dust grievance move the
+     * headline RAP indicator a lender reads.
+     */
     const livelihoodRestored = paps.filter(
       (p) =>
         LIVELIHOOD_REQUIRED_DISPLACEMENT.includes(p.displacementType) &&
-        (p.livelihoodRestoredAt != null || p.status === "livelihood_restored"),
+        (p.livelihoodRestoredAt != null || effectivePapStatus(p) === "livelihood_restored"),
     ).length;
 
     const readyParcels = parcels.filter((p) => p.status === PARCEL_READY_STATUS).length;
@@ -641,11 +841,25 @@ export async function registerPapRoutes(app: FastifyInstance): Promise<void> {
       byVulnerability,
       compensationCommitted,
       compensationPaid,
-      compensationOutstanding: round2(compensationCommitted - compensationPaid),
+      compensationOutstanding:
+        compensationCommitted === null || compensationPaid === null
+          ? null
+          : round2(compensationCommitted - compensationPaid),
       compensation: {
         parcels: { committed: parcelCommitted, paid: parcelPaid },
         paps: { committed: papCommitted, paid: papPaid },
       },
+      /** the single currency the flat totals are stated in, or null when mixed */
+      compensationCurrency: mixedCurrency ? null : (currencies[0] ?? null),
+      compensationCurrencies: currencies,
+      compensationMixedCurrency: mixedCurrency,
+      compensationByCurrency: byCurrency,
+      compensationReasons: mixedCurrency
+        ? [
+            `Compensation is recorded in ${currencies.join(", ")}. A single total across ` +
+              `currencies would not be money, so it is reported per currency instead.`,
+          ]
+        : [],
       livelihoodRequired,
       livelihoodRestored,
       /** null when no household requires livelihood restoration */

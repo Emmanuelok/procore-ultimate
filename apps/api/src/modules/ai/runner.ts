@@ -103,6 +103,7 @@ export async function createProposal(args: CreateProposalArgs): Promise<CreatePr
   const superseded = await supersedePending(
     app.db,
     args.companyId,
+    args.projectId,
     args.targetType,
     args.targetId,
     id,

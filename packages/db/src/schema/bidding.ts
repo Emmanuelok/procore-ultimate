@@ -121,6 +121,13 @@ export const bidPackages = pgTable(
     submissionCount: integer("submission_count").default(0).notNull(),
     declineCount: integer("decline_count").default(0).notNull(),
     documentFileIds: jsonb("document_file_ids").$type<string[]>().default([]).notNull(),
+    /* --- bid board publication (#180) --- */
+    /** published to the company bid board, where a supply chain can see it */
+    isPublished: integer("is_published").default(0).notNull(),
+    publishedAt: timestamp("published_at", { withTimezone: true, mode: "string" }),
+    publishedBy: text("published_by"),
+    /** what the board shows — never the estimate, never another bidder */
+    publicSummary: text("public_summary"),
     /* --- award (the decision itself lives in bid_awards) --- */
     awardedSubmissionId: text("awarded_submission_id"),
     awardedVendorId: text("awarded_vendor_id"),
@@ -184,6 +191,15 @@ export const bidInvitations = pgTable(
       withTimezone: true,
       mode: "string",
     }),
+    /**
+     * A bidder token is not a permanent credential. It expires (bid due date
+     * plus a validity tail) and is refused after award or cancellation, so a
+     * tender that closed in March is not still readable in November.
+     */
+    portalTokenExpiresAt: timestamp("portal_token_expires_at", {
+      withTimezone: true,
+      mode: "string",
+    }),
     /** addenda the bidder has acknowledged: [{ addendumRef, acknowledgedAt }] */
     addendaAcknowledged: jsonb("addenda_acknowledged").$type<unknown[]>().default([]).notNull(),
     questionsAsked: integer("questions_asked").default(0).notNull(),
@@ -202,6 +218,8 @@ export const bidInvitations = pgTable(
     index("bid_invitations_package_idx").on(t.packageId, t.status),
     index("bid_invitations_vendor_idx").on(t.vendorId),
     index("bid_invitations_project_idx").on(t.projectId),
+    /* every unauthenticated /bid-portal/* call looks a bidder up by this hash */
+    uniqueIndex("bid_invitations_portal_token_uq").on(t.portalTokenHash),
   ],
 );
 
@@ -290,8 +308,22 @@ export const bidSubmissions = pgTable(
       mode: "string",
     }),
     lineCount: integer("line_count").default(0).notNull(),
+    /**
+     * Set on revision N when revision N+1 arrives. A superseded bid is
+     * withdrawn from contention rather than deleted: "what did they price
+     * before the addendum" is a question the levelling has to answer.
+     */
+    supersededById: text("superseded_by_id"),
     detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
-    createdBy: text("created_by").notNull(),
+    /**
+     * The platform user who recorded the bid — NULL where the bidder
+     * submitted it themselves through the portal, because a bidder is not a
+     * user of this platform and inventing an actor for them would put a name
+     * on the ledger that never touched the record. The pathway is on the
+     * ledger entry instead (`via: "portal_token"`), and `detail.via` says the
+     * same thing on the row.
+     */
+    createdBy: text("created_by"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
@@ -458,6 +490,22 @@ export const bidAwards = pgTable(
     notLowestJustification: text("not_lowest_justification"),
     lowestBidAmount: doublePrecision("lowest_bid_amount"),
     savingAgainstEstimate: doublePrecision("saving_against_estimate"),
+    /**
+     * The figure the recommendation was actually COMPARED on — the levelled
+     * amount where the package was levelled, the as-bid total otherwise.
+     * `awardAmount` is the as-bid contract sum and the two are different
+     * numbers; showing one beside `lowestBidAmount` (which is levelled) was
+     * an apples-to-oranges audit block.
+     */
+    recommendedComparableAmount: doublePrecision("recommended_comparable_amount"),
+    /** which basis `recommendedComparableAmount` and `lowestBidAmount` are on */
+    comparisonBasis: text("comparison_basis"),
+    /** partial award: the levelling rows this award actually covers */
+    scopeLevellingItemIds: jsonb("scope_levelling_item_ids").$type<string[]>().default([]).notNull(),
+    /** the unwind of an approved award — reason, and who did it */
+    withdrawnAt: timestamp("withdrawn_at", { withTimezone: true, mode: "string" }),
+    withdrawnBy: text("withdrawn_by"),
+    withdrawnReason: text("withdrawn_reason"),
     recommendedBy: text("recommended_by"),
     recommendedAt: timestamp("recommended_at", { withTimezone: true, mode: "string" }),
     /* the approval — never the recommender */
@@ -656,6 +704,36 @@ export const prequalificationSubmissions = pgTable(
     suspendedAt: timestamp("suspended_at", { withTimezone: true, mode: "string" }),
     suspendedReason: text("suspended_reason"),
     supersedesId: text("supersedes_id"),
+    /*
+     * TIER AND RISK RATING — derived, never typed in.
+     *
+     * A tier is what a buyer actually uses: "this vendor may be considered
+     * for packages up to tier B". It is computed on decide from the score
+     * band, the financial limit and the SAFETY RECORD, and the safety record
+     * is a hard ceiling rather than one input among several — a contractor
+     * with a fatality or an EMR above 1.2 cannot be a tier A supplier
+     * whatever their balance sheet says. `tierBasis` and `riskBasis` carry
+     * the sentence, because a letter with no reasoning is a number somebody
+     * will argue with.
+     */
+    tier: text("tier"), // PrequalTier
+    tierBasis: text("tier_basis"),
+    riskRating: text("risk_rating"), // PrequalRiskRating
+    riskBasis: text("risk_basis"),
+    /*
+     * VENDOR SELF-SERVICE. sha256 of a `pq_` token, exactly as the bidder
+     * portal stores its own: the plaintext is shown once and never again, and
+     * the token dies with the assessment it was minted for.
+     */
+    portalTokenHash: text("portal_token_hash"),
+    portalTokenExpiresAt: timestamp("portal_token_expires_at", {
+      withTimezone: true,
+      mode: "string",
+    }),
+    portalLastAccessAt: timestamp("portal_last_access_at", {
+      withTimezone: true,
+      mode: "string",
+    }),
     attachmentFileIds: jsonb("attachment_file_ids").$type<string[]>().default([]).notNull(),
     detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
     createdBy: text("created_by").notNull(),
@@ -664,6 +742,7 @@ export const prequalificationSubmissions = pgTable(
   },
   (t) => [
     uniqueIndex("prequalification_submissions_uq").on(t.companyId, t.number),
+    uniqueIndex("prequalification_submissions_portal_token_uq").on(t.portalTokenHash),
     index("prequalification_submissions_vendor_idx").on(t.vendorId, t.status),
     index("prequalification_submissions_questionnaire_idx").on(t.questionnaireId),
     index("prequalification_submissions_expiry_idx").on(t.companyId, t.expiresAt),
@@ -781,5 +860,531 @@ export const prequalificationFinancials = pgTable(
     uniqueIndex("prequalification_financials_uq").on(t.vendorId, t.financialYearEnd, t.source),
     index("prequalification_financials_vendor_idx").on(t.vendorId, t.financialYearEnd),
     index("prequalification_financials_submission_idx").on(t.submissionId),
+  ],
+);
+
+/* ================================================================== */
+/* PLATFORM UPGRADE WAVE — WP-BID                                      */
+/*                                                                     */
+/* Everything above models ONE tender. Everything below models the      */
+/* business of tendering: which jobs we chase, what chasing them costs, */
+/* what the bidders asked us, what security they lodged, who looked at  */
+/* the documents, who may sign an award of a given size — and the       */
+/* patterns that only appear when several tenders are read together.    */
+/* ================================================================== */
+
+/**
+ * AN OPPORTUNITY IS A DECISION BEFORE IT IS A PIPELINE ROW (#1048, #1052).
+ *
+ * The expensive mistake in tendering is not losing; it is bidding for the
+ * wrong job. So the bid/no-bid decision is modelled as a scored gate with a
+ * recorded basis, a modelled win probability and its inputs, rather than a
+ * stage a card is dragged into. `winProbability` is stored WITH the model
+ * version and the features that produced it, because a probability whose
+ * inputs nobody kept is a number with no argument behind it.
+ *
+ * Capacity is the other half: an opportunity carries the resource it will
+ * consume if won, so the pipeline can say "we are chasing 4.2x what we can
+ * deliver" instead of showing a longer and longer list.
+ */
+export const bidOpportunities = pgTable(
+  "bid_opportunities",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    /** set once the pursuit becomes a real project on this platform */
+    projectId: text("project_id"),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    title: text("title").notNull(),
+    description: text("description"),
+    /** the buying organisation — a directory vendor/contact where we hold one */
+    clientName: text("client_name"),
+    clientVendorId: text("client_vendor_id"),
+    clientContactId: text("client_contact_id"),
+    sector: text("sector"),
+    workType: text("work_type"),
+    tradeCode: text("trade_code"),
+    region: text("region"),
+    country: text("country"),
+    source: text("source").default("other").notNull(), // OpportunitySource
+    procurementRoute: text("procurement_route"), // ProcurementRoute
+    stage: text("stage").default("identified").notNull(), // OpportunityStage
+    /* the money, always with its currency */
+    estimatedValue: doublePrecision("estimated_value"),
+    currency: text("currency").default("USD").notNull(),
+    expectedMarginPercent: doublePrecision("expected_margin_percent"),
+    /* the timetable */
+    expressionOfInterestDueAt: timestamp("eoi_due_at", { withTimezone: true, mode: "string" }),
+    submissionDueAt: timestamp("submission_due_at", { withTimezone: true, mode: "string" }),
+    decisionExpectedAt: text("decision_expected_at"),
+    anticipatedStartDate: text("anticipated_start_date"),
+    durationMonths: doublePrecision("duration_months"),
+    /* capacity: what winning it would consume */
+    peakResourceUnits: doublePrecision("peak_resource_units"),
+    resourceUnitLabel: text("resource_unit_label"),
+    /* the bid/no-bid gate (#1048) */
+    bidNoBidDecision: text("bid_no_bid_decision").default("pending").notNull(),
+    /** [{ factor, score, weight, note }] — the scored basis, never a bare verdict */
+    bidNoBidFactors: jsonb("bid_no_bid_factors").$type<unknown[]>().default([]).notNull(),
+    bidNoBidScore: doublePrecision("bid_no_bid_score"),
+    bidNoBidBasis: text("bid_no_bid_basis"),
+    bidNoBidDecidedBy: text("bid_no_bid_decided_by"),
+    bidNoBidDecidedAt: timestamp("bid_no_bid_decided_at", { withTimezone: true, mode: "string" }),
+    /* the modelled probability and the evidence behind it (#1048) */
+    winProbability: doublePrecision("win_probability"),
+    winProbabilityModel: text("win_probability_model"),
+    /** the features and coefficients the probability was produced from */
+    winProbabilityBasis: jsonb("win_probability_basis")
+      .$type<Record<string, unknown>>()
+      .default({})
+      .notNull(),
+    winProbabilityAt: timestamp("win_probability_at", { withTimezone: true, mode: "string" }),
+    /* the outcome */
+    outcome: text("outcome"), // won | lost | no_bid | abandoned
+    outcomeAt: timestamp("outcome_at", { withTimezone: true, mode: "string" }),
+    outcomeReason: text("outcome_reason"),
+    /** the competitor who took it, where we were told */
+    winningCompetitor: text("winning_competitor"),
+    winningAmount: doublePrecision("winning_amount"),
+    submittedAmount: doublePrecision("submitted_amount"),
+    /** competitors known to be bidding: [{ name, vendorId, note }] */
+    competitors: jsonb("competitors").$type<unknown[]>().default([]).notNull(),
+    ownerUserId: text("owner_user_id"),
+    /** the tender this pursuit became, where we ran one ourselves */
+    bidPackageId: text("bid_package_id"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("bid_opportunities_uq").on(t.companyId, t.number),
+    index("bid_opportunities_stage_idx").on(t.companyId, t.stage),
+    index("bid_opportunities_due_idx").on(t.companyId, t.submissionDueAt),
+    index("bid_opportunities_client_idx").on(t.companyId, t.clientVendorId),
+    index("bid_opportunities_trade_idx").on(t.companyId, t.tradeCode),
+  ],
+);
+
+/**
+ * THE COST OF SALE (#1051). Tendering is the largest unmeasured overhead in
+ * most contracting businesses: the hours are real, they are spent before any
+ * revenue exists, and nobody totals them by outcome. Every entry carries its
+ * kind and, for labour, its hours and rate, so "we spent 640 hours winning
+ * £4.1m and 2,900 hours losing" is a figure rather than an anecdote.
+ */
+export const tenderCosts = pgTable(
+  "tender_costs",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id"),
+    /** exactly one of these two is the subject; both may be set once linked */
+    opportunityId: text("opportunity_id"),
+    packageId: text("package_id"),
+    kind: text("kind").default("other").notNull(), // TenderCostKind
+    description: text("description").notNull(),
+    incurredOn: text("incurred_on").notNull(), // ISO date
+    hours: doublePrecision("hours"),
+    hourlyRate: doublePrecision("hourly_rate"),
+    amount: doublePrecision("amount").notNull(),
+    currency: text("currency").default("USD").notNull(),
+    userId: text("user_id"),
+    vendorId: text("vendor_id"),
+    invoiceReference: text("invoice_reference"),
+    fileIds: jsonb("file_ids").$type<string[]>().default([]).notNull(),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("tender_costs_opportunity_idx").on(t.opportunityId, t.incurredOn),
+    index("tender_costs_package_idx").on(t.packageId, t.incurredOn),
+    index("tender_costs_company_idx").on(t.companyId, t.incurredOn),
+  ],
+);
+
+/**
+ * A TENDER QUERY AND ITS ANSWER (#182). The control here is that an answer
+ * given to one bidder and not the others is a procurement failure: the
+ * question is anonymised and the answer is PUBLISHED to every live
+ * invitation, normally as an addendum. `publishedAddendumRef` is the proof
+ * that it was.
+ */
+export const bidQuestions = pgTable(
+  "bid_questions",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    packageId: text("package_id").notNull(),
+    /** who asked — null when the question arrived outside the portal */
+    invitationId: text("invitation_id"),
+    vendorId: text("vendor_id"),
+    number: integer("number").notNull(),
+    reference: text("reference").notNull(),
+    category: text("category").default("scope").notNull(), // BidQuestionCategory
+    question: text("question").notNull(),
+    /** the question as it will be published — names and hints removed */
+    anonymisedQuestion: text("anonymised_question"),
+    askedAt: timestamp("asked_at", { withTimezone: true, mode: "string" }),
+    /** questions asked after this are out of time and are refused */
+    status: text("status").default("submitted").notNull(), // BidQuestionStatus
+    answer: text("answer"),
+    answeredBy: text("answered_by"),
+    answeredAt: timestamp("answered_at", { withTimezone: true, mode: "string" }),
+    /** the addendum that carried the answer to every bidder */
+    publishedAddendumRef: text("published_addendum_ref"),
+    publishedAt: timestamp("published_at", { withTimezone: true, mode: "string" }),
+    /** an answer given to one bidder only, with the reason it was not shared */
+    isPrivate: integer("is_private").default(0).notNull(),
+    privateReason: text("private_reason"),
+    rejectedReason: text("rejected_reason"),
+    specSectionId: text("spec_section_id"),
+    drawingSheetId: text("drawing_sheet_id"),
+    fileIds: jsonb("file_ids").$type<string[]>().default([]).notNull(),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("bid_questions_uq").on(t.packageId, t.number),
+    index("bid_questions_package_idx").on(t.packageId, t.status),
+    index("bid_questions_vendor_idx").on(t.vendorId),
+    index("bid_questions_project_idx").on(t.projectId),
+  ],
+);
+
+/**
+ * PRE-BID MEETINGS AND SITE VISITS (#181). Attendance is the record that
+ * matters: a mandatory site visit a bidder did not attend is a compliance
+ * finding on their bid, and "everyone was told the same thing on the day" is
+ * only defensible if there is a minute and a register.
+ */
+export const bidMeetings = pgTable(
+  "bid_meetings",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    packageId: text("package_id").notNull(),
+    kind: text("kind").default("pre_bid").notNull(), // BidMeetingKind
+    title: text("title").notNull(),
+    scheduledAt: timestamp("scheduled_at", { withTimezone: true, mode: "string" }).notNull(),
+    durationMinutes: integer("duration_minutes"),
+    location: text("location"),
+    meetingUrl: text("meeting_url"),
+    isMandatory: integer("is_mandatory").default(0).notNull(),
+    agenda: text("agenda"),
+    minutes: text("minutes"),
+    minutesFileIds: jsonb("minutes_file_ids").$type<string[]>().default([]).notNull(),
+    /** the minute distributed to every bidder, as an addendum where issued */
+    minutesPublishedAt: timestamp("minutes_published_at", { withTimezone: true, mode: "string" }),
+    publishedAddendumRef: text("published_addendum_ref"),
+    heldAt: timestamp("held_at", { withTimezone: true, mode: "string" }),
+    chairedBy: text("chaired_by"),
+    status: text("status").default("scheduled").notNull(), // scheduled | held | cancelled
+    cancelledReason: text("cancelled_reason"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("bid_meetings_package_idx").on(t.packageId, t.scheduledAt),
+    index("bid_meetings_project_idx").on(t.projectId),
+  ],
+);
+
+/** One bidder's attendance at one meeting. */
+export const bidMeetingAttendees = pgTable(
+  "bid_meeting_attendees",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    meetingId: text("meeting_id").notNull(),
+    packageId: text("package_id").notNull(),
+    vendorId: text("vendor_id"),
+    invitationId: text("invitation_id"),
+    attendeeName: text("attendee_name"),
+    attendeeEmail: text("attendee_email"),
+    attendance: text("attendance").default("invited").notNull(), // BidMeetingAttendance
+    recordedBy: text("recorded_by"),
+    recordedAt: timestamp("recorded_at", { withTimezone: true, mode: "string" }),
+    note: text("note"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("bid_meeting_attendees_uq").on(t.meetingId, t.vendorId, t.attendeeName),
+    index("bid_meeting_attendees_meeting_idx").on(t.meetingId),
+    index("bid_meeting_attendees_vendor_idx").on(t.vendorId),
+  ],
+);
+
+/**
+ * BID BOND TRACKING (#183). The security a bidder lodges against walking
+ * away. It has an expiry, and an expired bid bond on a live tender is a hole
+ * in the arrangement rather than a filing problem — hence `expiresAt`
+ * indexed and swept.
+ */
+export const bidBonds = pgTable(
+  "bid_bonds",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    packageId: text("package_id").notNull(),
+    vendorId: text("vendor_id").notNull(),
+    invitationId: text("invitation_id"),
+    submissionId: text("submission_id"),
+    bondType: text("bond_type").default("bid").notNull(), // BondType
+    status: text("status").default("required").notNull(), // BidBondStatus
+    /** the required security, as a percent of the bid or an absolute amount */
+    requiredPercent: doublePrecision("required_percent"),
+    requiredAmount: doublePrecision("required_amount"),
+    providedAmount: doublePrecision("provided_amount"),
+    currency: text("currency").default("USD").notNull(),
+    provider: text("provider"),
+    bondNumber: text("bond_number"),
+    issuedAt: text("issued_at"),
+    validFrom: text("valid_from"),
+    expiresAt: text("expires_at"),
+    receivedAt: timestamp("received_at", { withTimezone: true, mode: "string" }),
+    /** verification of the instrument — never the bidder who supplied it */
+    verifiedBy: text("verified_by"),
+    verifiedAt: timestamp("verified_at", { withTimezone: true, mode: "string" }),
+    verificationNote: text("verification_note"),
+    releasedAt: timestamp("released_at", { withTimezone: true, mode: "string" }),
+    releasedBy: text("released_by"),
+    releaseReason: text("release_reason"),
+    calledAt: timestamp("called_at", { withTimezone: true, mode: "string" }),
+    calledReason: text("called_reason"),
+    rejectedReason: text("rejected_reason"),
+    fileIds: jsonb("file_ids").$type<string[]>().default([]).notNull(),
+    /** the obligation raised for its expiry, where one was */
+    obligationId: text("obligation_id"),
+    signalId: text("signal_id"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("bid_bonds_uq").on(t.packageId, t.vendorId, t.bondType),
+    index("bid_bonds_package_idx").on(t.packageId, t.status),
+    index("bid_bonds_expiry_idx").on(t.companyId, t.expiresAt),
+    index("bid_bonds_vendor_idx").on(t.vendorId),
+  ],
+);
+
+/**
+ * DOCUMENT ACCESS LOGGING PER BIDDER (#169). Who downloaded which tender
+ * document, and when. It answers the two questions a challenge asks: did
+ * every bidder get the same documents, and did the one who complains about
+ * the addendum ever open it.
+ */
+export const bidDocumentAccess = pgTable(
+  "bid_document_access",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    packageId: text("package_id").notNull(),
+    invitationId: text("invitation_id"),
+    vendorId: text("vendor_id"),
+    fileId: text("file_id").notNull(),
+    fileName: text("file_name"),
+    /** which part of the package the file belongs to */
+    documentKind: text("document_kind"), // tender_document | addendum | drawing | specification
+    addendumRef: text("addendum_ref"),
+    accessKind: text("access_kind").default("download").notNull(), // BidDocumentAccessKind
+    /** portal_token when the bidder did it themselves, user id otherwise */
+    via: text("via").default("portal_token").notNull(),
+    actorId: text("actor_id"),
+    ipHash: text("ip_hash"),
+    userAgent: text("user_agent"),
+    accessedAt: timestamp("accessed_at", { withTimezone: true, mode: "string" })
+      .defaultNow()
+      .notNull(),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index("bid_document_access_package_idx").on(t.packageId, t.accessedAt),
+    index("bid_document_access_invitation_idx").on(t.invitationId, t.accessedAt),
+    index("bid_document_access_file_idx").on(t.fileId),
+  ],
+);
+
+/**
+ * DELEGATED AWARD AUTHORITY (Domain A #41). An approval limit is only a
+ * control if the platform refuses the approval that exceeds it. Limits are
+ * per currency because "up to 500k" means nothing without one, and they are
+ * scoped either to a named person or to a company role.
+ */
+export const awardDelegations = pgTable(
+  "award_delegations",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    subjectKind: text("subject_kind").default("user").notNull(), // AwardDelegationSubject
+    /** user id, or a company role name when subjectKind is company_role */
+    subjectId: text("subject_id").notNull(),
+    label: text("label"),
+    maxAwardAmount: doublePrecision("max_award_amount").notNull(),
+    currency: text("currency").default("USD").notNull(),
+    /** narrow the delegation to one project, or leave null for company-wide */
+    projectId: text("project_id"),
+    packageKind: text("package_kind"),
+    validFrom: text("valid_from"),
+    validTo: text("valid_to"),
+    isActive: integer("is_active").default(1).notNull(),
+    basis: text("basis"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("award_delegations_company_idx").on(t.companyId, t.isActive),
+    index("award_delegations_subject_idx").on(t.companyId, t.subjectKind, t.subjectId),
+  ],
+);
+
+/* ==================================================================== */
+/* THE THINGS A PREQUALIFICATION ACTUALLY TURNS ON                       */
+/* ==================================================================== */
+
+/**
+ * A prequalification questionnaire is free text with a score on it. These
+ * three registers are the parts that decide the answer, held as TYPED rows
+ * rather than as sentences in a response:
+ *
+ *   safety records   an EMR, a TRIR and a fatality count are numbers that
+ *                    compare across vendors and across years. Buried in a
+ *                    free-text answer they compare with nothing, and the
+ *                    tiering rule ("a fatality caps this vendor at tier C")
+ *                    cannot be applied at all.
+ *   licences         a licence has a jurisdiction and an EXPIRY. A licence
+ *                    that expired last month is the single most common
+ *                    prequalification finding and it is invisible in prose.
+ *   references       a reference is a client, a project, a value and a
+ *                    person who was actually asked. `checkedBy` is the
+ *                    column that separates "we took up references" from "we
+ *                    have a list of names the vendor gave us".
+ *
+ * All three are per VENDOR (company-level, like the rest of
+ * prequalification) and optionally bound to the submission they arrived
+ * with, so the register survives the assessment that collected it.
+ */
+export const prequalificationSafetyRecords = pgTable(
+  "prequalification_safety_records",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    vendorId: text("vendor_id").notNull(),
+    submissionId: text("submission_id"),
+    /** the reporting year these figures describe */
+    year: integer("year").notNull(),
+    /** experience modification rate — >1.0 is worse than the industry average */
+    emr: doublePrecision("emr"),
+    /** total recordable incident rate, per 200k hours */
+    trir: doublePrecision("trir"),
+    /** days away, restricted or transferred */
+    dart: doublePrecision("dart"),
+    fatalities: integer("fatalities"),
+    lostTimeInjuries: integer("lost_time_injuries"),
+    recordableIncidents: integer("recordable_incidents"),
+    hoursWorked: doublePrecision("hours_worked"),
+    /** [{ agency, date, description, penalty, currency, status }] */
+    citations: jsonb("citations").$type<unknown[]>().default([]).notNull(),
+    /** self_declared | audited | regulator — provenance changes what it is worth */
+    source: text("source").default("self_declared").notNull(),
+    fileIds: jsonb("file_ids").$type<string[]>().default([]).notNull(),
+    verifiedBy: text("verified_by"),
+    verifiedAt: timestamp("verified_at", { withTimezone: true, mode: "string" }),
+    note: text("note"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("prequal_safety_uq").on(t.companyId, t.vendorId, t.year, t.source),
+    index("prequal_safety_vendor_idx").on(t.companyId, t.vendorId, t.year),
+    index("prequal_safety_submission_idx").on(t.submissionId),
+  ],
+);
+
+export const prequalificationLicences = pgTable(
+  "prequalification_licences",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    vendorId: text("vendor_id").notNull(),
+    submissionId: text("submission_id"),
+    /** trade licence, gas safe, asbestos, electrical contractor, … */
+    kind: text("kind").notNull(),
+    jurisdiction: text("jurisdiction"),
+    number: text("number"),
+    issuedBy: text("issued_by"),
+    issuedAt: text("issued_at"),
+    /** the column the whole register exists for */
+    expiresAt: text("expires_at"),
+    status: text("status").default("claimed").notNull(), // PrequalLicenceStatus
+    fileIds: jsonb("file_ids").$type<string[]>().default([]).notNull(),
+    verifiedBy: text("verified_by"),
+    verifiedAt: timestamp("verified_at", { withTimezone: true, mode: "string" }),
+    note: text("note"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("prequal_licences_vendor_idx").on(t.companyId, t.vendorId, t.status),
+    index("prequal_licences_expiry_idx").on(t.companyId, t.expiresAt),
+    index("prequal_licences_submission_idx").on(t.submissionId),
+  ],
+);
+
+export const prequalificationReferences = pgTable(
+  "prequalification_references",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    vendorId: text("vendor_id").notNull(),
+    submissionId: text("submission_id"),
+    clientName: text("client_name").notNull(),
+    projectName: text("project_name"),
+    contractValue: doublePrecision("contract_value"),
+    currency: text("currency").default("USD").notNull(),
+    completedAt: text("completed_at"),
+    contactName: text("contact_name"),
+    contactEmail: text("contact_email"),
+    contactPhone: text("contact_phone"),
+    /** delivered | delivered_late | terminated | disputed | unknown */
+    outcome: text("outcome").default("unknown").notNull(),
+    /** 0..5, and null until somebody actually asked */
+    rating: doublePrecision("rating"),
+    wouldUseAgain: integer("would_use_again"),
+    /** the column that separates a checked reference from a list of names */
+    checkedBy: text("checked_by"),
+    checkedAt: timestamp("checked_at", { withTimezone: true, mode: "string" }),
+    checkNote: text("check_note"),
+    detail: jsonb("detail").$type<Record<string, unknown>>().default({}).notNull(),
+    createdBy: text("created_by"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("prequal_references_vendor_idx").on(t.companyId, t.vendorId),
+    index("prequal_references_submission_idx").on(t.submissionId),
   ],
 );

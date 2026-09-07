@@ -2208,7 +2208,12 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
       }
     } else if (sourceType === "prime_contract_change") {
       const rows = await app.db
-        .select({ id: primeContractChanges.id, reference: primeContractChanges.reference, status: primeContractChanges.status })
+        .select({
+          id: primeContractChanges.id,
+          reference: primeContractChanges.reference,
+          status: primeContractChanges.status,
+          changeOrderPackageId: primeContractChanges.changeOrderPackageId,
+        })
         .from(primeContractChanges)
         .where(
           and(
@@ -2227,6 +2232,53 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
           `${pcco.reference} is ${pcco.status}, not executed. An owner_change needs an executed ` +
             "instrument behind it.",
         );
+      }
+      // The same instrument reached here under two names: change management
+      // executes a PACKAGE and stamps the budget change as
+      // 'change_order_package', while the prime module executes the CHANGE
+      // and stamps it 'prime_contract_change'. Without this, one executed
+      // PCCO raised through change management could be funded a second time
+      // by citing the change itself.
+      if (pcco.changeOrderPackageId) {
+        const pkgRows = await app.db
+          .select({ id: changeOrderPackages.id, reference: changeOrderPackages.reference, budgetChangeId: changeOrderPackages.budgetChangeId })
+          .from(changeOrderPackages)
+          .where(
+            and(
+              eq(changeOrderPackages.id, pcco.changeOrderPackageId),
+              eq(changeOrderPackages.projectId, budget.projectId),
+            ),
+          )
+          .limit(1);
+        const pkg = pkgRows[0];
+        if (pkg?.budgetChangeId && pkg.budgetChangeId !== excludeChangeId) {
+          throw conflict(
+            `${pcco.reference} belongs to package ${pkg.reference}, which already funded this ` +
+              `budget (budget change ${pkg.budgetChangeId}). One executed instrument funds the ` +
+              "budget once.",
+          );
+        }
+        const viaPackage = await app.db
+          .select({ id: budgetChanges.id, reference: budgetChanges.reference, status: budgetChanges.status })
+          .from(budgetChanges)
+          .where(
+            and(
+              eq(budgetChanges.projectId, budget.projectId),
+              eq(budgetChanges.kind, "owner_change"),
+              eq(budgetChanges.sourceType, "change_order_package"),
+              eq(budgetChanges.sourceId, pcco.changeOrderPackageId),
+              ne(budgetChanges.status, "void"),
+              ne(budgetChanges.status, "rejected"),
+            ),
+          );
+        const clash = viaPackage.find((d) => d.id !== excludeChangeId);
+        if (clash) {
+          throw conflict(
+            `${clash.reference} (${clash.status}) already carries ${pcco.reference}'s package into ` +
+              "the budget. One executed change order funds the budget once — void that change " +
+              "first if it is wrong.",
+          );
+        }
       }
     } else {
       throw badRequest(
@@ -2281,23 +2333,61 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
     }
   }
 
-  /** Move the legs on or off the lines' `pendingBudgetChanges` exposure. */
-  async function applyPending(db: Db, legs: ChangeLeg[], sign: 1 | -1): Promise<void> {
-    for (const leg of legs) {
+  /**
+   * Lock the budget lines a movement touches and hand back their CURRENT
+   * rows. Every money move on a line reads through here: the read and the
+   * write that follows it must be inside one transaction with the row held,
+   * or two movements on the same line both compute from the same starting
+   * figure and one of them silently vanishes (the SET writes an absolute
+   * number, so the later commit wins outright rather than adding).
+   *
+   * Ids are locked in sorted order so two transactions touching the same
+   * pair of lines queue behind each other instead of deadlocking.
+   */
+  async function lockLines(
+    db: Db,
+    lineIds: readonly string[],
+  ): Promise<Map<string, typeof budgetLineItems.$inferSelect>> {
+    const ids = [...new Set(lineIds)].sort();
+    const out = new Map<string, typeof budgetLineItems.$inferSelect>();
+    for (const id of ids) {
       const rows = await db
         .select()
         .from(budgetLineItems)
-        .where(eq(budgetLineItems.id, leg.lineItemId))
-        .limit(1);
+        .where(eq(budgetLineItems.id, id))
+        .for("update");
       const row = rows[0];
+      if (row) out.set(id, row);
+    }
+    return out;
+  }
+
+  /** Legs collapsed to one signed amount per line (a movement may carry two). */
+  function netByLine(legs: readonly ChangeLeg[]): Map<string, number> {
+    const out = new Map<string, number>();
+    for (const leg of legs) {
+      out.set(leg.lineItemId, round2((out.get(leg.lineItemId) ?? 0) + leg.amount));
+    }
+    return out;
+  }
+
+  /**
+   * Move the legs on or off the lines' `pendingBudgetChanges` exposure.
+   * MUST be called inside a transaction: it takes the row lock itself.
+   */
+  async function applyPending(db: Db, legs: ChangeLeg[], sign: 1 | -1): Promise<void> {
+    const net = netByLine(legs);
+    const locked = await lockLines(db, [...net.keys()]);
+    for (const [lineItemId, amount] of net) {
+      const row = locked.get(lineItemId);
       if (!row) continue;
       await db
         .update(budgetLineItems)
         .set({
-          pendingBudgetChanges: round2(row.pendingBudgetChanges + sign * leg.amount),
+          pendingBudgetChanges: round2(row.pendingBudgetChanges + sign * amount),
           updatedAt: nowIso(),
         })
-        .where(eq(budgetLineItems.id, leg.lineItemId));
+        .where(eq(budgetLineItems.id, lineItemId));
     }
   }
 
@@ -2556,46 +2646,9 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
     await assertPeriodOpen(budget.id, effectiveDate);
 
     const targetColumn = changeTargetColumn(kind);
-    const rows = await app.db
-      .select()
-      .from(budgetLineItems)
-      .where(
-        and(
-          eq(budgetLineItems.budgetId, budget.id),
-          inArray(
-            budgetLineItems.id,
-            legs.map((l) => l.lineItemId),
-          ),
-        ),
-      );
-    const byId = new Map(rows.map((r) => [r.id, r]));
-    const missing = legs.filter((l) => !byId.has(l.lineItemId));
-    if (missing.length > 0) {
-      throw conflict(
-        `Budget line(s) on this movement no longer exist: ${missing
-          .map((l) => l.costCode)
-          .join(", ")}. Void the change and raise it again.`,
-      );
-    }
-    // A movement may not drive a line's revised budget below zero: that is
-    // not a transfer, it is an unfunded position wearing one's clothes.
-    for (const leg of legs) {
-      const row = byId.get(leg.lineItemId)!;
-      const next = round2(
-        row.originalBudget +
-          (targetColumn === "budgetModifications"
-            ? row.budgetModifications + leg.amount
-            : row.budgetModifications) +
-          (targetColumn === "approvedChanges" ? row.approvedChanges + leg.amount : row.approvedChanges),
-      );
-      if (next < 0) {
-        throw conflict(
-          `Approving this movement would take line ${row.costCode} / ${row.costType} to ` +
-            `${next.toFixed(2)}. A budget line cannot hold a negative revised budget — reduce ` +
-            "the transfer or source it elsewhere.",
-        );
-      }
-    }
+    // The lines themselves are read INSIDE the transaction below, under a row
+    // lock: the balance check and the write that follows it are one decision,
+    // and two movements landing on the same line must add, not overwrite.
 
     // Contingency draws are mirrored onto the risk register's contingency
     // record when the source line is linked to one (#499), so the two
@@ -2622,13 +2675,45 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
         approvedAt,
         updatedAt: approvedAt,
       });
-      await applyPending(tx, legs, -1);
-      for (const leg of legs) {
-        const row = byId.get(leg.lineItemId)!;
+      const net = netByLine(legs);
+      const locked = await lockLines(tx, [...net.keys()]);
+      const missing = legs.filter(
+        (l) => !locked.has(l.lineItemId) || locked.get(l.lineItemId)!.budgetId !== budget.id,
+      );
+      if (missing.length > 0) {
+        throw conflict(
+          `Budget line(s) on this movement no longer exist on this budget: ${missing
+            .map((l) => l.costCode)
+            .join(", ")}. Void the change and raise it again.`,
+        );
+      }
+      // A movement may not drive a line's revised budget below zero: that is
+      // not a transfer, it is an unfunded position wearing one's clothes. The
+      // figures compared here are the LOCKED ones, so a movement approved a
+      // millisecond earlier is already in them.
+      for (const [lineItemId, amount] of net) {
+        const row = locked.get(lineItemId)!;
+        const next = round2(
+          row.originalBudget +
+            (targetColumn === "budgetModifications"
+              ? row.budgetModifications + amount
+              : row.budgetModifications) +
+            (targetColumn === "approvedChanges" ? row.approvedChanges + amount : row.approvedChanges),
+        );
+        if (next < 0) {
+          throw conflict(
+            `Approving this movement would take line ${row.costCode} / ${row.costType} to ` +
+              `${next.toFixed(2)}. A budget line cannot hold a negative revised budget — reduce ` +
+              "the transfer or source it elsewhere.",
+          );
+        }
+      }
+      for (const [lineItemId, amount] of net) {
+        const row = locked.get(lineItemId)!;
         const nextAmounts: LineAmounts & { forecastMethod: string; forecastToComplete: number } = {
           ...amountsOf(row),
-          pendingBudgetChanges: round2(row.pendingBudgetChanges - leg.amount),
-          [targetColumn]: round2(row[targetColumn] + leg.amount),
+          pendingBudgetChanges: round2(row.pendingBudgetChanges - amount),
+          [targetColumn]: round2(row[targetColumn] + amount),
           forecastMethod: row.forecastMethod,
           forecastToComplete: row.forecastToComplete,
         } as LineAmounts & { forecastMethod: string; forecastToComplete: number };
@@ -2641,7 +2726,7 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
             updatedAt: nowIso(),
             ...derived.set,
           })
-          .where(eq(budgetLineItems.id, leg.lineItemId));
+          .where(eq(budgetLineItems.id, lineItemId));
       }
       for (const leg of legs) {
         if (leg.amount >= 0) continue;

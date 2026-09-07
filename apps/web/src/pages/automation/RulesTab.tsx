@@ -23,7 +23,7 @@ import {
   useConfirm,
   type DescriptionItem,
 } from "../../ui";
-import { DataTable, formatRelativeTime, type DataColumns } from "../../ui/data";
+import { DataTable, Pagination, formatRelativeTime, type DataColumns } from "../../ui/data";
 import { IconPlay, IconRefresh, IconSearch, IconZap } from "../../ui/icons";
 import {
   RULE_STATUSES,
@@ -46,6 +46,9 @@ import {
   type Scope,
 } from "./automationShared";
 import { DryRunPanel } from "./RunsTab";
+
+/** Server-paged, like the runs log: the grid must never show fewer rows than the count above it claims. */
+const PAGE_SIZE = 50;
 
 export default function RulesTab({
   scope,
@@ -70,6 +73,7 @@ export default function RulesTab({
 }) {
   const [rules, setRules] = useState<RuleView[] | null>(null);
   const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [forbidden, setForbidden] = useState(false);
@@ -82,7 +86,7 @@ export default function RulesTab({
     setLoading(true);
     setError(null);
     try {
-      const params = new URLSearchParams({ page: "1", pageSize: "200" });
+      const params = new URLSearchParams({ page: String(page), pageSize: String(PAGE_SIZE) });
       if (status) params.set("status", status);
       if (triggerKind) params.set("triggerKind", triggerKind);
       if (search.trim()) params.set("search", search.trim());
@@ -98,11 +102,17 @@ export default function RulesTab({
     } finally {
       setLoading(false);
     }
-  }, [scope.base, status, triggerKind, search]);
+  }, [scope.base, status, triggerKind, search, page]);
 
   useEffect(() => {
     void load();
   }, [load, nonce]);
+
+  // A filter change re-queries from the first page: page 4 of the old filter
+  // is not page 4 of the new one.
+  useEffect(() => {
+    setPage(1);
+  }, [status, triggerKind, search]);
 
   const columns = useMemo<DataColumns<RuleView>>(
     () => [
@@ -241,7 +251,11 @@ export default function RulesTab({
         <Button size="sm" variant="secondary" leadingIcon={IconRefresh} onClick={() => void load()}>
           Refresh
         </Button>
-        <span className="ml-auto text-2xs text-content-subtle">{num(total)} rule{total === 1 ? "" : "s"}</span>
+        <span className="ml-auto text-2xs text-content-subtle">
+          {total > PAGE_SIZE
+            ? `${num(rules?.length ?? 0)} of ${num(total)} rules (page ${page})`
+            : `${num(total)} rule${total === 1 ? "" : "s"}`}
+        </span>
       </div>
 
       {error && !forbidden ? <ErrorAlert message={error} onRetry={() => void load()} /> : null}
@@ -281,6 +295,9 @@ export default function RulesTab({
           aria-label="Automation rules"
         />
       )}
+      {total > PAGE_SIZE ? (
+        <Pagination page={page} pageSize={PAGE_SIZE} total={total} onPageChange={setPage} size="sm" itemNoun="rules" />
+      ) : null}
 
       <RuleDetailDrawer
         rule={selected}
@@ -437,6 +454,19 @@ function RuleDetailDrawer({
     { label: "Failures", value: num(rule.failureCount), tone: rule.failureCount > 0 ? "danger" : undefined },
     { label: "Last run", value: formatDateTime(rule.lastRunAt) },
     { label: "Last scan", value: rule.triggerKind === "schedule" ? formatDateTime(rule.lastScanAt) : "—", hint: rule.triggerKind === "schedule" ? undefined : "Event rules do not scan" },
+    ...(rule.triggerKind === "schedule" && rule.lastScanAt
+      ? [
+          {
+            label: "Records scanned",
+            value: `${num(rule.lastScanCandidates)}${rule.lastScanTruncated ? " (capped)" : ""}`,
+            tone: rule.lastScanTruncated ? ("warning" as const) : undefined,
+            hint: rule.lastScanTruncated
+              ? `The scan hit its row cap: it looked at the ${num(rule.lastScanCandidates)} records with the earliest deadline (${rule.lastScanOrderedBy ?? "unordered"}) and no further, so "no match" is a partial answer. Narrow the rule to a project or a tighter type.`
+              : `Ordered by ${rule.lastScanOrderedBy ?? "createdAt asc"}; every live record of the type was evaluated.`,
+            span: 2 as const,
+          },
+        ]
+      : []),
     { label: "Created", value: formatDateTime(rule.createdAt) },
     { label: "Updated", value: formatDateTime(rule.updatedAt) },
   ];

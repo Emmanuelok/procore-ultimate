@@ -154,12 +154,19 @@ export const FACTORY_INSPECTION_KINDS = [
 ] as const;
 export type FactoryInspectionKind = (typeof FACTORY_INSPECTION_KINDS)[number];
 
+/**
+ * `voided` is how a mis-recorded inspection is withdrawn: the record survives
+ * with its reason, but a voided inspection may never feed the percent a
+ * valuation relies on. Only somebody other than the inspector of record may
+ * void one.
+ */
 export const FACTORY_INSPECTION_RESULTS = [
   "scheduled",
   "passed",
   "conditional",
   "failed",
   "cancelled",
+  "voided",
 ] as const;
 export type FactoryInspectionResult = (typeof FACTORY_INSPECTION_RESULTS)[number];
 

@@ -276,6 +276,49 @@ describe("markup cascade (#198–199)", () => {
     expect(res.markups[0]?.baseAmount).toBe(600);
   });
 
+  it("takes the intersection when a markup is narrowed to sections AND cost types", () => {
+    // s2 holds 600 of subcontract and 250 of labour; the tier is 5% on
+    // subcontract in s2, so its base is 600 — not the 850 the section
+    // subtotal would give, and not the 850 of subcontract company-wide.
+    const mixed = rollUpLines([
+      line({ costType: "labour", amount: 400, labourAmount: 400, materialAmount: 0, sectionId: "s1" }),
+      line({ costType: "subcontract", amount: 250, subcontractAmount: 250, materialAmount: 0, sectionId: "s1" }),
+      line({ costType: "labour", amount: 250, labourAmount: 250, materialAmount: 0, sectionId: "s2" }),
+      line({ costType: "subcontract", amount: 600, subcontractAmount: 600, materialAmount: 0, sectionId: "s2" }),
+    ]);
+    expect(mixed.bySection["s2"]).toBe(850);
+    expect(mixed.byCostType["subcontract"]).toBe(850);
+    const res = applyMarkups(
+      [markup({ basis: "cost_type", costTypes: ["subcontract"], sectionIds: ["s2"], rate: 5 })],
+      mixed,
+    );
+    expect(res.markups[0]?.baseAmount).toBe(600);
+    expect(res.markups[0]?.amount).toBe(30);
+    expect(res.markups[0]?.explanation).toContain("subcontract");
+    expect(res.markups[0]?.explanation).toContain("1 selected section");
+  });
+
+  it("buckets the rollup by section and cost type together", () => {
+    const mixed = rollUpLines([
+      line({ costType: "labour", amount: 400, labourAmount: 400, materialAmount: 0, sectionId: "s1" }),
+      line({ costType: "material", amount: 100, materialAmount: 100, sectionId: "s1" }),
+      line({ costType: "material", amount: 60, materialAmount: 60, sectionId: null }),
+    ]);
+    expect(mixed.bySectionCostType["s1"]?.["labour"]).toBe(400);
+    expect(mixed.bySectionCostType["s1"]?.["material"]).toBe(100);
+    expect(mixed.bySectionCostType[""]?.["material"]).toBe(60);
+    expect(mixed.bySectionCostType["s1"]?.["equipment"]).toBeUndefined();
+  });
+
+  it("widens a section-narrowed markup that names no cost type to the whole section", () => {
+    const res = applyMarkups(
+      [markup({ basis: "cost_type", costTypes: [], sectionIds: ["s2"], rate: 10 })],
+      rollup,
+    );
+    expect(res.markups[0]?.baseAmount).toBe(600);
+    expect(res.warnings.join(" ")).toMatch(/no cost type selected/);
+  });
+
   it("refuses to section a running-total markup and says why", () => {
     const res = applyMarkups(
       [markup({ basis: "running_total", sectionIds: ["s2"], rate: 10 })],

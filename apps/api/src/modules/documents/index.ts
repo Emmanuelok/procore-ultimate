@@ -74,6 +74,16 @@ import { buildEml, classifyUpload, parseFolderAlias, safeFilename } from "./inbo
 /* Schemas                                                             */
 /* ------------------------------------------------------------------ */
 
+/**
+ * A date or date-time filter. Postgres compares these against `timestamptz`
+ * columns, so an unparseable string is a 22007 from the driver (a 500) rather
+ * than the 400 the caller deserves — validate it here instead.
+ */
+const dateParam = z
+  .string()
+  .max(40)
+  .refine((v) => !Number.isNaN(Date.parse(v)), "Expected an ISO date or date-time");
+
 const folderCreateSchema = z.object({
   name: z.string().min(1).max(200).refine((v) => !v.includes("/"), "Folder names cannot contain '/'"),
   parentId: z.string().max(64).nullable().optional(),
@@ -99,8 +109,8 @@ const filesQuerySchema = pageQuerySchema.extend({
   uploadedBy: z.string().max(64).optional(),
   contentType: z.string().max(120).optional(),
   checkedOut: z.enum(["0", "1"]).optional(),
-  updatedAfter: z.string().max(40).optional(),
-  updatedBefore: z.string().max(40).optional(),
+  updatedAfter: dateParam.optional(),
+  updatedBefore: dateParam.optional(),
   /** recycle bin (documents admin only) */
   deleted: z.enum(["0", "1"]).optional(),
   /** include files owned by the drawing/spec pipelines */
@@ -145,13 +155,21 @@ const inboundSchema = z.object({
 });
 
 const accessReportQuery = z.object({
-  since: z.string().max(40).optional(),
+  since: dateParam.optional(),
   fileId: z.string().max(64).optional(),
   userId: z.string().max(64).optional(),
   limit: z.coerce.number().int().min(1).max(500).default(100),
 });
 
 const PIPELINE_KINDS = ["drawing_set", "spec_book"];
+/**
+ * `metadata.kind` is written by the drawings/specifications pipelines and read
+ * back as ownership: it hides the file from the documents list, disables the
+ * delete action and refuses a move. A client that could write it could hide
+ * any file from everyone, or re-expose (and move) a set/book source. It is
+ * therefore stripped from every client patch — the stored value always wins.
+ */
+const RESERVED_METADATA_KEYS = ["kind"];
 const STALE_CHECKOUT_DAYS = 7;
 const PREVIEWABLE = /^(application\/pdf|image\/(png|jpeg|gif|webp|svg\+xml|bmp)|text\/(plain|csv|markdown|html)|application\/json)$/;
 
@@ -592,17 +610,52 @@ export const documentsModule: FastifyPluginAsync = async (app) => {
     if (Number(childFolders?.n ?? 0) > 0 || Number(childFiles?.n ?? 0) > 0) {
       throw conflict("Folder is not empty");
     }
-    await app.db.delete(folders).where(eq(folders.id, folderId));
+    /*
+     * The emptiness check above only counts LIVE files. Files in the recycle
+     * bin still carry this folderId, and there is no purge: dropping the
+     * folder row underneath them would leave restorable files pointing at a
+     * folder that no longer exists — invisible in the tree, `folderPath: null`
+     * on the detail route, unreachable except by id. So they are reparented
+     * onto the deleted folder's parent (null = project root, which the file
+     * list already renders) inside the same transaction, and the move is
+     * ledgered with the folder deletion so the recycle bin stays honest.
+     */
+    const orphans = await app.db
+      .select({ id: files.id, name: files.name })
+      .from(files)
+      .where(and(eq(files.folderId, folderId), isNotNull(files.deletedAt)));
+    await app.db.transaction(async (tx) => {
+      if (orphans.length > 0) {
+        await tx
+          .update(files)
+          .set({ folderId: folder.parentId, updatedAt: new Date().toISOString() })
+          .where(and(eq(files.folderId, folderId), isNotNull(files.deletedAt)));
+      }
+      await tx.delete(folders).where(eq(folders.id, folderId));
+    });
     await appendLedger(app.db, {
       companyId: req.companyId!,
       actorId: req.user!.id,
       action: "delete",
       objectType: "folder",
       objectId: folderId,
-      payload: { name: folder.name, path: folder.path },
+      payload: {
+        name: folder.name,
+        path: folder.path,
+        recycleBinFilesMoved: orphans.length,
+        movedToFolderId: folder.parentId,
+      },
       projectId,
     });
-    return { ok: true };
+    return {
+      ok: true,
+      recycleBinFilesMoved: orphans.length,
+      movedToFolderId: folder.parentId,
+      note:
+        orphans.length > 0
+          ? `${orphans.length} file(s) in the recycle bin were moved to ${folder.parentId ? "the parent folder" : "the project root"} so they stay restorable.`
+          : null,
+    };
   });
 
   /* ---------------------------------------------------------------- */
@@ -714,6 +767,17 @@ export const documentsModule: FastifyPluginAsync = async (app) => {
     const { file: f } = await loadFile(req, fileId, "standard");
     if (f.checkedOutBy && f.checkedOutBy !== req.user!.id) {
       throw conflict("File is checked out by another user");
+    }
+    // A new version REPLACES storageKey/sha256 for everyone who resolves this
+    // file id. Drawing revisions and spec section revisions point at the file
+    // plus a page index, so swapping the bytes silently changes what every
+    // sheet and clause serves. Refuse exactly where DELETE refuses; a corrected
+    // set or book is uploaded as a new set/book, which supersedes properly.
+    const versionRefs = await fileReferences(fileId);
+    if (versionRefs.length > 0) {
+      throw conflict(
+        `This file is referenced by ${versionRefs.join(", ")}; upload a new set or issue instead of replacing its bytes`,
+      );
     }
     const mp = await req.file();
     if (!mp) throw badRequest("Expected a multipart file upload");
@@ -1159,7 +1223,9 @@ export const documentsModule: FastifyPluginAsync = async (app) => {
       await storeFile(d.filename, d.contentType, d.buf, null, { fromEmail: emlName });
     }
 
-    const status = rejected.length === 0 ? "stored" : decoded.length === 0 ? "partial" : "partial";
+    // The message itself is always stored, so a refused attachment makes the
+    // delivery partial, never wholly rejected (`rejectWhole` owns that case).
+    const status = rejected.length === 0 ? "stored" : "partial";
     const id = newId("inb");
     await app.db.insert(documentInboundEmails).values({
       id,
@@ -1364,6 +1430,14 @@ export const documentsModule: FastifyPluginAsync = async (app) => {
     if (body.folderId !== undefined && isPipelineOwned(f.metadata)) {
       throw badRequest("This file is owned by the drawings/specifications pipeline and cannot be moved");
     }
+    const ignoredMetadataKeys = Object.keys(body.metadata ?? {}).filter((k) =>
+      RESERVED_METADATA_KEYS.includes(k),
+    );
+    const patchMetadata = body.metadata
+      ? Object.fromEntries(
+          Object.entries(body.metadata).filter(([k]) => !RESERVED_METADATA_KEYS.includes(k)),
+        )
+      : undefined;
     if (body.folderId) {
       const folder = await app.db
         .select({ id: folders.id, projectId: folders.projectId })
@@ -1384,7 +1458,9 @@ export const documentsModule: FastifyPluginAsync = async (app) => {
         name: body.name ?? f.name,
         folderId: body.folderId === undefined ? f.folderId : body.folderId,
         isPrivate: body.isPrivate === undefined ? f.isPrivate : body.isPrivate ? 1 : 0,
-        metadata: body.metadata ? { ...(f.metadata as Record<string, unknown>), ...body.metadata } : (f.metadata as Record<string, unknown>),
+        metadata: patchMetadata
+          ? { ...(f.metadata as Record<string, unknown>), ...patchMetadata }
+          : (f.metadata as Record<string, unknown>),
         documentType: body.documentType === undefined ? f.documentType : body.documentType,
         tags: body.tags ?? f.tags,
         description: body.description === undefined ? f.description : body.description,
@@ -1398,11 +1474,11 @@ export const documentsModule: FastifyPluginAsync = async (app) => {
       action: "update",
       objectType: "file",
       objectId: fileId,
-      payload: body,
+      payload: { ...body, metadata: patchMetadata, ignoredMetadataKeys },
       projectId: f.projectId,
     });
     const updated = await app.db.select().from(files).where(eq(files.id, fileId)).limit(1);
-    return updated[0];
+    return { ...updated[0]!, ignoredMetadataKeys };
   });
 
   /** Copy: a new file row over the same content-addressed bytes (#294). */

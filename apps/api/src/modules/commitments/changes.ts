@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, count, desc, eq } from "drizzle-orm";
+import { and, count, desc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import {
   backcharges,
@@ -543,11 +543,25 @@ export const changeRoutes: FastifyPluginAsync = async (app) => {
             await syncBudgetCommitted(tx, req.companyId!, commitment.projectId, touched);
           }
           if (backchargeId) {
-            /* the recovery is now inside the commitment sum — the backcharge is settled */
+            /*
+             * The recovery is now inside the commitment sum, so the backcharge
+             * is settled — INCLUDING one the sub disputed. A disputed
+             * backcharge is still reserved against the next payment
+             * (`openBackchargeTotal`), and the approved negative change order
+             * has already reduced the revised commitment sum by the same
+             * money: leaving it open would reserve the amount twice, for the
+             * life of the commitment. Approving the change order IS the
+             * resolution of the dispute, whichever way the dispute went.
+             */
             await tx
               .update(backcharges)
               .set({ status: "settled", settledAt: now, settledBy: req.user!.id, updatedAt: now })
-              .where(and(eq(backcharges.id, backchargeId), eq(backcharges.status, "issued")));
+              .where(
+                and(
+                  eq(backcharges.id, backchargeId),
+                  inArray(backcharges.status, ["issued", "disputed"]),
+                ),
+              );
           }
           return { totals, applied };
         });

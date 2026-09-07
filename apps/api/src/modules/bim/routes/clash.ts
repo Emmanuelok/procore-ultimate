@@ -23,6 +23,7 @@ import {
   clashResults,
   clashTests,
   coordinationIssues,
+  federationGroups,
   federationMembers,
 } from "@constructos/db";
 import { CLASH_RULE_KINDS, CLASH_STATUSES, DRAWING_DISCIPLINES } from "@constructos/shared";
@@ -31,7 +32,15 @@ import { badRequest, conflict, notFound } from "../../../lib/errors.js";
 import { nextRecordNumber } from "../../../lib/numbering.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
 import { detectClashes, type ClashElement } from "../clash.js";
-import { buildBimGates, buildLoaders, closeSignal, ledger, nowISO, raiseSignal } from "../shared.js";
+import {
+  assertAssignable,
+  buildBimGates,
+  buildLoaders,
+  closeSignal,
+  ledger,
+  nowISO,
+  raiseSignal,
+} from "../shared.js";
 
 const filterSchema = z
   .object({
@@ -223,20 +232,46 @@ export const clashRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
+  /**
+   * A clash test may only point at a federation group in THIS project. The
+   * membership check alone let a test be stored against another tenant's
+   * group id; the run then found no versions in scope and failed with an
+   * unhelpful "No model versions in scope" instead of naming the real cause.
+   */
+  async function assertFederationInProject(
+    federationId: string,
+    companyId: string,
+    projectId: string,
+  ): Promise<void> {
+    const group = await app.db
+      .select({ id: federationGroups.id })
+      .from(federationGroups)
+      .where(
+        and(
+          eq(federationGroups.id, federationId),
+          eq(federationGroups.companyId, companyId),
+          eq(federationGroups.projectId, projectId),
+        ),
+      )
+      .limit(1);
+    if (!group[0]) throw badRequest("That federation group is not in this project");
+    const rows = await app.db
+      .select({ id: federationMembers.groupId })
+      .from(federationMembers)
+      .where(eq(federationMembers.groupId, federationId))
+      .limit(1);
+    if (!rows[0]) {
+      throw badRequest("Federation has no members — add model versions to it first");
+    }
+  }
+
   app.post(
     "/projects/:projectId/bim/clash-tests",
     { preHandler: gates.standardGate },
     async (req, reply) => {
       const body = testCreateSchema.parse(req.body);
       if (body.federationId) {
-        const rows = await app.db
-          .select({ id: federationMembers.groupId })
-          .from(federationMembers)
-          .where(eq(federationMembers.groupId, body.federationId))
-          .limit(1);
-        if (!rows[0]) {
-          throw badRequest("Federation has no members — add model versions to it first");
-        }
+        await assertFederationInProject(body.federationId, req.companyId!, req.projectId!);
       }
       const id = newId("clt");
       const [created] = await app.db
@@ -276,6 +311,9 @@ export const clashRoutes: FastifyPluginAsync = async (app) => {
       const test = await getClashTest(testId, req.companyId!);
       if (test.projectId !== req.projectId) throw notFound("Clash test not found");
       const body = testPatchSchema.parse(req.body);
+      if (body.federationId) {
+        await assertFederationInProject(body.federationId, req.companyId!, test.projectId);
+      }
       const patch: Record<string, unknown> = { updatedAt: nowISO() };
       for (const key of [
         "name",
@@ -602,6 +640,12 @@ export const clashRoutes: FastifyPluginAsync = async (app) => {
       const body = raiseIssueSchema.parse(req.body);
       const test = await getClashTest(testId, req.companyId!);
       if (test.projectId !== req.projectId) throw notFound("Clash test not found");
+      // exactly the rule the issue register enforces, through exactly the
+      // same helper: an issue is never assigned to someone outside the tenant
+      // (the register resolves assignee names and emails, so a foreign id
+      // would leak another tenant's user) nor to someone outside the project
+      // (assignment notifies, and they cannot open the record)
+      await assertAssignable(app.db, req.companyId!, test.projectId, [body.assigneeId]);
 
       const results = await app.db
         .select()

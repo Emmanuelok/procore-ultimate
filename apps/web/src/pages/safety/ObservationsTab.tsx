@@ -39,7 +39,9 @@ import {
   OBSERVATION_STATUS_TONE,
   RiskBadge,
   SAFETY_SEVERITY_TONE,
+  RegisterPager,
   count,
+  pageParams,
   dateTime,
   isoDate,
   labelize,
@@ -50,6 +52,8 @@ import {
 } from "./safetyShared";
 
 export interface ObservationFilters {
+  /** 1-based; the register is paged rather than silently truncated */
+  page: string;
   kind: string;
   category: string;
   severity: string;
@@ -58,7 +62,7 @@ export interface ObservationFilters {
   overdue: string;
 }
 
-export const EMPTY_OBSERVATION_FILTERS: ObservationFilters = {
+export const EMPTY_OBSERVATION_FILTERS: ObservationFilters = { page: "1",
   kind: "",
   category: "",
   severity: "",
@@ -510,6 +514,15 @@ export default function ObservationsTab({
         />
       )}
 
+      <RegisterPager
+        page={filters.page}
+        loaded={rows.length}
+        total={observations.data?.total ?? null}
+        noun="observation"
+        loading={observations.loading}
+        onPage={(page) => onFilters({ ...filters, page })}
+      />
+
       <p className="text-2xs text-content-subtle">
         The lanes are the lifecycle, not a drag surface. Assigning an owner, lifting a work stoppage
         and closing an observation are separate acts with their own preconditions — closure, in
@@ -520,7 +533,7 @@ export default function ObservationsTab({
 }
 
 export function observationQueryString(filters: ObservationFilters): string {
-  const params = new URLSearchParams({ page: "1", pageSize: "200" });
+  const params = pageParams(filters.page);
   if (filters.kind) params.set("kind", filters.kind);
   if (filters.category) params.set("category", filters.category);
   if (filters.severity) params.set("severity", filters.severity);

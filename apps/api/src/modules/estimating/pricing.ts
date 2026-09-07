@@ -448,6 +448,14 @@ export interface EstimateRollup {
   byCostType: Record<string, number>;
   /** direct cost per section id ("" = unsectioned), for a section markup */
   bySection: Record<string, number>;
+  /**
+   * Direct cost per section id AND cost type — the intersection a markup
+   * needs when it is narrowed BOTH ways ("5% on the subcontract cost of the
+   * external works section"). Without it the two filters cannot both be
+   * honoured, and a base that quietly widens to the whole section is a
+   * markup whose stated basis and whose number disagree.
+   */
+  bySectionCostType: Record<string, Record<string, number>>;
 }
 
 /** A line is in the estimate total when it is active or provisional. */
@@ -468,6 +476,7 @@ export function rollUpLines(lines: readonly RollupLine[]): EstimateRollup {
     alternateTotal: 0,
     byCostType: {},
     bySection: {},
+    bySectionCostType: {},
   };
   for (const line of lines) {
     const amount = num(line.amount);
@@ -487,6 +496,9 @@ export function rollUpLines(lines: readonly RollupLine[]): EstimateRollup {
     rollup.byCostType[ct] = round2((rollup.byCostType[ct] ?? 0) + amount);
     const sect = line.sectionId ?? "";
     rollup.bySection[sect] = round2((rollup.bySection[sect] ?? 0) + amount);
+    const cell = rollup.bySectionCostType[sect] ?? {};
+    cell[ct] = round2((cell[ct] ?? 0) + amount);
+    rollup.bySectionCostType[sect] = cell;
   }
   return {
     ...rollup,
@@ -565,33 +577,52 @@ export function applyMarkups(
     let baseAmount: number;
     let baseLabel: string;
     const sections = (m.sectionIds ?? []).filter((s) => s.length > 0);
+    const types = (m.costTypes ?? []).filter((t) => t.length > 0);
+    const compounding = m.basis === "running_total" || m.basis === "estimate_total";
+    /** every cost type inside the selected sections */
+    const sectionTotal = (): number =>
+      sections.reduce((sum, s) => sum + (rollup.bySection[s] ?? 0), 0);
+    /**
+     * The INTERSECTION of the two filters. A markup narrowed to sections AND
+     * to cost types must be a percentage of the selected cost types inside
+     * those sections only — taking the whole section subtotal would silently
+     * widen the base past the basis printed next to it.
+     */
+    const sectionCostTypeTotal = (): number =>
+      sections.reduce(
+        (sum, s) =>
+          sum + types.reduce((inner, t) => inner + (rollup.bySectionCostType[s]?.[t] ?? 0), 0),
+        0,
+      );
+
     if (m.basis === "cost_type") {
-      const types = (m.costTypes ?? []).filter((t) => t.length > 0);
       if (types.length === 0) {
-        baseAmount = rollup.directCostTotal;
+        baseAmount = sections.length > 0 ? sectionTotal() : rollup.directCostTotal;
         baseLabel = "direct cost (no cost type selected, so every type)";
         warnings.push(
           `"${m.name}" is a cost-type markup with no cost type selected; it was applied to the whole direct cost.`,
         );
       } else {
-        baseAmount = types.reduce((sum, t) => sum + (rollup.byCostType[t] ?? 0), 0);
+        baseAmount =
+          sections.length > 0
+            ? sectionCostTypeTotal()
+            : types.reduce((sum, t) => sum + (rollup.byCostType[t] ?? 0), 0);
         baseLabel = `direct cost of ${types.join(", ")}`;
       }
-    } else if (m.basis === "running_total" || m.basis === "estimate_total") {
+    } else if (compounding) {
       baseAmount = running;
       baseLabel = "direct cost plus the markups sequenced before this one";
     } else {
-      baseAmount = rollup.directCostTotal;
+      baseAmount = sections.length > 0 ? sectionTotal() : rollup.directCostTotal;
       baseLabel = "direct cost";
     }
 
     if (sections.length > 0) {
-      if (m.basis === "running_total" || m.basis === "estimate_total") {
+      if (compounding) {
         warnings.push(
           `"${m.name}" narrows to sections but is applied to the running total, which is not sectioned; the section filter was ignored.`,
         );
       } else {
-        baseAmount = sections.reduce((sum, s) => sum + (rollup.bySection[s] ?? 0), 0);
         baseLabel = `${baseLabel} in ${sections.length} selected section${sections.length === 1 ? "" : "s"}`;
       }
     }

@@ -444,7 +444,7 @@ export const identityModule: FastifyPluginAsync = async (app) => {
         includeOrphanTokens: true,
       });
       await recordAuthEvent(app.db, {
-        kind: "refresh_failure",
+        kind: "refresh_reuse_detected",
         outcome: "failure",
         userId: token.userId,
         reason: "Refresh token reuse detected; every session for this account was revoked",
@@ -491,7 +491,7 @@ export const identityModule: FastifyPluginAsync = async (app) => {
         includeOrphanTokens: true,
       });
       await recordAuthEvent(app.db, {
-        kind: "refresh_failure",
+        kind: "refresh_reuse_detected",
         outcome: "failure",
         userId: token.userId,
         reason: "Refresh token reuse detected; every session for this account was revoked",

@@ -17,17 +17,23 @@
  * stoppage waiting to be discovered by the thing it breaks.
  */
 import { useMemo, useState } from "react";
+import { toast } from "sonner";
 import {
   Alert,
   Badge,
+  Button,
   Card,
   CardBody,
   EmptyState,
+  Field,
+  Modal,
   SegmentedControl,
   SkeletonTable,
   Switch,
+  Textarea,
   Tooltip,
 } from "../../ui";
+import { api } from "../../lib/api";
 import { DataTable, type DataColumns } from "../../ui/data";
 import type { Tone } from "../../ui/tokens";
 import { IconTool } from "../../ui/icons";
@@ -36,10 +42,12 @@ import {
   LoadError,
   MAINTENANCE_STATUS_LABEL,
   ReasonList,
+  RefusalNotice,
   SectionHeading,
   isoDate,
   labelize,
   maintenanceTone,
+  useAction,
   type Loadable,
   type MaintenanceRegister,
   type MaintenanceRow,
@@ -58,6 +66,7 @@ export default function MaintenanceTab({
   onCriticalOnly: (next: boolean) => void;
   onOpenMachine: (equipmentId: string) => void;
 }) {
+  const [statusTarget, setStatusTarget] = useState<MaintenanceRow | null>(null);
   const [bucket, setBucket] = useState<Bucket>("overdue");
   const data = register.data;
   const items = useMemo(() => data?.items ?? [], [data]);
@@ -327,9 +336,33 @@ export default function MaintenanceTab({
                 label: "Open the machine",
                 onSelect: () => onOpenMachine(row.equipmentId),
               },
+              /*
+               * A schedule with no way out is a schedule people work around.
+               * A machine that has left the fleet, or whose regime changed,
+               * used to keep generating overdue services for ever.
+               */
+              {
+                id: "status",
+                label:
+                  row.status === "suspended"
+                    ? "Reinstate the schedule"
+                    : row.status === "retired"
+                      ? "Reinstate the schedule"
+                      : "Suspend or retire",
+                onSelect: () => setStatusTarget(row),
+              },
             ]}
             empty={{ title: "No schedules in this bucket" }}
             aria-label="Maintenance schedules"
+          />
+
+          <ScheduleStatusModal
+            row={statusTarget}
+            onClose={() => setStatusTarget(null)}
+            onDone={() => {
+              setStatusTarget(null);
+              register.reload();
+            }}
           />
 
           {bucket === "not_scheduled" ? (
@@ -445,5 +478,120 @@ function DueCell({ row }: { row: MaintenanceRow }) {
         </Badge>
       </span>
     </Tooltip>
+  );
+}
+
+/* ========================================================================== */
+/* Suspend, retire or reinstate a schedule                                     */
+/* ========================================================================== */
+
+/**
+ * SUSPENDING A SCHEDULE STOPS THE SWEEP COUNTING IT, and keeps its history.
+ * Retiring closes it. Neither deletes anything: a machine's service history is
+ * the evidence that it was maintained, and evidence is not tidied away.
+ *
+ * A STATUTORY schedule cannot be suspended or retired without a reason,
+ * because that regime is what keeps the plant lawful to operate — and the
+ * reason is ledgered with the person who gave it. The API's refusal is
+ * rendered verbatim.
+ */
+function ScheduleStatusModal({
+  row,
+  onClose,
+  onDone,
+}: {
+  row: MaintenanceRow | null;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [reason, setReason] = useState("");
+
+  if (!row) return null;
+  const suspended = row.status === "suspended" || row.status === "retired";
+
+  async function act(status: "active" | "suspended" | "retired") {
+    if (!row) return;
+    const done = await run(status, () =>
+      api.patch(
+        `/api/v1/companies/current/equipment/${row.equipmentId}/maintenance-schedules/${row.id}`,
+        { status, reason: reason.trim() || undefined },
+      ),
+    );
+    if (done) {
+      toast.success(
+        status === "active"
+          ? "Reinstated — the next due date was recomputed from the last service performed"
+          : status === "suspended"
+            ? "Suspended — it no longer raises a due or overdue service"
+            : "Retired",
+      );
+      setReason("");
+      onDone();
+    }
+  }
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title={row.name}
+      description={`${row.equipmentReference ?? "This machine"} · ${labelize(row.status)}${
+        row.isStatutory ? " · STATUTORY" : ""
+      }`}
+      footer={
+        <div className="flex flex-wrap justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Close
+          </Button>
+          {suspended ? (
+            <Button variant="primary" loading={busy === "active"} onClick={() => act("active")}>
+              Reinstate
+            </Button>
+          ) : (
+            <>
+              <Button
+                variant="secondary"
+                loading={busy === "suspended"}
+                disabled={row.isStatutory && reason.trim() === ""}
+                onClick={() => act("suspended")}
+              >
+                Suspend
+              </Button>
+              <Button
+                variant="danger"
+                loading={busy === "retired"}
+                disabled={row.isStatutory && reason.trim() === ""}
+                onClick={() => act("retired")}
+              >
+                Retire
+              </Button>
+            </>
+          )}
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {refusal ? <RefusalNotice refusal={refusal} onDismiss={clear} /> : null}
+        {row.isStatutory ? (
+          <p className="text-meta text-danger">
+            This is a STATUTORY schedule — the regime that keeps this machine lawful to operate.
+            Suspending or retiring it requires a reason, and the reason is kept on the ledger with
+            your name against it.
+          </p>
+        ) : null}
+        <Field
+          label="Why"
+          required={row.isStatutory}
+          hint="Kept on the ledger. 'Machine off hire', 'regime withdrawn', 'interval corrected under SFG20'."
+        >
+          <Textarea rows={2} value={reason} onChange={(event) => setReason(event.target.value)} />
+        </Field>
+        <p className="text-2xs text-content-subtle">
+          Nothing is deleted. A suspended schedule keeps its history and stops being counted;
+          reinstating it recomputes the next due date from the last service actually performed.
+        </p>
+      </div>
+    </Modal>
   );
 }

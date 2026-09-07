@@ -219,15 +219,55 @@ function GatesDrawer({ projectId, open, gates, onClose, onChanged }: { projectId
   const [maxVehicle, setMaxVehicle] = useState("");
   const [crane, setCrane] = useState(false);
   const [laydown, setLaydown] = useState("");
+  const [editId, setEditId] = useState<string | null>(null);
+
+  /**
+   * A gate's window, bays, crane and vehicle limit are what every booking is
+   * tested against, so they must be correctable: a gate created with one bay
+   * that actually has three silently refuses every second delivery.
+   */
+  function startEditing(g: GateRow) {
+    setEditId(g.id);
+    setName(g.name);
+    setOpensAt(g.opensAt);
+    setClosesAt(g.closesAt);
+    setBays(String(g.concurrentSlots));
+    setSlotMinutes(String(g.slotMinutes));
+    setMaxVehicle(g.maxVehicleType ?? "");
+    setCrane(g.craneAvailable === 1);
+    setLaydown(g.laydownAreas.join(", "));
+  }
+
+  function resetForm() {
+    setEditId(null);
+    setName("");
+    setOpensAt("07:00");
+    setClosesAt("18:00");
+    setBays("1");
+    setSlotMinutes("30");
+    setMaxVehicle("");
+    setCrane(false);
+    setLaydown("");
+  }
 
   async function create(e: FormEvent) {
     e.preventDefault();
-    const payload: Record<string, unknown> = { name: name.trim(), opensAt, closesAt, concurrentSlots: Number(bays) || 1, slotMinutes: Number(slotMinutes) || 30, craneAvailable: crane, laydownAreas: laydown.split(",").map((s) => s.trim()).filter(Boolean) };
-    if (maxVehicle) payload["maxVehicleType"] = maxVehicle;
-    const r = await action.run("gate", () => api.post<GateRow>(base, payload));
+    const payload: Record<string, unknown> = {
+      name: name.trim(),
+      opensAt,
+      closesAt,
+      concurrentSlots: Number(bays) || 1,
+      slotMinutes: Number(slotMinutes) || 30,
+      craneAvailable: crane,
+      laydownAreas: laydown.split(",").map((s) => s.trim()).filter(Boolean),
+      maxVehicleType: maxVehicle ? maxVehicle : null,
+    };
+    const r = editId
+      ? await action.run("gate", () => api.patch<GateRow>(`${base}/${editId}`, payload))
+      : await action.run("gate", () => api.post<GateRow>(base, payload));
     if (r) {
-      toast.success(`Gate ${r.name} added`);
-      setName("");
+      toast.success(editId ? `Gate ${r.name} updated` : `Gate ${r.name} added`);
+      resetForm();
       onChanged();
     }
   }
@@ -251,12 +291,14 @@ function GatesDrawer({ projectId, open, gates, onClose, onChanged }: { projectId
               </span>
               <span className="flex items-center gap-2">
                 <Badge tone={g.status === "open" ? "success" : "neutral"} size="xs" dot>{g.status}</Badge>
+                <Button size="xs" variant="ghost" onClick={() => startEditing(g)}>Edit</Button>
                 <Button size="xs" variant="ghost" loading={action.busy === `toggle:${g.id}`} onClick={() => void toggle(g)}>{g.status === "open" ? "Close" : "Open"}</Button>
               </span>
             </li>
           ))}
         </ul>
         <form onSubmit={(e) => void create(e)} className="grid grid-cols-2 gap-2 rounded-md border border-border p-3">
+          <p className="col-span-2 text-2xs text-content-muted">{editId ? "Editing an existing gate. Changing the window or the bays does not re-test bookings already made — check the day's availability afterwards." : "Add a gate."}</p>
           <Field label="Name" required className="col-span-2">
             <Input value={name} onChange={(e) => setName(e.target.value)} required />
           </Field>
@@ -287,7 +329,14 @@ function GatesDrawer({ projectId, open, gates, onClose, onChanged }: { projectId
           </Field>
           <div className="col-span-2 flex items-center justify-between">
             <Checkbox label="Crane / hoist allocation at this gate" checked={crane} onChange={(e) => setCrane(e.target.checked)} />
-            <Button type="submit" size="sm" loading={action.busy === "gate"}>Add gate</Button>
+            <span className="flex items-center gap-2">
+              {editId ? (
+                <Button type="button" size="sm" variant="ghost" onClick={resetForm}>
+                  Cancel edit
+                </Button>
+              ) : null}
+              <Button type="submit" size="sm" loading={action.busy === "gate"}>{editId ? "Save gate" : "Add gate"}</Button>
+            </span>
           </div>
         </form>
       </div>

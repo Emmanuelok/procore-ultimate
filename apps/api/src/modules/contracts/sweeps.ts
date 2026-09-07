@@ -29,7 +29,7 @@ import type { Db } from "../../lib/db.js";
 import { forEachCompany } from "../../lib/scheduler.js";
 import { pushNotifications } from "../notifications/service.js";
 import { deemedAcceptance } from "./ce.js";
-import { daysBetweenIso } from "./timebar.js";
+import { addDaysOnCalendar, daysBetweenIso } from "./timebar.js";
 
 function today(now: Date): string {
   return now.toISOString().slice(0, 10);
@@ -96,10 +96,16 @@ export async function sweepTimeBars(
   options: { projectId?: string; contractIds?: string[] } = {},
 ): Promise<TimeBarSweepResult> {
   const todayIso = today(now);
+  // Bound the scan by a date window (PLAN §6.4): nothing outside it can breach
+  // or warn today, because the largest warning window the schema allows is 365
+  // days. A long-running tenant otherwise pays, every hour, for open events
+  // whose deadlines are years away.
+  const horizon = addDaysOnCalendar(todayIso, 366, "calendar");
   const clauses = [
     eq(contractEvents.companyId, companyId),
     eq(contractEvents.status, "open"),
     isNotNull(contractEvents.noticeDeadline),
+    lte(contractEvents.noticeDeadline, horizon),
   ];
   if (options.projectId) clauses.push(eq(contractEvents.projectId, options.projectId));
   if (options.contractIds && options.contractIds.length > 0) {

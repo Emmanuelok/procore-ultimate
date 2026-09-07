@@ -55,8 +55,12 @@ import { formatDate, formatDateTime } from "../format";
 import {
   ActivityPanel,
   AttentionDrawer,
+  AttentionStatusFilter,
   AttentionTable,
   BriefingCard,
+  TruncationNote,
+  attentionEmpty,
+  statusHint,
   LEVEL_META,
   LEVEL_ORDER,
   LevelBadge,
@@ -68,6 +72,8 @@ import {
   errorMessage,
   type ActivityResponse,
   type AttentionItem,
+  type AttentionList,
+  type AttentionStatus,
   type BriefingLatest,
   type BriefingView,
   type HealthLevel,
@@ -393,12 +399,18 @@ export default function PulsePage() {
   const { user, company } = useAuth();
   const isAdmin = company?.role === "owner" || company?.role === "admin";
   const [tab, setTab] = useState<TabKey>("attention");
+  const [attentionStatus, setAttentionStatus] = useState<AttentionStatus>("open");
   const [selected, setSelected] = useState<AttentionItem | null>(null);
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [generating, setGenerating] = useState(false);
 
   const pulse = useResource<PulseResponse>("/api/v1/pulse?attentionLimit=100");
+  // The open feed rides along on the one Pulse read; the other two states are
+  // their own request, so a dismissal can always be found and undone.
+  const otherStatus = useResource<AttentionList>(
+    attentionStatus === "open" ? null : `/api/v1/attention?limit=100&status=${attentionStatus}`,
+  );
   const history = useResource<PulseHistory>("/api/v1/pulse/history?days=30");
   const activity = useResource<ActivityResponse>("/api/v1/pulse/activity?limit=20");
   const briefing = useResource<BriefingLatest>("/api/v1/pulse/briefing");
@@ -406,11 +418,17 @@ export default function PulsePage() {
 
   const reloadAll = useCallback(() => {
     pulse.reload();
+    otherStatus.reload();
     history.reload();
     activity.reload();
     briefing.reload();
     briefings.reload();
-  }, [pulse, history, activity, briefing, briefings]);
+  }, [pulse, otherStatus, history, activity, briefing, briefings]);
+
+  const reloadAttention = useCallback(() => {
+    pulse.reload();
+    otherStatus.reload();
+  }, [pulse, otherStatus]);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -453,16 +471,18 @@ export default function PulsePage() {
       setBusy(true);
       try {
         await api.post(`/api/v1/attention/${item.id}/dismiss`, reason ? { reason } : {});
-        toast.success("Set aside — recorded on the ledger.");
+        toast.success("Set aside — recorded on the ledger. Find it again under “Set aside”.");
         setSelected(null);
-        pulse.reload();
+        reloadAttention();
       } catch (err) {
-        toast.error(errorMessage(err, "Could not dismiss the item."));
+        if (err instanceof ApiClientError && err.status === 403) {
+          toast.error("Setting an item aside needs standard access to intelligence on its project.");
+        } else toast.error(errorMessage(err, "Could not dismiss the item."));
       } finally {
         setBusy(false);
       }
     },
-    [pulse],
+    [reloadAttention],
   );
 
   const reopen = useCallback(
@@ -470,19 +490,24 @@ export default function PulsePage() {
       setBusy(true);
       try {
         await api.post(`/api/v1/attention/${item.id}/reopen`, {});
-        toast.success("Reopened.");
+        toast.success("Reopened — back in the open feed.");
         setSelected(null);
-        pulse.reload();
+        reloadAttention();
       } catch (err) {
-        toast.error(errorMessage(err, "Could not reopen the item."));
+        if (err instanceof ApiClientError && err.status === 403) {
+          toast.error("Reopening an item needs standard access to intelligence on its project.");
+        } else toast.error(errorMessage(err, "Could not reopen the item."));
       } finally {
         setBusy(false);
       }
     },
-    [pulse],
+    [reloadAttention],
   );
 
   const data = pulse.data;
+  const attentionItems = attentionStatus === "open" ? (data?.attention ?? []) : (otherStatus.data?.items ?? []);
+  const attentionLoading = attentionStatus === "open" ? pulse.loading : otherStatus.loading;
+  const attentionError = attentionStatus === "open" ? pulse.error : otherStatus.error;
   const sev = data?.attentionBySeverity ?? {};
   const firstName = user?.name?.split(" ")[0] ?? "there";
   const aiEnabled = briefing.data?.aiEnabled ?? activity.data?.aiEnabled ?? false;
@@ -563,23 +588,27 @@ export default function PulsePage() {
         <Card>
           <CardHeader
             title="What needs a decision"
-            subtitle="Ranked by severity × urgency × money. Click a row for the basis, the record, and to set it aside with a reason."
+            subtitle={statusHint(attentionStatus)}
+            actions={<AttentionStatusFilter value={attentionStatus} onChange={setAttentionStatus} counts={{ open: data?.openAttention }} />}
           />
           <CardBody flush>
             <AttentionTable
-              items={data?.attention ?? []}
-              loading={pulse.loading}
-              error={pulse.error}
-              onRetry={pulse.reload}
+              items={attentionItems}
+              loading={attentionLoading}
+              error={attentionError}
+              onRetry={attentionStatus === "open" ? pulse.reload : otherStatus.reload}
               onSelect={setSelected}
               showProject
-              tableId="pulse-attention"
+              emptyTitle={attentionEmpty(attentionStatus, "company").title}
+              emptyHint={attentionEmpty(attentionStatus, "company").hint}
+              tableId={`pulse-attention-${attentionStatus}`}
             />
-            {data && data.openAttention > data.attention.length ? (
+            {attentionStatus === "open" && data && data.openAttention > data.attention.length ? (
               <p className="border-t border-border px-4 py-2 text-meta text-content-subtle">
                 Showing the top {data.attention.length} of {data.openAttention} open items. Open a project's intelligence tab for its full list.
               </p>
             ) : null}
+            {attentionStatus === "open" ? <TruncationNote sources={data?.attentionTruncated} /> : null}
           </CardBody>
         </Card>
       ) : null}
@@ -648,7 +677,9 @@ export default function PulsePage() {
 
       {tab === "activity" ? <ActivityPanel data={activity.data} loading={activity.loading} error={activity.error} onRetry={activity.reload} reviewHref="/agents" /> : null}
 
-      <AttentionDrawer item={selected} onClose={() => setSelected(null)} canAct onDismiss={dismiss} onReopen={reopen} busy={busy} />
+      {/* canAct comes from the API per item: a reader without standard access
+          on the item's project is told so, not handed a button that 403s. */}
+      <AttentionDrawer item={selected} onClose={() => setSelected(null)} canAct={selected?.canAct ?? false} onDismiss={dismiss} onReopen={reopen} busy={busy} />
     </div>
   );
 }

@@ -164,6 +164,8 @@ export interface DrawingIssue {
 
 export interface DrawingIssueDetail extends Omit<DrawingIssue, "recipients" | "acknowledged"> {
   sheets: IssueSheet[];
+  /** sheets on this distribution the segregation rules hide from the reader (#265, #282) */
+  hiddenSheets: number;
   recipients: IssueRecipient[];
   acknowledged: number;
   createdByName: string | null;

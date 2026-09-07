@@ -66,9 +66,42 @@ interface AutoResult {
   assertions: number;
   created: number;
   skipped: number;
+  /** Rows the reconcilers could only test against the claimant's own evidence. */
+  selfCertified?: number;
   results: Record<string, number>;
   contradicted: { assertionId: string; reconciliationId: string; variancePercent: number | null }[];
   signalsCreated: number;
+}
+
+/** One assertion kind's tolerance band, and where the band came from. */
+interface EffectivePolicy {
+  assertionKind: string;
+  supportedWithinPercent: number;
+  partialWithinPercent: number;
+  minIndependence: number;
+  maxCaptureGapDays: number | null;
+  source: string;
+}
+
+interface ReconcilerDescriptor {
+  kind: string;
+  assertionKinds: string[];
+  evidenceKinds: string[];
+  aggregation: string;
+  description: string;
+}
+
+interface PolicyResponse {
+  items: unknown[];
+  effective: EffectivePolicy[];
+  reconcilers: ReconcilerDescriptor[];
+}
+
+interface PolicyDraft {
+  supportedWithinPercent: string;
+  partialWithinPercent: string;
+  minIndependence: string;
+  maxCaptureGapDays: string;
 }
 
 export default function ReconcileTab({ projectId }: { projectId: string }) {
@@ -104,6 +137,19 @@ export default function ReconcileTab({ projectId }: { projectId: string }) {
   const [dispBusyId, setDispBusyId] = useState<string | null>(null);
   const [dispDraft, setDispDraft] = useState<Record<string, string>>({});
 
+  const [policy, setPolicy] = useState<PolicyResponse | null>(null);
+  const [policyError, setPolicyError] = useState<string | null>(null);
+  const [policyOpen, setPolicyOpen] = useState(false);
+  const [editingKind, setEditingKind] = useState<string | null>(null);
+  const [policyDraft, setPolicyDraft] = useState<PolicyDraft>({
+    supportedWithinPercent: "",
+    partialWithinPercent: "",
+    minIndependence: "",
+    maxCaptureGapDays: "",
+  });
+  const [policyBusy, setPolicyBusy] = useState(false);
+  const [policySaveError, setPolicySaveError] = useState<string | null>(null);
+
   const load = useCallback(async () => {
     setError(null);
     try {
@@ -123,9 +169,74 @@ export default function ReconcileTab({ projectId }: { projectId: string }) {
     }
   }, [base]);
 
+  const loadPolicy = useCallback(async () => {
+    setPolicyError(null);
+    try {
+      const res = await api.get<PolicyResponse>(`${base}/reconciliation-policies`);
+      setPolicy(res);
+    } catch (err) {
+      setPolicy(null);
+      setPolicyError(
+        err instanceof Error ? err.message : "Failed to load the reconciliation tolerance bands",
+      );
+    }
+  }, [base]);
+
   useEffect(() => {
     void load();
-  }, [load]);
+    void loadPolicy();
+  }, [load, loadPolicy]);
+
+  function startEditPolicy(p: EffectivePolicy) {
+    setEditingKind(p.assertionKind);
+    setPolicySaveError(null);
+    setPolicyDraft({
+      supportedWithinPercent: String(p.supportedWithinPercent),
+      partialWithinPercent: String(p.partialWithinPercent),
+      minIndependence: String(p.minIndependence),
+      maxCaptureGapDays: p.maxCaptureGapDays === null ? "" : String(p.maxCaptureGapDays),
+    });
+  }
+
+  async function savePolicy(assertionKind: string) {
+    setPolicyBusy(true);
+    setPolicySaveError(null);
+    try {
+      const supported = Number(policyDraft.supportedWithinPercent);
+      const partial = Number(policyDraft.partialWithinPercent);
+      const independence = Number(policyDraft.minIndependence);
+      if (!Number.isFinite(supported) || !Number.isFinite(partial)) {
+        throw new Error("Both tolerance bands must be numbers");
+      }
+      if (partial < supported) {
+        throw new Error("The partial band must be at least as wide as the supported band");
+      }
+      if (!Number.isFinite(independence) || independence < 0 || independence > 1) {
+        throw new Error("Minimum independence is a score between 0 and 1");
+      }
+      const payload: Record<string, unknown> = {
+        assertionKind,
+        supportedWithinPercent: supported,
+        partialWithinPercent: partial,
+        minIndependence: independence,
+      };
+      const gap = policyDraft.maxCaptureGapDays.trim();
+      payload["maxCaptureGapDays"] = gap === "" ? null : Number(gap);
+      await api.put(`${base}/reconciliation-policies`, payload);
+      setEditingKind(null);
+      await loadPolicy();
+    } catch (err) {
+      setPolicySaveError(
+        err instanceof ApiClientError && err.status === 403
+          ? "Changing a project's tolerance bands needs assurance write access on this project."
+          : err instanceof Error
+            ? err.message
+            : "Failed to save the tolerance band",
+      );
+    } finally {
+      setPolicyBusy(false);
+    }
+  }
 
   async function runAutoReconcile() {
     setAutoBusy(true);
@@ -299,8 +410,191 @@ export default function ReconcileTab({ projectId }: { projectId: string }) {
               {Object.entries(autoResult.results)
                 .map(([k, v]) => `${v} ${humanize(k).toLowerCase()}`)
                 .join(", ") || "no numeric verdicts"}{" "}
-              · {autoResult.signalsCreated} over-certification signal
+              · {autoResult.signalsCreated} signal
               {autoResult.signalsCreated === 1 ? "" : "s"} raised.
+              {autoResult.selfCertified ? (
+                <div className="mt-1 text-amber-800">
+                  {autoResult.selfCertified} claim
+                  {autoResult.selfCertified === 1 ? " was" : "s were"} evidenced only by the person
+                  who made {autoResult.selfCertified === 1 ? "it" : "them"}. No result is recorded
+                  for {autoResult.selfCertified === 1 ? "it" : "those"} — the arithmetic would be
+                  the claimant checking their own work — and the owner-side variance excludes{" "}
+                  {autoResult.selfCertified === 1 ? "it" : "them"}.
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </CardBody>
+      </Card>
+
+      {/* ------------------------- Tolerance bands ------------------------- */}
+      <Card>
+        <CardBody>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold text-ink-900">Tolerance bands</div>
+              <p className="mt-0.5 max-w-2xl text-xs text-ink-500">
+                What counts as “supported” for each kind of claim on this project, and how
+                independent a piece of evidence must be before a reconciler will weight it at all.
+                A band set here overrides the company policy, which overrides the library default.
+              </p>
+            </div>
+            <Button variant="secondary" size="sm" onClick={() => setPolicyOpen((o) => !o)}>
+              {policyOpen ? "Hide" : "Show"}
+            </Button>
+          </div>
+
+          {policyOpen ? (
+            <div className="mt-3">
+              <ErrorAlert message={policyError} />
+              <ErrorAlert message={policySaveError} />
+              {policy === null ? (
+                policyError ? null : (
+                  <Spinner />
+                )
+              ) : (
+                <>
+                  <Table>
+                    <thead>
+                      <tr>
+                        <Th>Assertion kind</Th>
+                        <Th className="text-right">Supported within</Th>
+                        <Th className="text-right">Partial within</Th>
+                        <Th className="text-right">Min independence</Th>
+                        <Th className="text-right">Max capture gap</Th>
+                        <Th>In force from</Th>
+                        <Th />
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-ink-100">
+                      {policy.effective.map((p) =>
+                        editingKind === p.assertionKind ? (
+                          <tr key={p.assertionKind} className="bg-brand-50/40">
+                            <Td className="text-sm font-medium">{humanize(p.assertionKind)}</Td>
+                            <Td>
+                              <Input
+                                type="number"
+                                step="any"
+                                min="0"
+                                value={policyDraft.supportedWithinPercent}
+                                onChange={(e) =>
+                                  setPolicyDraft((d) => ({
+                                    ...d,
+                                    supportedWithinPercent: e.target.value,
+                                  }))
+                                }
+                              />
+                            </Td>
+                            <Td>
+                              <Input
+                                type="number"
+                                step="any"
+                                min="0"
+                                value={policyDraft.partialWithinPercent}
+                                onChange={(e) =>
+                                  setPolicyDraft((d) => ({
+                                    ...d,
+                                    partialWithinPercent: e.target.value,
+                                  }))
+                                }
+                              />
+                            </Td>
+                            <Td>
+                              <Input
+                                type="number"
+                                step="0.05"
+                                min="0"
+                                max="1"
+                                value={policyDraft.minIndependence}
+                                onChange={(e) =>
+                                  setPolicyDraft((d) => ({ ...d, minIndependence: e.target.value }))
+                                }
+                              />
+                            </Td>
+                            <Td>
+                              <Input
+                                type="number"
+                                step="1"
+                                min="0"
+                                placeholder="no limit"
+                                value={policyDraft.maxCaptureGapDays}
+                                onChange={(e) =>
+                                  setPolicyDraft((d) => ({
+                                    ...d,
+                                    maxCaptureGapDays: e.target.value,
+                                  }))
+                                }
+                              />
+                            </Td>
+                            <Td className="text-xs text-ink-400">—</Td>
+                            <Td className="whitespace-nowrap">
+                              <div className="flex gap-2">
+                                <Button
+                                  size="sm"
+                                  disabled={policyBusy}
+                                  onClick={() => void savePolicy(p.assertionKind)}
+                                >
+                                  {policyBusy ? "Saving…" : "Save"}
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="secondary"
+                                  onClick={() => setEditingKind(null)}
+                                >
+                                  Cancel
+                                </Button>
+                              </div>
+                            </Td>
+                          </tr>
+                        ) : (
+                          <tr key={p.assertionKind}>
+                            <Td className="text-sm font-medium">{humanize(p.assertionKind)}</Td>
+                            <Td className="text-right text-sm tabular-nums">
+                              ±{p.supportedWithinPercent}%
+                            </Td>
+                            <Td className="text-right text-sm tabular-nums">
+                              ±{p.partialWithinPercent}%
+                            </Td>
+                            <Td className="text-right text-sm tabular-nums">
+                              {p.minIndependence.toFixed(2)}
+                            </Td>
+                            <Td className="text-right text-sm tabular-nums">
+                              {p.maxCaptureGapDays === null ? "—" : `${p.maxCaptureGapDays} d`}
+                            </Td>
+                            <Td className="text-xs text-ink-500">{p.source}</Td>
+                            <Td className="whitespace-nowrap">
+                              <button
+                                type="button"
+                                className="text-xs text-brand-700 underline"
+                                onClick={() => startEditPolicy(p)}
+                              >
+                                Edit
+                              </button>
+                            </Td>
+                          </tr>
+                        ),
+                      )}
+                    </tbody>
+                  </Table>
+                  <div className="mt-3">
+                    <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-ink-400">
+                      Reconcilers in the library
+                    </div>
+                    <ul className="space-y-1 text-xs text-ink-600">
+                      {policy.reconcilers.map((r) => (
+                        <li key={r.kind} className="rounded border border-ink-100 px-2 py-1">
+                          <span className="font-mono text-ink-800">{r.kind}</span> — {r.description}
+                          <div className="mt-0.5 text-[11px] text-ink-400">
+                            tests {r.assertionKinds.map(humanize).join(", ") || "—"} · accepts{" "}
+                            {r.evidenceKinds.map(humanize).join(", ") || "any evidence"} ·{" "}
+                            {r.aggregation}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </>
+              )}
             </div>
           ) : null}
         </CardBody>

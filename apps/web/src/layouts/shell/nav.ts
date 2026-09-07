@@ -13,18 +13,29 @@
  */
 import {
   IconAdmin,
+  IconAi,
+  IconApproval,
   IconAssurance,
+  IconAudit,
   IconBell,
   IconBenchmark,
   IconDashboard,
   IconDirectory,
+  IconDispute,
+  IconFinance,
   IconIngestion,
+  IconInsight,
   IconIntegration,
   IconLearning,
   IconLedger,
+  IconProcurement,
   IconProject,
+  IconSearch,
+  IconSecurity,
+  IconZap,
   type IconComponent,
 } from "../../ui/icons";
+import { PROJECT_NAV_ITEMS } from "../project/nav";
 
 /** Which live counter, if any, decorates an entry. */
 export type NavBadgeKey = "notifications" | "signals";
@@ -50,14 +61,19 @@ export interface NavGroup {
 }
 
 /**
- * FINANCIALS is deliberately absent.
+ * FIVE GROUPS, and the three the route table calls canonical are Overview,
+ * Assurance and Platform. Directory and Admin predate them and hold entries
+ * the table does not cover (the directory itself, notifications, permissions).
  *
- * Budget, prime contracts, commitments, change management and invoicing are
- * all PROJECT-scoped (`/projects/:projectId/budget`, …). There is no
- * company-level financial route in App.tsx and no company-level financial
- * endpoint in the API, so there is nothing for a "Financials" group to link
- * to. Those workspaces are reachable from the project navigation and from the
- * command palette once a project is chosen.
+ * A "Financials" group is still deliberately absent. Budget, prime contracts,
+ * commitments, change management and invoicing are all PROJECT-scoped
+ * (`/projects/:projectId/budget`, …), so there is nothing company-wide for
+ * such a group to link to; they are reachable from the project navigation and
+ * from the command palette once a project is chosen. The two company-level
+ * money routes that DO exist — `/portfolio` (what has been authorised across
+ * the programme) and `/finance-portfolio` (lender exposure across it) — are
+ * portfolio questions rather than project accounting, which is why they sit
+ * in Overview beside the dashboard rather than in a group of their own.
  */
 export const NAV_GROUPS: readonly NavGroup[] = [
   {
@@ -78,6 +94,73 @@ export const NAV_GROUPS: readonly NavGroup[] = [
         icon: IconProject,
         description: "Every project in this company",
         keywords: ["portfolio", "jobs", "sites"],
+      },
+      {
+        to: "/pulse",
+        label: "Pulse",
+        icon: IconInsight,
+        description: "Health, the attention feed and what changed",
+        keywords: ["pulse", "health", "attention", "briefing", "portfolio", "what changed"],
+      },
+      {
+        to: "/workflows",
+        label: "Approvals",
+        icon: IconApproval,
+        description: "Your approval inbox, running instances and templates",
+        keywords: [
+          "workflow",
+          "approval",
+          "inbox",
+          "delegate",
+          "reassign",
+          "escalation",
+          "template",
+          "designer",
+        ],
+      },
+      {
+        to: "/search",
+        label: "Search",
+        icon: IconSearch,
+        description: "Every record you may see, refined rather than skimmed",
+        keywords: ["search", "find", "record", "global", "palette"],
+      },
+      {
+        to: "/portfolio",
+        label: "Portfolio",
+        icon: IconProcurement,
+        description: "Funding, appropriations, affordability and frameworks",
+        keywords: [
+          "portfolio",
+          "programme",
+          "funding",
+          "appropriation",
+          "allocation",
+          "affordability",
+          "envelope",
+          "prioritisation",
+          "mcda",
+          "framework",
+          "call-off",
+          "term contract",
+          "schedule of rates",
+        ],
+      },
+      {
+        to: "/finance-portfolio",
+        label: "Lender exposure",
+        icon: IconFinance,
+        description: "Facilities, lenders and closing dates across the portfolio",
+        keywords: [
+          "facilities",
+          "lenders",
+          "debt",
+          "grant",
+          "disbursement",
+          "closing date",
+          "covenants",
+          "draw stop",
+        ],
       },
     ],
   },
@@ -114,38 +197,147 @@ export const NAV_GROUPS: readonly NavGroup[] = [
         keywords: ["audit", "chain", "anchor", "seal", "escrow", "verify"],
       },
       {
+        to: "/assurance-reviews",
+        label: "Gate reviews",
+        icon: IconAudit,
+        description: "Gates due, conditions of approval and assurance actions",
+        keywords: [
+          "gate",
+          "gateway",
+          "review",
+          "assurance",
+          "conditions",
+          "actions",
+          "governance",
+          "independent reviewer",
+        ],
+      },
+      {
         to: "/benchmarks",
         label: "Benchmarks",
         icon: IconBenchmark,
         description: "Metric catalogue, snapshots and distributions",
-        keywords: ["metrics", "compare", "distribution", "percentile"],
+        keywords: [
+          "metrics",
+          "compare",
+          "distribution",
+          "percentile",
+          "reference class",
+          "forecast",
+        ],
+      },
+      {
+        to: "/dispute-outcomes",
+        label: "Dispute outcomes",
+        icon: IconDispute,
+        description: "Win rates, awards and the clauses behind them",
+        keywords: ["disputes", "win rate", "awards", "root cause", "forum", "clauses", "drafting"],
       },
       {
         to: "/learning",
         label: "Learning",
         icon: IconLearning,
         description: "Lessons captured, applied and reviewed",
-        keywords: ["lessons", "knowledge", "capture", "review"],
+        keywords: [
+          "lessons",
+          "knowledge",
+          "capture",
+          "review",
+          "libraries",
+          "rates",
+          "durations",
+          "onboarding",
+        ],
       },
     ],
   },
   {
-    id: "data",
-    label: "Data",
+    id: "platform",
+    label: "Platform",
     items: [
       {
         to: "/ingestion",
         label: "Ingestion",
         icon: IconIngestion,
         description: "Sources, runs and import tokens",
-        keywords: ["import", "sources", "runs", "etl", "upload"],
+        keywords: [
+          "import",
+          "sources",
+          "runs",
+          "etl",
+          "upload",
+          "programme",
+          "p6",
+          "xer",
+          "msp",
+          "templates",
+          "reconcile",
+        ],
       },
       {
         to: "/integrations",
         label: "Integrations",
         icon: IconIntegration,
         description: "Webhooks, OAuth clients and delivery health",
-        keywords: ["webhooks", "oauth", "api", "connectors", "delivery"],
+        keywords: [
+          "webhooks",
+          "oauth",
+          "api",
+          "connectors",
+          "delivery",
+          "erp",
+          "export",
+          "sandbox",
+          "openapi",
+          "mcp",
+        ],
+      },
+      {
+        to: "/automation",
+        label: "Automation",
+        icon: IconZap,
+        description: "Rules, templates, runs and the engine's health",
+        keywords: ["rules", "workflow", "triggers", "escalation", "webhooks", "automation"],
+      },
+      {
+        to: "/agents",
+        label: "AI Agents",
+        icon: IconAi,
+        description: "The fleet, the review queue, rollback and governance",
+        keywords: [
+          "ai",
+          "agents",
+          "fleet",
+          "policy",
+          "review queue",
+          "rollback",
+          "schedules",
+          "governance",
+          "bias",
+          "adversarial",
+          "validation",
+          "models",
+          "transparency",
+        ],
+      },
+      {
+        to: "/security",
+        label: "Security",
+        icon: IconSecurity,
+        description: "Policy, sessions, IP allowlist, SCIM, retention and audit",
+        keywords: [
+          "security",
+          "policy",
+          "password",
+          "session",
+          "ip allowlist",
+          "mfa",
+          "scim",
+          "webhooks",
+          "audit",
+          "retention",
+          "legal hold",
+        ],
       },
     ],
   },
@@ -166,7 +358,7 @@ export const NAV_GROUPS: readonly NavGroup[] = [
         label: "Admin",
         icon: IconAdmin,
         description: "Permission templates, grants and auth events",
-        keywords: ["permissions", "roles", "security", "settings", "access"],
+        keywords: ["permissions", "roles", "settings", "access"],
       },
     ],
   },
@@ -191,6 +383,17 @@ export const SEGMENT_LABELS: Readonly<Record<string, string>> = {
   integrations: "Integrations",
   notifications: "Notifications",
   admin: "Admin",
+  pulse: "Pulse",
+  workflows: "Approvals",
+  search: "Search",
+  portfolio: "Portfolio",
+  "finance-portfolio": "Lender exposure",
+  "assurance-reviews": "Gate reviews",
+  "dispute-outcomes": "Dispute outcomes",
+  automation: "Automation",
+  agents: "AI Agents",
+  security: "Security",
+  account: "Account",
 
   /* project workspaces */
   documents: "Documents",
@@ -234,6 +437,18 @@ export const SEGMENT_LABELS: Readonly<Record<string, string>> = {
   equipment: "Equipment",
   timecards: "Timecards",
   bidding: "Bidding",
+
+  /* WP-SHELL project workspaces. `portfolio` and `automation` are shared with
+     the company segments above — same word, same meaning, one label each. */
+  correspondence: "Correspondence",
+  design: "Design",
+  observations: "Observations",
+  site: "Site Operations",
+  "supply-chain": "Supply Chain",
+  resources: "Resources",
+  estimating: "Estimating",
+  tax: "Tax & Deductions",
+  intelligence: "Intelligence",
 };
 
 /** Every project-scoped destination the palette can jump straight into. */
@@ -242,27 +457,21 @@ export interface ProjectDestination {
   label: string;
 }
 
-export const PROJECT_DESTINATIONS: readonly ProjectDestination[] = [
-  { segment: "", label: "Overview" },
-  { segment: "budget", label: "Budget" },
-  { segment: "prime-contract", label: "Prime Contract" },
-  { segment: "commitments", label: "Commitments" },
-  { segment: "changes", label: "Change Management" },
-  { segment: "invoicing", label: "Invoicing" },
-  { segment: "rfis", label: "RFIs" },
-  { segment: "submittals", label: "Submittals" },
-  { segment: "drawings", label: "Drawings" },
-  { segment: "schedule", label: "Schedule" },
-  { segment: "documents", label: "Documents" },
-  { segment: "assurance", label: "Assurance" },
-  { segment: "specifications", label: "Specifications" },
-  { segment: "meetings", label: "Meetings" },
-  { segment: "safety", label: "Safety" },
-  { segment: "quality", label: "Quality" },
-  { segment: "equipment", label: "Equipment" },
-  { segment: "timecards", label: "Timecards" },
-  { segment: "bidding", label: "Bidding" },
-];
+/**
+ * Derived from the project navigation rather than hand-maintained.
+ *
+ * This list used to be a curated literal, and it drifted: workspaces were
+ * routed and given a project nav entry while the palette kept offering the
+ * same nineteen destinations. Deriving it means the palette can never offer a
+ * jump to a route that does not exist (PROJECT_NAV_ITEMS is itself bound by
+ * project/nav.ts's ONE RULE), and never miss one that does. Detail routes
+ * (`drawings/:sheetId`, `bim/:modelId`, `contracts/:contractId`) are absent
+ * because they are absent from the nav — you cannot jump to a record without
+ * knowing which record.
+ */
+export const PROJECT_DESTINATIONS: readonly ProjectDestination[] = PROJECT_NAV_ITEMS.map(
+  (item) => ({ segment: item.to, label: item.label }),
+);
 
 /** Title Case fallback for a segment with no explicit label. */
 export function segmentLabel(segment: string): string {

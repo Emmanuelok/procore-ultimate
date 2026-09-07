@@ -47,7 +47,6 @@ import {
   todayIso,
   useCompanyUsers,
   useFieldResource,
-  useMe,
   type AgeingReport,
   type ListResponse,
 } from "./fieldShared";
@@ -109,7 +108,6 @@ export default function RfisPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const base = `/api/v1/projects/${projectId}/rfis`;
   const { users, nameOf } = useCompanyUsers();
-  const me = useMe();
 
   const [tab, setTab] = useState<TabKey>(() => {
     const t = searchParams.get("tab");
@@ -347,7 +345,7 @@ export default function RfisPage() {
 
       {tab === "inbound" ? <InboundPanel base={base} onDone={(id) => navigate(`/projects/${projectId}/rfis/${id}`)} /> : null}
 
-      {tab === "escalations" ? <EscalationsPanel projectId={projectId} isAdmin={me.isCompanyAdmin} users={users} nameOf={nameOf} /> : null}
+      {tab === "escalations" ? <EscalationsPanel projectId={projectId} users={users} nameOf={nameOf} /> : null}
 
       <Modal open={createOpen} title="New RFI" onClose={() => setCreateOpen(false)} wide>
         <ErrorAlert message={createError} />

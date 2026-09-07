@@ -10,11 +10,20 @@
  *                 ordered by consequence rather than by reference
  *   Checklists    the records made when a point is reached, item by item,
  *                 with numeric tolerances drawn rather than ticked
+ *   Site records  concrete, welding and NDT, material certificates and the
+ *                 calibration of the instruments every reading depends on
  *   NCRs          the disposition workflow — proposed by one person, approved
  *                 by another, and refused when they are the same person
+ *   Concessions   every departure somebody agreed to, and when it expires
+ *   Rework        what it cost to do it twice, split by cause and by where it
+ *                 was caught — the cost of quality and first-time-right
  *   Commissioning systems as a hierarchy, with pre-functional and functional
  *                 test records and their witnesses
  *   Turnover      required artefacts against present ones. The gap leads.
+ *   Closeout      the year after handover: defects liability, performance
+ *                 guarantees and their LD exposure, training, spares, POE
+ *   Audits        findings with requirement, evidence and conclusion, and the
+ *                 ISO 9001 evidence pack assembled from what the platform holds
  *
  * Everything opens in a drawer over whichever tab you are on, so the register
  * keeps its place while one record is worked on. Every write bumps a version
@@ -26,9 +35,12 @@ import { useParams, useSearchParams } from "react-router-dom";
 import { Alert, PageHeader, Tabs } from "../../ui";
 import { IconQuality } from "../../ui/icons";
 import { api } from "../../lib/api";
+import AuditsTab from "./AuditsTab";
 import ChecklistDrawer from "./ChecklistDrawer";
 import ChecklistsTab, { EMPTY_CHECKLIST_FILTERS, type ChecklistFilters } from "./ChecklistsTab";
+import CloseoutTab, { type CloseoutSection } from "./CloseoutTab";
 import CommissioningTab, { EMPTY_CX_FILTERS, type CxFilters } from "./CommissioningTab";
+import ConcessionsTab from "./ConcessionsTab";
 import HoldPointsTab, {
   EMPTY_HOLD_POINT_FILTERS,
   type HoldPointFilters,
@@ -38,19 +50,31 @@ import ItpsTab, { EMPTY_ITP_FILTERS, type ItpFilters } from "./ItpsTab";
 import NcrDrawer from "./NcrDrawer";
 import NcrsTab, { EMPTY_NCR_FILTERS, type NcrFilters } from "./NcrsTab";
 import OverviewTab from "./OverviewTab";
+import RecordsTab, { type RecordsSection } from "./RecordsTab";
+import ReworkTab from "./ReworkTab";
 import SystemDrawer from "./SystemDrawer";
 import TurnoverDrawer from "./TurnoverDrawer";
 import TurnoverTab from "./TurnoverTab";
 import { plural, query, useCompanyUsers, useResource } from "./qualityShared";
 import type {
+  AuditFinding,
   Checklist,
   ChecklistTemplate,
+  CloseoutSummary,
+  Concession,
+  ConcessionSummary,
+  CostOfQuality,
   CxSystem,
+  FirstTimeRight,
   HoldPointPage,
+  IsoEvidence,
   Itp,
   Ncr,
   Paged,
+  QualityAudit,
   QualitySummary,
+  ReworkItem,
+  ReworkSummary,
   TurnoverSummary,
 } from "./types";
 
@@ -59,18 +83,28 @@ type TabKey =
   | "itps"
   | "holdPoints"
   | "checklists"
+  | "records"
   | "ncrs"
+  | "concessions"
+  | "rework"
   | "commissioning"
-  | "turnover";
+  | "turnover"
+  | "closeout"
+  | "audits";
 
 const TABS: Array<{ value: TabKey; label: string }> = [
   { value: "overview", label: "Overview" },
   { value: "itps", label: "Plans" },
   { value: "holdPoints", label: "Hold points" },
   { value: "checklists", label: "Checklists" },
+  { value: "records", label: "Site records" },
   { value: "ncrs", label: "NCRs" },
+  { value: "concessions", label: "Concessions" },
+  { value: "rework", label: "Rework" },
   { value: "commissioning", label: "Commissioning" },
   { value: "turnover", label: "Turnover" },
+  { value: "closeout", label: "Closeout" },
+  { value: "audits", label: "Audits" },
 ];
 
 const isTabKey = (value: string | null): value is TabKey =>
@@ -97,6 +131,8 @@ export default function QualityPage() {
     useState<ChecklistFilters>(EMPTY_CHECKLIST_FILTERS);
   const [ncrFilters, setNcrFilters] = useState<NcrFilters>(EMPTY_NCR_FILTERS);
   const [cxFilters, setCxFilters] = useState<CxFilters>(EMPTY_CX_FILTERS);
+  const [recordsSection, setRecordsSection] = useState<RecordsSection>("concrete");
+  const [closeoutSection, setCloseoutSection] = useState<CloseoutSection>("dlp");
 
   const [openItp, setOpenItp] = useState<string | null>(() => searchParams.get("itp"));
   const [openChecklist, setOpenChecklist] = useState<string | null>(() =>
@@ -263,6 +299,96 @@ export default function QualityPage() {
     enabled,
   );
 
+  /*
+   * The registers added by the upgrade wave. Each one is loaded independently
+   * so a failure in, say, the ISO evidence pack cannot blank the concession
+   * register beside it — every panel fails alone, and a failed load is drawn
+   * as a failure rather than as an empty register.
+   */
+  const concessions = useResource<Paged<Concession>>(
+    (signal) =>
+      api.get<Paged<Concession>>(
+        `/api/v1/projects/${projectKey}/concessions?page=1&pageSize=200`,
+        { signal },
+      ),
+    [projectKey, version],
+    enabled,
+  );
+
+  const concessionSummary = useResource<ConcessionSummary>(
+    (signal) =>
+      api.get<ConcessionSummary>(`/api/v1/projects/${projectKey}/concessions-summary`, { signal }),
+    [projectKey, version],
+    enabled,
+  );
+
+  const rework = useResource<Paged<ReworkItem>>(
+    (signal) =>
+      api.get<Paged<ReworkItem>>(
+        `/api/v1/projects/${projectKey}/rework-items?page=1&pageSize=200`,
+        { signal },
+      ),
+    [projectKey, version],
+    enabled,
+  );
+
+  const reworkSummary = useResource<ReworkSummary>(
+    (signal) =>
+      api.get<ReworkSummary>(`/api/v1/projects/${projectKey}/rework-summary`, { signal }),
+    [projectKey, version],
+    enabled,
+  );
+
+  const costOfQuality = useResource<CostOfQuality>(
+    (signal) =>
+      api.get<CostOfQuality>(`/api/v1/projects/${projectKey}/quality/cost-of-quality`, { signal }),
+    [projectKey, version],
+    enabled,
+  );
+
+  const firstTimeRight = useResource<FirstTimeRight>(
+    (signal) =>
+      api.get<FirstTimeRight>(`/api/v1/projects/${projectKey}/quality/first-time-right`, {
+        signal,
+      }),
+    [projectKey, version],
+    enabled,
+  );
+
+  const audits = useResource<Paged<QualityAudit>>(
+    (signal) =>
+      api.get<Paged<QualityAudit>>(
+        `/api/v1/projects/${projectKey}/quality-audits?page=1&pageSize=200`,
+        { signal },
+      ),
+    [projectKey, version],
+    enabled,
+  );
+
+  const auditFindings = useResource<Paged<AuditFinding>>(
+    (signal) =>
+      api.get<Paged<AuditFinding>>(
+        `/api/v1/projects/${projectKey}/audit-findings?page=1&pageSize=200`,
+        { signal },
+      ),
+    [projectKey, version],
+    enabled,
+  );
+
+  const isoEvidence = useResource<IsoEvidence>(
+    (signal) =>
+      api.get<IsoEvidence>(`/api/v1/projects/${projectKey}/iso9001-evidence`, { signal }),
+    [projectKey, version],
+    enabled,
+  );
+
+  const closeoutSummary = useResource<CloseoutSummary>(
+    (signal) =>
+      api.get<CloseoutSummary>(`/api/v1/projects/${projectKey}/closeout-summary`, { signal }),
+    [projectKey, version],
+    enabled,
+  );
+
   function selectTab(next: TabKey) {
     setTab(next);
     const params = new URLSearchParams(searchParams);
@@ -298,12 +424,30 @@ export default function QualityPage() {
 
   const counts = useMemo(() => {
     const s = summary.data;
+    const c = concessionSummary.data;
+    const co = closeoutSummary.data;
+    const findings = auditFindings.data?.items ?? [];
     return {
       holdPoints: s ? s.holdPoints.overdue : 0,
       ncrs: s ? s.ncrs.awaitingDispositionApproval + s.ncrs.overdue : 0,
       turnover: s ? s.turnover.gaps.length : 0,
+      /* A concession about to lapse turns conforming work non-conforming again. */
+      concessions: c ? c.expiring.length + c.expired : 0,
+      /* Closeout leads with the two clocks nobody watches: the period and the guarantee. */
+      closeout: co
+        ? co.dlps.expiringWithin60Days.length +
+          co.guarantees.notMet +
+          co.dlps.handedOverPackagesWithoutAPeriod.length
+        : 0,
+      /* Only a major non-conformity still open earns a badge: a minor one is
+         work, a major one is a finding somebody has to answer. */
+      audits: findings.filter(
+        (f) =>
+          f.findingType === "major_nonconformity" &&
+          !["verified", "closed", "rejected"].includes(f.status),
+      ).length,
     };
-  }, [summary.data]);
+  }, [summary.data, concessionSummary.data, closeoutSummary.data, auditFindings.data]);
 
   if (!projectId) {
     return (
@@ -348,6 +492,15 @@ export default function QualityPage() {
               ...(t.value === "turnover" && counts.turnover > 0
                 ? { count: counts.turnover, tone: "danger" as const }
                 : {}),
+              ...(t.value === "concessions" && counts.concessions > 0
+                ? { count: counts.concessions, tone: "warning" as const }
+                : {}),
+              ...(t.value === "closeout" && counts.closeout > 0
+                ? { count: counts.closeout, tone: "warning" as const }
+                : {}),
+              ...(t.value === "audits" && counts.audits > 0
+                ? { count: counts.audits, tone: "danger" as const }
+                : {}),
             }))}
             value={tab}
             onChange={selectTab}
@@ -388,6 +541,14 @@ export default function QualityPage() {
           onOpen={(id) => openRecord("checklist", id)}
           onMutated={refresh}
         />
+      ) : tab === "records" ? (
+        <RecordsTab
+          section={recordsSection}
+          onSection={setRecordsSection}
+          projectId={projectId}
+          version={version}
+          onMutated={refresh}
+        />
       ) : tab === "ncrs" ? (
         <NcrsTab
           ncrs={ncrs}
@@ -398,6 +559,23 @@ export default function QualityPage() {
           onOpen={(id) => openRecord("ncr", id)}
           onMutated={refresh}
         />
+      ) : tab === "concessions" ? (
+        <ConcessionsTab
+          concessions={concessions}
+          summary={concessionSummary}
+          projectId={projectId}
+          users={users}
+          onMutated={refresh}
+        />
+      ) : tab === "rework" ? (
+        <ReworkTab
+          rework={rework}
+          summary={reworkSummary}
+          costOfQuality={costOfQuality}
+          firstTimeRight={firstTimeRight}
+          projectId={projectId}
+          onMutated={refresh}
+        />
       ) : tab === "commissioning" ? (
         <CommissioningTab
           systems={systems}
@@ -405,6 +583,24 @@ export default function QualityPage() {
           onFilters={setCxFilters}
           projectId={projectId}
           onOpen={(id) => openRecord("system", id)}
+          onMutated={refresh}
+        />
+      ) : tab === "closeout" ? (
+        <CloseoutTab
+          section={closeoutSection}
+          onSection={setCloseoutSection}
+          projectId={projectId}
+          version={version}
+          users={users}
+          onMutated={refresh}
+        />
+      ) : tab === "audits" ? (
+        <AuditsTab
+          audits={audits}
+          findings={auditFindings}
+          evidence={isoEvidence}
+          projectId={projectId}
+          users={users}
           onMutated={refresh}
         />
       ) : (

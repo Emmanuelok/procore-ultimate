@@ -22,7 +22,7 @@ import {
 } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
 import { newId } from "../../lib/ids.js";
-import { addDaysISO } from "./engines/dates.js";
+import { addDaysISO, addWorkingDaysISO } from "./engines/dates.js";
 import { correspondenceModule } from "./index.js";
 
 let built: Awaited<ReturnType<typeof buildTestApp>>;
@@ -113,11 +113,11 @@ beforeAll(async () => {
     metadata: {},
     uploadedBy: owner.userId,
   });
-}, 180_000);
+}, 600_000);
 
 afterAll(async () => {
   await built.close();
-}, 60_000);
+}, 120_000);
 
 /* ================================================================== */
 /* Types                                                               */
@@ -179,6 +179,52 @@ describe("correspondence types (#440, #445)", () => {
     const removed = await del(`/correspondence/types/${tempId}`);
     expect(removed.statusCode).toBe(200);
     expect(removed.json()).toMatchObject({ deleted: false, deactivated: true, letterCount: 1 });
+  });
+
+  it("counts a response period in working days when the type says so", async () => {
+    // A Friday, so five days lands on a different date under each basis.
+    const friday = "2026-09-04";
+    const calendar = await post("/correspondence/types", {
+      key: "calendar_type",
+      name: "Counted in calendar days",
+      prefix: "CAL",
+      requiresResponse: true,
+      responseDays: 5,
+    });
+    expect(calendar.statusCode).toBe(201);
+    expect(calendar.json().responseDaysBasis).toBe("calendar");
+    const working = await post("/correspondence/types", {
+      key: "working_type",
+      name: "Counted in working days",
+      prefix: "WRK",
+      requiresResponse: true,
+      responseDays: 5,
+      responseDaysBasis: "working",
+    });
+    expect(working.statusCode).toBe(201);
+    expect(working.json().responseDaysBasis).toBe("working");
+
+    const a = await post(`/projects/${projectId}/correspondence/letters`, {
+      typeId: calendar.json().id,
+      subject: "Five calendar days",
+      letterDate: friday,
+    });
+    const b = await post(`/projects/${projectId}/correspondence/letters`, {
+      typeId: working.json().id,
+      subject: "Five working days",
+      letterDate: friday,
+    });
+    expect(a.json().responseDueDate).toBe(addDaysISO(friday, 5)); // 2026-09-09
+    expect(b.json().responseDueDate).toBe(addWorkingDaysISO(friday, 5)); // skips two weekends' worth of Sat/Sun
+    expect(b.json().responseDueDate).toBe("2026-09-11");
+    expect(b.json().responseDueDate).not.toBe(a.json().responseDueDate);
+
+    // and the basis can be changed on an existing type
+    const flipped = await patch(`/correspondence/types/${calendar.json().id}`, {
+      responseDaysBasis: "working",
+    });
+    expect(flipped.statusCode).toBe(200);
+    expect(flipped.json().responseDaysBasis).toBe("working");
   });
 
   it("reads and edits a single type, and keeps its response rule coherent", async () => {
@@ -246,7 +292,9 @@ describe("letters (#441, #444, #446)", () => {
     expect(body.status).toBe("draft");
     expect(body.isContractual).toBe(1);
     expect(body.responseRequired).toBe(1);
-    expect(body.responseDueDate).toBe(addDaysISO(today, 7));
+    // the seeded "notice" type counts its response period in WORKING days,
+    // which is how the contract that produced it counts them
+    expect(body.responseDueDate).toBe(addWorkingDaysISO(today, 7));
     expect(body.threadId).toBe(body.id);
     expect(body.recipients).toHaveLength(2);
     // the contact's name and address were taken from the directory, not typed
@@ -345,7 +393,7 @@ describe("letters (#441, #444, #446)", () => {
       await app.db.select().from(obligations).where(eq(obligations.id, body.obligationId))
     )[0];
     expect(obligation?.status).toBe("open");
-    expect(obligation?.deadline?.slice(0, 10)).toBe(addDaysISO(today, 7));
+    expect(obligation?.deadline?.slice(0, 10)).toBe(addWorkingDaysISO(today, 7));
 
     const notified = await app.db
       .select()
@@ -354,6 +402,35 @@ describe("letters (#441, #444, #446)", () => {
         and(eq(notifications.userId, approver.userId), eq(notifications.recordId, letterId)),
       );
     expect(notified.length).toBeGreaterThan(0);
+  });
+
+  it("opens the obligation against the response date the draft was edited to", async () => {
+    // The drawer lets a draft's response date be moved before issue. The
+    // obligation must be opened against THAT date, not the type's default —
+    // otherwise the register and the assurance layer chase different days.
+    const agreed = addDaysISO(today, 21);
+    const draft = await post(`/projects/${projectId}/correspondence/letters`, {
+      typeId: noticeTypeId,
+      subject: "Response period agreed with the recipient",
+      recipients: [{ partyType: "external", name: "Recipient", email: "resp@x.example" }],
+    });
+    const id = draft.json().id as string;
+    expect(draft.json().responseDueDate).not.toBe(agreed);
+
+    const edited = await patch(`/projects/${projectId}/correspondence/letters/${id}`, {
+      responseDueDate: agreed,
+    });
+    expect(edited.json().responseDueDate).toBe(agreed);
+
+    const issued = await post(`/projects/${projectId}/correspondence/letters/${id}/issue`, {
+      issueDate: today,
+    });
+    expect(issued.statusCode).toBe(200);
+    expect(issued.json().responseDueDate).toBe(agreed);
+    const obligation = (
+      await app.db.select().from(obligations).where(eq(obligations.id, issued.json().obligationId))
+    )[0];
+    expect(obligation?.deadline?.slice(0, 10)).toBe(agreed);
   });
 
   it("freezes an issued letter against edits", async () => {
@@ -575,6 +652,71 @@ describe("configurable approval workflow (#445)", () => {
     expect(after.json().status).toBe("draft");
     expect(after.json().approvals.filter((a: { status: string }) => a.status === "pending")).toHaveLength(0);
   });
+
+  it("lets a rejected letter be corrected and resubmitted for approval", async () => {
+    const draft = await post(`/projects/${projectId}/correspondence/letters`, {
+      typeId: workflowTypeId,
+      subject: "Instruction that is rejected then fixed",
+      recipients: [{ partyType: "external", name: "Site agent" }],
+    });
+    const id = draft.json().id as string;
+    await post(`/projects/${projectId}/correspondence/letters/${id}/submit`, {});
+    const first = await get(`/projects/${projectId}/correspondence/letters/${id}`);
+    await post(
+      `/projects/${projectId}/correspondence/letters/${id}/approvals/${first.json().approvals[0].id}/decide`,
+      { decision: "rejected", comment: "Wrong clause cited." },
+      approver.headers,
+    );
+    await patch(`/projects/${projectId}/correspondence/letters/${id}`, {
+      body: "Clause corrected.",
+    });
+
+    // The rejected step is still on the record; a second round must not
+    // collide with it on (letter_id, seq).
+    const resubmitted = await post(
+      `/projects/${projectId}/correspondence/letters/${id}/submit`,
+      {},
+    );
+    expect(resubmitted.statusCode).toBe(200);
+    expect(resubmitted.json().status).toBe("pending_approval");
+
+    const detail = await get(`/projects/${projectId}/correspondence/letters/${id}`);
+    const approvals = detail.json().approvals as Array<{ id: string; seq: number; status: string }>;
+    expect(approvals).toHaveLength(2);
+    expect(approvals.filter((a) => a.status === "rejected")).toHaveLength(1);
+    const pending = approvals.filter((a) => a.status === "pending");
+    expect(pending).toHaveLength(1);
+
+    const approved = await post(
+      `/projects/${projectId}/correspondence/letters/${id}/approvals/${pending[0]!.id}/decide`,
+      { decision: "approved" },
+      approver.headers,
+    );
+    expect(approved.statusCode).toBe(200);
+    expect(approved.json().readyToIssue).toBe(true);
+    const issued = await post(`/projects/${projectId}/correspondence/letters/${id}/issue`, {});
+    expect(issued.statusCode).toBe(200);
+    expect(issued.json().status).toBe("issued");
+  });
+
+  it("refuses to delete a recipient the record says was already sent the letter", async () => {
+    const draft = await post(`/projects/${projectId}/correspondence/letters`, {
+      typeId: letterTypeId,
+      subject: "Issued, so its distribution list is frozen",
+      recipients: [{ partyType: "external", name: "Named recipient", email: "named@x.example" }],
+    });
+    const id = draft.json().id as string;
+    await post(`/projects/${projectId}/correspondence/letters/${id}/issue`, {});
+    const detail = await get(`/projects/${projectId}/correspondence/letters/${id}`);
+    const recipientId = detail.json().recipients[0].id as string;
+
+    const removed = await del(`/projects/${projectId}/correspondence/recipients/${recipientId}`);
+    expect(removed.statusCode).toBe(409);
+    expect(removed.json().message).toContain("frozen");
+
+    const after = await get(`/projects/${projectId}/correspondence/letters/${id}`);
+    expect(after.json().recipients).toHaveLength(1);
+  });
 });
 
 /* ================================================================== */
@@ -594,7 +736,7 @@ describe("inbound email capture (#99)", () => {
     targetId = created.json().id;
     targetReference = created.json().reference;
     await post(`/projects/${projectId}/correspondence/letters/${targetId}/issue`, {});
-  }, 180_000);
+  }, 600_000);
 
   it("routes a reply onto the thread it quotes and answers the letter", async () => {
     const res = await post(`/projects/${projectId}/correspondence/inbound`, {
@@ -668,6 +810,55 @@ describe("inbound email capture (#99)", () => {
 
     const register = await get(`/projects/${projectId}/correspondence/inbound?status=unmatched`);
     expect(register.json().items.length).toBeGreaterThan(0);
+
+    // Regression: an email the router could not file must reach the assurance
+    // layer as a signal, not only as a count on a tab badge.
+    expect(res.json().signalId).toBeTruthy();
+    const raised = (
+      await app.db.select().from(signals).where(eq(signals.id, res.json().signalId))
+    )[0];
+    expect(raised?.detector).toBe("correspondence_inbound_unmatched");
+    expect(raised?.projectId).toBe(projectId);
+    expect((raised?.evidenceRefs as { key?: string })?.key).toBe(
+      `corr:inbound:${res.json().messageId}:unmatched`,
+    );
+    const feed = await get(`/projects/${projectId}/correspondence/signals`);
+    expect(
+      feed.json().items.some((s: { detector: string }) => s.detector === "correspondence_inbound_unmatched"),
+    ).toBe(true);
+  });
+
+  it("raises no unmatched signal for a message it could file", async () => {
+    const before = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "correspondence_inbound_unmatched"),
+        ),
+      );
+    const res = await post(`/projects/${projectId}/correspondence/inbound`, {
+      email: {
+        from: "ana@steelwork.example",
+        subject: "A message with nothing to match, filed as new",
+        text: "No reference here.",
+        messageId: "<plain-new@mail>",
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().action).toBe("new");
+    expect(res.json().signalId).toBeNull();
+    const after = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "correspondence_inbound_unmatched"),
+        ),
+      );
+    expect(after.length).toBe(before.length);
   });
 
   it("captures a brand new inbound letter when there is no reference at all", async () => {

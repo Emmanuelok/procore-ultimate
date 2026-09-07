@@ -34,6 +34,7 @@ import {
   INTERVENTION_LABEL,
   INTERVENTION_POINTS,
   INTERVENTION_TONE,
+  EditModal,
   Facts,
   LoadError,
   NothingHere,
@@ -47,8 +48,34 @@ import {
   plural,
   useAction,
   useResource,
+  type EditFieldSpec,
 } from "./qualityShared";
 import type { ItpActivity, ItpDetail } from "./types";
+
+/*
+ * THE PLAN IS EDITED WHILE IT IS A DRAFT AND REVISED AFTERWARDS.
+ *
+ * The API allows these columns only while the plan is `draft` or `rejected`;
+ * once it has been agreed with the engineer, changing it is a revision with a
+ * new number, not an edit of the document people have already signed against.
+ * The button is therefore shown only on a draft, and the refusal — should the
+ * status change under the drawer — says the same thing in the server's words.
+ */
+const ITP_EDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "title", label: "Title", kind: "text", nullable: false, wide: true },
+  { key: "discipline", label: "Discipline", kind: "text" },
+  { key: "workPackage", label: "Work package", kind: "text" },
+  { key: "specSectionCode", label: "Specification section", kind: "text" },
+  { key: "effectiveFrom", label: "Effective from", kind: "date" },
+  {
+    key: "standardsReferences",
+    label: "Standards",
+    kind: "list",
+    hint: "Comma separated — the codes this plan inspects against.",
+  },
+  { key: "description", label: "Description", kind: "textarea" },
+  { key: "scopeOfWork", label: "Scope of work", kind: "textarea" },
+];
 
 export default function ItpDrawer({
   itpId,
@@ -131,14 +158,27 @@ function ItpBody({
   const [decision, setDecision] = useState<"approved" | "approved_as_noted" | "rejected">("approved");
   const [comments, setComments] = useState("");
   const [addOpen, setAddOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
 
   const base = `/api/v1/projects/${projectId}/itps/${itp.id}`;
+  const editable = itp.status === "draft" || itp.status === "rejected";
   const held = itp.activities.filter((a) => !a.mayProceed.allowed);
   const overdue = itp.activities.filter(isOverdueHoldPoint);
   const firstHeld = held[0];
 
   async function lifecycle(action: "submit" | "activate" | "close") {
     const done = await run(action, () => api.post(`${base}/${action}`, {}));
+    if (done) onMutated();
+  }
+
+  /** Swap two steps and send the whole order, which is what the API expects. */
+  async function move(from: number, to: number, activityId: string) {
+    const order = itp.activities.map((a) => a.id);
+    const moved = order[from];
+    if (moved === undefined || to < 0 || to >= order.length) return;
+    order.splice(from, 1);
+    order.splice(to, 0, moved);
+    const done = await run(`move-${activityId}`, () => api.post(`${base}/activities/reorder`, { order }));
     if (done) onMutated();
   }
 
@@ -280,7 +320,22 @@ function ItpBody({
           >
             Close the plan
           </Button>
+          {editable ? (
+            <Button size="sm" variant="ghost" onClick={() => setEditOpen(true)}>
+              Edit the draft
+            </Button>
+          ) : null}
         </div>
+        <EditModal
+          open={editOpen}
+          onClose={() => setEditOpen(false)}
+          title={`Edit ${itp.reference}`}
+          description="A draft plan is edited freely. Once it is agreed it is revised instead — with a new revision number — because people sign releases against the version they were shown."
+          url={base}
+          fields={ITP_EDIT_FIELDS}
+          record={itp as unknown as Record<string, unknown>}
+          onSaved={onMutated}
+        />
         <p className="text-2xs text-content-subtle">
           The approval is not the author&apos;s to give. The API refuses an approval by the person
           who wrote the plan and by the person who submitted it — a plan the contractor approved for
@@ -322,14 +377,48 @@ function ItpBody({
           />
         ) : (
           <div className="space-y-3">
-            {itp.activities.map((a) => (
-              <ActivityCard
-                key={a.id}
-                activity={a}
-                users={users}
-                projectId={projectId}
-                onMutated={onMutated}
-              />
+            {itp.activities.map((a, index) => (
+              <div key={a.id} className="space-y-1">
+                {/*
+                  THE ORDER IS PART OF THE PLAN. An ITP is a sequence — a hold
+                  point stops everything after it — so the position of an
+                  activity is not presentation, it is what the plan says
+                  happens first. The reorder route existed and nothing in the
+                  product called it, which left a mis-ordered draft only
+                  fixable by deleting and re-adding rows.
+                */}
+                {editable && itp.activities.length > 1 ? (
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-2xs text-content-subtle">
+                      Step {index + 1} of {itp.activities.length}
+                    </span>
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      disabled={index === 0}
+                      loading={busy === `move-${a.id}`}
+                      onClick={() => move(index, index - 1, a.id)}
+                    >
+                      Move up
+                    </Button>
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      disabled={index === itp.activities.length - 1}
+                      loading={busy === `move-${a.id}`}
+                      onClick={() => move(index, index + 1, a.id)}
+                    >
+                      Move down
+                    </Button>
+                  </div>
+                ) : null}
+                <ActivityCard
+                  activity={a}
+                  users={users}
+                  projectId={projectId}
+                  onMutated={onMutated}
+                />
+              </div>
             ))}
           </div>
         )}

@@ -23,6 +23,7 @@ import {
   EmptyState,
   ErrorAlert,
   Field,
+  Input,
   Modal,
   Select,
   Spinner,
@@ -189,6 +190,9 @@ export default function CaptureTab({
         onInspect={(id) => setOpenLessonId(id)}
         onApplied={() => void load()}
       />
+
+      {/* --------------- the reverse question: what did we learn? -------------- */}
+      <ForRecordPanel projectId={projectId} onInspect={(id) => setOpenLessonId(id)} />
 
       {/* ------------------------------ the lifecycle ------------------------- */}
       <Card>
@@ -412,7 +416,7 @@ export default function CaptureTab({
       </Card>
 
       {/* ------------------------------- reviews ------------------------------ */}
-      <ReviewsPanel projectId={projectId} canAdmin={canAdmin} />
+      <ReviewsPanel projectId={projectId} />
 
       {/* -------------------------------- modals ------------------------------ */}
       <Modal open={createOpen} title="Capture a lesson" onClose={() => setCreateOpen(false)} wide>
@@ -502,3 +506,162 @@ export default function CaptureTab({
     </div>
   );
 }
+
+/* ------------------------------------------------------------------ */
+/* THE REVERSE QUESTION (#992)                                         */
+/*                                                                     */
+/* "What did we learn from THIS?" asked of a record rather than of the */
+/* register. `GET /learning/for-record` exists for the dispute, NCR and */
+/* variation pages to call; it is surfaced here as well because the    */
+/* person assembling a claim is usually standing in this workspace,    */
+/* and because an edge nobody can query is an edge nobody trusts.      */
+/* ------------------------------------------------------------------ */
+
+interface ForRecordEdge {
+  edge: { id: string; role: string; targetLabel: string | null; verified: number };
+  lesson: Lesson | null;
+}
+
+interface ForRecordResponse {
+  record: { type: string; id: string; resolvable: boolean };
+  items: ForRecordEdge[];
+  total: number;
+  reason: string;
+}
+
+function ForRecordPanel({
+  projectId,
+  onInspect,
+}: {
+  projectId: string;
+  onInspect: (lessonId: string) => void;
+}) {
+  const [type, setType] = useState("dispute");
+  const [id, setId] = useState("");
+  const [result, setResult] = useState<ForRecordResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  /* The list the API itself publishes on the trigger-rules route, so the
+     picker can never drift from what the server can actually verify. */
+  const [types, setTypes] = useState<string[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get<{ resolvableTypes?: string[] }>("/api/v1/learning/triggers/rules")
+      .then((res) => {
+        if (!cancelled && Array.isArray(res.resolvableTypes)) setTypes(res.resolvableTypes);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const run = useCallback(async () => {
+    if (id.trim().length === 0) return;
+    setLoading(true);
+    setError(null);
+    try {
+      setResult(
+        await api.get<ForRecordResponse>(
+          `/api/v1/projects/${projectId}/learning/for-record?type=${encodeURIComponent(type)}&id=${encodeURIComponent(id.trim())}`,
+        ),
+      );
+    } catch (err) {
+      setResult(null);
+      setError(errorMessage(err, "The lookup failed"));
+    } finally {
+      setLoading(false);
+    }
+  }, [projectId, type, id]);
+
+  const options = types.length > 0 ? types : FALLBACK_RECORD_TYPES;
+
+  return (
+    <Card>
+      <CardBody className="space-y-3">
+        <SectionTitle hint="Paste a record's id to see the lessons that cite it as their origin, their evidence, or the place they were applied. The direction nobody builds, and the only one a person standing in front of the record can use.">
+          What did we learn from this record?
+        </SectionTitle>
+        <div className="flex flex-wrap items-end gap-2">
+          <Field label="Record type">
+            <Select value={type} onChange={(e) => setType(e.target.value)} className="w-52">
+              {options.map((t) => (
+                <option key={t} value={t}>
+                  {label(t)}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="Record id" className="grow">
+            <Input
+              value={id}
+              onChange={(e) => setId(e.target.value)}
+              placeholder="dsp_…"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void run();
+              }}
+            />
+          </Field>
+          <Button disabled={id.trim().length === 0 || loading} onClick={() => void run()}>
+            {loading ? "Looking…" : "Look it up"}
+          </Button>
+        </div>
+        <ErrorAlert message={error} />
+        {result ? (
+          <div className="space-y-2">
+            {!result.record.resolvable ? (
+              <NoteCard
+                tone="amber"
+                title="This type cannot be verified —"
+                note="The registry does not know this record type, so an edge to it is stored unverified and is never mirrored into record_links. Knowledge does not stop being knowledge because the pointer cannot be resolved, but the platform will not pretend it checked."
+              />
+            ) : null}
+            {result.items.length === 0 ? (
+              <NoteCard tone="ink" title="Nothing cites it —" note={result.reason} />
+            ) : (
+              <>
+                <ul className="space-y-1.5">
+                  {result.items.map(({ edge, lesson }) =>
+                    lesson ? (
+                      <li
+                        key={edge.id}
+                        className="flex flex-wrap items-center gap-2 rounded-md bg-ink-50 px-2.5 py-2 text-sm"
+                      >
+                        <Badge tone={lessonStatusTone(lesson.status)}>{lesson.status}</Badge>
+                        <button
+                          type="button"
+                          className="grow text-left font-medium text-brand-700 hover:underline"
+                          onClick={() => onInspect(lesson.id)}
+                        >
+                          <span className="font-mono text-xs text-ink-500">{lesson.number}</span>{" "}
+                          {lesson.title}
+                        </button>
+                        <Badge tone="gray">{label(edge.role)}</Badge>
+                        {edge.verified ? null : <Badge tone="amber">unverified edge</Badge>}
+                      </li>
+                    ) : null,
+                  )}
+                </ul>
+                <NoteCard tone="ink" title="Reading —" note={result.reason} />
+              </>
+            )}
+          </div>
+        ) : null}
+      </CardBody>
+    </Card>
+  );
+}
+
+/* Used only until the API's own list arrives — never instead of it. */
+const FALLBACK_RECORD_TYPES = [
+  "dispute",
+  "delay_event",
+  "variation",
+  "signal",
+  "gate_review",
+  "rfi",
+  "ncr",
+  "safety_incident",
+];

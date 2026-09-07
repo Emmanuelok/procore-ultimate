@@ -19,11 +19,10 @@
  * synthetic telemetry must never contaminate the assurance record.
  */
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, gte, ilike, inArray, lte, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, ilike, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   assets,
-  companyMemberships,
   locations,
   sensorAlerts,
   sensorReadings,
@@ -33,8 +32,9 @@ import { SENSOR_ALERT_STATUSES, SENSOR_KINDS } from "@constructos/shared";
 import { newId } from "../../../lib/ids.js";
 import { badRequest, conflict, forbidden, notFound } from "../../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
-import { applyBreaches, evaluateBreaches } from "../alerts.js";
+import { applyBreaches, clearStaleAlerts, evaluateBreaches } from "../alerts.js";
 import {
+  assertAssignable,
   buildTwinGates,
   buildTwinLoaders,
   isoTimestampSchema,
@@ -120,18 +120,10 @@ export const sensorRoutes: FastifyPluginAsync = async (app) => {
         .limit(1);
       if (!rows[0]) throw badRequest("Location not found in this project");
     }
+    // the owner is paged when this channel breaches or goes silent, and the
+    // alert names the project — so they have to be able to open it
     if (body.ownerId) {
-      const rows = await app.db
-        .select({ userId: companyMemberships.userId })
-        .from(companyMemberships)
-        .where(
-          and(
-            eq(companyMemberships.companyId, companyId),
-            eq(companyMemberships.userId, body.ownerId),
-          ),
-        )
-        .limit(1);
-      if (!rows[0]) throw badRequest("Owner must be a member of this company");
+      await assertAssignable(app.db, companyId, projectId, [body.ownerId]);
     }
   }
 
@@ -384,32 +376,63 @@ export const sensorRoutes: FastifyPluginAsync = async (app) => {
       source,
     }));
 
-    let inserted = 0;
+    // Only rows that were actually stored count. A retried batch stores
+    // nothing, so it must not re-fire alerts, and it must not rewrite the
+    // channel's "last reading" fields either.
+    const storedRows: Array<{ value: number; at: string }> = [];
     for (let i = 0; i < rows.length; i += 500) {
       const chunk = rows.slice(i, i + 500);
       const done = await app.db
         .insert(sensorReadings)
         .values(chunk)
         .onConflictDoNothing({ target: [sensorReadings.sensorId, sensorReadings.at] })
-        .returning({ id: sensorReadings.id });
-      inserted += done.length;
+        .returning({ at: sensorReadings.at, value: sensorReadings.value });
+      storedRows.push(...done);
     }
+    const inserted = storedRows.length;
     const duplicates = rows.length - inserted;
 
-    const latest = rows.reduce((acc, r) => (Date.parse(r.at) > Date.parse(acc.at) ? r : acc), rows[0]!);
-    if (source === "ingest") {
-      await app.db
+    // A gateway backfilling last week's history must not rewind the channel:
+    // lastReadingAt drives the staleness sweep, so moving it backwards would
+    // flag a healthy sensor as silent and show a week-old value as current.
+    // The write is conditional on the stored instant being genuinely newer.
+    const latest =
+      storedRows.length > 0
+        ? storedRows.reduce((acc, r) => (Date.parse(r.at) > Date.parse(acc.at) ? r : acc), storedRows[0]!)
+        : null;
+    let advanced = false;
+    if (source === "ingest" && latest) {
+      const moved = await app.db
         .update(sensors)
         .set({ lastReadingAt: latest.at, lastValue: latest.value })
-        .where(eq(sensors.id, sensor.id));
+        .where(
+          and(
+            eq(sensors.id, sensor.id),
+            or(isNull(sensors.lastReadingAt), lt(sensors.lastReadingAt, latest.at)),
+          ),
+        )
+        .returning({ id: sensors.id });
+      advanced = moved.length > 0;
+      if (advanced) {
+        sensor.lastReadingAt = latest.at;
+        sensor.lastValue = latest.value;
+        // fresh data means the channel is reporting again
+        await clearStaleAlerts(app, sensor);
+      }
     }
 
+    // Alerts are evaluated over what was STORED, never over what was
+    // submitted. A retried batch is not new evidence: it must not re-count a
+    // breach, and — the sharper case — a batch of pure duplicates must not
+    // read as "no breach in this batch" and clear an alert that is still true.
+    // So a batch that stored nothing leaves the alert register exactly as it
+    // was.
     const alerts =
-      source === "ingest"
+      source === "ingest" && storedRows.length > 0
         ? await applyBreaches(
             app,
             sensor,
-            evaluateBreaches(rows, { minValue: sensor.minValue, maxValue: sensor.maxValue }),
+            evaluateBreaches(storedRows, { minValue: sensor.minValue, maxValue: sensor.maxValue }),
             actorId,
           )
         : { raised: 0, refreshed: 0, suppressed: 0, cleared: 0 };
@@ -421,10 +444,10 @@ export const sensorRoutes: FastifyPluginAsync = async (app) => {
       action: "create",
       objectType: "sensor_reading_batch",
       objectId: sensor.id,
-      payload: { inserted, duplicates, source, alerts },
+      payload: { inserted, duplicates, source, alerts, advanced },
     });
 
-    return { inserted, duplicates, source, alerts };
+    return { inserted, duplicates, source, alerts, latestAt: latest?.at ?? null, advanced };
   }
 
   /** Machine-callable ingest: tool-gated, so OAuth2 gateway clients pass. */

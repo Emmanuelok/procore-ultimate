@@ -424,6 +424,20 @@ export const auditRoutes: FastifyPluginAsync = async (app) => {
             `Closing an audit over open non-conformities is how they stop being tracked; close them, or force the closure and state why.`,
         );
       }
+      /*
+       * The refusal above demands a reason, so the override must carry one.
+       * `{ force: true }` on its own closed the audit over live
+       * non-conformities and wrote closureNote: null — the register then said
+       * the findings had stopped mattering without saying who decided that or
+       * on what basis, which is precisely the record an ISO 9001 surveillance
+       * visit asks for.
+       */
+      if (open.length > 0 && (body.note ?? "").trim().length < 10) {
+        throw badRequest(
+          `Forcing ${audit.reference} closed over ${open.length} open finding(s) needs a stated reason of at least 10 characters. ` +
+            `"Force" is not a reason: the note is what the next auditor reads when they ask why ${open.map((f) => f.reference).join(", ")} was closed out unresolved.`,
+        );
+      }
       const at = nowISO();
       await app.db
         .update(qualityAudits)

@@ -21,24 +21,25 @@ import { constantTimeEquals, deriveKey, KEY_PURPOSE, type KeyMaterialConfig } fr
  * There is a test for exactly this: a challenge token presented as
  * `Authorization: Bearer …` to an authenticated route gets a 401.
  *
- * WHY IT IS STATELESS, AND WHAT THAT COSTS
- * ----------------------------------------
- * There is no `mfa_challenges` table in the schema this module builds against,
- * and this module does not own the schema. So the token carries its own claims
- * under a MAC instead of naming a row. The honest consequence: within its
- * short life (MFA_CHALLENGE_TTL_MINUTES, default 10) the same token can be
- * presented more than once.
+ * WHY THE TOKEN IS STATELESS AND THE CHALLENGE IS NOT
+ * ---------------------------------------------------
+ * The token carries its own claims under a MAC rather than being a lookup key,
+ * because three modules mint challenges — `mfa`, `sso` and `identity` — and
+ * `identity` belongs to a different work package. A format that required a
+ * shared write before it could be verified would have made a cross-package
+ * edit a precondition of every sign-in.
  *
- * That is bounded to almost nothing by the rest of the design, and it is worth
- * being precise about why rather than waving at it. Presenting the token
- * achieves nothing on its own — it is only ever exchanged WITH a second
- * factor, and a TOTP code is single-use per step (`last_used_step`) while a
- * recovery code is single-use for ever. So an attacker holding a stolen
- * challenge token must ALSO hold a code that has not been spent, and an
- * attacker with a live code and the token has, by then, everything the token
- * could have added. What statelessness genuinely costs is server-side
- * revocation of a challenge in flight; a ten-minute expiry is the mitigation,
- * and the ledger of attempts is in `auth_security_events` either way.
+ * The CHALLENGE, though, is a row: `mfa_challenges` (packages/db/src/schema/
+ * auth.ts), spent through `challenge-store.ts`. Consumption is an upsert on
+ * the `jti` below, so the first exchange wins and every later exchange of the
+ * same token is refused as a replay — including a token minted by a module
+ * that never registered it. That closes the two things statelessness alone
+ * cost: replay inside the ten-minute life, and revocation in flight (an
+ * administrator clearing somebody's factor cuts their live challenges).
+ *
+ * What is deliberately NOT here: this file stays pure and synchronous. It
+ * verifies a MAC and an expiry and nothing else, so it can be unit-tested
+ * without a database, and the store is the only thing that touches one.
  */
 
 const TOKEN_PREFIX = "mfachal_v1";

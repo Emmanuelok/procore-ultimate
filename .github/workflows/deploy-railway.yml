@@ -22,6 +22,19 @@ name: Deploy to Railway
 # Actions → New repository secret, named RAILWAY_TOKEN. A project token is
 # scoped to one project; prefer it over an account token.
 
+# WHAT CHANGED, AND WHY
+# ---------------------
+# The comment below the job used to say "deploy only what already passed CI on
+# this exact commit" and nothing enforced it: the job triggered on `push`, in
+# parallel with ci.yml, so a commit whose tests were still running — or had
+# already failed — was deployed to production the moment RAILWAY_TOKEN existed.
+# The concurrency group cancelled a SUPERSEDED deploy; it never cancelled a
+# FAILING one.
+#
+# It now triggers on the COMPLETION of the CI workflow and refuses to run
+# unless that run concluded `success`, and it checks out the exact commit CI
+# tested (`workflow_run.head_sha`) rather than whatever the branch tip happens
+# to be by then.
 on:
   workflow_dispatch:
     inputs:
@@ -29,25 +42,43 @@ on:
         description: "Railway service name (leave blank for the project default)"
         required: false
         type: string
-  push:
+      ref:
+        description: "Commit or branch to deploy (defaults to this workflow's checkout)"
+        required: false
+        type: string
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
     branches:
       - main
-      - claude/ai-saas-construction-platform-9bkv1v
 
 concurrency:
-  # One deploy at a time per branch. A superseded deploy is cancelled rather
+  # One deploy at a time per target. A superseded deploy is cancelled rather
   # than racing the newer one to the same service.
-  group: railway-${{ github.ref }}
+  group: railway-${{ github.event.workflow_run.head_branch || github.ref }}
   cancel-in-progress: true
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    # Deploy only what already passed CI on this exact commit. Railway builds
-    # the image itself from the Dockerfile, so this job's own checkout is only
-    # needed for the railway CLI to have a project directory to upload.
+    # THE GATE. A manual dispatch is a deliberate act by an operator and runs;
+    # an automatic run happens only when the CI run that triggered it passed.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The commit CI actually tested, not the branch tip — between CI
+          # finishing and this job starting, the branch can have moved.
+          ref: ${{ github.event.inputs.ref || github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Say what is being deployed
+        run: |
+          echo "commit:  ${{ github.event.workflow_run.head_sha || github.sha }}"
+          echo "branch:  ${{ github.event.workflow_run.head_branch || github.ref_name }}"
+          echo "trigger: ${{ github.event_name }}"
+          echo "ci:      ${{ github.event.workflow_run.conclusion || 'manual dispatch (not gated on CI)' }}"
 
       - name: Check for a deploy token
         id: guard
@@ -83,7 +114,25 @@ jobs:
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
         run: |
-          echo "Deployed ${{ github.sha }}."
+          echo "Deployed ${{ github.event.workflow_run.head_sha || github.sha }}."
           echo "Migrations 0000 onward apply automatically at container boot; the"
-          echo "release is live once /api/v1/health reports db: postgres."
+          echo "release is live once /api/v1/health/ready answers 200."
           railway status || true
+
+      # The release is not a release until something has driven it. The smoke
+      # script registers a throwaway account, uploads and downloads a file
+      # (which is the only way to prove the storage wiring) and verifies the
+      # ledger chain. Set RAILWAY_PUBLIC_URL to enable it; without the variable
+      # the step says so and skips rather than pretending to have checked.
+      - name: Post-deploy smoke test
+        if: steps.guard.outputs.configured == 'true'
+        env:
+          BASE_URL: ${{ vars.RAILWAY_PUBLIC_URL }}
+        run: |
+          if [ -z "${BASE_URL:-}" ]; then
+            echo "::notice title=Smoke test skipped::Set the repository variable RAILWAY_PUBLIC_URL to the deployment's public origin to run scripts/post-deploy-smoke.sh after every deploy."
+            exit 0
+          fi
+          # Railway needs a moment to swap the running container over.
+          sleep 20
+          ./scripts/post-deploy-smoke.sh "$BASE_URL"

@@ -7,7 +7,7 @@
  */
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { useParams } from "react-router-dom";
-import { DISPUTE_KINDS } from "@constructos/shared";
+import { DISPUTE_JURISDICTIONS, DISPUTE_KINDS } from "@constructos/shared";
 import { api, ApiClientError } from "../../lib/api";
 import {
   Badge,
@@ -96,6 +96,8 @@ export default function DisputesPage() {
   const [cCounterpartyId, setCCounterpartyId] = useState("");
   const [cAmount, setCAmount] = useState("");
   const [cCurrency, setCCurrency] = useState("GBP");
+  const [cJurisdiction, setCJurisdiction] = useState("");
+  const [cTriggerDate, setCTriggerDate] = useState("");
   const [cSteps, setCSteps] = useState<TimetableDraftRow[]>([]);
   const [contracts, setContracts] = useState<ContractLite[]>([]);
   const [claims, setClaims] = useState<ClaimLite[]>([]);
@@ -112,6 +114,8 @@ export default function DisputesPage() {
     setCCounterpartyId("");
     setCAmount("");
     setCCurrency("GBP");
+    setCJurisdiction("");
+    setCTriggerDate("");
     setCSteps([]);
     setCreateOpen(true);
     void (async () => {
@@ -159,6 +163,12 @@ export default function DisputesPage() {
           ...(s.dueDate ? { dueDate: s.dueDate } : {}),
         }));
       if (steps.length > 0) payload["timetable"] = steps;
+      // A regime + trigger date generates the statutory timetable server-side
+      // (#322-333); without both, only the manual steps above are created.
+      if (cJurisdiction && cTriggerDate) {
+        payload["jurisdiction"] = cJurisdiction;
+        payload["triggerDate"] = cTriggerDate;
+      }
       const created = await api.post<DisputeRow>(`${base}/disputes`, payload);
       setCreateOpen(false);
       setPage(1);
@@ -344,6 +354,40 @@ export default function DisputesPage() {
                 value={cRules}
                 onChange={(e) => setCRules(e.target.value)}
                 placeholder="ICC 2021, UNCITRAL…"
+              />
+            </Field>
+          </div>
+
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <Field
+              label="Statutory regime"
+              hint="Generates the procedural timetable and its obligations from the published offsets."
+            >
+              <Select
+                value={cJurisdiction}
+                onChange={(e) => setCJurisdiction(e.target.value)}
+              >
+                <option value="">None — enter steps manually</option>
+                {DISPUTE_JURISDICTIONS.map((j) => (
+                  <option key={j} value={j}>
+                    {humanize(j)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field
+              label="Trigger date"
+              hint={
+                cJurisdiction
+                  ? "Required when a regime is chosen — every offset is measured from it."
+                  : "Only used with a regime."
+              }
+            >
+              <Input
+                type="date"
+                required={Boolean(cJurisdiction)}
+                value={cTriggerDate}
+                onChange={(e) => setCTriggerDate(e.target.value)}
               />
             </Field>
           </div>

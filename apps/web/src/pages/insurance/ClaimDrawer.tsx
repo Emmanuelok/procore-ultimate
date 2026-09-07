@@ -13,6 +13,7 @@ import { Badge, Button, ErrorAlert, Field, Input, Select, Spinner, Textarea } fr
 import { formatDate, formatDateTime } from "../format";
 import {
   CHART,
+  CLAIM_REQUEST_KIND_LABELS,
   CLAIM_STATUS_LABELS,
   CLAIM_TRANSITIONS,
   Caveat,
@@ -31,6 +32,8 @@ import {
   todayIso,
   type ClaimDetail,
   type ClaimNotifyResult,
+  type ClaimPackResult,
+  type ClaimRequestList,
 } from "./insuranceShared";
 
 export default function ClaimDrawer({
@@ -545,6 +548,9 @@ export default function ClaimDrawer({
             </div>
           )}
 
+          {/* ------------------------ pack + adjuster requests ---------------------- */}
+          <ClaimPackPanel projectId={projectId} claimId={claimId} claim={claim} onChanged={load} />
+
           {/* -------------------------------- status -------------------------------- */}
           <SectionTitle>Status</SectionTitle>
           <ErrorAlert message={statusError} />
@@ -782,5 +788,317 @@ function NotificationTimeline({ claim }: { claim: ClaimDetail }) {
             : `Awareness arose ${daysWord(incidentToAware)} after the incident — and the deadline runs from awareness, not from the incident.`}
       </p>
     </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* THE PACK, AND THE ADJUSTER'S TASK LIST (#784, #785)                 */
+/*                                                                     */
+/* An insurer decides a claim on the pack it was given. This panel     */
+/* assembles it, prints the hash, and — because a claim is more often  */
+/* lost on an unanswered request than on its merits — keeps the        */
+/* adjuster's asks in front of the person who owes them.               */
+/* ------------------------------------------------------------------ */
+
+function ClaimPackPanel({
+  projectId,
+  claimId,
+  claim,
+  onChanged,
+}: {
+  projectId: string;
+  claimId: string;
+  claim: ClaimDetail;
+  onChanged: () => Promise<void> | void;
+}) {
+  const base = `/api/v1/projects/${projectId}/insurance/claims/${claimId}`;
+  const [requests, setRequests] = useState<ClaimRequestList | null>(null);
+  const [listError, setListError] = useState<string | null>(null);
+  const [packError, setPackError] = useState<string | null>(null);
+  const [pack, setPack] = useState<ClaimPackResult | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const [addOpen, setAddOpen] = useState(false);
+  const [addKind, setAddKind] = useState("information_request");
+  const [addTitle, setAddTitle] = useState("");
+  const [addBy, setAddBy] = useState("");
+  const [addDue, setAddDue] = useState("");
+  const [addError, setAddError] = useState<string | null>(null);
+
+  const [respondFor, setRespondFor] = useState<string | null>(null);
+  const [respondNote, setRespondNote] = useState("");
+  const [respondError, setRespondError] = useState<string | null>(null);
+
+  const loadRequests = useCallback(async () => {
+    setListError(null);
+    try {
+      setRequests(await api.get<ClaimRequestList>(`${base}/requests`));
+    } catch (err) {
+      setRequests(null);
+      setListError(errMsg(err, "Failed to load the adjuster's requests"));
+    }
+  }, [base]);
+
+  useEffect(() => {
+    void loadRequests();
+  }, [loadRequests]);
+
+  async function generate() {
+    setBusy("pack");
+    setPackError(null);
+    try {
+      setPack(await api.post<ClaimPackResult>(`${base}/pack`, {}));
+      await onChanged();
+    } catch (err) {
+      setPackError(errMsg(err, "The pack could not be assembled"));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function addRequest() {
+    if (!addTitle.trim()) return;
+    setBusy("add");
+    setAddError(null);
+    try {
+      await api.post(`${base}/requests`, {
+        kind: addKind,
+        title: addTitle.trim(),
+        requestedBy: addBy.trim() || null,
+        dueDate: addDue || null,
+      });
+      setAddOpen(false);
+      setAddTitle("");
+      setAddBy("");
+      setAddDue("");
+      await loadRequests();
+    } catch (err) {
+      setAddError(errMsg(err, "The request could not be recorded"));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function respond(requestId: string) {
+    if (!respondNote.trim()) return;
+    setBusy(`respond:${requestId}`);
+    setRespondError(null);
+    try {
+      await api.post(
+        `/api/v1/projects/${projectId}/insurance/claim-requests/${requestId}/respond`,
+        { responseNote: respondNote.trim() },
+      );
+      setRespondFor(null);
+      setRespondNote("");
+      await loadRequests();
+    } catch (err) {
+      setRespondError(errMsg(err, "The answer could not be recorded"));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const generatedAt = pack?.generatedAt ?? claim.packGeneratedAt;
+  const sha = pack?.sha256 ?? claim.packSha256;
+  const itemCount = pack?.itemCount ?? claim.packItemCount;
+
+  return (
+    <>
+      <SectionTitle hint="The pack indexes the evidence and is hashed; it does not copy the files, which stay in the register under their own hashes.">
+        Documentation pack
+      </SectionTitle>
+      <ErrorAlert message={packError} />
+      <div className="mb-4 space-y-2">
+        {generatedAt ? (
+          <div className="rounded-lg bg-ink-50 p-3 text-xs">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge tone="success" variant="outline">
+                assembled
+              </Badge>
+              <span className="text-ink-600">
+                {formatDateTime(generatedAt)} · {itemCount} record
+                {itemCount === 1 ? "" : "s"} indexed
+              </span>
+            </div>
+            {sha ? (
+              <p className="mt-1 break-all font-mono text-[11px] text-ink-500">sha256 {sha}</p>
+            ) : null}
+            <p className="mt-1 text-ink-500">
+              The hash is in the hash-chained ledger, so what was submitted stays checkable a year
+              from now.
+            </p>
+          </div>
+        ) : (
+          <p className="text-sm text-ink-500">
+            No pack has been assembled. An insurer decides a claim on the pack it was given — and
+            without one there is no record of what that was.
+          </p>
+        )}
+        <div className="flex flex-wrap gap-2">
+          <Button size="sm" disabled={busy !== null} onClick={() => void generate()}>
+            {busy === "pack" ? "Assembling…" : generatedAt ? "Re-assemble" : "Assemble pack"}
+          </Button>
+          {claim.packFileId ? (
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => window.open(`${base}/pack`, "_blank", "noopener")}
+            >
+              Open the stored pack
+            </Button>
+          ) : null}
+        </div>
+        {pack && pack.gaps.length > 0 ? (
+          <Disclosure label={`${pack.gaps.length} thing(s) this pack does not establish`} tone="amber">
+            <ul className="list-disc space-y-1 pl-4">
+              {pack.gaps.map((g, i) => (
+                <li key={i}>{g}</li>
+              ))}
+            </ul>
+          </Disclosure>
+        ) : null}
+      </div>
+
+      <SectionTitle hint="A claim is more often lost on an unanswered request than on its merits. Each request with a date is carried as an obligation.">
+        Loss adjuster requests
+      </SectionTitle>
+      <ErrorAlert message={listError} />
+      <div className="space-y-2">
+        {requests === null && listError === null ? (
+          <Spinner label="Loading requests…" />
+        ) : requests && requests.total === 0 ? (
+          <p className="text-sm text-ink-500">
+            Nothing recorded from the adjuster. Record each ask as it arrives — an unanswered
+            request that nobody wrote down is invisible until the claim is declined.
+          </p>
+        ) : requests ? (
+          <>
+            <div className="flex flex-wrap gap-2 text-xs text-ink-500">
+              <span>{requests.open} open</span>
+              {requests.overdue > 0 ? (
+                <Badge tone="danger">{requests.overdue} past their date</Badge>
+              ) : null}
+            </div>
+            <ul className="space-y-2">
+              {requests.items.map((r) => (
+                <li key={r.id} className="rounded-lg border border-ink-100 p-2 text-xs">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge tone={r.overdue ? "danger" : r.status === "open" ? "warning" : "success"}>
+                      {r.overdue ? "overdue" : r.status}
+                    </Badge>
+                    <span className="font-medium">{r.title}</span>
+                    <span className="text-ink-400">
+                      {CLAIM_REQUEST_KIND_LABELS[r.kind] ?? r.kind}
+                    </span>
+                  </div>
+                  <div className="mt-1 text-ink-500">
+                    {r.requestedBy ? <>Asked by {r.requestedBy}. </> : null}
+                    {r.dueDate ? (
+                      <>
+                        Due {formatDate(r.dueDate)}
+                        {r.daysToDue !== null && r.status === "open"
+                          ? ` (${daysWord(Math.abs(r.daysToDue))} ${r.daysToDue < 0 ? "ago" : "away"})`
+                          : ""}
+                        .
+                      </>
+                    ) : (
+                      <>No date was given, so nothing warns before it is late. </>
+                    )}
+                    {r.respondedAt ? <> Answered {formatDateTime(r.respondedAt)}.</> : null}
+                  </div>
+                  {r.responseNote ? (
+                    <p className="mt-1 whitespace-pre-wrap text-ink-600">{r.responseNote}</p>
+                  ) : null}
+                  {r.status === "open" ? (
+                    respondFor === r.id ? (
+                      <div className="mt-2 space-y-2">
+                        <ErrorAlert message={respondError} />
+                        <Textarea
+                          value={respondNote}
+                          rows={2}
+                          placeholder="What was sent, and when"
+                          onChange={(e) => setRespondNote(e.target.value)}
+                        />
+                        <div className="flex gap-2">
+                          <Button
+                            size="sm"
+                            disabled={busy !== null || !respondNote.trim()}
+                            onClick={() => void respond(r.id)}
+                          >
+                            Record the answer
+                          </Button>
+                          <Button size="sm" variant="ghost" onClick={() => setRespondFor(null)}>
+                            Cancel
+                          </Button>
+                        </div>
+                      </div>
+                    ) : (
+                      <Button
+                        size="xs"
+                        variant="secondary"
+                        className="mt-2"
+                        onClick={() => {
+                          setRespondFor(r.id);
+                          setRespondNote("");
+                          setRespondError(null);
+                        }}
+                      >
+                        Answer
+                      </Button>
+                    )
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          </>
+        ) : null}
+
+        {addOpen ? (
+          <div className="space-y-2 rounded-lg bg-ink-50 p-3">
+            <ErrorAlert message={addError} />
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <Field label="Kind">
+                <Select value={addKind} onChange={(e) => setAddKind(e.target.value)}>
+                  {Object.entries(CLAIM_REQUEST_KIND_LABELS).map(([k, label]) => (
+                    <option key={k} value={k}>
+                      {label}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <Field label="Due date" hint="Without one, nothing can warn before it is late.">
+                <Input type="date" value={addDue} onChange={(e) => setAddDue(e.target.value)} />
+              </Field>
+            </div>
+            <Field label="What was asked for">
+              <Input value={addTitle} onChange={(e) => setAddTitle(e.target.value)} />
+            </Field>
+            <Field label="Asked by">
+              <Input
+                value={addBy}
+                placeholder={claim.lossAdjuster ?? "The adjuster or insurer"}
+                onChange={(e) => setAddBy(e.target.value)}
+              />
+            </Field>
+            <div className="flex gap-2">
+              <Button
+                size="sm"
+                disabled={busy !== null || !addTitle.trim()}
+                onClick={() => void addRequest()}
+              >
+                Record the request
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setAddOpen(false)}>
+                Cancel
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <Button size="sm" variant="secondary" onClick={() => setAddOpen(true)}>
+            Record a request
+          </Button>
+        )}
+      </div>
+    </>
   );
 }

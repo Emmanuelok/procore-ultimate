@@ -73,7 +73,7 @@ import {
   testBodySchema,
   unsavedTestBodySchema,
 } from "./schemas.js";
-import { snapshotCatalogue } from "./snapshots.js";
+import { loadSnapshot, snapshotCatalogue, SCAN_LIMIT } from "./snapshots.js";
 import { RULE_TEMPLATES, ruleTemplate } from "./templates.js";
 
 const ACTION_HINTS: Record<(typeof AUTOMATION_ACTION_TYPES)[number], { label: string; description: string; params: string[] }> = {
@@ -157,7 +157,7 @@ export const automationModule: FastifyPluginAsync = async (app) => {
     everyMs: 5 * 60_000,
     runOnBoot: true,
     run: async ({ db, now }) => {
-      const totals = { rulesScanned: 0, candidates: 0, matched: 0, deduped: 0, executed: 0 };
+      const totals = { rulesScanned: 0, candidates: 0, matched: 0, deduped: 0, executed: 0, truncated: 0 };
       const outcome = await forEachCompany(db, async (companyId) => {
         const s = await engine.scanSchedules(companyId, now);
         totals.rulesScanned += s.rulesScanned;
@@ -165,6 +165,9 @@ export const automationModule: FastifyPluginAsync = async (app) => {
         totals.matched += s.matched;
         totals.deduped += s.deduped;
         totals.executed += s.executed;
+        // A capped scan is recorded on the rule; the job's own line says how
+        // many rules could not see all of their live records.
+        totals.truncated += s.truncated.length;
       });
       return { ...totals, companies: outcome.companies, failed: outcome.failed };
     },
@@ -220,12 +223,6 @@ export const automationModule: FastifyPluginAsync = async (app) => {
       .limit(1);
     if (!row) throw notFound("Automation rule not found");
     return row;
-  }
-
-  async function assertRuleVisible(req: FastifyRequest, rule: RuleRow): Promise<void> {
-    if (!rule.projectId) return;
-    const visible = await visibleProjectIds(req);
-    if (visible !== null && !visible.includes(rule.projectId)) throw notFound("Automation rule not found");
   }
 
   async function loadRun(req: FastifyRequest, id: string): Promise<RunRow> {
@@ -479,8 +476,13 @@ export const automationModule: FastifyPluginAsync = async (app) => {
   app.get("/automation/rules/:id", { preHandler: memberGate }, async (req) => {
     const { id } = req.params as { id: string };
     const rule = await loadRule(req, id);
-    await assertRuleVisible(req, rule);
-    const recent = await engine.recentRuns(rule.id, 10);
+    const visible = await visibleProjectIds(req);
+    if (rule.projectId && visible !== null && !visible.includes(rule.projectId)) throw notFound("Automation rule not found");
+    // Plan §6.3: a company-wide rule is readable by every member, but its runs
+    // are project data — a member only sees the runs on projects they can see.
+    const recent = (await engine.recentRuns(rule.id, 10)).filter(
+      (r) => visible === null || r.projectId === null || visible.includes(r.projectId),
+    );
     return { rule: serializeRule(rule), recentRuns: recent };
   });
 
@@ -598,8 +600,43 @@ export const automationModule: FastifyPluginAsync = async (app) => {
     return summaryFor(req.companyId!, visible, new Date());
   });
 
-  app.get("/automation/status", { preHandler: adminGate }, async () => ({
-    engine: engine.getHealth(),
+  /**
+   * Schedule rules whose last scan hit the row cap. A capped scan looked at
+   * the oldest `SCAN_LIMIT` records of the type and no further, so the rule's
+   * "0 matched" is a partial answer — the operator has to see that.
+   */
+  async function cappedScans(companyId: string, visible: string[] | null) {
+    return app.db
+      .select({
+        id: automationRules.id,
+        name: automationRules.name,
+        objectType: automationRules.triggerObjectType,
+        projectId: automationRules.projectId,
+        lastScanAt: automationRules.lastScanAt,
+        candidates: automationRules.lastScanCandidates,
+        orderedBy: automationRules.lastScanOrderedBy,
+      })
+      .from(automationRules)
+      .where(
+        and(
+          eq(automationRules.companyId, companyId),
+          eq(automationRules.lastScanTruncated, 1),
+          inArray(automationRules.status, ["active", "paused"]),
+          projectScope(automationRules.projectId, visible),
+        ),
+      )
+      .orderBy(desc(automationRules.lastScanAt))
+      .limit(20);
+  }
+
+  app.get("/automation/status", { preHandler: adminGate }, async (req) => ({
+    // Per company: the counters and the last error name this tenant's rules
+    // and runs only (plan §6.3 — the engine object is shared by the process).
+    engine: engine.getHealth(req.companyId!),
+    scan: {
+      limit: SCAN_LIMIT,
+      cappedRules: await cappedScans(req.companyId!, await visibleProjectIds(req)),
+    },
     options: {
       maxActionsPerMinute: engine.options.maxActionsPerMinute,
       maxChainDepth: engine.options.maxChainDepth,
@@ -617,8 +654,8 @@ export const automationModule: FastifyPluginAsync = async (app) => {
     const body = runCycleBodySchema.parse(req.body ?? {});
     const now = new Date();
     const scan = body.scan === false ? null : await engine.scanSchedules(req.companyId!, now, body.force === true);
-    const drain = body.drain === false ? null : await engine.drain();
-    return { at: now.toISOString(), scan, drain, health: engine.getHealth() };
+    const drain = body.drain === false ? null : await engine.drain(undefined, req.companyId!);
+    return { at: now.toISOString(), scan, drain, health: engine.getHealth(req.companyId!) };
   });
 
   /* ---------------------------------------------------------------- */
@@ -719,14 +756,17 @@ export const automationModule: FastifyPluginAsync = async (app) => {
     const rule = await loadProjectRule(req, id, false);
     const body = testBodySchema.parse(req.body ?? {});
     // A project-level tester may only dry-run against this project's records.
-    const result = await engine.dryRun(rule, { ...body, persist: false });
-    if (body.objectId && result.context.record) {
-      const recProject = (result.context.record as { projectId?: unknown })["projectId"];
-      if (typeof recProject === "string" && recProject !== req.projectId) {
+    // The project comes from the snapshot registry, never from a `projectId`
+    // key on the row: a project record IS its own project and carries no such
+    // column, so reading the field would let this route return another
+    // project's row. Company-level records (no project at all) stay allowed.
+    if (body.objectId) {
+      const snapshot = await loadSnapshot(app.db, req.companyId!, rule.triggerObjectType, body.objectId);
+      if (snapshot && snapshot.projectId !== null && snapshot.projectId !== req.projectId) {
         throw forbidden("That record belongs to a different project");
       }
     }
-    return result;
+    return engine.dryRun(rule, { ...body, persist: false });
   });
 
   app.get("/projects/:projectId/automation/runs", { preHandler: projectRead }, async (req) => {
@@ -788,6 +828,26 @@ export const automationModule: FastifyPluginAsync = async (app) => {
     const total = Object.values(byStatus).reduce((a, b) => a + b, 0);
     const activeRules = Number(rules?.n ?? 0);
     if (activeRules === 0) reasons.push("No active automation rules cover this project; failure metrics are null because nothing could have failed.");
+    // A schedule rule whose last scan hit the row cap did not look at every
+    // live record, so "0 matched" is a partial answer. Say so rather than let
+    // the intelligence layer read the silence as health.
+    const [capped] = await app.db
+      .select({ n: count() })
+      .from(automationRules)
+      .where(
+        and(
+          eq(automationRules.companyId, req.companyId!),
+          eq(automationRules.status, "active"),
+          eq(automationRules.lastScanTruncated, 1),
+          or(eq(automationRules.projectId, req.projectId!), isNull(automationRules.projectId)),
+        ),
+      );
+    const cappedScans = Number(capped?.n ?? 0);
+    if (cappedScans > 0) {
+      reasons.push(
+        `${cappedScans} schedule rule(s) covering this project hit the ${SCAN_LIMIT}-record scan cap at their last scan: the oldest ${SCAN_LIMIT} records were evaluated and the rest were not.`,
+      );
+    }
     return {
       metrics: {
         activeRules,
@@ -795,6 +855,7 @@ export const automationModule: FastifyPluginAsync = async (app) => {
         failedRuns24h: activeRules === 0 ? null : (byStatus["failed"] ?? 0),
         throttledRuns24h: activeRules === 0 ? null : (byStatus["throttled"] ?? 0),
         queuedRuns: activeRules === 0 ? null : (byStatus["queued"] ?? 0),
+        cappedScans,
       },
       reasons,
     };

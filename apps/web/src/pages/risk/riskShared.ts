@@ -110,6 +110,13 @@ export interface RiskRow {
   costImpact: Record<string, unknown> | null;
   scheduleTaskId: string | null;
   durationImpact: Record<string, unknown> | null;
+  /* register depth (#447-450) */
+  cause?: string | null;
+  effect?: string | null;
+  responseStrategy?: string | null;
+  proximityDate?: string | null;
+  triggers?: string[];
+  secondaryOfRiskId?: string | null;
   mitigations: unknown[];
   mitigationCost: number | null;
   createdAt: string;
@@ -118,6 +125,31 @@ export interface RiskRow {
   preScore?: number;
   postScore?: number | null;
 }
+
+/** The detail response adds the risk's own chain: where it came from and what it created. */
+export interface RiskDetail extends RiskRow {
+  primary: RiskRow | null;
+  secondaries: RiskRow[];
+}
+
+export const RESPONSE_STRATEGIES = [
+  "avoid",
+  "reduce",
+  "transfer",
+  "share",
+  "accept",
+  "exploit",
+] as const;
+
+/** What each strategy actually commits the team to, shown next to the choice. */
+export const RESPONSE_STRATEGY_HINT: Record<string, string> = {
+  avoid: "Change the plan so the risk cannot arise.",
+  reduce: "Act to lower the probability, the impact, or both.",
+  transfer: "Move the consequence to another party — and inherit their counterparty risk.",
+  share: "Split the exposure and the upside with a partner.",
+  accept: "Carry it knowingly, with contingency set aside against it.",
+  exploit: "Act to make the opportunity happen.",
+};
 
 export function preScore(r: RiskRow): number {
   return r.preScore ?? r.probabilityScore * r.impactScore;

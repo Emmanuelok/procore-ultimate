@@ -9,7 +9,11 @@
  *   · a quality checkpoint blocks everything after it until it closes (#456);
  *   · the person who submitted the evidence may not be the only signatory when
  *     the plan asks for someone else — a signature by the doer alone is not an
- *     independent check.
+ *     independent check;
+ *   · an activity whose plan named NO signatory has nobody to address, so it
+ *     closes through POST .../activities/:id/complete instead. Without that
+ *     route such an activity would stay open forever and the plan could never
+ *     report progress (#454) or completion (#455).
  *
  * Templates are company-level configuration; plans are project data.
  */
@@ -882,6 +886,73 @@ export const planRoutes: FastifyPluginAsync = async (app) => {
       });
       await syncPlan(app.db, companyId, projectId, activity.planId, req.user!.id, todayISO());
       return row;
+    },
+  );
+
+  /**
+   * Close an activity that asks for NO signature. Most activities close when
+   * their signatories sign; an activity whose plan named no signatory has
+   * nobody to address, so without this route it would stay open forever and
+   * the plan could never reach 100% (#454) or be reported complete (#455).
+   * Every other rule still applies: evidence must be attached where the
+   * activity requires it, and a quality checkpoint ahead of it still holds.
+   */
+  app.post(
+    "/projects/:projectId/correspondence/activities/:activityId/complete",
+    { preHandler: standardGate },
+    async (req) => {
+      const { projectId, activityId } = req.params as { projectId: string; activityId: string };
+      const body = z
+        .object({ note: z.string().max(4000).nullable().optional() })
+        .parse(req.body ?? {});
+      const companyId = req.companyId!;
+      const activity = await loadActivity(companyId, projectId, activityId);
+      if (activity.signoffRequiredCount > 0) {
+        throw conflict(
+          `Activity ${activity.seq} names ${activity.signoffRequiredCount} signator${activity.signoffRequiredCount === 1 ? "y" : "ies"}; it closes when they sign, not by being marked complete.`,
+        );
+      }
+      const activities = (await loadPlanActivities(app.db, companyId, activity.planId)).map(
+        toActivityInput,
+      );
+      const readiness = signoffReadiness(toActivityInput(activity), activities);
+      if (!readiness.ready) throw conflict(readiness.blockers[0]!);
+
+      const now = nowISO();
+      const [row] = await app.db
+        .update(actionPlanActivities)
+        .set({
+          status: "signed_off",
+          completedAt: now,
+          blockedReason: null,
+          evidenceNote: body.note ?? activity.evidenceNote,
+          updatedAt: now,
+        })
+        .where(eq(actionPlanActivities.id, activityId))
+        .returning();
+      await ledger(app.db, {
+        companyId,
+        projectId,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "action_plan_activity",
+        objectId: activityId,
+        payload: {
+          planId: activity.planId,
+          to: "signed_off",
+          signatures: 0,
+          basis: "the plan asked for no signature on this activity",
+        },
+      });
+      const synced = await syncPlan(
+        app.db,
+        companyId,
+        projectId,
+        activity.planId,
+        req.user!.id,
+        todayISO(),
+      );
+      return { ...row, progress: synced.progress, planStatus: synced.status };
     },
   );
 

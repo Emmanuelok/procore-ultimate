@@ -35,6 +35,13 @@ export interface RelevanceQuery {
   category?: string | null;
   phase?: string | null;
   tags?: string[];
+  /**
+   * Optional tf-idf similarity of each lesson to the free text of the record
+   * being created (0..1), computed by `semanticMatches`. Supplied as a map
+   * rather than computed here so ranking stays pure arithmetic over inputs
+   * and the index can be built once per request.
+   */
+  semantic?: ReadonlyMap<string, number>;
   /** evaluation instant (ISO); injected so ranking is testable and stable */
   now: string;
 }
@@ -48,7 +55,8 @@ export interface RelevanceReason {
     | "tag_overlap"
     | "impact_magnitude"
     | "recency"
-    | "previously_applied";
+    | "previously_applied"
+    | "semantic_similarity";
   points: number;
   detail: string;
 }
@@ -78,6 +86,8 @@ export const WEIGHTS = {
   appliedBase: 8,
   appliedPerExtra: 2,
   maxAppliedPoints: 16,
+  /** full marks for a lesson whose words are the record's words */
+  maxSemanticPoints: 34,
 } as const;
 
 /**
@@ -181,8 +191,13 @@ export function rankLessons(
 ): RankedLesson[] {
   const wantedTags = (query.tags ?? []).map((t) => t.trim().toLowerCase()).filter(Boolean);
   const affinity = toolAffinity(query.tool);
+  const semantic = query.semantic;
   const hasDimension =
-    Boolean(query.tool) || Boolean(query.category) || Boolean(query.phase) || wantedTags.length > 0;
+    Boolean(query.tool) ||
+    Boolean(query.category) ||
+    Boolean(query.phase) ||
+    wantedTags.length > 0 ||
+    (semantic !== undefined && semantic.size > 0);
 
   const ranked: RankedLesson[] = [];
   for (const lesson of lessons) {
@@ -236,6 +251,26 @@ export function rankLessons(
           detail: `Shares ${overlap.length} tag(s) with your record: ${overlap.join(", ")}.`,
         });
       }
+    }
+
+    /*
+     * SIMILARITY IS A DIMENSION, NOT A TIEBREAK.
+     *
+     * The structured filters (category, phase, tags) only find lessons whose
+     * metadata somebody remembered to set. A lesson filed under "commercial"
+     * that describes exactly this ground condition is the one the reader
+     * needs, and no tag says so. The tf-idf similarity of the lesson's own
+     * words to the record's words is therefore allowed to MATCH on its own —
+     * and it is reported as a number, so a weak match reads as a weak match.
+     */
+    const similarity = semantic?.get(lesson.id) ?? 0;
+    if (similarity >= SEMANTIC_MATCH_FLOOR) {
+      matched = true;
+      reasons.push({
+        code: "semantic_similarity",
+        points: Math.round(similarity * WEIGHTS.maxSemanticPoints),
+        detail: `Semantic similarity: ${similarity.toFixed(2)} — the lesson's own wording overlaps the text of the record you are working on (tf-idf cosine over the published register).`,
+      });
     }
 
     if (hasDimension && !matched) continue;
@@ -372,4 +407,211 @@ export function keywordSearch(
     return a.lesson.id.localeCompare(b.lesson.id);
   });
   return hits;
+}
+
+/* ------------------------------------------------------------------ */
+/* Semantic-ish retrieval: tf-idf cosine, no external dependency (#993) */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A lesson only matches below this and it is not worth surfacing: at 0.05 the
+ * overlap is a couple of common-ish words, which is noise dressed as insight.
+ */
+export const SEMANTIC_MATCH_FLOOR = 0.05;
+
+/**
+ * WHY tf-idf AND NOT EMBEDDINGS.
+ *
+ * The honest options were a vector database (an operational dependency, a
+ * model version to pin, and a similarity nobody can explain) or classical
+ * tf-idf cosine (deterministic, inspectable, and computable in the request).
+ * For a register of hundreds — not millions — of lessons the second wins on
+ * every axis that matters here: a reader can be shown WHICH terms drove the
+ * match, and the same query gives the same answer next month. If embeddings
+ * are ever added they should sit BESIDE this, not replace it: the reason line
+ * must always be able to name the words.
+ *
+ * Terms are weighted by the field they appear in (a term in the title says
+ * more than the same term buried in the context), which is the classic
+ * field-boost trick and keeps the vector sparse.
+ */
+const SEMANTIC_FIELD_WEIGHTS: {
+  weight: number;
+  read: (l: SearchableLesson) => string;
+}[] = [
+  { weight: 4, read: (l) => l.title },
+  { weight: 3, read: (l) => l.tags.join(" ") },
+  { weight: 2, read: (l) => l.category },
+  { weight: 2, read: (l) => l.phase ?? "" },
+  { weight: 3, read: (l) => l.recommendation },
+  { weight: 2, read: (l) => l.whatHappened },
+  { weight: 2, read: (l) => l.rootCause ?? "" },
+  { weight: 1, read: (l) => l.context ?? "" },
+];
+
+export interface TfIdfIndex {
+  /** unit-length tf-idf vector per lesson id */
+  vectors: Map<string, Map<string, number>>;
+  idf: Map<string, number>;
+  documents: number;
+}
+
+/** Weighted term counts for one lesson. Pure. */
+export function documentTerms(lesson: SearchableLesson): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const { weight, read } of SEMANTIC_FIELD_WEIGHTS) {
+    const text = read(lesson);
+    if (!text) continue;
+    for (const term of tokenizeAll(text)) {
+      counts.set(term, (counts.get(term) ?? 0) + weight);
+    }
+  }
+  return counts;
+}
+
+/**
+ * Like `tokenize` but keeps repeats: term FREQUENCY is the point here, where
+ * the keyword searcher only cares whether a term is present.
+ */
+export function tokenizeAll(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9£$€%-]+/)
+    .map((t) => t.replace(/^-+|-+$/g, ""))
+    .filter((t) => t.length >= 3 && !STOPWORDS.has(t));
+}
+
+function l2normalise(vec: Map<string, number>): Map<string, number> {
+  let sum = 0;
+  for (const v of vec.values()) sum += v * v;
+  const norm = Math.sqrt(sum);
+  if (norm === 0) return new Map();
+  const out = new Map<string, number>();
+  for (const [k, v] of vec) out.set(k, v / norm);
+  return out;
+}
+
+/**
+ * Build the index over the register. O(total terms); called once per request.
+ * Smoothed idf (`log(1 + N/df)`) so a term present in every lesson still
+ * contributes a little rather than collapsing the vector to nothing.
+ */
+export function buildTfIdfIndex(lessons: readonly SearchableLesson[]): TfIdfIndex {
+  const termCounts: Array<[string, Map<string, number>]> = lessons.map((l) => [
+    l.id,
+    documentTerms(l),
+  ]);
+  const df = new Map<string, number>();
+  for (const [, counts] of termCounts) {
+    for (const term of counts.keys()) df.set(term, (df.get(term) ?? 0) + 1);
+  }
+  const n = Math.max(1, termCounts.length);
+  const idf = new Map<string, number>();
+  for (const [term, d] of df) idf.set(term, Math.log(1 + n / d));
+  const vectors = new Map<string, Map<string, number>>();
+  for (const [id, counts] of termCounts) {
+    const vec = new Map<string, number>();
+    for (const [term, tf] of counts) {
+      vec.set(term, (1 + Math.log(tf)) * (idf.get(term) ?? 0));
+    }
+    vectors.set(id, l2normalise(vec));
+  }
+  return { vectors, idf, documents: termCounts.length };
+}
+
+function queryVector(index: TfIdfIndex, text: string): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const term of tokenizeAll(text)) counts.set(term, (counts.get(term) ?? 0) + 1);
+  const vec = new Map<string, number>();
+  for (const [term, tf] of counts) {
+    const idf = index.idf.get(term);
+    /* A term the register has never used carries no information about it. */
+    if (idf === undefined) continue;
+    vec.set(term, (1 + Math.log(tf)) * idf);
+  }
+  return l2normalise(vec);
+}
+
+function cosine(a: Map<string, number>, b: Map<string, number>): number {
+  /* Both vectors are unit length, so the dot product IS the cosine. */
+  const [small, large] = a.size <= b.size ? [a, b] : [b, a];
+  let dot = 0;
+  for (const [term, v] of small) {
+    const w = large.get(term);
+    if (w !== undefined) dot += v * w;
+  }
+  return dot;
+}
+
+export interface SemanticMatch {
+  lessonId: string;
+  similarity: number;
+  /** the terms that contributed most, so the match can be explained */
+  terms: string[];
+}
+
+/**
+ * Rank the register against free text — the title and description of the RFI,
+ * variation or risk the user is creating. Returns a stable total order.
+ */
+export function semanticMatches(
+  index: TfIdfIndex,
+  text: string,
+  opts: { floor?: number; limit?: number } = {},
+): SemanticMatch[] {
+  const floor = opts.floor ?? SEMANTIC_MATCH_FLOOR;
+  const qv = queryVector(index, text);
+  if (qv.size === 0) return [];
+  const out: SemanticMatch[] = [];
+  for (const [lessonId, vec] of index.vectors) {
+    const similarity = cosine(qv, vec);
+    if (similarity < floor) continue;
+    const contributions: Array<[string, number]> = [];
+    for (const [term, v] of qv) {
+      const w = vec.get(term);
+      if (w !== undefined) contributions.push([term, v * w]);
+    }
+    contributions.sort((a, b) => (b[1] !== a[1] ? b[1] - a[1] : a[0].localeCompare(b[0])));
+    out.push({
+      lessonId,
+      similarity,
+      terms: contributions.slice(0, 5).map(([t]) => t),
+    });
+  }
+  out.sort((a, b) =>
+    b.similarity !== a.similarity
+      ? b.similarity - a.similarity
+      : a.lessonId.localeCompare(b.lessonId),
+  );
+  return opts.limit ? out.slice(0, opts.limit) : out;
+}
+
+/** Lesson-to-lesson similarity, for "see also" edges in the knowledge graph. */
+export function similarLessons(
+  index: TfIdfIndex,
+  lessonId: string,
+  opts: { floor?: number; limit?: number } = {},
+): SemanticMatch[] {
+  const floor = opts.floor ?? SEMANTIC_MATCH_FLOOR;
+  const self = index.vectors.get(lessonId);
+  if (!self) return [];
+  const out: SemanticMatch[] = [];
+  for (const [otherId, vec] of index.vectors) {
+    if (otherId === lessonId) continue;
+    const similarity = cosine(self, vec);
+    if (similarity < floor) continue;
+    const contributions: Array<[string, number]> = [];
+    for (const [term, v] of self) {
+      const w = vec.get(term);
+      if (w !== undefined) contributions.push([term, v * w]);
+    }
+    contributions.sort((a, b) => (b[1] !== a[1] ? b[1] - a[1] : a[0].localeCompare(b[0])));
+    out.push({ lessonId: otherId, similarity, terms: contributions.slice(0, 5).map(([t]) => t) });
+  }
+  out.sort((a, b) =>
+    b.similarity !== a.similarity
+      ? b.similarity - a.similarity
+      : a.lessonId.localeCompare(b.lessonId),
+  );
+  return opts.limit ? out.slice(0, opts.limit) : out;
 }

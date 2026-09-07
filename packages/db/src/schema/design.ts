@@ -130,6 +130,12 @@ export const designPackages = pgTable(
     frozenAt: ts("frozen_at"),
     frozenBy: text("frozen_by"),
     freezeId: text("freeze_id"),
+    /**
+     * The status the package actually held when the freeze took effect, so a
+     * lift restores THAT rather than assuming "approved". A freeze must never
+     * be able to promote a package nobody approved.
+     */
+    preFreezeStatus: text("pre_freeze_status"),
     supersededById: text("superseded_by_id"),
     /** counters kept in step by the routes so the register reads in one query */
     reviewCount: integer("review_count").default(0).notNull(),
@@ -497,6 +503,15 @@ export const designDeliverables = pgTable(
     plannedIssueDate: text("planned_issue_date"),
     forecastIssueDate: text("forecast_issue_date"),
     actualIssueDate: text("actual_issue_date"),
+    /**
+     * Who issued it, and when. Acceptance is refused to this actor: the
+     * assertion ("this is delivered") and the evidence that tests it ("and it
+     * is acceptable") must not be authored by the same person. The registrar
+     * (`createdBy`) is often somebody else entirely, so the issuer has to be
+     * recorded in its own right rather than inferred.
+     */
+    issuedBy: text("issued_by"),
+    issuedAt: ts("issued_at"),
     acceptedAt: ts("accepted_at"),
     acceptedBy: text("accepted_by"),
     rejectedAt: ts("rejected_at"),

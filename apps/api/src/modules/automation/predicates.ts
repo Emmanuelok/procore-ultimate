@@ -317,6 +317,38 @@ export function evaluateCondition(
   return { matched, evaluations, reason };
 }
 
+/**
+ * Operators that ask "how long has this been waiting?" — the ones a schedule
+ * rule is written with. The record field they read is the field a capped scan
+ * must order by, oldest first, or the matches sit outside the cap.
+ */
+const AGEING_OPERATORS = new Set(["overdue_by_days", "older_than_days", "before", "due_within_days", "within_days"]);
+
+/**
+ * The record field a schedule scan should order by for this rule: the first
+ * `record.<field>` compared with an ageing operator. Null when the rule has no
+ * such condition (the caller then falls back to the type's deadline field).
+ */
+export function ageingOrderField(node: AutomationConditionJson | null | undefined): string | null {
+  let found: string | null = null;
+  const walk = (n: AutomationConditionJson | null | undefined, depth: number) => {
+    if (!n || found !== null || depth > MAX_DEPTH) return;
+    if (isLeaf(n)) {
+      if (AGEING_OPERATORS.has(n.op) && n.field.startsWith("record.")) {
+        const path = n.field.slice("record.".length);
+        // Only a direct column can be ordered by in SQL.
+        if (path && !path.includes(".")) found = path;
+      }
+      return;
+    }
+    if ("all" in n) n.all.forEach((c) => walk(c, depth + 1));
+    else if ("any" in n) n.any.forEach((c) => walk(c, depth + 1));
+    else if ("not" in n) walk(n.not, depth + 1);
+  };
+  walk(node, 0);
+  return found;
+}
+
 /** Every field path a condition tree references — used by the builder and the dry run. */
 export function referencedFields(node: AutomationConditionJson | null | undefined): string[] {
   const out = new Set<string>();

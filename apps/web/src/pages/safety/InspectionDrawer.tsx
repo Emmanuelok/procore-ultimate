@@ -29,6 +29,7 @@ import {
 import { IconInspection } from "../../ui/icons";
 import { api } from "../../lib/api";
 import ActionList from "./ActionList";
+import InspectionAnswerForm from "./InspectionAnswerForm";
 import {
   EM_DASH,
   INSPECTION_RESULT_TONE,
@@ -244,6 +245,21 @@ export default function InspectionDrawer({
           </div>
 
           <DescriptionList items={facts} columns={2} dividers />
+
+          {/* ------------------------------------------------------------ */}
+          {inspection.status === "scheduled" ||
+          inspection.status === "in_progress" ||
+          inspection.status === "overdue" ? (
+            <InspectionAnswerForm
+              projectId={projectId}
+              inspection={inspection}
+              users={users}
+              onCompleted={() => {
+                setVersion((n) => n + 1);
+                onMutated();
+              }}
+            />
+          ) : null}
 
           {/* ------------------------------------------------------------ */}
           <section>

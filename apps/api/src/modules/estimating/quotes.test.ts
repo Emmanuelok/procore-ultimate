@@ -189,6 +189,54 @@ describe("levelQuotes", () => {
     expect(a?.missingRows).toBe(0);
   });
 
+  it("treats a blank row as unpriced rather than as a price of nil", () => {
+    // C listed "Y" and left both the rate and the amount empty. Counting
+    // that as £0 would drag the median down, make C an outlier at the bottom
+    // and make C look like the cheapest bid.
+    const res = levelQuotes([
+      quote("a", "A", [{ scope: "X", amount: 100 }, { scope: "Y", amount: 500, rate: 5 }]),
+      quote("b", "B", [{ scope: "X", amount: 110 }, { scope: "Y", amount: 520, rate: 5.2 }]),
+      quote("c", "C", [{ scope: "X", amount: 105 }, { scope: "Y", amount: 0 }]),
+    ]);
+    const y = res.rows.find((r) => r.scopeKey === "y");
+    expect(y?.pricedCount).toBe(2);
+    expect(y?.unpricedCount).toBe(1);
+    expect(y?.median).toBe(510);
+    expect(y?.low).toBe(500);
+    expect(res.outliers).toHaveLength(0);
+    const c = res.totals.find((t) => t.vendorName === "C");
+    expect(c?.unpricedRows).toBe(1);
+    expect(c?.pricedRows).toBe(1);
+    // 105 quoted + the pack median of 510 for the row C left blank
+    expect(c?.comparableTotal).toBe(615);
+    expect(c?.comparableBasis).toMatch(/blank/);
+    const gap = res.scopeGaps.find((g) => g.scopeKey === "y");
+    expect(gap?.unpricedVendors).toEqual(["C"]);
+    expect(gap?.missingVendors).toEqual([]);
+  });
+
+  it("keeps an explicit rate of zero as a price", () => {
+    const res = levelQuotes([
+      quote("a", "A", [{ scope: "X", amount: 0, rate: 0 }]),
+      quote("b", "B", [{ scope: "X", amount: 100, rate: 1 }]),
+    ]);
+    const x = res.rows[0];
+    expect(x?.pricedCount).toBe(2);
+    expect(x?.unpricedCount).toBe(0);
+    expect(x?.low).toBe(0);
+  });
+
+  it("says a row every bidder left blank was priced by nobody", () => {
+    const res = levelQuotes([
+      quote("a", "A", [{ scope: "X", amount: 0 }]),
+      quote("b", "B", [{ scope: "X", amount: 0 }]),
+    ]);
+    expect(res.rows[0]?.pricedCount).toBe(0);
+    expect(res.rows[0]?.median).toBeNull();
+    expect(res.rows[0]?.verdict).toMatch(/left it blank/);
+    expect(res.totals[0]?.comparableTotal).toBeNull();
+  });
+
   it("sorts totals cheapest-comparable first", () => {
     const res = levelQuotes(quotes);
     expect(res.totals[0]?.vendorName).toBe("Alpha");

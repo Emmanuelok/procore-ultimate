@@ -599,8 +599,12 @@ function FileDrawer({ projectId, fileId, flat, onClose, onChanged }: { projectId
 
           {f.previewable ? (
             <div className="overflow-hidden rounded-md ring-1 ring-ink-200" style={{ height: 360 }}>
+              {/* The preview is fetched and framed as a blob: URL, which inherits THIS
+                  origin — the API's nosniff/CSP headers do not travel with it. Anything
+                  that is not a PDF (an uploaded .html, .svg, .xml) is therefore framed
+                  fully sandboxed, so stored bytes can never run script beside the app. */}
               {previewUrl ? (
-                f.contentType.startsWith("image/") ? <img src={previewUrl} alt={f.name} className="h-full w-full object-contain" /> : <iframe src={previewUrl} title={f.name} className="h-full w-full" />
+                f.contentType.startsWith("image/") ? <img src={previewUrl} alt={f.name} className="h-full w-full object-contain" /> : <iframe src={previewUrl} title={f.name} className="h-full w-full" sandbox={f.contentType === "application/pdf" ? undefined : ""} />
               ) : (
                 <div className="flex h-full items-center justify-center"><Spinner label="Fetching preview…" /></div>
               )}

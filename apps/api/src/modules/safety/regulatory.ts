@@ -526,6 +526,8 @@ export interface Osha300ASummary {
   totals: Osha300Log["totals"];
   /** the denominator OSHA asks for on the form itself */
   annualAverageEmployees: FormField<number>;
+  /** the derivation behind the employment figure, printed beside it */
+  employeesBasis: string | null;
   totalHoursWorked: FormField<number>;
   /** how the hours figure was arrived at, quoted */
   hoursBasis: string | null;
@@ -548,6 +550,14 @@ export interface Osha300AInput {
   hoursSource: string | null;
   annualAverageEmployees: number | null;
   employeeReasons: readonly string[];
+  /**
+   * How the employment figure was arrived at, in one sentence, when there IS
+   * one. OSHA defines the annual average over pay periods and this platform
+   * holds no payroll periods, so any figure it can produce is a derivation
+   * from another register — and a derivation whose method is not printed next
+   * to it is indistinguishable from the number the form asks for.
+   */
+  employeesBasis?: string | null;
   generatedAt: string;
 }
 
@@ -594,6 +604,7 @@ export function buildOsha300A(input: Osha300AInput, ctx: FormContext): Osha300AS
     year: log.year,
     totals: log.totals,
     annualAverageEmployees: employees,
+    employeesBasis: input.employeesBasis ?? null,
     totalHoursWorked: hours,
     hoursBasis: input.hoursSource
       ? `Hours taken from ${input.hoursSource.replace(/_/g, " ")} records for ${log.from} to ${log.to}.`

@@ -240,6 +240,224 @@ function CreateEventModal({
 
 /* ------------------------------- Event drawer ------------------------------ */
 
+/* ----------------------------- Notice pack -------------------------------- */
+
+interface NoticeRequirement {
+  key: string;
+  label: string;
+  satisfied: boolean;
+  detail: string;
+}
+
+interface NoticePack {
+  clauseRef: string | null;
+  clauseTitle: string | null;
+  deadline: string | null;
+  daysRemaining: number | null;
+  urgency: "expired" | "critical" | "soon" | "routine" | "no_bar";
+  servedBy: string | null;
+  addressee: string | null;
+  addresseeRole: string;
+  serviceRules: string[];
+  requirements: NoticeRequirement[];
+  missing: string[];
+  draft: string;
+  basis: string;
+  noticeRequired: boolean;
+  aiAvailable: boolean;
+  note: string;
+}
+
+interface AiDraft {
+  runId: string;
+  subject: string | null;
+  noticeText: string;
+  missingFacts: string[];
+  confidence: number | null;
+  droppedCitations: number;
+}
+
+const URGENCY_TONE: Record<string, "red" | "amber" | "blue" | "slate"> = {
+  expired: "red",
+  critical: "red",
+  soon: "amber",
+  routine: "blue",
+  no_bar: "slate",
+};
+
+/**
+ * The notice a live time bar demands, composed from the contract and the
+ * event record. The deterministic pack is always available; the AI drafter is
+ * an enhancement on top of it and says so when it is not configured.
+ */
+function NoticePackPanel({ base }: { base: string }) {
+  const [pack, setPack] = useState<NoticePack | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [draft, setDraft] = useState<AiDraft | null>(null);
+  const [aiError, setAiError] = useState<string | null>(null);
+  const [aiBusy, setAiBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      setPack(await api.get<NoticePack>(`${base}/notice-pack`));
+    } catch (err) {
+      setError(err instanceof ApiClientError ? err.message : "Failed to compose the notice pack.");
+    } finally {
+      setLoading(false);
+    }
+  }, [base]);
+
+  async function runDrafter() {
+    setAiBusy(true);
+    setAiError(null);
+    try {
+      setDraft(await api.post<AiDraft>(`${base}/draft-notice`, {}));
+    } catch (err) {
+      setAiError(
+        err instanceof ApiClientError
+          ? err.message
+          : "The notice drafter did not return a draft.",
+      );
+    } finally {
+      setAiBusy(false);
+    }
+  }
+
+  if (!pack) {
+    return (
+      <div className="mb-4 rounded-md border border-ink-100 p-3">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-semibold text-ink-900">Notice pack</h3>
+            <p className="text-xs text-ink-500">
+              What the notice must state, who it is served on, by which route — and a draft built
+              only from facts on the record.
+            </p>
+          </div>
+          <Button size="sm" variant="secondary" disabled={loading} onClick={() => void load()}>
+            {loading ? "Composing…" : "Prepare notice"}
+          </Button>
+        </div>
+        <ErrorAlert message={error} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="mb-4 space-y-3 rounded-md border border-ink-100 p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-sm font-semibold text-ink-900">
+          Notice pack
+          {pack.clauseRef ? (
+            <span className="ml-2 font-mono text-xs font-normal text-ink-500">
+              Clause {pack.clauseRef}
+            </span>
+          ) : null}
+        </h3>
+        <Badge tone={URGENCY_TONE[pack.urgency] ?? "slate"}>
+          {pack.urgency === "no_bar"
+            ? "No day-counted bar"
+            : pack.daysRemaining !== null && pack.daysRemaining < 0
+              ? `${Math.abs(pack.daysRemaining)} days past the deadline`
+              : `${pack.daysRemaining ?? "—"} days remaining`}
+        </Badge>
+      </div>
+
+      <p className="text-xs text-ink-500">{pack.basis}</p>
+
+      <div className="grid grid-cols-1 gap-2 text-sm sm:grid-cols-2">
+        <div>
+          <span className="text-xs uppercase tracking-wide text-ink-400">Served on</span>
+          <div className="text-ink-800">
+            {pack.addressee ?? (
+              <span className="text-amber-700">
+                Not on record — the contract's {pack.addresseeRole} is not named
+              </span>
+            )}
+          </div>
+        </div>
+        <div>
+          <span className="text-xs uppercase tracking-wide text-ink-400">Given by</span>
+          <div className="text-ink-800">{pack.servedBy ? humanize(pack.servedBy) : "Either party"}</div>
+        </div>
+      </div>
+
+      <div>
+        <div className="text-xs font-semibold uppercase tracking-wide text-ink-400">
+          Service rules
+        </div>
+        <ul className="mt-1 space-y-0.5 text-xs text-ink-600">
+          {pack.serviceRules.map((r) => (
+            <li key={r}>{r}</li>
+          ))}
+        </ul>
+      </div>
+
+      <div>
+        <div className="text-xs font-semibold uppercase tracking-wide text-ink-400">
+          The notice must state
+        </div>
+        <ul className="mt-1 space-y-1 text-sm">
+          {pack.requirements.map((r) => (
+            <li key={r.key} className="flex gap-2">
+              <span className={r.satisfied ? "text-emerald-600" : "text-amber-600"}>
+                {r.satisfied ? "✓" : "!"}
+              </span>
+              <span>
+                <span className="text-ink-800">{r.label}</span>
+                <span className="block text-xs text-ink-500">{r.detail}</span>
+              </span>
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      <div>
+        <div className="mb-1 flex items-center justify-between">
+          <div className="text-xs font-semibold uppercase tracking-wide text-ink-400">Draft</div>
+          <div className="flex gap-2">
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => void navigator.clipboard?.writeText(draft?.noticeText ?? pack.draft)}
+            >
+              Copy
+            </Button>
+            {pack.aiAvailable ? (
+              <Button size="sm" variant="secondary" disabled={aiBusy} onClick={() => void runDrafter()}>
+                {aiBusy ? "Drafting…" : "Draft with AI"}
+              </Button>
+            ) : null}
+          </div>
+        </div>
+        {!pack.aiAvailable ? <InfoBanner message={pack.note} /> : null}
+        <ErrorAlert message={aiError} />
+        <pre className="max-h-72 overflow-auto whitespace-pre-wrap rounded bg-ink-50 p-3 font-mono text-xs text-ink-800">
+          {draft?.noticeText ?? pack.draft}
+        </pre>
+        {draft ? (
+          <p className="mt-1 text-xs text-ink-500">
+            Drafted by the notice drafter (run {draft.runId})
+            {draft.confidence !== null ? ` · confidence ${Math.round(draft.confidence * 100)}%` : ""}
+            {draft.droppedCitations > 0
+              ? ` · ${draft.droppedCitations} unverifiable citation(s) dropped`
+              : ""}
+            . Review before serving.
+          </p>
+        ) : null}
+        {(draft?.missingFacts ?? pack.missing).length > 0 ? (
+          <div className="mt-2 rounded bg-amber-50 p-2 text-xs text-amber-900">
+            <strong>Still missing:</strong> {(draft?.missingFacts ?? pack.missing).join("; ")}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function EventDrawer({
   projectId,
   contractId,
@@ -407,6 +625,8 @@ function EventDrawer({
           </ul>
         </div>
       ) : null}
+
+      {canServe ? <NoticePackPanel base={base} /> : null}
 
       {canServe ? (
         <form onSubmit={serveNotice} className="mb-4 space-y-3 rounded-md border border-ink-100 p-3">

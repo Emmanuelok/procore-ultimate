@@ -1,0 +1,613 @@
+import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
+import { and, desc, eq, inArray, like } from "drizzle-orm";
+import { z } from "zod";
+import { bidPackages, signals } from "@constructos/db";
+import { badRequest, notFound } from "../../lib/errors.js";
+import { appendLedger } from "../../lib/ledger.js";
+import { fetchPackage, justificationSchema, reasonSchema } from "./shared.js";
+import { sealState } from "./sealing.js";
+import {
+  DEFAULT_INTEGRITY_THRESHOLDS,
+  resolveThresholds,
+  type IntegrityFinding,
+} from "./integrity.js";
+import {
+  CROSS_PACKAGE_WINDOW_MONTHS,
+  integritySignalsForPackage,
+  loadPackageIntegrityInput,
+  runCompanyIntegrityAndPersist,
+  runPackageIntegrityAndPersist,
+} from "./integrity-service.js";
+
+/**
+ * BID-INTEGRITY ENDPOINTS.
+ *
+ * Two surfaces, because the two kinds of pattern live at different scales:
+ *
+ *   /projects/:id/bid-packages/:id/integrity   what the shape of THESE bids
+ *                                              says — clustering, shared
+ *                                              rates, proportional bills,
+ *                                              submission timing, abnormally
+ *                                              low or high prices, unbalanced
+ *                                              rates.
+ *
+ *   /companies/current/bid-integrity           what the shape of the LAST TWO
+ *                                              YEARS says — cover bidding,
+ *                                              winner rotation, a bidder list
+ *                                              that never changes, bidders
+ *                                              who always withdraw.
+ *
+ * Both are readable by anyone with `bidding:read` (or company membership for
+ * the company view), because a control only a specialist can see is a control
+ * nobody applies. Running the detectors — which writes signals — needs
+ * `standard`.
+ *
+ * The findings do not block. They are put in front of the recommender at the
+ * moment of recommendation, where a high or critical finding must be
+ * acknowledged in writing before a bidder can be recommended.
+ */
+export const integrityRoutes: FastifyPluginAsync = async (app) => {
+  const readGate = [app.authenticate, app.requireCompany, app.requireTool("bidding", "read")];
+  const standardGate = [
+    app.authenticate,
+    app.requireCompany,
+    app.requireTool("bidding", "standard"),
+  ];
+  const companyGate = [app.authenticate, app.requireCompany];
+
+  /*
+   * DISPOSITIONING A FINDING IS A SEGREGATED ACT, NOT AN ORDINARY EDIT.
+   *
+   * `signals.disposition` is the same column the assurance register guards
+   * with `requireAssuranceRole(["integrity_reviewer"])`, for the stated
+   * reason that operational owners must not clear findings about their own
+   * records. Bidding writes into that column too, and awards.ts derives the
+   * award's written-acknowledgement gate from it — so a route open to plain
+   * company membership was a second, unguarded way to switch the gate off.
+   *
+   * The gate here admits an integrity reviewer FIRST (the platform's own
+   * segregated role) and falls back to owner/admin, because a tenant that has
+   * granted nobody the assurance role must still be able to work its
+   * register. Whichever way the caller got in, `reviewerId` records who it
+   * was, and awards.ts refuses to treat a finding the RECOMMENDER cleared as
+   * cleared.
+   */
+  const dispositionGate = [
+    app.authenticate,
+    app.requireCompany,
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      if (req.companyRole === "owner" || req.companyRole === "admin") return;
+      await app.requireAssuranceRole(["integrity_reviewer"])(req, reply);
+    },
+  ];
+
+  const openSignals = (rows: Array<typeof signals.$inferSelect>) =>
+    rows.filter(
+      (r) => r.disposition !== "false_positive" && r.disposition !== "closed" && r.closedAt === null,
+    );
+
+  const shapeSignal = (row: typeof signals.$inferSelect) => ({
+    id: row.id,
+    detector: row.detector,
+    severity: row.severity,
+    confidence: row.confidence,
+    title: row.title,
+    explanation: row.explanation,
+    disposition: row.disposition,
+    subjectType: row.subjectType,
+    subjectId: row.subjectId,
+    evidenceRefs: row.evidenceRefs,
+    firstSeenAt: row.firstSeenAt,
+    lastSeenAt: row.lastSeenAt,
+    createdAt: row.createdAt,
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Package-level                                                     */
+  /* ---------------------------------------------------------------- */
+
+  app.get(
+    "/projects/:projectId/bid-packages/:packageId/integrity",
+    { preHandler: readGate },
+    async (req) => {
+      const { packageId } = req.params as { packageId: string };
+      const pkg = await fetchPackage(app.db, packageId, req.companyId!, req.projectId!);
+      const seal = sealState(pkg);
+      if (seal.amountsWithheld) {
+        return {
+          seal,
+          sealed: true,
+          findings: [],
+          signals: [],
+          dispersion: null,
+          abnormal: { median: null, assessments: [] },
+          unbalanced: [],
+          notRun: [
+            {
+              detector: "all",
+              reason:
+                "Every detector here reads submitted amounts, and this package is sealed. " +
+                seal.note,
+            },
+          ],
+          thresholds: resolveThresholds(
+            (pkg.detail as Record<string, unknown>)["integrityThresholds"],
+          ),
+          note:
+            "Integrity analysis is withheld while the seal is on. The detectors compare prices, " +
+            "and comparing prices before the opening is precisely what the seal prevents.",
+        };
+      }
+      // Read-only: the read path never writes signals. Running them is a
+      // deliberate act with a `standard` gate on it.
+      const report = await runPackageIntegrityAndPersist(app.db, pkg, req.user!.id, {
+        persist: false,
+      });
+      const existing = await integritySignalsForPackage(app.db, req.companyId!, packageId);
+      const input = await loadPackageIntegrityInput(app.db, pkg);
+      return {
+        seal,
+        sealed: false,
+        packageReference: pkg.reference,
+        comparisonBasis: report.comparisonBasis,
+        contenders: input.contenders.map((c) => ({
+          submissionId: c.submissionId,
+          reference: c.reference,
+          vendorId: c.vendorId,
+          vendorName: c.vendorName,
+          amount: c.amount,
+          currency: c.currency,
+          receivedAt: c.receivedAt,
+          isLate: c.isLate,
+        })),
+        findings: report.findings,
+        signals: existing.map(shapeSignal),
+        openSignals: openSignals(existing).length,
+        dispersion: report.dispersion,
+        abnormal: report.abnormal,
+        unbalanced: report.unbalanced,
+        notRun: report.notRun,
+        thresholds: resolveThresholds(
+          (pkg.detail as Record<string, unknown>)["integrityThresholds"],
+        ),
+        defaultThresholds: DEFAULT_INTEGRITY_THRESHOLDS,
+        note: report.note,
+      };
+    },
+  );
+
+  /** Run the detectors and record what they found. */
+  app.post(
+    "/projects/:projectId/bid-packages/:packageId/integrity/run",
+    { preHandler: standardGate },
+    async (req) => {
+      const { packageId } = req.params as { packageId: string };
+      const pkg = await fetchPackage(app.db, packageId, req.companyId!, req.projectId!);
+      const seal = sealState(pkg);
+      if (seal.amountsWithheld) {
+        throw badRequest(
+          `Running the integrity detectors reads submitted amounts. ${seal.note}`,
+        );
+      }
+      const report = await runPackageIntegrityAndPersist(app.db, pkg, req.user!.id);
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "bid_package",
+        objectId: packageId,
+        payload: {
+          event: "bid_integrity_run",
+          reference: pkg.reference,
+          findings: report.findings.length,
+          raised: report.raised.length,
+          alreadyOpen: report.alreadyOpen.length,
+          detectors: report.findings.map((f) => f.detector),
+        },
+        storePayload: true,
+      });
+      return {
+        ...report,
+        note:
+          report.raised.length === 0 && report.findings.length > 0
+            ? `${report.findings.length} finding(s), all of them already on the register. ` +
+              "Re-running a detector over unchanged data must not manufacture a second signal — " +
+              "false-positive fatigue is what stops anybody reading the register at all."
+            : report.note,
+      };
+    },
+  );
+
+  /**
+   * Set or clear per-package thresholds. A two-bidder plant hire enquiry and
+   * a public works tender do not share a dispersion expectation, and a
+   * threshold nobody can move is a threshold people learn to ignore. The
+   * change is ledgered with the old and new values.
+   */
+  app.put(
+    "/projects/:projectId/bid-packages/:packageId/integrity/thresholds",
+    { preHandler: standardGate },
+    async (req) => {
+      const { packageId } = req.params as { packageId: string };
+      const body = z
+        .object({
+          thresholds: z.record(z.string(), z.number().finite().min(0)).nullable(),
+          reason: reasonSchema,
+        })
+        .parse(req.body);
+      const pkg = await fetchPackage(app.db, packageId, req.companyId!, req.projectId!);
+      const previous = resolveThresholds(
+        (pkg.detail as Record<string, unknown>)["integrityThresholds"],
+      );
+      const detail = { ...(pkg.detail as Record<string, unknown>) };
+      if (body.thresholds === null) delete detail["integrityThresholds"];
+      else detail["integrityThresholds"] = body.thresholds;
+      await app.db
+        .update(bidPackages)
+        .set({ detail, updatedAt: new Date().toISOString() })
+        .where(eq(bidPackages.id, packageId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "bid_package",
+        objectId: packageId,
+        payload: {
+          event: "bid_integrity_thresholds_changed",
+          reason: body.reason,
+          previous,
+          next: resolveThresholds(body.thresholds),
+        },
+        storePayload: true,
+      });
+      return {
+        thresholds: resolveThresholds(body.thresholds),
+        defaults: DEFAULT_INTEGRITY_THRESHOLDS,
+        previous,
+        note:
+          "Thresholds moved. The change is on the ledger with its reason, because a detector " +
+          "quietly relaxed the week before an award is itself a finding.",
+      };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Company-level                                                     */
+  /* ---------------------------------------------------------------- */
+
+  app.get("/companies/current/bid-integrity", { preHandler: companyGate }, async (req) => {
+    const q = z
+      .object({
+        detector: z.string().max(80).optional(),
+        severity: z.enum(["critical", "high", "medium", "low", "info"]).optional(),
+        openOnly: z
+          .union([z.boolean(), z.string()])
+          .optional()
+          .transform((v) => v !== false && v !== "false"),
+      })
+      .parse(req.query ?? {});
+
+    /*
+     * The detector filter belongs in the STATEMENT, not in the array that
+     * comes back. Reading the newest 1000 signals of every kind and then
+     * keeping the bidding ones meant that on a company whose other detectors
+     * are busy — safety, assurance, field — this register silently showed
+     * nothing at all, because every bid-integrity finding had been pushed
+     * past the limit by rows this endpoint was never going to display.
+     */
+    const rows = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, req.companyId!),
+          like(signals.detector, "bid_integrity_%"),
+        ),
+      )
+      .orderBy(desc(signals.createdAt))
+      .limit(1000);
+    const mine = rows.filter(
+      (r) =>
+        (!q.detector || r.detector === q.detector) &&
+        (!q.severity || r.severity === q.severity) &&
+        (!q.openOnly || (r.disposition !== "false_positive" && r.disposition !== "closed")),
+    );
+
+    const packageIds = [
+      ...new Set(
+        mine
+          .filter((r) => r.subjectType === "bid_package" && r.subjectId)
+          .map((r) => r.subjectId as string),
+      ),
+    ];
+    const packageRows = packageIds.length
+      ? await app.db
+          .select({
+            id: bidPackages.id,
+            reference: bidPackages.reference,
+            title: bidPackages.title,
+            projectId: bidPackages.projectId,
+          })
+          .from(bidPackages)
+          .where(
+            and(eq(bidPackages.companyId, req.companyId!), inArray(bidPackages.id, packageIds)),
+          )
+      : [];
+    const packagesById = new Map(packageRows.map((p) => [p.id, p] as const));
+
+    const byDetector = new Map<string, number>();
+    for (const row of mine) byDetector.set(row.detector, (byDetector.get(row.detector) ?? 0) + 1);
+    const bySeverity = new Map<string, number>();
+    for (const row of mine) bySeverity.set(row.severity, (bySeverity.get(row.severity) ?? 0) + 1);
+
+    return {
+      items: mine.map((row) => ({
+        ...shapeSignal(row),
+        package:
+          row.subjectType === "bid_package" ? (packagesById.get(row.subjectId ?? "") ?? null) : null,
+      })),
+      total: mine.length,
+      byDetector: [...byDetector.entries()]
+        .map(([detector, count]) => ({ detector, count }))
+        .sort((a, b) => b.count - a.count),
+      bySeverity: [...bySeverity.entries()].map(([severity, count]) => ({ severity, count })),
+      windowMonths: CROSS_PACKAGE_WINDOW_MONTHS,
+      note:
+        mine.length === 0
+          ? "No bid-integrity finding is open. That is a statement about what the detectors can " +
+            "see: cross-package patterns need several tenders in the same trade before they say " +
+            "anything, and the within-package ones need a field of at least three bids."
+          : "Every finding carries the statistic it was computed from. The ordinary outcome of " +
+            "reviewing one is an innocent explanation recorded next to it — dismissing a finding " +
+            "with a reason is how the detector's measured precision improves.",
+    };
+  });
+
+  /** Run the cross-package detectors over the company's own history. */
+  app.post(
+    "/companies/current/bid-integrity/run",
+    {
+      preHandler: [
+        app.authenticate,
+        app.requireCompany,
+        app.requireCompanyRole(["owner", "admin"]),
+      ],
+    },
+    async (req) => {
+      const report = await runCompanyIntegrityAndPersist(app.db, req.companyId!, req.user!.id);
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "company",
+        objectId: req.companyId!,
+        payload: {
+          event: "bid_integrity_company_run",
+          packagesExamined: report.packagesExamined,
+          findings: report.findings.length,
+          raised: report.raised.length,
+        },
+        storePayload: true,
+      });
+      return report;
+    },
+  );
+
+  /**
+   * Dismissing a finding WITH A REASON. This is the feedback loop that makes
+   * a detector's precision measurable: a detector whose findings are all
+   * dismissed is a detector that should be re-tuned or retired, and that is
+   * only visible if the dismissal is recorded rather than the row deleted.
+   */
+  app.post(
+    "/companies/current/bid-integrity/:signalId/dismiss",
+    { preHandler: dispositionGate },
+    async (req) => {
+      const { signalId } = req.params as { signalId: string };
+      /*
+       * A dismissal switches off an award's acknowledgement gate, so it is
+       * held to the same length as the justification it replaces: three
+       * characters ("n/a") is not a reason, it is a way past a control.
+       */
+      const { reason } = z.object({ reason: justificationSchema }).parse(req.body);
+      const [row] = await app.db
+        .select()
+        .from(signals)
+        .where(and(eq(signals.id, signalId), eq(signals.companyId, req.companyId!)))
+        .limit(1);
+      if (!row) throw notFound("Signal not found");
+      if (!row.detector.startsWith("bid_integrity_")) {
+        throw badRequest(
+          "That signal was not raised by the bidding detectors, so it is not this module's to " +
+            "close. Use the assurance register.",
+        );
+      }
+      const now = new Date().toISOString();
+      await app.db
+        .update(signals)
+        .set({
+          disposition: "false_positive",
+          reviewerId: req.user!.id,
+          reviewerNotes: reason,
+          closedAt: now,
+        })
+        .where(eq(signals.id, signalId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        projectId: row.projectId,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "signal",
+        objectId: signalId,
+        payload: {
+          detector: row.detector,
+          to: "false_positive",
+          reason,
+          subjectType: row.subjectType,
+          subjectId: row.subjectId,
+        },
+        storePayload: true,
+      });
+      return {
+        id: signalId,
+        disposition: "false_positive",
+        reviewerNotes: reason,
+        note:
+          "Recorded. A dismissal with a stated reason is what makes this detector's precision " +
+          "measurable — a detector whose findings are always dismissed should be re-tuned or " +
+          "retired, and that only becomes visible if the dismissals are counted.",
+      };
+    },
+  );
+
+  /**
+   * CONFIRMING a finding — the other half of the feedback loop.
+   *
+   * Precision is confirmed ÷ (confirmed + false positive). A register where
+   * the only recordable outcome is "dismissed" measures nothing: every
+   * detector converges on a precision of zero regardless of how good it is.
+   * A confirmation is a reviewer saying "this one was real", with what they
+   * found, and it leaves the finding OPEN — a confirmed pattern still bears
+   * on the next recommendation.
+   */
+  app.post(
+    "/companies/current/bid-integrity/:signalId/confirm",
+    { preHandler: dispositionGate },
+    async (req) => {
+      const { signalId } = req.params as { signalId: string };
+      const { reason, escalate } = z
+        .object({ reason: reasonSchema, escalate: z.boolean().default(false) })
+        .parse(req.body);
+      const [row] = await app.db
+        .select()
+        .from(signals)
+        .where(and(eq(signals.id, signalId), eq(signals.companyId, req.companyId!)))
+        .limit(1);
+      if (!row) throw notFound("Signal not found");
+      if (!row.detector.startsWith("bid_integrity_")) {
+        throw badRequest(
+          "That signal was not raised by the bidding detectors, so it is not this module's to " +
+            "disposition. Use the assurance register.",
+        );
+      }
+      const disposition = escalate ? "escalated" : "confirmed";
+      await app.db
+        .update(signals)
+        .set({ disposition, reviewerId: req.user!.id, reviewerNotes: reason })
+        .where(eq(signals.id, signalId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        projectId: row.projectId,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "signal",
+        objectId: signalId,
+        payload: {
+          detector: row.detector,
+          to: disposition,
+          reason,
+          subjectType: row.subjectType,
+          subjectId: row.subjectId,
+        },
+        storePayload: true,
+      });
+      return {
+        id: signalId,
+        disposition,
+        reviewerNotes: reason,
+        note:
+          "Recorded, and the finding stays open: a confirmed pattern still has to be " +
+          "acknowledged before the next recommendation on the packages it touches." +
+          (escalate
+            ? " It is escalated — the assurance register is where an escalated signal is worked."
+            : ""),
+      };
+    },
+  );
+
+  /**
+   * MEASURED PRECISION PER DETECTOR.
+   *
+   * A detector's worth is not what it fires on, it is what survives review.
+   * This counts, per detector over the trailing window: how many findings
+   * were raised, how many a human has dispositioned, and of those how many
+   * were real. Where too few have been reviewed to say anything, precision is
+   * `null` WITH THE REASON — a precision of "1.00 from one review" is the
+   * kind of number that gets a detector trusted for the wrong reason.
+   */
+  app.get("/companies/current/bid-integrity/precision", { preHandler: companyGate }, async (req) => {
+    const MIN_REVIEWED = 5;
+    const rows = await app.db
+      .select({
+        detector: signals.detector,
+        disposition: signals.disposition,
+        severity: signals.severity,
+        createdAt: signals.createdAt,
+      })
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, req.companyId!),
+          like(signals.detector, "bid_integrity_%"),
+        ),
+      );
+    const mine = rows;
+    const byDetector = new Map<
+      string,
+      { raised: number; confirmed: number; falsePositive: number; escalated: number; open: number }
+    >();
+    for (const row of mine) {
+      const entry = byDetector.get(row.detector) ?? {
+        raised: 0,
+        confirmed: 0,
+        falsePositive: 0,
+        escalated: 0,
+        open: 0,
+      };
+      entry.raised += 1;
+      if (row.disposition === "confirmed") entry.confirmed += 1;
+      else if (row.disposition === "false_positive") entry.falsePositive += 1;
+      else if (row.disposition === "escalated") entry.escalated += 1;
+      else entry.open += 1;
+      byDetector.set(row.detector, entry);
+    }
+    const items = [...byDetector.entries()]
+      .map(([detector, e]) => {
+        const real = e.confirmed + e.escalated;
+        const reviewed = real + e.falsePositive;
+        const enough = reviewed >= MIN_REVIEWED;
+        return {
+          detector,
+          raised: e.raised,
+          open: e.open,
+          confirmed: e.confirmed,
+          escalated: e.escalated,
+          falsePositive: e.falsePositive,
+          reviewed,
+          precision: enough ? Math.round((real / reviewed) * 1000) / 1000 : null,
+          basis: enough
+            ? `${real} of ${reviewed} reviewed finding(s) were real.`
+            : reviewed === 0
+              ? "No finding from this detector has been dispositioned yet, so its precision is " +
+                "unmeasured. Confirm or dismiss findings with a reason and the figure appears."
+              : `Only ${reviewed} finding(s) have been reviewed; ${MIN_REVIEWED} are needed ` +
+                "before a precision figure means anything. A rate computed from two reviews is " +
+                "noise wearing a decimal point.",
+        };
+      })
+      .sort((a, b) => b.raised - a.raised);
+    return {
+      items,
+      total: items.length,
+      minReviewed: MIN_REVIEWED,
+      note:
+        "Precision is (confirmed + escalated) ÷ (confirmed + escalated + false positive). It is " +
+        "measured, never asserted, and it is null with a reason wherever the review history is " +
+        "too thin to support a number.",
+    };
+  });
+};
+
+export type { IntegrityFinding };

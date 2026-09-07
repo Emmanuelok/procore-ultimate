@@ -52,3 +52,13 @@ export function addWorkingDaysISO(date: string, days: number): string {
   }
   return cursor;
 }
+
+/**
+ * The date a response is due, counted on the basis the type declares.
+ * `working` counts Mon–Fri (see `addWorkingDaysISO`); anything else counts
+ * calendar days. The caller records which basis produced the date, because a
+ * deadline whose derivation is not stated cannot be argued about.
+ */
+export function responseDueOn(from: string, days: number, basis: string): string {
+  return basis === "working" ? addWorkingDaysISO(from, days) : addDaysISO(from, days);
+}

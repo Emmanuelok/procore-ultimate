@@ -126,6 +126,15 @@ export default function AnalysisTab({ projectId }: { projectId: string }) {
   const [windowsRes, setWindowsRes] = useState<WindowsResponse | null>(null);
   const [windowsError, setWindowsError] = useState<string | null>(null);
   const [windowsBusy, setWindowsBusy] = useState(false);
+  const [includeWithdrawn, setIncludeWithdrawn] = useState(false);
+
+  // Switching programme invalidates the windows result: leaving the previous
+  // schedule's cards on screen under the new schedule's comparison is a lie
+  // about which programme they describe.
+  useEffect(() => {
+    setWindowsRes(null);
+    setWindowsError(null);
+  }, [scheduleId]);
 
   function setBoundary(i: number, value: string) {
     setBoundaries((b) => b.map((d, j) => (j === i ? value : d)));
@@ -142,6 +151,7 @@ export default function AnalysisTab({ projectId }: { projectId: string }) {
     try {
       const params = new URLSearchParams({ boundaries: dates.join(",") });
       if (scheduleId) params.set("scheduleId", scheduleId);
+      if (includeWithdrawn) params.set("statuses", "open,assessed,closed,withdrawn");
       const res = await api.get<WindowsResponse>(`${base}/forensics/windows?${params}`);
       setWindowsRes(res);
     } catch (err) {
@@ -349,6 +359,14 @@ export default function AnalysisTab({ projectId }: { projectId: string }) {
           <Button size="sm" onClick={() => void runWindows()} disabled={windowsBusy}>
             {windowsBusy ? "Analysing…" : "Run windows analysis"}
           </Button>
+          <label className="flex items-center gap-1.5 text-xs text-ink-500">
+            <input
+              type="checkbox"
+              checked={includeWithdrawn}
+              onChange={(e) => setIncludeWithdrawn(e.target.checked)}
+            />
+            Include withdrawn events
+          </label>
         </div>
 
         <ErrorAlert message={windowsError} />
@@ -356,6 +374,18 @@ export default function AnalysisTab({ projectId }: { projectId: string }) {
         {windowsRes ? (
           <>
             <InfoBanner message={windowsRes.method} />
+            {windowsRes.statuses ? (
+              <p className="mb-2 text-xs text-ink-400">
+                Counting events with status {windowsRes.statuses.join(", ")}.
+              </p>
+            ) : null}
+            {windowsRes.windows.some((w) => (w.totals.staleTia ?? 0) > 0) ? (
+              <p className="mb-3 text-xs text-amber-600">
+                Some events carry a time impact computed against an earlier version of this
+                programme; those deltas are excluded from the window totals until the analysis is
+                re-run.
+              </p>
+            ) : null}
             {windowsRes.unattributedEvents > 0 ? (
               <p className="mb-3 text-xs text-amber-600">
                 {windowsRes.unattributedEvents} event

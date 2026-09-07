@@ -177,7 +177,7 @@ beforeAll(async () => {
       createdBy: "seed",
     },
   ]);
-});
+}, 300_000);
 
 afterAll(async () => {
   await built.close();

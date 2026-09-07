@@ -24,6 +24,7 @@ import {
   AUTHORISATION_TONE,
   DECISION_STATUS_TONE,
   EM_DASH,
+  EditPanel,
   ISSUE_STATUS_TONE,
   KeyValue,
   LoadError,
@@ -642,6 +643,35 @@ function IssueDrawer({
               </Button>
             )}
 
+            <EditPanel
+              title="Correct this issue"
+              hint="Assignment and routing move through Route above, so they are ledgered and the assignee is told."
+              path={`${base}/issues/${row.id}`}
+              initial={row as unknown as Record<string, unknown>}
+              disabled={row.status === "closed" || row.status === "void"}
+              disabledReason={`This issue is ${labelize(row.status).toLowerCase()}. Reopen it before correcting the record.`}
+              onSaved={onChanged}
+              fields={[
+                { key: "title", label: "Title", kind: "text", maxLength: 200, nullable: false, wide: true },
+                { key: "description", label: "Description", kind: "textarea" },
+                {
+                  key: "issueType",
+                  label: "Type",
+                  kind: "select",
+                  options: DESIGN_ISSUE_TYPES.map((t) => ({ value: t, label: labelize(t) })),
+                },
+                {
+                  key: "priority",
+                  label: "Priority",
+                  kind: "select",
+                  options: DESIGN_ISSUE_PRIORITIES.map((p) => ({ value: p, label: labelize(p) })),
+                  hint: "Drives how quickly the staleness sweep flags it.",
+                },
+                { key: "dueDate", label: "Due", kind: "date" },
+                { key: "locationRef", label: "Location", kind: "text", maxLength: 160 },
+              ]}
+            />
+
             {row.decisions && row.decisions.length > 0 ? (
               <div>
                 <SectionHeading title="Decisions taken on this issue" />
@@ -861,6 +891,27 @@ function DecisionDrawer({
                 Superseded by {row.supersededBy.map((d) => d.reference).join(", ")}
               </p>
             ) : null}
+
+            <EditPanel
+              title="Correct this decision"
+              hint="Only while it is still proposed: once taken, a decision is superseded rather than rewritten."
+              path={`${base}/decisions/${row.id}`}
+              initial={row as unknown as Record<string, unknown>}
+              disabled={row.status !== "proposed"}
+              disabledReason={`This decision is ${labelize(row.status).toLowerCase()}. Propose a superseding decision rather than editing the record of what was decided.`}
+              onSaved={onChanged}
+              fields={[
+                { key: "title", label: "Title", kind: "text", maxLength: 200, nullable: false, wide: true },
+                { key: "question", label: "Question", kind: "textarea", nullable: false },
+                { key: "background", label: "Background", kind: "textarea" },
+                {
+                  key: "discipline",
+                  label: "Discipline",
+                  kind: "select",
+                  options: DESIGN_DISCIPLINES.map((d) => ({ value: d, label: labelize(d) })),
+                },
+              ]}
+            />
 
             {row.status === "proposed" ? (
               <form onSubmit={(e) => void decide(e)} className="space-y-2 rounded-lg border border-border-subtle p-3">

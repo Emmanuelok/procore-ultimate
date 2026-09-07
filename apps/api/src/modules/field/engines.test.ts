@@ -43,8 +43,8 @@ import {
   toCsv,
   validateVerifierChange,
 } from "./punchEngine.js";
-import { exifDateToIso, extractExif, haversineKm, isValidPin, sniffMediaType } from "./photoEngine.js";
-import { buildZip, listZip, uniqueZipNames } from "./zip.js";
+import { EXIF_THUMBNAIL_MAX_BYTES, exifDateToIso, extractExif, extractExifThumbnail, haversineKm, isValidPin, sniffMediaType } from "./photoEngine.js";
+import { buildZip, listZip, uniqueZipNames, zipStream } from "./zip.js";
 import {
   detectCoApprovalPattern,
   detectPhotoDateDrift,
@@ -57,7 +57,7 @@ import {
 } from "./integrityEngine.js";
 import { cleanSubject, detectRfiReference, htmlToText, parseAddress, parseInboundRfiEmail, stripQuotedReply } from "./emailIngest.js";
 import { ballInCourtSummary, cycleTimeStats } from "./rfiEngine.js";
-import { jpegWithExif } from "./testFixtures.js";
+import { jpegWithExif, tinyJpeg, tinyPng } from "./testFixtures.js";
 
 describe("ageing engine", () => {
   it("buckets ages and computes overdue days", () => {
@@ -203,6 +203,17 @@ describe("daily log engine", () => {
     });
     expect(out["delays"]).toEqual([{ cause: "Unclassified", description: "Crane down", hoursLost: 2 }]);
     expect(out["manpower"]).toEqual([{ company: "Acme", workers: 3, hours: 24, notes: "Pour" }]);
+  });
+
+  it("keeps the diarist's own manpower fields when normalising (trade is not an AI key)", () => {
+    // dailyLogs.ts runs this over the request body on the first save of a day,
+    // so anything it drops is data the site typed and never gets back.
+    const out = normaliseAiSections({
+      manpower: [{ company: "Acme", trade: "Formwork", workers: 5, hours: 40, notes: "L3 east" }],
+    });
+    expect(out["manpower"]).toEqual([
+      { company: "Acme", trade: "Formwork", workers: 5, hours: 40, notes: "L3 east" },
+    ]);
   });
 
   it("consolidates a site day across creators", () => {
@@ -402,6 +413,32 @@ describe("punch engine", () => {
     expect(stats.overdue).toBe(1);
     expect(toCsv([{ a: 'x,"y"', b: 1 }], [{ key: "a", header: "A" }, { key: "b", header: "B" }])).toBe('A,B\r\n"x,""y""",1\r\n');
   });
+
+  it("neutralises spreadsheet formulas in exported punch text", () => {
+    // A punch title is user text and the register is opened in Excel: a cell
+    // starting =, +, -, @, tab or CR must not execute. Same rule as
+    // modules/twin/shared.ts.
+    const csv = toCsv(
+      [
+        { title: "=cmd|'/c calc'!A1" },
+        { title: "+1+1" },
+        { title: "-2" },
+        { title: "@SUM(A1)" },
+        { title: "\tlead" },
+        { title: "=A1,=B1" },
+        { title: "Normal title" },
+      ],
+      [{ key: "title", header: "Title" }],
+    );
+    const lines = csv.trimEnd().split("\r\n");
+    expect(lines[1]).toBe("'=cmd|'/c calc'!A1");
+    expect(lines[2]).toBe("'+1+1");
+    expect(lines[3]).toBe("'-2");
+    expect(lines[4]).toBe("'@SUM(A1)");
+    expect(lines[5]).toBe("'\tlead");
+    expect(lines[6]).toBe("\"'=A1,=B1\""); // still quoted because it holds a comma
+    expect(lines[7]).toBe("Normal title");
+  });
 });
 
 describe("photo engine", () => {
@@ -431,6 +468,24 @@ describe("photo engine", () => {
     expect(exifDateToIso("2026:01:02 03:04:05", "+02:00")).toBe("2026-01-02T01:04:05.000Z");
   });
 
+  it("lifts the camera's own thumbnail out of EXIF IFD1, and never invents one", () => {
+    const thumb = tinyJpeg(0x2a);
+    const withThumb = extractExifThumbnail(jpegWithExif({ thumbnail: thumb }));
+    expect(withThumb).not.toBeNull();
+    // byte-identical to what the camera wrote — a derivative of the uploaded
+    // file, not something reconstructed
+    expect(withThumb!.equals(thumb)).toBe(true);
+    expect(withThumb!.length).toBeLessThan(EXIF_THUMBNAIL_MAX_BYTES);
+    // no IFD1 at all: honest null rather than a fabricated rendition
+    expect(extractExifThumbnail(jpegWithExif())).toBeNull();
+    expect(extractExifThumbnail(tinyPng())).toBeNull();
+    expect(extractExifThumbnail(Buffer.from("not a jpeg"))).toBeNull();
+    // a truncated file must not throw and must not return partial bytes
+    expect(extractExifThumbnail(jpegWithExif({ thumbnail: thumb }).subarray(0, 60))).toBeNull();
+    // IFD1 present but the payload is not a JPEG: refused by the magic bytes
+    expect(extractExifThumbnail(jpegWithExif({ thumbnail: Buffer.from([1, 2, 3, 4, 5, 6]) }))).toBeNull();
+  });
+
   it("measures distance and validates pins", () => {
     expect(haversineKm(51.5074, -0.1278, 48.8566, 2.3522)).toBeCloseTo(343.5, 0);
     expect(isValidPin({ sheetId: "s1", x: 0.5, y: 0.2 })).toBe(true);
@@ -455,6 +510,37 @@ describe("zip writer", () => {
     // local header offset points at a local header signature
     expect(zip.readUInt32LE(entries[1]!.offset)).toBe(0x04034b50);
     expect(uniqueZipNames(["x", "x", "../x"])).toEqual(["x", "x (2)", "x (3)"]);
+  });
+
+  it("streams the same archive without ever holding an entry in memory", async () => {
+    const a = Buffer.from("hello");
+    const b = Buffer.from("world!!");
+    const chunks: Buffer[] = [];
+    for await (const chunk of zipStream([
+      // Deliberately handed out in pieces: the writer must accumulate the CRC
+      // and the size across chunks and only then emit the data descriptor.
+      { name: "a.txt", mtime: new Date("2026-08-12T10:00:00Z"), open: () => (async function* () { yield a.subarray(0, 2); yield a.subarray(2); })() },
+      { name: "a.txt", mtime: new Date("2026-08-12T10:00:00Z"), open: () => (async function* () { yield b; })() },
+    ])) {
+      chunks.push(chunk);
+    }
+    const zip = Buffer.concat(chunks);
+    const entries = listZip(zip);
+    expect(entries.map((e) => e.name)).toEqual(["a.txt", "a (2).txt"]);
+    expect(entries[0]!.crc).toBe(crc32(a) >>> 0);
+    expect(entries[0]!.size).toBe(a.length);
+    expect(entries[1]!.crc).toBe(crc32(b) >>> 0);
+    expect(entries[1]!.size).toBe(b.length);
+    for (const e of entries) {
+      expect(zip.readUInt32LE(e.offset)).toBe(0x04034b50);
+      // bit 3 set, CRC/size zero in the local header, real values in a
+      // trailing descriptor — the shape that makes streaming possible.
+      expect(zip.readUInt16LE(e.offset + 6) & 0x0008).toBe(0x0008);
+      expect(zip.readUInt32LE(e.offset + 14)).toBe(0);
+      const dataStart = e.offset + 30 + zip.readUInt16LE(e.offset + 26);
+      expect(zip.readUInt32LE(dataStart + e.size)).toBe(0x08074b50);
+      expect(zip.readUInt32LE(dataStart + e.size + 4)).toBe(e.crc);
+    }
   });
 });
 

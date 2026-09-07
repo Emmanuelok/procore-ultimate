@@ -15,14 +15,32 @@ export interface ListResponse<T> {
   pageSize: number;
 }
 
-/** Category allocation with utilisation (#739). */
+/** Category allocation with utilisation (#739).
+ *  `pipeline` = submitted + approved (not yet paid) and `available` =
+ *  limit − pipeline: the number the submit gate actually enforces. `remaining`
+ *  (limit − disbursed) is the cash view. Showing only `remaining` used to
+ *  contradict the gate on the same screen. */
 export interface CategoryUtilisation {
   id: string;
   name: string;
   limit: number;
   disbursed: number;
   remaining: number;
+  pipeline: number;
+  available: number;
+  /** present on the company summary rows, absent on the facility detail */
+  currency?: string;
 }
+
+/** Money bucketed by currency — never summed across them. */
+export interface CurrencyBucket {
+  currency: string;
+  amount: number;
+  recordCount: number;
+}
+
+/** A single figure, or an explained null when the figure is unknowable. */
+export type MaybeTotal = { value: number; currency: string } | { value: null; reasons: string[] };
 
 export interface FacilityRow {
   id: string;
@@ -38,6 +56,10 @@ export interface FacilityRow {
   updatedAt: string;
   /** aggregates (#739-741) */
   disbursed: number;
+  /** submitted + approved + disbursed — what the headroom gate counts */
+  pipeline: number;
+  /** committed less the pipeline: what may still be requested */
+  available: number;
   undisbursed: number;
   openConditions: number;
   pendingRequests: number;
@@ -86,6 +108,12 @@ export interface DisbursementRow {
   approvedBy: string | null;
   disbursedAt: string | null;
   rejectionReason: string | null;
+  certifiedAt: string | null;
+  certifiedBy: string | null;
+  certificationNote: string | null;
+  certificationEvidenceIds: string[];
+  /** per-evidence eligibility classification (#736-737) */
+  evidenceEligibility: EligibilityEntry[];
   createdBy: string;
   createdAt: string;
   updatedAt: string;
@@ -112,10 +140,13 @@ export interface CovenantRow {
   operator: string; // gte | lte
   threshold: number;
   unit: string | null;
+  formula: string | null;
   createdAt: string;
   latestReading: CovenantReadingRow | null;
   compliant: boolean | null;
   headroom: number | null;
+  waivedBy?: string | null;
+  waivedUntil?: string | null;
 }
 
 export interface FacilityDetailData extends FacilityRow {
@@ -126,13 +157,147 @@ export interface FacilityDetailData extends FacilityRow {
 
 export interface FinanceSummary {
   facilities: number;
-  committed: number;
-  disbursed: number;
-  undisbursed: number;
+  committedByCurrency: CurrencyBucket[];
+  disbursedByCurrency: CurrencyBucket[];
+  pipelineByCurrency: CurrencyBucket[];
+  undisbursedByCurrency: CurrencyBucket[];
+  availableByCurrency: CurrencyBucket[];
+  committedTotal: MaybeTotal;
+  disbursedTotal: MaybeTotal;
+  undisbursedTotal: MaybeTotal;
   pendingRequests: number;
+  awaitingCertification: number;
   openConditions: number;
   byCategory: Array<CategoryUtilisation & { facilityId: string; facilityName: string }>;
-  covenantStatus: "breached" | "unknown" | "compliant" | null;
+  covenantStatus: "breached" | "waived" | "unknown" | "compliant" | null;
+  currencies: string[];
+}
+
+/* ------------------------- Lender discipline (#736-751) ------------------- */
+
+export interface ForecastRow {
+  id: string;
+  facilityId: string;
+  periodStart: string;
+  periodEnd: string;
+  plannedAmount: number;
+  milestoneTaskId: string | null;
+  note: string | null;
+  createdAt: string;
+}
+
+/** One period of the forecast-vs-actual comparison (compareForecast). */
+export interface ForecastPoint {
+  periodStart: string;
+  periodEnd: string;
+  planned: number;
+  actual: number;
+  cumulativePlanned: number;
+  cumulativeActual: number;
+  variance: number;
+  variancePercent: number | null;
+  milestoneOutstanding: boolean;
+}
+
+export interface ForecastResponse {
+  facilityId: string;
+  currency: string;
+  forecasts: ForecastRow[];
+  milestones: Array<{ id: string; name: string; actualFinish: string | null }>;
+  points: ForecastPoint[];
+  totalPlanned: number;
+  totalActual: number;
+  lagAmount: number;
+  lagPercent: number | null;
+  behindPlan: boolean;
+  milestoneBreaches: string[];
+  basis: string;
+}
+
+export interface RecoveryRow {
+  id: string;
+  facilityId: string;
+  disbursementId: string | null;
+  evidenceId: string | null;
+  amount: number;
+  currency: string;
+  /** IneligibilityReason */
+  reason: string;
+  detail: string | null;
+  status: string;
+  resolvedAt: string | null;
+  resolvedBy: string | null;
+  resolutionNote: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CovenantStanding {
+  covenantId: string;
+  name: string;
+  compliant: boolean | null;
+  readingDate: string | null;
+  headroom: number | null;
+  waivedBy: { id: string; reference: string | null; effectiveTo: string | null } | null;
+}
+
+/** Whether money may move at all today (#747): availability period + covenants. */
+export interface DrawStop {
+  facilityId: string;
+  stopped: boolean;
+  reasons: string[];
+  breachedCovenantIds: string[];
+  pastAvailability: boolean;
+  covenants: CovenantStanding[];
+}
+
+export interface AccrualPeriod {
+  periodStart: string;
+  periodEnd: string;
+  days: number;
+  openingDrawn: number;
+  drawnInPeriod: number;
+  closingDrawn: number;
+  averageDrawn: number;
+  averageUndrawn: number;
+  interest: number;
+  commitmentFee: number;
+  capitalised: number;
+  cumulativeInterest: number;
+  cumulativeFees: number;
+}
+
+export interface CostOfFinance {
+  facilityId: string;
+  currency: string;
+  periods: AccrualPeriod[];
+  totalInterest: number;
+  totalCommitmentFees: number;
+  totalCostOfFinance: number;
+  basis: string;
+  /** set when the facility has no rates configured — empty, not zero */
+  unavailableReason: string | null;
+}
+
+export interface EligibilityEntry {
+  evidenceId: string;
+  eligibility: string;
+  reason?: string | null;
+  amount?: number | null;
+  note?: string | null;
+}
+
+export interface EligibilityAssessment {
+  total: number;
+  eligible: number;
+  ineligible: number;
+  unassessed: number;
+  ineligibleEntries: EligibilityEntry[];
+  unassessedEvidenceIds: string[];
+  ineligibleAmount: number | null;
+  submittable: boolean;
+  reasons: string[];
 }
 
 export interface EvidenceRow {
@@ -204,6 +369,8 @@ export function disbursementTone(status: string): string {
   switch (status) {
     case "draft":
       return "gray";
+    case "certified":
+      return "violet";
     case "submitted":
       return "blue";
     case "approved":

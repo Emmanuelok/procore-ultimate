@@ -11,6 +11,7 @@
  * unreleased hold points past their date, dispositions waiting for an
  * independent approval, overdue NCRs and turnover artefact gaps.
  */
+import { useState } from "react";
 import {
   Alert,
   BarChart,
@@ -47,18 +48,62 @@ export default function OverviewTab({
 }: {
   summary: Resource<QualitySummary>;
   projectId: string;
-  onGoTo: (tab: "itps" | "holdPoints" | "checklists" | "ncrs" | "commissioning" | "turnover") => void;
+  onGoTo: (
+    tab:
+      | "itps"
+      | "holdPoints"
+      | "checklists"
+      | "records"
+      | "ncrs"
+      | "concessions"
+      | "rework"
+      | "commissioning"
+      | "turnover"
+      | "closeout"
+      | "audits",
+  ) => void;
 }) {
   const { busy, refusal, clear, run } = useAction();
 
+  /*
+   * RUN EVERY DETECTOR, NOT JUST THE CORE FOUR.
+   *
+   * The registers each carry their own sweep — concessions past their expiry,
+   * instruments out of calibration, certificates nobody has verified, audit
+   * findings past their close-out date — and each is also a scheduler job. The
+   * button used to run only the core sweep, so the four register sweeps could
+   * be triggered from nowhere in the product and a user who had just fixed a
+   * date had to wait for the next scheduled run to see the signal clear. They
+   * are idempotent on their signal key, so running them by hand costs nothing
+   * and duplicates nothing.
+   */
+  const [swept, setSwept] = useState<string | null>(null);
+
   async function sweep() {
-    const done = await run("sweep", () =>
-      api.post<{ raised: number; byDetector: Record<string, number> }>(
-        `/api/v1/projects/${projectId}/quality/sweep`,
+    const base = `/api/v1/projects/${projectId}`;
+    const done = await run("sweep", async () => {
+      const core = await api.post<{ raised: number; byDetector: Record<string, number> }>(
+        `${base}/quality/sweep`,
         {},
-      ),
-    );
-    if (done) summary.reload();
+      );
+      const rest = await Promise.all([
+        api.post<{ raised?: number; expired?: number }>(`${base}/concessions/sweep`, {}),
+        api.post<{ raised?: number }>(`${base}/instruments/sweep`, {}),
+        api.post<{ raised?: number }>(`${base}/material-certificates/sweep`, {}),
+        api.post<{ raised?: number }>(`${base}/audit-findings/sweep`, {}),
+      ]);
+      const raised =
+        core.raised + rest.reduce((total, r) => total + (r.raised ?? 0), 0);
+      return { raised };
+    });
+    if (done) {
+      setSwept(
+        done.raised === 0
+          ? "Every detector ran and raised nothing new — the registers agree with the signals already open."
+          : `Every detector ran; ${done.raised} new ${plural(done.raised, "signal")} raised.`,
+      );
+      summary.reload();
+    }
   }
 
   if (summary.error) {
@@ -105,10 +150,21 @@ export default function OverviewTab({
     );
   }
 
+  /*
+   * The label names the currency ONLY when there is one. With costs in more
+   * than one currency the API returns a null total and the per-currency
+   * figures beside it; labelling that "USD" would put a currency on a number
+   * that has none.
+   */
   const ncrCurrency =
     typeof s.ncrs.totalCostImpact.inputs["currency"] === "string"
       ? (s.ncrs.totalCostImpact.inputs["currency"] as string)
-      : "USD";
+      : null;
+  const ncrCostCurrencies = s.ncrs.costByCurrency
+    .map((f) => (typeof f.inputs["currency"] === "string" ? (f.inputs["currency"] as string) : null))
+    .filter((c): c is string => c !== null);
+
+  const r = s.registers;
 
   const severityData = Object.entries(s.ncrs.bySeverity).map(([severity, count]) => ({
     severity: labelize(severity),
@@ -140,10 +196,15 @@ export default function OverviewTab({
           }
         />
         <p className="text-2xs text-content-subtle">
-          The detectors run lazily on every list read and are idempotent — reading this page has
-          already run them, and running them again over an unchanged project raises nothing. There
-          is no scheduled job behind them, so nothing here is waiting on a cron to notice it.
+          The detectors also run on a schedule — hold points, concessions, calibration, welding,
+          certificates, audit findings, defects liability and seasonal commissioning each have their
+          own job — and they are idempotent on the condition they describe, so running them here
+          raises nothing over a project that has not changed. This button runs the core four and the
+          four register sweeps immediately rather than waiting for the next scheduled pass.
         </p>
+        {swept ? (
+          <p className="text-2xs font-medium text-content-muted">{swept}</p>
+        ) : null}
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <CountTile
             label="Hold points past their date"
@@ -268,10 +329,18 @@ export default function OverviewTab({
             tone="info"
           />
           <FigureTile
-            label={`Cost of non-conformance · ${ncrCurrency}`}
+            label={
+              ncrCurrency
+                ? `Cost of non-conformance · ${ncrCurrency}`
+                : "Cost of non-conformance"
+            }
             figure={s.ncrs.totalCostImpact}
-            render={(v) => money(v, ncrCurrency)}
-            hint="Only NCRs carrying a recorded cost"
+            render={(v) => money(v, ncrCurrency ?? "USD")}
+            hint={
+              ncrCostCurrencies.length > 1
+                ? `Recorded in ${ncrCostCurrencies.join(", ")} — reported per currency below, never summed`
+                : "Only NCRs carrying a recorded cost"
+            }
             tone="warning"
           />
           <FigureTile
@@ -294,6 +363,145 @@ export default function OverviewTab({
           <CountTile label="Systems" value={s.commissioning.systems} hint={`${s.commissioning.openDeficiencies} open ${plural(s.commissioning.openDeficiencies, "deficiency", "deficiencies")}`} />
           <CountTile label="Turnover packages" value={s.turnover.packages} hint={`${s.turnover.handedOver} handed over`} />
           <CountTile label="Assets handed over" value={s.turnover.assetsHandedOver} hint="Into the twin's register" />
+        </div>
+      </section>
+
+      {/* ---------------- Domain Z and closeout registers ---------------- */}
+      <section className="space-y-2.5">
+        <SectionTitle
+          title="Proving what went in, and what happens after"
+          hint="The registers that decide whether the work can be proved rather than merely claimed, and the two clocks that keep running after handover."
+        />
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <RegisterCard
+            label="Site records"
+            onOpen={() => onGoTo("records")}
+            lines={[
+              {
+                text: `${r.concrete.pours} concrete ${plural(r.concrete.pours, "pour")}`,
+                detail:
+                  r.concrete.failing > 0
+                    ? `${r.concrete.failing} failing acceptance`
+                    : r.concrete.awaitingResults > 0
+                      ? `${r.concrete.awaitingResults} awaiting results`
+                      : null,
+                tone: r.concrete.failing > 0 ? "danger" : null,
+              },
+              {
+                text: `${r.welding.welds} ${plural(r.welding.welds, "weld")}`,
+                detail:
+                  r.welding.rejected > 0
+                    ? `${r.welding.rejected} rejected`
+                    : r.welding.awaitingRequiredNdt > 0
+                      ? `${r.welding.awaitingRequiredNdt} awaiting required NDT`
+                      : null,
+                tone: r.welding.rejected > 0 ? "danger" : null,
+              },
+              {
+                text: `${r.certificates.total} material ${plural(r.certificates.total, "certificate")}`,
+                detail:
+                  r.certificates.unverified > 0
+                    ? `${r.certificates.unverified} unverified`
+                    : r.certificates.withoutTraceability > 0
+                      ? `${r.certificates.withoutTraceability} with no heat number`
+                      : null,
+                tone: r.certificates.failed > 0 ? "danger" : null,
+              },
+              {
+                text: `${r.calibration.instruments} ${plural(r.calibration.instruments, "instrument")}`,
+                detail:
+                  r.calibration.overdue > 0
+                    ? `${r.calibration.overdue} out of calibration`
+                    : r.calibration.dueSoon > 0
+                      ? `${r.calibration.dueSoon} due soon`
+                      : null,
+                tone: r.calibration.overdue > 0 ? "danger" : null,
+              },
+            ]}
+          />
+          <RegisterCard
+            label="Concessions"
+            onOpen={() => onGoTo("concessions")}
+            lines={[
+              { text: `${r.concessions.total} recorded`, detail: null, tone: null },
+              {
+                text: `${r.concessions.live} live`,
+                detail: "departures currently agreed",
+                tone: null,
+              },
+              {
+                text: `${r.concessions.expiringWithin30Days} expiring within 30 days`,
+                detail: "work covered by a lapsed concession is non-conforming again",
+                tone: r.concessions.expiringWithin30Days > 0 ? "warning" : null,
+              },
+              {
+                text: `${r.concessions.awaitingDecision} awaiting a decision`,
+                detail: null,
+                tone: r.concessions.awaitingDecision > 0 ? "warning" : null,
+              },
+            ]}
+          />
+          <RegisterCard
+            label="Rework and audits"
+            onOpen={() => onGoTo("rework")}
+            lines={[
+              {
+                text: `${r.rework.total} rework ${plural(r.rework.total, "item")}`,
+                detail:
+                  r.rework.costByCurrency.length === 0
+                    ? "no cost recorded — unmeasured, not zero"
+                    : r.rework.costByCurrency
+                        .map((t) => money(t.amount, t.currency))
+                        .join(" + "),
+                tone: null,
+              },
+              {
+                text: `${r.rework.uncosted} carrying no cost`,
+                detail: null,
+                tone: r.rework.uncosted > 0 ? "warning" : null,
+              },
+              {
+                text: `${r.audits.total} ${plural(r.audits.total, "audit")}`,
+                detail: `${r.audits.openFindings} open ${plural(r.audits.openFindings, "finding")}`,
+                tone: null,
+              },
+              {
+                text: `${r.audits.majorNonConformities} major ${plural(r.audits.majorNonConformities, "non-conformity", "non-conformities")}`,
+                detail:
+                  r.audits.overdueFindings > 0
+                    ? `${r.audits.overdueFindings} findings past their close-out date`
+                    : null,
+                tone: r.audits.majorNonConformities > 0 ? "danger" : null,
+              },
+            ]}
+          />
+          <RegisterCard
+            label="Closeout"
+            onOpen={() => onGoTo("closeout")}
+            lines={[
+              {
+                text: `${r.closeout.liabilityPeriods} liability ${plural(r.closeout.liabilityPeriods, "period")}`,
+                detail:
+                  r.closeout.expired > 0 ? `${r.closeout.expired} already expired` : null,
+                tone: r.closeout.expired > 0 ? "danger" : null,
+              },
+              {
+                text: `${r.closeout.expiringWithin60Days} ending within 60 days`,
+                detail: "the retention and the final certificate hang on this date",
+                tone: r.closeout.expiringWithin60Days > 0 ? "warning" : null,
+              },
+              {
+                text: `${r.closeout.guarantees} performance ${plural(r.closeout.guarantees, "guarantee")}`,
+                detail: `${r.closeout.guaranteesUnmeasured} never measured`,
+                tone: null,
+              },
+              {
+                text: `${r.closeout.guaranteesNotMet} not met`,
+                detail: "an unmeasured guarantee is not a met one",
+                tone: r.closeout.guaranteesNotMet > 0 ? "danger" : null,
+              },
+            ]}
+          />
         </div>
       </section>
 
@@ -380,6 +588,52 @@ export default function OverviewTab({
           />
         </section>
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * One register in a line each: the count, then the fact that matters about it.
+ * A register with nothing wrong still shows its count — "0 rejected welds" and
+ * "no weld register" are different statements, and only the second is a gap.
+ */
+function RegisterCard({
+  label,
+  lines,
+  onOpen,
+}: {
+  label: string;
+  lines: Array<{ text: string; detail: string | null; tone: "danger" | "warning" | null }>;
+  onOpen: () => void;
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-surface-raised p-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-label uppercase tracking-wide text-content-subtle">{label}</div>
+        <Button size="xs" variant="ghost" onClick={onOpen}>
+          Open
+        </Button>
+      </div>
+      <ul className="mt-1.5 space-y-1">
+        {lines.map((line) => (
+          <li key={line.text} className="text-meta">
+            <span
+              className={
+                line.tone === "danger"
+                  ? "font-medium text-danger"
+                  : line.tone === "warning"
+                    ? "font-medium text-warning"
+                    : "font-medium text-content"
+              }
+            >
+              {line.text}
+            </span>
+            {line.detail ? (
+              <span className="ml-1 text-2xs text-content-subtle">{line.detail}</span>
+            ) : null}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

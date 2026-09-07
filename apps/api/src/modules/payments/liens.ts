@@ -55,6 +55,9 @@ const listQuery = pageQuerySchema.extend({
   kind: z.enum(STATUTORY_LIEN_KINDS).optional(),
 });
 
+/** A lien that still bites: it has not been released, bonded off, expired or voided. */
+export const OPEN_LIEN_STATUSES = ["noticed", "served", "filed", "disputed"] as const;
+
 const daysUntil = (iso: string, today: string): number =>
   Math.round((Date.parse(`${iso}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
 
@@ -73,7 +76,7 @@ export async function sweepLienDeadlines(
     .where(
       and(
         eq(statutoryLiens.companyId, companyId),
-        inArray(statutoryLiens.status, ["noticed", "filed", "disputed"]),
+        inArray(statutoryLiens.status, [...OPEN_LIEN_STATUSES]),
         isNotNull(statutoryLiens.deadlineAt),
         lt(statutoryLiens.deadlineAt, today),
       ),
@@ -260,7 +263,7 @@ export const lienRoutes: FastifyPluginAsync = async (app) => {
       .from(statutoryLiens)
       .where(and(eq(statutoryLiens.companyId, req.companyId!), eq(statutoryLiens.projectId, req.projectId!)))
       .orderBy(asc(statutoryLiens.deadlineAt));
-    const open = rows.filter((l) => ["noticed", "filed", "disputed"].includes(l.status));
+    const open = rows.filter((l) => (OPEN_LIEN_STATUSES as readonly string[]).includes(l.status));
     const today = todayISO();
     const byCurrency = new Map<string, { currency: string; count: number; amount: number; tier2Plus: number }>();
     for (const l of open) {
@@ -301,13 +304,19 @@ export const lienRoutes: FastifyPluginAsync = async (app) => {
     return fetchLien(lienId, req.companyId!, req.projectId!);
   });
 
+  /*
+   * The lifecycle, in the order the paperwork actually happens: a notice is
+   * recorded, SERVED on the owner or lender, then filed; from any live state
+   * it can be disputed, bonded off, released, expired or voided.
+   */
   const transitions: Record<string, { from: string[]; to: string; body: z.ZodTypeAny }> = {
-    file: { from: ["noticed"], to: "filed", body: z.object({ filedAt: isoDateSchema.optional() }) },
-    dispute: { from: ["noticed", "filed"], to: "disputed", body: z.object({ reason: z.string().min(1).max(4000) }) },
-    "bond-off": { from: ["noticed", "filed", "disputed"], to: "bonded_off", body: z.object({ bondReference: z.string().min(1).max(200) }) },
-    release: { from: ["noticed", "filed", "disputed", "bonded_off"], to: "released", body: z.object({ releaseDocumentId: z.string().max(64).nullable().optional(), releasedAt: isoDateSchema.optional() }) },
-    expire: { from: ["noticed", "filed", "disputed"], to: "expired", body: z.object({ reason: z.string().min(1).max(4000) }) },
-    void: { from: ["noticed", "filed", "disputed"], to: "void", body: z.object({ reason: z.string().min(1).max(4000) }) },
+    serve: { from: ["noticed"], to: "served", body: z.object({ servedAt: isoDateSchema.optional() }) },
+    file: { from: ["noticed", "served"], to: "filed", body: z.object({ filedAt: isoDateSchema.optional() }) },
+    dispute: { from: ["noticed", "served", "filed"], to: "disputed", body: z.object({ reason: z.string().min(1).max(4000) }) },
+    "bond-off": { from: [...OPEN_LIEN_STATUSES], to: "bonded_off", body: z.object({ bondReference: z.string().min(1).max(200) }) },
+    release: { from: [...OPEN_LIEN_STATUSES, "bonded_off"], to: "released", body: z.object({ releaseDocumentId: z.string().max(64).nullable().optional(), releasedAt: isoDateSchema.optional() }) },
+    expire: { from: [...OPEN_LIEN_STATUSES], to: "expired", body: z.object({ reason: z.string().min(1).max(4000) }) },
+    void: { from: [...OPEN_LIEN_STATUSES], to: "void", body: z.object({ reason: z.string().min(1).max(4000) }) },
   };
 
   for (const [action, t] of Object.entries(transitions)) {
@@ -318,6 +327,7 @@ export const lienRoutes: FastifyPluginAsync = async (app) => {
       if (!t.from.includes(lien.status)) throw conflict(`Cannot ${action} a lien that is ${lien.status}`);
       const now = new Date().toISOString();
       const set: Record<string, unknown> = { status: t.to, updatedAt: now };
+      if (t.to === "served") set["servedAt"] = (body["servedAt"] as string | undefined) ?? todayISO();
       if (t.to === "filed") set["filedAt"] = (body["filedAt"] as string | undefined) ?? todayISO();
       if (t.to === "disputed") set["disputeReason"] = body["reason"];
       if (t.to === "bonded_off") set["bondReference"] = body["bondReference"];
@@ -326,11 +336,26 @@ export const lienRoutes: FastifyPluginAsync = async (app) => {
         set["releaseDocumentId"] = body["releaseDocumentId"] ?? null;
       }
       if (t.to === "expired" || t.to === "void") set["notes"] = `${lien.notes ?? ""}\n[${t.to}] ${String(body["reason"])}`.trim();
-      await app.db.update(statutoryLiens).set(set).where(eq(statutoryLiens.id, lienId));
-      /* a closed lien satisfies its deadline obligation; a bonded-off lien too */
-      if (["released", "bonded_off", "expired", "void"].includes(t.to) && lien.obligationId) {
-        await app.db.update(obligations).set({ status: "satisfied" }).where(and(eq(obligations.id, lien.obligationId), eq(obligations.status, "open")));
-      }
+      /*
+       * The move is ONE guarded write, not a read then a write: `WHERE status
+       * IN (from) RETURNING` means two people releasing and expiring the same
+       * lien at the same moment cannot both win and leave two contradictory
+       * state_change entries behind the same obligation.
+       */
+      await app.db.transaction(async (tx) => {
+        const moved = await tx
+          .update(statutoryLiens)
+          .set(set)
+          .where(and(eq(statutoryLiens.id, lienId), inArray(statutoryLiens.status, t.from)))
+          .returning({ id: statutoryLiens.id });
+        if (moved.length === 0) {
+          throw conflict(`This lien moved before it could be ${t.to}. Reload it — nothing was applied twice.`);
+        }
+        /* a closed lien satisfies its deadline obligation; a bonded-off lien too */
+        if (["released", "bonded_off", "expired", "void"].includes(t.to) && lien.obligationId) {
+          await tx.update(obligations).set({ status: "satisfied" }).where(and(eq(obligations.id, lien.obligationId), eq(obligations.status, "open")));
+        }
+      });
       await appendLedger(app.db, {
         companyId: req.companyId!,
         actorId: req.user!.id,

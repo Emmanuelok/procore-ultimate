@@ -541,8 +541,23 @@ export const measureRoutes: FastifyPluginAsync = async (app) => {
       throw badRequest(`A ${ps.status} provisional sum cannot take further expenditure`);
     }
     const id = newId("psx");
-    const newTotal = round2(ps.expendedTotal + body.amount);
+    // The running total is a money accumulator: read it INSIDE the transaction
+    // with the row locked, or two concurrent expenditures both read the same
+    // total and the second write silently swallows the first (PLAN §6.2).
+    let newTotal = 0;
     await app.db.transaction(async (tx) => {
+      const locked = (
+        await tx
+          .select({ expendedTotal: provisionalSums.expendedTotal, status: provisionalSums.status })
+          .from(provisionalSums)
+          .where(eq(provisionalSums.id, psId))
+          .for("update")
+      )[0];
+      if (!locked) throw notFound("Provisional sum not found");
+      if (locked.status === "omitted" || locked.status === "closed") {
+        throw badRequest(`A ${locked.status} provisional sum cannot take further expenditure`);
+      }
+      newTotal = round2(locked.expendedTotal + body.amount);
       await tx.insert(provisionalSumExpenditures).values({
         id,
         companyId: req.companyId!,
@@ -558,7 +573,10 @@ export const measureRoutes: FastifyPluginAsync = async (app) => {
         .update(provisionalSums)
         .set({
           expendedTotal: newTotal,
-          status: ps.status === "open" ? "expended" : ps.status === "instructed" ? "expended" : ps.status,
+          status:
+            locked.status === "open" || locked.status === "instructed"
+              ? "expended"
+              : locked.status,
           updatedAt: new Date().toISOString(),
         })
         .where(eq(provisionalSums.id, psId));

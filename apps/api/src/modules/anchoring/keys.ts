@@ -392,9 +392,25 @@ export async function registerPublicKey(
       .where(eq(signingKeys.keyId, record.keyId))
       .limit(1);
     if (raced[0]) return { row: raced[0], created: false };
+    // Neither our insert nor the winner's row is visible. That is not a state
+    // this function may paper over with a non-null assertion (`rows[0]!` threw
+    // a TypeError on `.keyId` at the call site instead): the key register is
+    // what every seal signature is checked against, so an unexplained absence
+    // is reported as one.
+    throw new Error(
+      `signing key ${record.keyId} was neither inserted nor found after an ON CONFLICT ` +
+        "retry — the signing_keys register is not in a state this process can reason about",
+    );
   }
   const rows = await db.select().from(signingKeys).where(eq(signingKeys.id, id)).limit(1);
-  return { row: rows[0]!, created: true };
+  const row = rows[0];
+  if (!row) {
+    throw new Error(
+      `signing key ${record.keyId} was inserted as ${id} but cannot be read back — the ` +
+        "signing_keys register is not in a state this process can reason about",
+    );
+  }
+  return { row, created: true };
 }
 
 /**

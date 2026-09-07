@@ -10,7 +10,7 @@
  * someone other than whoever delivered it.
  */
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, eq, ilike, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, ilike, or } from "drizzle-orm";
 import { z } from "zod";
 import { designConsultants, designDeliverables, designInfoRequirements, obligations } from "@constructos/db";
 import {
@@ -30,6 +30,7 @@ import { pushNotifications } from "../../notifications/service.js";
 import { assessPi } from "../engines/readiness.js";
 import { slippageByConsultant, slippageStats } from "../engines/slippage.js";
 import {
+  ROLLUP_ROW_CAP,
   assessDeliverableRow,
   persistDeliverableAssessment,
   sweepDeliverables,
@@ -513,6 +514,11 @@ export const deliverableRoutes: FastifyPluginAsync = async (app) => {
     const set: Record<string, unknown> = {
       actualIssueDate: body.actualIssueDate ?? todayISO(),
       status: "issued",
+      // Who issued it is the fact acceptance is tested against. Without it the
+      // acceptance check could only look at the registrar, so whoever actually
+      // issued the document could turn round and accept their own issue.
+      issuedBy: req.user!.id,
+      issuedAt: nowISO(),
       rejectedAt: null,
       rejectedReason: null,
       updatedAt: nowISO(),
@@ -551,9 +557,14 @@ export const deliverableRoutes: FastifyPluginAsync = async (app) => {
     const companyId = req.companyId!;
     const row = await loadDeliverable(companyId, projectId, deliverableId);
     if (row.status !== "issued") throw badRequest("Only an issued deliverable can be accepted.");
-    if (row.createdBy === req.user!.id) {
+    // The issuer is who the acceptance is tested against; the registrar is the
+    // fallback only for rows issued before the issuer was recorded.
+    const issuer = row.issuedBy ?? row.createdBy;
+    if (issuer === req.user!.id) {
       throw forbidden(
-        "A deliverable is accepted by someone other than the person who registered and issued it. Otherwise acceptance records nothing.",
+        row.issuedBy === req.user!.id
+          ? "A deliverable is accepted by someone other than the person who issued it. Accepting your own issue records nothing: the assertion and the evidence that tests it would carry one name."
+          : "A deliverable is accepted by someone other than the person who registered and issued it. Otherwise acceptance records nothing.",
       );
     }
     const [updated] = await app.db
@@ -568,7 +579,7 @@ export const deliverableRoutes: FastifyPluginAsync = async (app) => {
       action: "state_change",
       objectType: "design_deliverable",
       objectId: deliverableId,
-      payload: { to: "accepted", note: body.note ?? null },
+      payload: { to: "accepted", issuedBy: issuer, acceptedBy: req.user!.id, note: body.note ?? null },
     });
     return updated;
   });
@@ -587,6 +598,10 @@ export const deliverableRoutes: FastifyPluginAsync = async (app) => {
         rejectedAt: nowISO(),
         rejectedReason: body.reason,
         actualIssueDate: null,
+        // The rejected issue no longer counts, so neither does its issuer: the
+        // next issue records whoever actually makes it.
+        issuedBy: null,
+        issuedAt: null,
         acceptedAt: null,
         acceptedBy: null,
         updatedAt: nowISO(),
@@ -643,11 +658,14 @@ export const deliverableRoutes: FastifyPluginAsync = async (app) => {
         actualIssueDate: designDeliverables.actualIssueDate,
       })
       .from(designDeliverables)
-      .where(and(eq(designDeliverables.companyId, req.companyId!), eq(designDeliverables.projectId, projectId)));
+      .where(and(eq(designDeliverables.companyId, req.companyId!), eq(designDeliverables.projectId, projectId)))
+      .orderBy(desc(designDeliverables.createdAt))
+      .limit(ROLLUP_ROW_CAP);
     const consultants = await app.db
       .select({ id: designConsultants.id, name: designConsultants.name, discipline: designConsultants.discipline })
       .from(designConsultants)
-      .where(and(eq(designConsultants.companyId, req.companyId!), eq(designConsultants.projectId, projectId)));
+      .where(and(eq(designConsultants.companyId, req.companyId!), eq(designConsultants.projectId, projectId)))
+      .limit(ROLLUP_ROW_CAP);
     const names = new Map(consultants.map((c) => [c.id, c.name]));
     return {
       overall: slippageStats(rows),
@@ -711,7 +729,7 @@ export const deliverableRoutes: FastifyPluginAsync = async (app) => {
     const companyId = req.companyId!;
     if (body.packageId) await assertPackage(app.db, companyId, projectId, body.packageId);
     if (body.consultantId) await assertConsultant(app.db, companyId, projectId, body.consultantId);
-    if (body.responsibleUserId) await assertUser(app.db, body.responsibleUserId);
+    if (body.responsibleUserId) await assertUser(app.db, companyId, body.responsibleUserId);
     if (body.responsibleVendorId) await assertVendor(app.db, companyId, body.responsibleVendorId);
     const { number, reference } = await allocateReference(app.db, projectId, "design_info_requirement", "IR");
     const id = newId("dir");
@@ -761,7 +779,7 @@ export const deliverableRoutes: FastifyPluginAsync = async (app) => {
       }
       if (body.packageId) await assertPackage(app.db, companyId, projectId, body.packageId);
       if (body.consultantId) await assertConsultant(app.db, companyId, projectId, body.consultantId);
-      if (body.responsibleUserId) await assertUser(app.db, body.responsibleUserId);
+      if (body.responsibleUserId) await assertUser(app.db, companyId, body.responsibleUserId);
       const set = patchSet(body as Record<string, unknown>, [
         "kind",
         "title",

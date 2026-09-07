@@ -37,6 +37,7 @@ import {
   costCodes,
   customFieldDefs,
   customFieldValues,
+  distributionGroupMembers,
   distributionGroups,
   drawingSheets,
   equipment,
@@ -44,6 +45,7 @@ import {
   invoiceLineItems,
   legalHolds,
   locations,
+  notifications,
   portfolios,
   projectMemberships,
   projects,
@@ -59,6 +61,8 @@ import {
   users,
   watchers,
   wbsSegments,
+  workflowInstances,
+  workflowStepInstances,
   workflowTemplates,
 } from "@constructos/db";
 import {
@@ -70,6 +74,7 @@ import {
 } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
+import type { Db } from "../../lib/db.js";
 import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { pushNotifications, notifyWatchers } from "../notifications/service.js";
@@ -91,6 +96,11 @@ import {
   type ImportRowError,
 } from "./import.js";
 import { checkRecord } from "./records.js";
+import {
+  loadVendorsByName,
+  referencedVendorNames,
+  unresolvedVendorFindings,
+} from "../directory/importrefs.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -829,20 +839,98 @@ export const projectsModule: FastifyPluginAsync = async (app) => {
       await del("savedViews", () =>
         tx.delete(savedViews).where(eq(savedViews.projectId, projectId)).returning({ id: savedViews.id }),
       );
+      /*
+       * Notifications go with the project.
+       *
+       * A notification deep-links to /projects/<id>; once the project is
+       * gone the link 403s, so leaving the row behind produces an inbox item
+       * that can never be opened and a badge count that can never be
+       * cleared by acting on it.
+       */
+      await del("notifications", () =>
+        tx
+          .delete(notifications)
+          .where(eq(notifications.projectId, projectId))
+          .returning({ id: notifications.id }),
+      );
+      /*
+       * Workflow instances AND their steps.
+       *
+       * `workflow_step_instances` carries only `instance_id` — no tenant or
+       * project column — so deleting the instances alone left every step row
+       * behind, orphaned and unreachable: the same dangling-child problem the
+       * purge exists to end.
+       */
+      const doomedInstances = await tx
+        .select({ id: workflowInstances.id })
+        .from(workflowInstances)
+        .where(eq(workflowInstances.projectId, projectId));
+      const doomedIds = doomedInstances.map((r) => r.id);
+      counts["workflowSteps"] =
+        doomedIds.length === 0
+          ? 0
+          : (
+              await tx
+                .delete(workflowStepInstances)
+                .where(inArray(workflowStepInstances.instanceId, doomedIds))
+                .returning({ id: workflowStepInstances.id })
+            ).length;
+      await del("workflowInstances", () =>
+        tx
+          .delete(workflowInstances)
+          .where(eq(workflowInstances.projectId, projectId))
+          .returning({ id: workflowInstances.id }),
+      );
+      /*
+       * Distribution groups and their members — same dangling-child shape:
+       * `distribution_group_members` carries only `group_id`.
+       */
+      const doomedGroups = await tx
+        .select({ id: distributionGroups.id })
+        .from(distributionGroups)
+        .where(eq(distributionGroups.projectId, projectId));
+      const doomedGroupIds = doomedGroups.map((g) => g.id);
+      counts["distributionGroupMembers"] =
+        doomedGroupIds.length === 0
+          ? 0
+          : (
+              await tx
+                .delete(distributionGroupMembers)
+                .where(inArray(distributionGroupMembers.groupId, doomedGroupIds))
+                .returning({ id: distributionGroupMembers.id })
+            ).length;
+      await del("distributionGroups", () =>
+        tx
+          .delete(distributionGroups)
+          .where(eq(distributionGroups.projectId, projectId))
+          .returning({ id: distributionGroups.id }),
+      );
       await tx.delete(projects).where(eq(projects.id, projectId));
+      /*
+       * The ledger append is INSIDE this transaction.
+       *
+       * Everywhere else in the codebase the operational write commits first
+       * and the ledger append follows, so a failing append leaves exactly the
+       * unledgered mutation lib/ledger.ts says is unacceptable. For a purge
+       * that is unrecoverable: the rows are gone and nothing records that
+       * they were. `appendLedger` opens a nested transaction (a savepoint)
+       * when handed a transaction handle, and its per-company advisory lock
+       * is held to the outer commit — so either the purge and its ledger
+       * entry both land, or neither does.
+       */
+      await appendLedger(tx as Db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "delete",
+        objectType: "project",
+        objectId: projectId,
+        payload: { event: "purged", name: project.name, removed: counts },
+        storePayload: true,
+        projectId,
+      });
       return counts;
     });
 
-    await appendLedger(app.db, {
-      companyId: req.companyId!,
-      actorId: req.user!.id,
-      action: "delete",
-      objectType: "project",
-      objectId: projectId,
-      payload: { event: "purged", name: project.name, removed },
-      storePayload: true,
-      projectId,
-    });
     return { ok: true, purged: true, removed };
   });
 
@@ -1049,9 +1137,41 @@ export const projectsModule: FastifyPluginAsync = async (app) => {
           companyId,
           projectId: newProjectId,
           name: row.name,
+          sourceId: row.id,
         }));
-        if (values.length > 0) await tx.insert(distributionGroups).values(values);
+        if (values.length > 0) {
+          await tx
+            .insert(distributionGroups)
+            .values(values.map(({ sourceId: _ignored, ...v }) => v));
+        }
         copied["distributionGroups"] = values.length;
+        /*
+         * The recipients too. Copying group NAMES and reporting
+         * "3 distributionGroups" reads as confirmation, and the first
+         * distribution from the cloned project goes to nobody with nothing
+         * saying so.
+         */
+        const groupIdMap = new Map(values.map((v) => [v.sourceId, v.id]));
+        let members = 0;
+        if (groupIdMap.size > 0) {
+          const memberRows = await tx
+            .select()
+            .from(distributionGroupMembers)
+            .where(inArray(distributionGroupMembers.groupId, [...groupIdMap.keys()]));
+          const memberValues = memberRows.map((row) => ({
+            id: newId("dgm"),
+            groupId: groupIdMap.get(row.groupId)!,
+            userId: row.userId,
+            contactId: row.contactId,
+            email: row.email,
+            memberKey: row.memberKey,
+          }));
+          if (memberValues.length > 0) {
+            await tx.insert(distributionGroupMembers).values(memberValues);
+          }
+          members = memberValues.length;
+        }
+        copied["distributionGroupMembers"] = members;
       }
 
       return copied;
@@ -1994,6 +2114,14 @@ export const projectsModule: FastifyPluginAsync = async (app) => {
     async (req, reply) => {
       const { recordType, recordId } = req.params as RecordParams;
       const body = commentCreateSchema.parse(req.body);
+      /*
+       * Prove the record is IN this project before stamping the URL's
+       * companyId/projectId onto it. Without this a caller with standard
+       * access to project A could comment on a record of project B — an
+       * orphan comment filed under A, and (with the watcher fan-out below)
+       * the comment text delivered to B's watchers.
+       */
+      await assertRecordInProject(req.companyId!, req.projectId!, recordType, recordId);
       const id = newId("cmt");
       const mentionIds = [...new Set(body.mentions ?? [])].filter((m) => m !== req.user!.id);
 
@@ -2078,6 +2206,11 @@ export const projectsModule: FastifyPluginAsync = async (app) => {
         .where(
           and(
             eq(watchers.companyId, req.companyId!),
+            // Project-scoped, like the GET route: `watchers` is addressed by
+            // (recordType, recordId), and a record id colliding across two
+            // projects of one tenant otherwise delivers the comment text to
+            // people who cannot open the project it was written in.
+            eq(watchers.projectId, req.projectId!),
             eq(watchers.recordType, recordType),
             eq(watchers.recordId, recordId),
           ),
@@ -2715,6 +2848,21 @@ export const projectsModule: FastifyPluginAsync = async (app) => {
     if (q.projectId) {
       conds.push(or(isNull(savedViews.projectId), eq(savedViews.projectId, q.projectId))!);
     }
+    /*
+     * A company-scoped view attached to a project the caller cannot open is
+     * still that project's business: its name and saved state name cost
+     * codes, vendors and thresholds. Company-wide views (projectId null) are
+     * shared by design; project-scoped ones follow the same membership rule
+     * as the projects themselves (PLAN §6.3).
+     */
+    const visible = await visibleProjectIds(app, req);
+    if (visible !== null) {
+      conds.push(
+        visible.length === 0
+          ? isNull(savedViews.projectId)
+          : or(isNull(savedViews.projectId), inArray(savedViews.projectId, visible))!,
+      );
+    }
     const items = await app.db
       .select()
       .from(savedViews)
@@ -2918,6 +3066,20 @@ export const projectsModule: FastifyPluginAsync = async (app) => {
       await liveProject(req.companyId!, body.projectId);
     }
     const preview = validateRows(spec, toRecords(parseCsv(body.csv)));
+    /*
+     * The column spec cannot know whether "Acme Ltd." is a vendor this tenant
+     * has. Cross-reference the directory before anybody is asked to approve
+     * the file: a dry run that reports nothing about 60 unmatched employers
+     * is worse than no dry run, because it is believed.
+     */
+    if (dataset === "contacts") {
+      const byName = await loadVendorsByName(
+        app.db,
+        req.companyId!,
+        referencedVendorNames(preview.rows),
+      );
+      preview.errors = [...preview.errors, ...unresolvedVendorFindings(preview.rows, byName)];
+    }
     const id = newId("imp");
     await app.db.insert(importJobs).values({
       id,

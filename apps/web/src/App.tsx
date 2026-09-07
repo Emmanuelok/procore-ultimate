@@ -73,6 +73,45 @@ const IntegrationsPage = lazy(() => import("./pages/integrations/IntegrationsPag
 const InsurancePage = lazy(() => import("./pages/insurance/InsurancePage"));
 
 /* --------------------------------------------------------------------------
+ * WP-SHELL. Twenty workspaces that shipped complete and unreachable: no
+ * import, no route, no chunk. Ten are company-scoped, ten project-scoped.
+ *
+ * Two of them are why this block exists at all:
+ *   • SecurityPage is the ENTIRE company security workspace (policy,
+ *     sessions, lockout, IP allowlist, retention, legal hold, SCIM, audit).
+ *     Until now the only way in was an Organisation tab on /account/security.
+ *   • AgentsPage is the AI agents console. WP-INTEL's attention feed already
+ *     emits /agents for agent_proposal items, so those rows resolved to
+ *     nothing without this route.
+ *
+ * AutomationPage is deliberately mounted TWICE. One component serves both
+ * scopes — it reads the scope from the route via `useScope()` in
+ * automationShared — so /automation and /projects/:projectId/automation are
+ * the same module rendering different data, not a duplicated page.
+ * ----------------------------------------------------------------------- */
+const PulsePage = lazy(() => import("./pages/pulse/PulsePage"));
+const WorkflowsPage = lazy(() => import("./pages/admin/WorkflowsPage"));
+const SearchPage = lazy(() => import("./pages/admin/SearchPage"));
+const PortfolioPage = lazy(() => import("./pages/portfolio/PortfolioPage"));
+const FinancePortfolioPage = lazy(() => import("./pages/finance/FinancePortfolioPage"));
+const ReviewerWorkspacePage = lazy(() => import("./pages/governance/ReviewerWorkspacePage"));
+const DisputeAnalyticsPage = lazy(() => import("./pages/disputes/DisputeAnalyticsPage"));
+const AutomationPage = lazy(() => import("./pages/automation/AutomationPage"));
+const AgentsPage = lazy(() => import("./pages/agents/AgentsPage"));
+const SecurityPage = lazy(() => import("./pages/auth/SecurityPage"));
+
+const CorrespondencePage = lazy(() => import("./pages/correspondence/CorrespondencePage"));
+const DesignPage = lazy(() => import("./pages/design/DesignPage"));
+const ObservationsPage = lazy(() => import("./pages/punch/ObservationsPage"));
+const SitePage = lazy(() => import("./pages/site/SitePage"));
+const SupplyChainPage = lazy(() => import("./pages/supplychain/SupplyChainPage"));
+const ResourcesPage = lazy(() => import("./pages/resources/ResourcesPage"));
+const EstimatingPage = lazy(() => import("./pages/estimating/EstimatingPage"));
+const TaxPage = lazy(() => import("./pages/tax/TaxPage"));
+const ProjectPortfolioPage = lazy(() => import("./pages/portfolio/ProjectPortfolioPage"));
+const IntelligencePage = lazy(() => import("./pages/intelligence/IntelligencePage"));
+
+/* --------------------------------------------------------------------------
  * The financial suite (M2–M6). Five complete, project-scoped workspaces that
  * shipped without routes; each exports a default component and reads
  * `projectId` from useParams.
@@ -338,6 +377,88 @@ export default function App() {
                 element={
                   <S>
                     <AdminPage />
+                  </S>
+                }
+              />
+
+              {/* ---- WP-SHELL: company workspaces ---- */}
+              <Route
+                path="pulse"
+                element={
+                  <S>
+                    <PulsePage />
+                  </S>
+                }
+              />
+              <Route
+                path="workflows"
+                element={
+                  <S>
+                    <WorkflowsPage />
+                  </S>
+                }
+              />
+              <Route
+                path="search"
+                element={
+                  <S>
+                    <SearchPage />
+                  </S>
+                }
+              />
+              <Route
+                path="portfolio"
+                element={
+                  <S>
+                    <PortfolioPage />
+                  </S>
+                }
+              />
+              <Route
+                path="finance-portfolio"
+                element={
+                  <S>
+                    <FinancePortfolioPage />
+                  </S>
+                }
+              />
+              <Route
+                path="assurance-reviews"
+                element={
+                  <S>
+                    <ReviewerWorkspacePage />
+                  </S>
+                }
+              />
+              <Route
+                path="dispute-outcomes"
+                element={
+                  <S>
+                    <DisputeAnalyticsPage />
+                  </S>
+                }
+              />
+              <Route
+                path="automation"
+                element={
+                  <S>
+                    <AutomationPage />
+                  </S>
+                }
+              />
+              <Route
+                path="agents"
+                element={
+                  <S>
+                    <AgentsPage />
+                  </S>
+                }
+              />
+              <Route
+                path="security"
+                element={
+                  <S>
+                    <SecurityPage />
                   </S>
                 }
               />
@@ -695,6 +816,96 @@ export default function App() {
                   element={
                     <S>
                       <BiddingPage />
+                    </S>
+                  }
+                />
+
+                {/* ---- WP-SHELL: project workspaces ---- */}
+                <Route
+                  path="correspondence"
+                  element={
+                    <S>
+                      <CorrespondencePage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="design"
+                  element={
+                    <S>
+                      <DesignPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="observations"
+                  element={
+                    <S>
+                      <ObservationsPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="site"
+                  element={
+                    <S>
+                      <SitePage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="supply-chain"
+                  element={
+                    <S>
+                      <SupplyChainPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="resources"
+                  element={
+                    <S>
+                      <ResourcesPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="estimating"
+                  element={
+                    <S>
+                      <EstimatingPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="tax"
+                  element={
+                    <S>
+                      <TaxPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="portfolio"
+                  element={
+                    <S>
+                      <ProjectPortfolioPage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="intelligence"
+                  element={
+                    <S>
+                      <IntelligencePage />
+                    </S>
+                  }
+                />
+                <Route
+                  path="automation"
+                  element={
+                    <S>
+                      <AutomationPage />
                     </S>
                   }
                 />

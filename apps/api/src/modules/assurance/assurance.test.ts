@@ -29,6 +29,10 @@ let projectId: string;
 /** headers for `reviewer` acting inside owner's company */
 let reviewerHeaders: Record<string, string>;
 
+// 120s, not the global 30s: this hook boots an embedded PGlite and applies the whole
+// migration set, which on a loaded build machine takes longer than the default hook
+// timeout — a worker that times out here reports every test in the file as skipped,
+// which looks exactly like a green run that tested nothing.
 beforeAll(async () => {
   built = await buildTestApp();
   app = built.app;
@@ -51,7 +55,7 @@ beforeAll(async () => {
     companyId: owner.companyId,
     name: "P1",
   });
-});
+}, 120_000);
 
 afterAll(async () => {
   await built.close();

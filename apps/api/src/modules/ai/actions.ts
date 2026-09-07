@@ -25,14 +25,17 @@
  * caller runs them after the transaction commits, which is how every other
  * module on this platform orders those two things.
  */
-import { and, eq, lt, ne } from "drizzle-orm";
+import { and, eq, isNull, lt, ne } from "drizzle-orm";
 import {
   agentActions,
   aiReviewQueue,
+  comments,
   dailyLogs,
   drawingSheets,
+  photos,
   rfis,
   signals,
+  submittals,
 } from "@constructos/db";
 import type { LedgerAction } from "@constructos/shared";
 import type { Db } from "../../lib/db.js";
@@ -90,6 +93,9 @@ export const OPERATIONAL_TARGET_TYPES = [
   "rfi_response",
   "drawing_sheet",
   "signal_explanation",
+  // Approval writes an advisory review comment on the submittal (#763); it
+  // sets no response code, but it does create a record another module owns.
+  "submittal_review",
 ] as const;
 
 /* ------------------------------------------------------------------ */
@@ -101,24 +107,45 @@ export const OPERATIONAL_TARGET_TYPES = [
  * Called when a new proposal is created and when a guard refuses an old one:
  * duplicate pending items for one target were the mechanism by which a stale
  * proposal stayed applicable forever.
+ *
+ * Scoped by PROJECT as well as company. A `daily_log` proposal's targetId is
+ * a calendar DATE, not a record id, so without the project predicate queuing
+ * a draft on one project silently superseded another project's pending draft
+ * for the same day — and ledgered that state change against the wrong
+ * project.
+ *
+ * A NULL targetId is not "no target": four fleet agents draft a whole-project
+ * artefact (evidence assessment, document synthesis, cost forecast, schedule
+ * risk) and three of those are schedulable, so returning early on a null id —
+ * the old behaviour — meant a daily cost forecast queued a fresh identical
+ * proposal every day and superseded none of them. Fourteen pending items for
+ * one project then inflated the console's "awaiting a human" count, the
+ * health-inputs metric and the attention feed. With no id to match on, the
+ * target IS (project, targetType): the newest whole-project forecast replaces
+ * the previous whole-project forecast, which is what a reader means by it.
  */
 export async function supersedePending(
   db: Db,
   companyId: string,
+  projectId: string | null,
   targetType: string,
   targetId: string | null,
   exceptId: string | null,
   now: string,
 ): Promise<string[]> {
-  if (!targetId) return [];
   const rows = await db
     .update(aiReviewQueue)
     .set({ status: "superseded", reviewedAt: now })
     .where(
       and(
         eq(aiReviewQueue.companyId, companyId),
+        projectId === null
+          ? isNull(aiReviewQueue.projectId)
+          : eq(aiReviewQueue.projectId, projectId),
         eq(aiReviewQueue.targetType, targetType),
-        eq(aiReviewQueue.targetId, targetId),
+        targetId === null
+          ? isNull(aiReviewQueue.targetId)
+          : eq(aiReviewQueue.targetId, targetId),
         eq(aiReviewQueue.status, "pending"),
         exceptId ? ne(aiReviewQueue.id, exceptId) : undefined,
       ),
@@ -551,6 +578,103 @@ export async function applyProposal(
     }
 
     /* ---------------------------------------------------------------- */
+    case "submittal_review": {
+      // #763. The review is only useful where the submittal is: approving one
+      // used to change nothing at all, so the reviewer got a success toast and
+      // whoever opened the submittal next saw no trace of the review. It is
+      // written as a comment on the submittal — the same thread a human
+      // reviewer writes into — and the comment id is the before-image, so a
+      // rollback removes exactly what the approval added.
+      //
+      // It deliberately does NOT set `response_code`: a response code is the
+      // reviewer's determination, taken through submittals' own transition
+      // route with its own notifications and ball-in-court move.
+      if (!row.targetId) throw badRequest("Review item is missing its submittal id");
+      if (!row.projectId) throw badRequest("Review item is missing its project");
+      const [submittal] = await tx
+        .select()
+        .from(submittals)
+        .where(and(eq(submittals.id, row.targetId), eq(submittals.companyId, ctx.companyId)))
+        .limit(1);
+      if (!submittal) throw notFound("Target submittal not found");
+
+      const recommendation =
+        typeof proposal["recommendation"] === "string"
+          ? (proposal["recommendation"] as string)
+          : "no recommendation recorded";
+      const findings = Array.isArray(proposal["findings"]) ? (proposal["findings"] as unknown[]) : [];
+      const findingLines = findings
+        .map((f, i) => {
+          if (typeof f === "string") return `${i + 1}. ${f}`;
+          if (f && typeof f === "object") {
+            const o = f as Record<string, unknown>;
+            const text = [o["issue"], o["finding"], o["detail"], o["description"]]
+              .find((v) => typeof v === "string" && v !== "") as string | undefined;
+            const sev = typeof o["severity"] === "string" ? ` [${o["severity"] as string}]` : "";
+            const clause = typeof o["clause"] === "string" ? ` (clause ${o["clause"] as string})` : "";
+            return text ? `${i + 1}. ${text}${clause}${sev}` : null;
+          }
+          return null;
+        })
+        .filter((v): v is string => Boolean(v));
+      const rationale =
+        typeof proposal["rationale"] === "string" ? (proposal["rationale"] as string) : null;
+
+      const body = [
+        `AI submittal review — recommendation: ${recommendation}`,
+        `Accepted by a reviewer on ${ctx.now.slice(0, 10)}. Advisory only: it sets no response code.`,
+        rationale ? `\nRationale: ${rationale}` : "",
+        findingLines.length > 0 ? `\nFindings:\n${findingLines.join("\n")}` : "\nNo findings were recorded.",
+        `\nSource: AI run ${row.runId} (review item ${row.id}).`,
+      ]
+        .filter(Boolean)
+        .join("\n")
+        .slice(0, 20_000);
+
+      const commentId = newId("cmt");
+      await tx.insert(comments).values({
+        id: commentId,
+        companyId: ctx.companyId,
+        projectId: row.projectId,
+        recordType: "submittal",
+        recordId: submittal.id,
+        authorId: actorId ?? submittal.createdBy,
+        body,
+        mentions: [],
+      });
+
+      return {
+        applied: { submittalId: submittal.id, commentId, recommendation },
+        action: {
+          actionType: "comment_submittal_review",
+          targetType: "submittal_review",
+          targetId: submittal.id,
+          beforeImage: { commentId, existed: false },
+          afterImage: { commentId, recommendation, findings: findingLines.length },
+          reversible: true,
+          irreversibleReason: null,
+        },
+        ledger: [
+          {
+            action: "create",
+            objectType: "comment",
+            objectId: commentId,
+            payload: {
+              recordType: "submittal",
+              recordId: submittal.id,
+              source: "ai_submittal_review",
+              recommendation,
+              reviewId: row.id,
+              runId: row.runId,
+            },
+            projectId: row.projectId,
+          },
+        ],
+        notifications: [],
+      };
+    }
+
+    /* ---------------------------------------------------------------- */
     default: {
       // Advisory artefact: the memo, narrative, forecast or assessment is the
       // deliverable. Approval records that a human accepted it; nothing in
@@ -781,6 +905,60 @@ export async function revertAction(
             objectId: signal.id,
             payload: { rollbackOf: action.id },
             projectId: signal.projectId,
+          },
+        ],
+      };
+    }
+
+    case "comment_submittal_review": {
+      const commentId = typeof before?.["commentId"] === "string" ? (before["commentId"] as string) : null;
+      if (!commentId) throw badRequest("Action has no before-image");
+      const removed = await tx
+        .delete(comments)
+        .where(and(eq(comments.id, commentId), eq(comments.companyId, ctx.companyId)))
+        .returning({ id: comments.id, recordId: comments.recordId, projectId: comments.projectId });
+      const row = removed[0];
+      if (!row) {
+        throw notFound("The review comment this action wrote has already been removed");
+      }
+      return {
+        restored: { commentId: row.id, submittalId: row.recordId, deleted: true },
+        ledger: [
+          {
+            action: "delete",
+            objectType: "comment",
+            objectId: row.id,
+            payload: { rollbackOf: action.id, recordType: "submittal", recordId: row.recordId },
+            projectId: row.projectId,
+          },
+        ],
+      };
+    }
+
+    case "tag_photo": {
+      if (!action.targetId || !before) throw badRequest("Action has no before-image");
+      const [photo] = await tx
+        .select()
+        .from(photos)
+        .where(and(eq(photos.id, action.targetId), eq(photos.companyId, ctx.companyId)))
+        .limit(1);
+      if (!photo) throw notFound("The photo this action tagged no longer exists");
+      await tx
+        .update(photos)
+        .set({
+          aiTags: Array.isArray(before["aiTags"]) ? (before["aiTags"] as string[]) : [],
+          aiSummary: typeof before["aiSummary"] === "string" ? (before["aiSummary"] as string) : null,
+        })
+        .where(eq(photos.id, photo.id));
+      return {
+        restored: { photoId: photo.id, tagsRestored: true },
+        ledger: [
+          {
+            action: "update",
+            objectType: "photo",
+            objectId: photo.id,
+            payload: { rollbackOf: action.id, aiTags: before["aiTags"] ?? [] },
+            projectId: photo.projectId,
           },
         ],
       };

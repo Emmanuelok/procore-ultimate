@@ -46,13 +46,21 @@ import {
   totalsByCurrency,
 } from "./shared.js";
 
+/*
+ * Every cost here is a cost INCURRED — it is summed into the item total, into
+ * the per-currency register total and into the internal/external failure
+ * buckets of the cost-of-quality model. A negative entry does not represent a
+ * credit; it silently reduces what rework is reported to have cost, which is
+ * the one number this register exists to be honest about. A credit belongs in
+ * a backcharge, which has its own record.
+ */
 const costFields = {
   labourHours: z.number().finite().nonnegative().nullable().optional(),
-  labourCost: z.number().finite().nullable().optional(),
-  materialCost: z.number().finite().nullable().optional(),
-  plantCost: z.number().finite().nullable().optional(),
-  subcontractorCost: z.number().finite().nullable().optional(),
-  otherCost: z.number().finite().nullable().optional(),
+  labourCost: z.number().finite().nonnegative().nullable().optional(),
+  materialCost: z.number().finite().nonnegative().nullable().optional(),
+  plantCost: z.number().finite().nonnegative().nullable().optional(),
+  subcontractorCost: z.number().finite().nonnegative().nullable().optional(),
+  otherCost: z.number().finite().nonnegative().nullable().optional(),
   currency: z.string().length(3).optional(),
   costBasis: z.enum(REWORK_COST_BASES).optional(),
 };

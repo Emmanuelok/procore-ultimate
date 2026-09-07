@@ -42,6 +42,7 @@ import {
   corrApi,
   count,
   dateTime,
+  downloadCsv,
   isoDate,
   responseTone,
   titleCase,
@@ -95,6 +96,7 @@ function TemplatesView({ projectId, onChanged }: { projectId: string; onChanged:
     `/api/v1/correspondence/form-templates?projectId=${projectId}`,
   );
   const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState<FormTemplateDetail | null>(null);
   const [openId, setOpenId] = useState<string | null>(null);
 
   const columns = useMemo<DataColumns<FormTemplate>>(
@@ -183,11 +185,16 @@ function TemplatesView({ projectId, onChanged }: { projectId: string; onChanged:
         />
       )}
 
-      <TemplateCreateDrawer
-        open={creating}
-        onClose={() => setCreating(false)}
-        onCreated={() => {
+      <TemplateFormDrawer
+        open={creating || editing !== null}
+        template={editing}
+        onClose={() => {
           setCreating(false);
+          setEditing(null);
+        }}
+        onSaved={() => {
+          setCreating(false);
+          setEditing(null);
           list.reload();
           onChanged();
         }}
@@ -195,6 +202,10 @@ function TemplatesView({ projectId, onChanged }: { projectId: string; onChanged:
       <TemplateDrawer
         templateId={openId}
         onClose={() => setOpenId(null)}
+        onEdit={(t) => {
+          setOpenId(null);
+          setEditing(t);
+        }}
         onChanged={() => {
           list.reload();
           onChanged();
@@ -224,16 +235,42 @@ const emptyField = (): FieldDraft => ({
   showWhenValue: "",
 });
 
-function TemplateCreateDrawer({
+/** A template's stored fields, back in the shape the builder edits. */
+function toDrafts(fields: readonly FormFieldDef[]): FieldDraft[] {
+  if (fields.length === 0) return [emptyField()];
+  return fields.map((f) => {
+    const condition = f.visibleWhen?.all?.[0] ?? f.visibleWhen?.any?.[0] ?? null;
+    return {
+      key: f.key,
+      label: f.label,
+      type: f.type,
+      required: f.required === true,
+      options: (f.options ?? []).map((o) => o.value).join(", "),
+      showWhenField: condition?.field ?? "",
+      showWhenValue: condition?.value === undefined || condition?.value === null ? "" : String(condition.value),
+    };
+  });
+}
+
+/**
+ * The builder, used both to write a new form and to correct an existing one.
+ * Editing matters: the detail drawer reports why a template cannot be
+ * published, and without an edit path a template with a reported problem could
+ * only be abandoned and rebuilt under a new key.
+ */
+function TemplateFormDrawer({
   open,
+  template,
   onClose,
-  onCreated,
+  onSaved,
 }: {
   open: boolean;
+  template: FormTemplateDetail | null;
   onClose: () => void;
-  onCreated: () => void;
+  onSaved: () => void;
 }) {
   const action = useAction();
+  const editing = template !== null;
   const [key, setKey] = useState("");
   const [name, setName] = useState("");
   const [category, setCategory] = useState("");
@@ -242,19 +279,18 @@ function TemplateCreateDrawer({
 
   useEffect(() => {
     if (!open) return;
-    setKey("");
-    setName("");
-    setCategory("");
-    setSignatureRequired(false);
-    setFields([emptyField()]);
+    setKey(template?.key ?? "");
+    setName(template?.name ?? "");
+    setCategory(template?.category ?? "");
+    setSignatureRequired(template?.signatureRequired === 1);
+    setFields(template ? toDrafts(template.fields) : [emptyField()]);
     action.clear();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, [open, template?.id, template?.version]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
-    const payload = {
-      key: key.trim(),
+    const body = {
       name: name.trim(),
       category: category.trim() || null,
       signatureRequired,
@@ -279,10 +315,16 @@ function TemplateCreateDrawer({
               : { all: [{ field: f.showWhenField.trim(), operator: "eq", value: f.showWhenValue }] },
         })),
     };
-    const created = await action.run("create", () => corrApi.createFormTemplate(payload));
-    if (created) {
-      toast.success(`"${created.name}" created as a draft.`);
-      onCreated();
+    const saved = editing
+      ? await action.run("save", () => corrApi.patchFormTemplate(template!.id, body))
+      : await action.run("save", () => corrApi.createFormTemplate({ ...body, key: key.trim() }));
+    if (saved) {
+      toast.success(
+        editing
+          ? `"${saved.name}" saved — published forms move to version ${saved.version}.`
+          : `"${saved.name}" created as a draft.`,
+      );
+      onSaved();
     }
   }
 
@@ -291,15 +333,19 @@ function TemplateCreateDrawer({
       open={open}
       onClose={onClose}
       size="lg"
-      title="New form"
-      description="Fields and simple show/hide logic (#459). Publish it when it is ready to be filled in."
+      title={editing ? `Edit ${template!.name}` : "New form"}
+      description={
+        editing
+          ? "Changing the questions on a published form bumps its version; responses already captured keep the version they were answered on."
+          : "Fields and simple show/hide logic (#459). Publish it when it is ready to be filled in."
+      }
       footer={
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button type="submit" form="corr-form-create" loading={action.busy === "create"}>
-            Create draft
+          <Button type="submit" form="corr-form-create" loading={action.busy === "save"}>
+            {editing ? "Save changes" : "Create draft"}
           </Button>
         </div>
       }
@@ -307,8 +353,17 @@ function TemplateCreateDrawer({
       <form id="corr-form-create" onSubmit={submit} className="space-y-4">
         {action.error ? <Alert tone="danger" size="sm">{action.error}</Alert> : null}
         <div className="grid gap-3 sm:grid-cols-2">
-          <Field label="Key" required hint="Lower case, digits, - and _">
-            <Input value={key} onChange={(e) => setKey(e.target.value)} required />
+          <Field
+            label="Key"
+            required={!editing}
+            hint={editing ? "A form's key never changes once it exists" : "Lower case, digits, - and _"}
+          >
+            <Input
+              value={key}
+              disabled={editing}
+              onChange={(e) => setKey(e.target.value)}
+              required={!editing}
+            />
           </Field>
           <Field label="Name" required>
             <Input value={name} onChange={(e) => setName(e.target.value)} required />
@@ -430,10 +485,12 @@ function TemplateCreateDrawer({
 function TemplateDrawer({
   templateId,
   onClose,
+  onEdit,
   onChanged,
 }: {
   templateId: string | null;
   onClose: () => void;
+  onEdit: (template: FormTemplateDetail) => void;
   onChanged: () => void;
 }) {
   const detail = useResource<FormTemplateDetail>(
@@ -465,6 +522,11 @@ function TemplateDrawer({
         <div className="space-y-5">
           {action.error ? <Alert tone="danger" size="sm">{action.error}</Alert> : null}
           <div className="flex flex-wrap gap-2">
+            {template.status !== "archived" ? (
+              <Button size="sm" variant="secondary" onClick={() => onEdit(template)}>
+                Edit questions
+              </Button>
+            ) : null}
             {template.status !== "published" ? (
               <Button
                 size="sm"
@@ -490,6 +552,9 @@ function TemplateDrawer({
           {template.problems.length > 0 ? (
             <Alert tone="danger" size="sm" title="This template cannot be published yet">
               <ReasonList reasons={template.problems} />
+              <Button size="xs" variant="secondary" className="mt-2" onClick={() => onEdit(template)}>
+                Fix the questions
+              </Button>
             </Alert>
           ) : null}
 
@@ -564,6 +629,7 @@ function TemplateDrawer({
 function AssignmentsView({ projectId, onChanged }: { projectId: string; onChanged: () => void }) {
   const [overdueOnly, setOverdueOnly] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [open, setOpen] = useState<FormAssignment | null>(null);
   const params = new URLSearchParams({ page: "1", pageSize: "200" });
   if (overdueOnly) params.set("overdueOnly", "true");
   const list = useResource<Paginated<FormAssignment>>(
@@ -657,9 +723,22 @@ function AssignmentsView({ projectId, onChanged }: { projectId: string; onChange
               "An unreturned form is an unrecorded inspection, not an inspection that passed — assign one with a due date and the platform will chase it.",
           }}
           rowTone={(row) => (row.overdue ? "danger" : undefined)}
+          onRowClick={({ row }) => setOpen(row)}
           aria-label="Form assignments"
         />
       )}
+
+      <AssignmentDrawer
+        projectId={projectId}
+        assignment={open}
+        templateName={open ? (byTemplate.get(open.templateId) ?? open.templateId) : ""}
+        onClose={() => setOpen(null)}
+        onChanged={() => {
+          setOpen(null);
+          list.reload();
+          onChanged();
+        }}
+      />
 
       <AssignDrawer
         projectId={projectId}
@@ -674,6 +753,105 @@ function AssignmentsView({ projectId, onChanged }: { projectId: string; onChange
         }}
       />
     </div>
+  );
+}
+
+/**
+ * One assignment, and the only thing that can still be done to it: withdraw it
+ * with a reason. An assignment that no longer applies but cannot be cancelled
+ * goes on being chased by the overdue sweep for ever.
+ */
+function AssignmentDrawer({
+  projectId,
+  assignment,
+  templateName,
+  onClose,
+  onChanged,
+}: {
+  projectId: string;
+  assignment: FormAssignment | null;
+  templateName: string;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const action = useAction();
+  const [reason, setReason] = useState("");
+
+  useEffect(() => {
+    setReason("");
+    action.clear();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [assignment?.id]);
+
+  const openStatus = assignment?.status === "assigned" || assignment?.status === "in_progress";
+
+  return (
+    <Drawer
+      open={assignment !== null}
+      onClose={onClose}
+      size="sm"
+      title={assignment ? templateName : "Assignment"}
+      description={assignment ? `${titleCase(assignment.status)} · assigned to ${assignment.assigneeName}` : undefined}
+    >
+      {assignment ? (
+        <div className="space-y-4">
+          {action.error ? <Alert tone="danger" size="sm">{action.error}</Alert> : null}
+          <dl className="divide-y divide-border">
+            <Row label="Assigned to">{assignment.assigneeName}</Row>
+            <Row label="Form version">v{assignment.templateVersion}</Row>
+            <Row label="Due">
+              <DueBadge date={assignment.dueDate} daysOverdue={assignment.overdue ? 1 : null} />
+            </Row>
+            <Row label="Response">
+              {assignment.responseId ?? <span className="text-content-subtle">Nothing returned yet</span>}
+            </Row>
+            <Row label="Completed">{isoDate(assignment.completedAt)}</Row>
+          </dl>
+          {assignment.instructions ? (
+            <p className="whitespace-pre-wrap rounded-md border border-border bg-surface-raised p-3 text-meta text-content">
+              {assignment.instructions}
+            </p>
+          ) : null}
+          {openStatus ? (
+            <section className="rounded-md border border-danger-border p-3">
+              <h3 className="mb-1 text-meta font-semibold text-danger-text">Withdraw this assignment</h3>
+              <p className="mb-2 text-2xs text-content-muted">
+                Cancelling stops the overdue chase. The record and the reason stay.
+              </p>
+              <div className="flex gap-2">
+                <Input
+                  size="sm"
+                  value={reason}
+                  placeholder="Reason"
+                  onChange={(e) => setReason(e.target.value)}
+                />
+                <Button
+                  size="sm"
+                  variant="danger"
+                  disabled={reason.trim().length < 3}
+                  loading={action.busy === "cancel"}
+                  onClick={async () => {
+                    const done = await action.run("cancel", () =>
+                      corrApi.cancelAssignment(projectId, assignment.id, reason.trim()),
+                    );
+                    if (done) {
+                      toast.success("Assignment withdrawn.");
+                      onChanged();
+                    }
+                  }}
+                >
+                  Cancel it
+                </Button>
+              </div>
+            </section>
+          ) : (
+            <p className="text-meta text-content-subtle">
+              This assignment is {titleCase(assignment.status).toLowerCase()}; there is nothing left to do to it.
+            </p>
+          )}
+        </div>
+      ) : null}
+    </Drawer>
   );
 }
 
@@ -793,6 +971,7 @@ function ResponsesView({ projectId, onChanged }: { projectId: string; onChanged:
   const [templateId, setTemplateId] = useState("");
   const [openId, setOpenId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const exportAction = useAction();
 
   const params = new URLSearchParams({ page: "1", pageSize: "200" });
   if (status) params.set("status", status);
@@ -888,13 +1067,16 @@ function ResponsesView({ projectId, onChanged }: { projectId: string; onChanged:
               variant="ghost"
               icon={IconDownload}
               disabled={!templateId}
+              loading={exportAction.busy === "export"}
               title={templateId ? undefined : "Choose a form first — the export has one column per field"}
               onClick={() =>
-                window.open(
-                  `/api/v1/projects/${projectId}/correspondence/form-responses/export?templateId=${templateId}`,
-                  "_blank",
-                  "noopener",
-                )
+                void exportAction.run("export", async () => {
+                  await downloadCsv(
+                    `/api/v1/projects/${projectId}/correspondence/form-responses/export?templateId=${templateId}`,
+                    `${byTemplate.get(templateId) ?? "form"}-responses.csv`,
+                  );
+                  return true;
+                })
               }
             >
               Export
@@ -905,6 +1087,12 @@ function ResponsesView({ projectId, onChanged }: { projectId: string; onChanged:
           </div>
         </CardBody>
       </Card>
+
+      {exportAction.error ? (
+        <Alert tone="danger" size="sm">
+          {exportAction.error}
+        </Alert>
+      ) : null}
 
       {list.error ? (
         <LoadError message={list.error} onRetry={list.reload} />
@@ -1026,6 +1214,97 @@ function ResponseCreateDrawer({
   );
 }
 
+/**
+ * A list-valued answer. `multiselect`, `photo` and `file` are the three field
+ * kinds the API validates as arrays, so the renderer has to produce arrays for
+ * them: handing back a string makes the response unsavable AND unsubmittable,
+ * with no way for the person filling it in to clear the field.
+ */
+function asList(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((v) => String(v));
+  if (typeof value === "string" && value.trim() !== "") return [value];
+  return [];
+}
+
+function MultiSelectInput({
+  field,
+  value,
+  disabled,
+  onChange,
+}: {
+  field: FormFieldDef;
+  value: string[];
+  disabled: boolean;
+  onChange: (next: string[]) => void;
+}) {
+  const options = field.options ?? [];
+  if (options.length === 0) {
+    return (
+      <ListInput
+        disabled={disabled}
+        value={value}
+        placeholder="Values, comma separated"
+        hint="This field offers no options, so any comma-separated list is accepted."
+        onChange={onChange}
+      />
+    );
+  }
+  return (
+    <div className="flex flex-wrap gap-x-4 gap-y-1">
+      {options.map((o) => (
+        <label key={o.value} className="flex items-center gap-2 text-meta text-content-muted">
+          <input
+            type="checkbox"
+            disabled={disabled}
+            checked={value.includes(o.value)}
+            onChange={(e) =>
+              onChange(
+                e.target.checked
+                  ? [...value, o.value]
+                  : value.filter((v) => v !== o.value),
+              )
+            }
+          />
+          {o.label}
+        </label>
+      ))}
+    </div>
+  );
+}
+
+function ListInput({
+  value,
+  disabled,
+  placeholder,
+  hint,
+  onChange,
+}: {
+  value: string[];
+  disabled: boolean;
+  placeholder: string;
+  hint?: string;
+  onChange: (next: string[]) => void;
+}) {
+  return (
+    <div className="space-y-1">
+      <Input
+        disabled={disabled}
+        placeholder={placeholder}
+        value={value.join(", ")}
+        onChange={(e) =>
+          onChange(
+            e.target.value
+              .split(",")
+              .map((v) => v.trim())
+              .filter((v) => v !== ""),
+          )
+        }
+      />
+      {hint ? <p className="text-2xs text-content-subtle">{hint}</p> : null}
+    </div>
+  );
+}
+
 function ResponseDrawer({
   projectId,
   responseId,
@@ -1127,6 +1406,25 @@ function ResponseDrawer({
                       disabled={response.status !== "draft"}
                       checked={values[f.key] === true}
                       onChange={(e) => setValues((v) => ({ ...v, [f.key]: e.target.checked }))}
+                    />
+                  ) : f.type === "multiselect" ? (
+                    <MultiSelectInput
+                      field={f}
+                      disabled={response.status !== "draft"}
+                      value={asList(values[f.key])}
+                      onChange={(next) => setValues((v) => ({ ...v, [f.key]: next }))}
+                    />
+                  ) : f.type === "photo" || f.type === "file" ? (
+                    <ListInput
+                      disabled={response.status !== "draft"}
+                      value={asList(values[f.key])}
+                      placeholder="File ids, comma separated"
+                      hint={
+                        f.type === "photo"
+                          ? "Photograph file ids, comma separated. Each id is checked against this project's files."
+                          : "File ids, comma separated. Each id is checked against this project's files."
+                      }
+                      onChange={(next) => setValues((v) => ({ ...v, [f.key]: next }))}
                     />
                   ) : (
                     <Input

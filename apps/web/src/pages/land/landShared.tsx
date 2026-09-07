@@ -39,6 +39,12 @@ export interface ParcelRow {
   papCount: number;
 }
 
+/** Acquisition pipeline over the whole register (#551). */
+export interface ParcelSummary {
+  byStatus: Record<string, number>;
+  total: number;
+}
+
 export interface BlockingTask {
   id: string;
   name: string | null;
@@ -50,6 +56,45 @@ export interface ParcelDetail extends ParcelRow {
   affectedPersons: PapRow[];
   blockingTasks: BlockingTask[];
   allowedTransitions: string[];
+  /**
+   * `acquired` is not in the transition table: title passes through the
+   * evidenced /acquire route, which records the BASIS on which it passed.
+   * The server says when that route is open so the workspace never has to
+   * guess (and a state-owned or donated parcel never has to be routed
+   * through a fictitious dispute to be marked acquired).
+   */
+  acquirable: boolean;
+  acquisitionBases: string[];
+  /** bases that require compensation to have been paid before possession */
+  cashAcquisitionBases: string[];
+  /**
+   * Whether a payment can be recorded — INCLUDING a supplementary one on an
+   * already-compensated or acquired parcel. The tab used to hard-code the
+   * three pre-payment statuses, so a revised valuation or a crop missed at
+   * the survey had no route and the register stayed on the first figure.
+   */
+  compensable: boolean;
+  /** a correction restates a paid figure, so it needs one to restate */
+  correctable: boolean;
+  compensationPaymentCount: number;
+  /** the latest payment date; `compensationPaidAt` stays the first */
+  compensationLastPaidAt: string | null;
+  compensationPayments: ParcelPayment[];
+}
+
+/** One payment or correction against a parcel; the total is their sum. */
+export interface ParcelPayment {
+  id: string;
+  kind: "initial" | "supplementary" | "correction";
+  /** the parcel total AFTER this entry */
+  amount: number;
+  /** what this entry moved the total by */
+  delta: number;
+  paidAt: string;
+  reason: string | null;
+  evidenceIds: string[];
+  recordedBy: string;
+  recordedAt: string;
 }
 
 export interface Entitlement {
@@ -70,16 +115,31 @@ export interface PapRow {
   baseline: Record<string, unknown>;
   entitlements: Entitlement[];
   compensationTotal: number | null;
+  /** the currency the entitlement matrix is priced in */
+  currency: string;
   compensationPaidAt: string | null;
   livelihoodProgramme: string | null;
   livelihoodRestoredAt: string | null;
   status: string;
+  /**
+   * `grievance_open` is an OVERLAY the grievance register imposes, not a step
+   * in the resettlement lifecycle. `effectiveStatus` is where the register
+   * actually has the household — a household under a live complaint is still
+   * a compensated, resettled one — and `underOpenGrievance` says the overlay
+   * is on. Rendering only `status` would make a dust complaint look like a
+   * household that lost its resettlement.
+   */
+  effectiveStatus?: string;
+  underOpenGrievance?: boolean;
   censusDate: string | null;
   createdAt: string;
   updatedAt: string;
   vulnerable?: boolean;
   entitlementCount?: number;
   livelihoodRequired?: boolean;
+  physicalDisplacement?: boolean;
+  /** the server's own state machine — the UI drives its buttons from it */
+  allowedTransitions?: string[];
 }
 
 export interface GrievanceSlaRule {
@@ -106,6 +166,12 @@ export interface GrievanceRow {
   acknowledgedAt: string | null;
   resolvedAt: string | null;
   resolution: string | null;
+  /**
+   * Who authored the resolution. Closure verification is segregated from it:
+   * the officer who wrote a resolution cannot also certify that the
+   * complainant accepted it (#573).
+   */
+  resolvedBy: string | null;
   verifiedAt: string | null;
   verifiedBy: string | null;
   complainantSatisfied: boolean | null;
@@ -169,13 +235,34 @@ export interface RapProgress {
   economicallyDisplaced: number;
   vulnerableHouseholds: number;
   byVulnerability: Record<string, number>;
-  compensationCommitted: number;
-  compensationPaid: number;
-  compensationOutstanding: number;
+  /*
+   * Flat totals are stated only when ONE currency is in play. On a scheme
+   * holding compensation in two currencies they are null with a reason, and
+   * `compensationByCurrency` carries the answer — adding UGX to USD would
+   * produce a figure that is not money.
+   */
+  compensationCommitted: number | null;
+  compensationPaid: number | null;
+  compensationOutstanding: number | null;
   compensation: {
-    parcels: { committed: number; paid: number };
-    paps: { committed: number; paid: number };
+    parcels: { committed: number | null; paid: number | null };
+    paps: { committed: number | null; paid: number | null };
   };
+  compensationCurrency: string | null;
+  compensationCurrencies: string[];
+  compensationMixedCurrency: boolean;
+  compensationByCurrency: Record<
+    string,
+    {
+      currency: string;
+      committed: number;
+      paid: number;
+      outstanding: number;
+      parcels: { committed: number; paid: number };
+      paps: { committed: number; paid: number };
+    }
+  >;
+  compensationReasons: string[];
   livelihoodRequired: number;
   livelihoodRestored: number;
   livelihoodRestoredPercent: number | null;
@@ -183,25 +270,64 @@ export interface RapProgress {
   cutOffDate: string | null;
 }
 
+/**
+ * Consent to programme (#591). One row per (dependency × blocked task), and
+ * a dependency is a land parcel OR a statutory permit — the two registers
+ * are answered by one engine, because a task blocked by both an unacquired
+ * parcel and an ungranted consent is blocked once, by its worst dependency.
+ *
+ * `daysUntilStart` is null when the task carries no planned start, and
+ * `parcelId` is null on a permit row: neither may be treated as zero.
+ */
 export interface ScheduleRiskItem {
-  parcelId: string;
+  kind: "parcel" | "permit";
+  dependencyId: string;
+  /** set only on a parcel row (kept for the parcel drawer link) */
+  parcelId: string | null;
+  /** set only on a permit row */
+  permitId: string | null;
   reference: string;
+  label: string;
   status: string;
-  tenureType: string;
-  ownerName: string | null;
   taskId: string;
   taskName: string;
-  taskStart: string;
-  daysUntilStart: number;
+  taskStart: string | null;
+  daysUntilStart: number | null;
+  isCritical: boolean;
+  totalFloat: number | null;
+  /** days the dependency is expected to resolve AFTER the task should start */
+  daysAtRisk: number;
+  expectedResolutionDate: string;
+  /** where the expectation came from — evidence or a stated assumption */
+  estimateSource: "observed_median" | "default" | "unknown_state";
+  estimateSampleSize: number;
+  /** days-at-risk beyond the float that could absorb it; null when unknowable */
+  slipContribution: number | null;
+  startedUnconsented: boolean;
+  basis: string;
+  detail: Record<string, unknown>;
+}
+
+export interface ScheduleRiskSummary {
+  blockedTasks: number;
+  criticalBlockedTasks: number;
+  startedUnconsented: number;
+  blockingParcels: number;
+  blockingPermits: number;
+  projectedSlipDays: number | null;
+  unquantifiedTasks: number;
+  soonestBlockedStart: string | null;
 }
 
 export interface ScheduleRisk {
   horizonDays: number;
   blockedTasks: number;
   blockedParcels: number;
+  blockingPermits: number;
   imminent: number;
   alreadyStarted: number;
   signalHorizonDays: number;
+  summary: ScheduleRiskSummary;
   items: ScheduleRiskItem[];
 }
 
@@ -423,11 +549,27 @@ export function fmtShare(value: number | null | undefined): string {
   return `${fmtNum(value * 100, 0)}%`;
 }
 
-/** Human phrasing for the schedule-risk countdown. */
-export function startPhrase(days: number): string {
+/**
+ * Human phrasing for the schedule-risk countdown. A task with no planned
+ * start has no countdown — it says so rather than reading as "starts today",
+ * which is what treating the missing value as 0 used to do.
+ */
+export function startPhrase(days: number | null | undefined): string {
+  if (days === null || days === undefined || !Number.isFinite(days)) return "no planned start";
   if (days < 0) return `started ${Math.abs(days)}d ago`;
   if (days === 0) return "starts today";
   return `in ${days}d`;
+}
+
+/** How the days-at-risk expectation was arrived at — evidence or assumption. */
+export function estimateBasisLabel(
+  source: ScheduleRiskItem["estimateSource"],
+  sampleSize: number,
+): string {
+  if (source === "observed_median")
+    return `median of ${sampleSize} comparable resolution${sampleSize === 1 ? "" : "s"} on this company's own record`;
+  if (source === "default") return "documented default duration for this state (no history yet)";
+  return "no documented duration for this state — a conservative 90-day assumption";
 }
 
 /**

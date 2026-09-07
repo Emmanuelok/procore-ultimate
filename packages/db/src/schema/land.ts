@@ -20,6 +20,22 @@ const updatedAt = () =>
  * single source of delay on internationally financed infrastructure.
  * Compliance frames: IFC Performance Standard 5 / World Bank ESS5.
  */
+/** One recorded compensation payment or correction against a parcel. */
+export interface ParcelCompensationPayment {
+  id: string;
+  /** initial payment, a later supplement, or a restatement of the total */
+  kind: "initial" | "supplementary" | "correction";
+  /** the parcel total AFTER this entry */
+  amount: number;
+  /** the movement this entry made to the total (negative for a correction down) */
+  delta: number;
+  paidAt: string;
+  reason: string | null;
+  evidenceIds: string[];
+  recordedBy: string;
+  recordedAt: string;
+}
+
 export const landParcels = pgTable(
   "land_parcels",
   {
@@ -35,10 +51,25 @@ export const landParcels = pgTable(
     ownerEntityId: text("owner_entity_id"),
     encumbrances: text("encumbrances"),
     status: text("status").default("identified").notNull(), // ParcelStatus
+    /** how title actually passed — AcquisitionBasis (#551-554) */
+    acquisitionBasis: text("acquisition_basis"),
+    acquiredAt: text("acquired_at"), // ISO date
     valuationAmount: doublePrecision("valuation_amount"),
     compensationAmount: doublePrecision("compensation_amount"),
     currency: text("currency").default("USD").notNull(),
     compensationPaidAt: text("compensation_paid_at"), // ISO date
+    /**
+     * Every payment made against this parcel, in order. `compensationAmount`
+     * is their SUM, not the last one keyed: a supplementary payment and a
+     * corrected figure are both routine on a RAP, and a register that can
+     * only hold the first number understates what was actually paid.
+     * [{ id, kind: "initial"|"supplementary"|"correction", amount, delta,
+     *    paidAt, reason, evidenceIds, recordedBy, recordedAt }]
+     */
+    compensationPayments: jsonb("compensation_payments")
+      .$type<ParcelCompensationPayment[]>()
+      .default([])
+      .notNull(),
     /** links to the assurance evidence substantiating payment/verification */
     evidenceIds: jsonb("evidence_ids").$type<string[]>().default([]).notNull(),
     latitude: doublePrecision("latitude"),
@@ -78,11 +109,27 @@ export const affectedPersons = pgTable(
     /** entitlement matrix application (#566): [{ item, basis, amount, delivered }] */
     entitlements: jsonb("entitlements").$type<unknown[]>().default([]).notNull(),
     compensationTotal: doublePrecision("compensation_total"),
+    /**
+     * The currency the entitlement matrix is priced in. Parcels have always
+     * carried one; households did not, so every household figure was summed
+     * into the parcel total and rendered as dollars regardless of where the
+     * scheme is. A compensation total that adds UGX to USD is not a number.
+     */
+    currency: text("currency").default("USD").notNull(),
     compensationPaidAt: text("compensation_paid_at"),
     /** livelihood restoration programme tracking (#561) */
     livelihoodProgramme: text("livelihood_programme"),
     livelihoodRestoredAt: text("livelihood_restored_at"),
     status: text("status").default("registered").notNull(), // PapStatus
+    /**
+     * Where the register had this household before a grievance naming it was
+     * opened. `grievance_open` is a state the grievance module imposes, not a
+     * step in the resettlement lifecycle, so the household has to be able to
+     * come BACK to where it was when the grievance settles — otherwise a dust
+     * complaint permanently erases the fact that the household was
+     * compensated and resettled.
+     */
+    statusBeforeGrievance: text("status_before_grievance"),
     /** declared before the cut-off date; later arrivals are encroachment (#564) */
     censusDate: text("census_date"),
     createdBy: text("created_by").notNull(),
@@ -125,8 +172,20 @@ export const grievances = pgTable(
     /** closure verified with the complainant (#573) */
     verifiedAt: timestamp("verified_at", { withTimezone: true, mode: "string" }),
     verifiedBy: text("verified_by"),
+    /**
+     * Who authored the resolution. Recorded so closure verification can be
+     * refused to the person who wrote what is being verified (segregation of
+     * duties: the assertion and the evidence that tests it are not authored
+     * by the same actor through the same pathway).
+     */
+    resolvedBy: text("resolved_by"),
     complainantSatisfied: integer("complainant_satisfied"),
     status: text("status").default("received").notNull(), // GrievanceStatus
+    /** escalation ladder position (#572): 0 site officer .. 3 external route */
+    escalationTier: integer("escalation_tier").default(0).notNull(),
+    escalatedAt: timestamp("escalated_at", { withTimezone: true, mode: "string" }),
+    /** [{ at, fromTier, toTier, reason, automatic, assigneeId }] */
+    escalationHistory: jsonb("escalation_history").$type<unknown[]>().default([]).notNull(),
     assigneeId: text("assignee_id"),
     obligationId: text("obligation_id"),
     createdBy: text("created_by").notNull(),
@@ -182,5 +241,280 @@ export const engagements = pgTable(
     recordedBy: text("recorded_by").notNull(),
     createdAt: createdAt(),
   },
-  (t) => [index("engagements_project_idx").on(t.projectId, t.engagementDate)],
+  (t) => [
+    index("engagements_project_idx").on(t.projectId, t.engagementDate),
+    index("engagements_kind_idx").on(t.projectId, t.kind),
+    /**
+     * GIN over the JSONB member array so `stakeholder_ids @> '["stk_x"]'`
+     * is an index lookup. Without it, every "what have we discussed with
+     * this stakeholder?" question was a full project scan filtered in JS.
+     */
+    index("engagements_stakeholders_idx").using("gin", t.stakeholderIds),
+  ],
+);
+
+/* ------------------------------------------------------------------ */
+/* WP-SAFEG — resettlement depth                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Replacement-cost verification (#550, IFC PS5 para 27 and its footnote 22).
+ *
+ * The single most common finding on a lender supervision mission is that a
+ * project paid the government's depreciated schedule rate rather than full
+ * replacement cost. Full replacement cost = the market value of the asset
+ * with NO deduction for depreciation, plus the transaction costs the
+ * household actually has to bear (registration, transfer duty, moving) —
+ * so the study has to carry the market survey behind it and the gap it
+ * leaves against what was offered.
+ */
+export const replacementCostStudies = pgTable(
+  "replacement_cost_studies",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    parcelId: text("parcel_id"),
+    papId: text("pap_id"),
+    assetType: text("asset_type").notNull(), // ReplacementAssetType
+    description: text("description").notNull(),
+    method: text("method").notNull(), // ValuationMethod
+    /** the surveyed market value of an equivalent asset */
+    marketValue: doublePrecision("market_value").notNull(),
+    /** depreciation the government schedule would have deducted — recorded so
+     *  the difference between schedule rate and replacement cost is visible */
+    depreciationDeducted: doublePrecision("depreciation_deducted").default(0).notNull(),
+    /** registration, transfer duty, moving costs the household must bear */
+    transactionCosts: doublePrecision("transaction_costs").default(0).notNull(),
+    /** computed at write: marketValue + transactionCosts (no depreciation) */
+    replacementCost: doublePrecision("replacement_cost").notNull(),
+    /** what the project actually offered or paid, when known */
+    compensationOffered: doublePrecision("compensation_offered"),
+    currency: text("currency").default("USD").notNull(),
+    /** computed: replacementCost − compensationOffered, positive = shortfall */
+    shortfall: doublePrecision("shortfall"),
+    verdict: text("verdict").default("unverified").notNull(), // ReplacementVerdict
+    surveyDate: text("survey_date").notNull(),
+    valuerName: text("valuer_name"),
+    /** independent valuer = not the acquiring authority or the contractor */
+    valuerIndependent: integer("valuer_independent").default(0).notNull(),
+    evidenceIds: jsonb("evidence_ids").$type<string[]>().default([]).notNull(),
+    notes: text("notes"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("replacement_cost_project_idx").on(t.projectId),
+    index("replacement_cost_parcel_idx").on(t.parcelId),
+    index("replacement_cost_pap_idx").on(t.papId),
+    index("replacement_cost_verdict_idx").on(t.projectId, t.verdict),
+  ],
+);
+
+/**
+ * Indigenous Peoples plans, cultural heritage management plans, FPIC
+ * processes and chance-find procedures (IFC PS7 / PS8, spec #575-578).
+ * A plan with commitments nobody tracks is a document, not a safeguard, so
+ * every commitment carries a due date and is counted in the RAP dashboard.
+ */
+export const heritagePlans = pgTable(
+  "heritage_plans",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    kind: text("kind").notNull(), // HeritagePlanKind
+    title: text("title").notNull(),
+    /** the community, group or asset the plan is for */
+    subject: text("subject"),
+    status: text("status").default("draft").notNull(), // HeritagePlanStatus
+    /** FPIC standing where PS7 para 12-17 is engaged */
+    consentStatus: text("consent_status"), // ConsentStatus
+    consentEvidenceIds: jsonb("consent_evidence_ids").$type<string[]>().default([]).notNull(),
+    /** [{ id, text, dueDate, owner, status, closedAt, note }] */
+    commitments: jsonb("commitments").$type<unknown[]>().default([]).notNull(),
+    stakeholderIds: jsonb("stakeholder_ids").$type<string[]>().default([]).notNull(),
+    disclosedAt: text("disclosed_at"),
+    reviewDueAt: text("review_due_at"),
+    fileIds: jsonb("file_ids").$type<string[]>().default([]).notNull(),
+    notes: text("notes"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("heritage_plans_project_idx").on(t.projectId),
+    index("heritage_plans_status_idx").on(t.projectId, t.status),
+  ],
+);
+
+/**
+ * Chance finds (PS8 para 16). A find stops the works in the affected area
+ * until the authority has spoken; the register is what proves it did.
+ */
+export const chanceFinds = pgTable(
+  "chance_finds",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    planId: text("plan_id"),
+    discoveredAt: text("discovered_at").notNull(),
+    locationId: text("location_id"),
+    locationDescription: text("location_description"),
+    description: text("description").notNull(),
+    workStoppedAt: timestamp("work_stopped_at", { withTimezone: true, mode: "string" }),
+    authorityNotifiedAt: timestamp("authority_notified_at", {
+      withTimezone: true,
+      mode: "string",
+    }),
+    authority: text("authority"),
+    assessment: text("assessment"),
+    disposition: text("disposition"),
+    releasedAt: timestamp("released_at", { withTimezone: true, mode: "string" }),
+    status: text("status").default("reported").notNull(), // ChanceFindStatus
+    affectedTaskIds: jsonb("affected_task_ids").$type<string[]>().default([]).notNull(),
+    evidenceIds: jsonb("evidence_ids").$type<string[]>().default([]).notNull(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("chance_finds_uq").on(t.projectId, t.number),
+    index("chance_finds_project_idx").on(t.projectId, t.status),
+  ],
+);
+
+/**
+ * Livelihood restoration activities per household (#561, PS5 paras 27-29).
+ *
+ * "Livelihood restored" is a measured claim, not a tick: it holds when
+ * income after the intervention is at least the pre-displacement baseline.
+ * Recording the baseline and the current figure is what turns a training
+ * course into evidence.
+ */
+export const livelihoodActivities = pgTable(
+  "livelihood_activities",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    papId: text("pap_id").notNull(),
+    kind: text("kind").notNull(), // LivelihoodActivityKind
+    description: text("description").notNull(),
+    status: text("status").default("planned").notNull(), // LivelihoodActivityStatus
+    plannedAt: text("planned_at"),
+    deliveredAt: text("delivered_at"),
+    verifiedAt: text("verified_at"),
+    verifiedBy: text("verified_by"),
+    cost: doublePrecision("cost"),
+    currency: text("currency").default("USD").notNull(),
+    /** monthly household income before displacement and at last measurement */
+    incomeBaseline: doublePrecision("income_baseline"),
+    incomeCurrent: doublePrecision("income_current"),
+    incomeMeasuredAt: text("income_measured_at"),
+    evidenceIds: jsonb("evidence_ids").$type<string[]>().default([]).notNull(),
+    notes: text("notes"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("livelihood_activities_project_idx").on(t.projectId),
+    index("livelihood_activities_pap_idx").on(t.papId),
+    index("livelihood_activities_status_idx").on(t.projectId, t.status),
+  ],
+);
+
+/**
+ * RAP completion audit (#568) and lender supervision pack (#558-560).
+ * The audit is a point-in-time assertion about the register, so it stores
+ * the indicator set it computed AND the ledger sequence range it was built
+ * from: an auditor can replay the same window and get the same numbers.
+ */
+export const rapAudits = pgTable(
+  "rap_audits",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    number: integer("number").notNull(),
+    kind: text("kind").default("completion_audit").notNull(),
+    auditor: text("auditor").notNull(),
+    /** independent monitor = not the implementing agency (#568) */
+    auditorIndependent: integer("auditor_independent").default(0).notNull(),
+    auditDate: text("audit_date").notNull(),
+    scope: text("scope"),
+    /** computed indicator set, frozen at the moment of the audit */
+    indicators: jsonb("indicators").$type<Record<string, unknown>>().default({}).notNull(),
+    /** [{ id, ref, severity, finding, recommendation, status, dueDate }] */
+    findings: jsonb("findings").$type<unknown[]>().default([]).notNull(),
+    conclusion: text("conclusion").default("not_assessed").notNull(), // RapAuditConclusion
+    /** the ledger window the pack was assembled from */
+    ledgerSeqFrom: integer("ledger_seq_from"),
+    ledgerSeqTo: integer("ledger_seq_to"),
+    evidenceIds: jsonb("evidence_ids").$type<string[]>().default([]).notNull(),
+    fileIds: jsonb("file_ids").$type<string[]>().default([]).notNull(),
+    notes: text("notes"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("rap_audits_uq").on(t.projectId, t.number),
+    index("rap_audits_project_idx").on(t.projectId, t.auditDate),
+  ],
+);
+
+/**
+ * Grievance triage proposals and their calibration (#571-572).
+ *
+ * An intake officer classifies a grievance in the minutes before the
+ * acknowledgement clock starts, and the severity they choose IS the service
+ * standard the project published to the community. This table records what
+ * the assistant proposed, the precedent and rule text it cited, and — the
+ * point of the exercise — what the officer actually decided, so agreement
+ * can be measured instead of assumed.
+ *
+ * A proposal is never applied on its own: `decidedAt` is set only by an
+ * officer confirming or overriding it, which is also the moment the
+ * grievance's own category/severity change and are ledgered.
+ */
+export const grievanceTriages = pgTable(
+  "grievance_triages",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    grievanceId: text("grievance_id").notNull(),
+    /** ai_runs.id when a model produced this; null for the precedent-only baseline */
+    runId: text("run_id"),
+    /** "precedent" (deterministic tf-idf vote) | "agent" (cited model proposal) */
+    method: text("method").default("precedent").notNull(),
+    proposedCategory: text("proposed_category").notNull(),
+    proposedSeverity: text("proposed_severity").notNull(),
+    proposedAssigneeId: text("proposed_assignee_id"),
+    confidence: doublePrecision("confidence").default(0).notNull(),
+    rationale: text("rationale").notNull(),
+    /** SLA rule text quoted in support of the proposed severity */
+    ruleCitations: jsonb("rule_citations").$type<unknown[]>().default([]).notNull(),
+    /** [{ id, number, score, category, severity, sharedTerms }] */
+    precedents: jsonb("precedents").$type<unknown[]>().default([]).notNull(),
+    /** citations the model made that survived validation against the inputs */
+    citations: jsonb("citations").$type<unknown[]>().default([]).notNull(),
+    decidedCategory: text("decided_category"),
+    decidedSeverity: text("decided_severity"),
+    decidedAssigneeId: text("decided_assignee_id"),
+    decisionNote: text("decision_note"),
+    decidedAt: timestamp("decided_at", { withTimezone: true, mode: "string" }),
+    decidedBy: text("decided_by"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index("grievance_triages_grievance_idx").on(t.grievanceId, t.createdAt),
+    index("grievance_triages_project_idx").on(t.companyId, t.projectId, t.decidedAt),
+  ],
 );

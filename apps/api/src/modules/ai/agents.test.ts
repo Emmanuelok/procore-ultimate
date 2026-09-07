@@ -36,6 +36,7 @@ import type { BuiltApp } from "../../app.js";
 import { newId } from "../../lib/ids.js";
 import { setAiClientFactory, type AiClientLike, type AiRequest } from "./service.js";
 import { bookUsage, usageDate } from "./policy.js";
+import { claimSchedule, runSchedule } from "./schedules.js";
 
 /* ------------------------------------------------------------------ */
 /* The fake model                                                      */
@@ -1220,6 +1221,73 @@ describe("schedules", () => {
     const [run] = await built.app.db.select().from(aiRuns).where(eq(aiRuns.id, runId));
     // A scheduled run borrows nobody's identity.
     expect(run!.requestedBy).toBe("system");
+  });
+
+  // REGRESSION. runSchedule advanced nextRunAt only AFTER the run, so a
+  // 5-minute tick and an operator pressing "Run now" both passed the budget
+  // check (neither had booked yet), both called the model, and two duplicate
+  // proposals were queued for one target. The claim is now a conditional
+  // UPDATE taken before anything else, so exactly one caller proceeds.
+  it("exactly one of two callers claims a due schedule", async () => {
+    // Due-ness is read from the ROW IN THE DATABASE, not from the object the
+    // caller happens to be holding — that is the whole point of a conditional
+    // claim — so the previous test's run (which moved nextRunAt forward) has
+    // to be undone here rather than masked with a local override.
+    await built.app.db
+      .update(agentSchedules)
+      .set({ nextRunAt: null, lastRunAt: null, lastStatus: "done" })
+      .where(eq(agentSchedules.id, scheduleId));
+    const [due] = await built.app.db
+      .select()
+      .from(agentSchedules)
+      .where(eq(agentSchedules.id, scheduleId));
+    const now = new Date();
+    const first = await claimSchedule(built.app.db, due!, now);
+    const second = await claimSchedule(built.app.db, due!, now);
+    expect(first).not.toBeNull();
+    expect(second).toBeNull();
+    expect(first!.lastStatus).toBe("running");
+    // The claim moved the schedule forward, which is what makes the second
+    // caller's WHERE fail.
+    expect(first!.nextRunAt).not.toBeNull();
+  });
+
+  it("a schedule another caller is running is refused, and no second model call happens", async () => {
+    // The state a tick leaves behind between its claim and its finish.
+    await built.app.db
+      .update(agentSchedules)
+      .set({ lastStatus: "running", lastRunAt: new Date().toISOString(), nextRunAt: null })
+      .where(eq(agentSchedules.id, scheduleId));
+
+    const before = callCount;
+    const manual = await inject("POST", `/api/v1/agents/schedules/${scheduleId}/run`);
+    expect(manual.statusCode).toBe(409);
+    expect(manual.json().message).toContain("Already running");
+
+    const [row] = await built.app.db
+      .select()
+      .from(agentSchedules)
+      .where(eq(agentSchedules.id, scheduleId));
+    const tick = await runSchedule(built.app, { ...row!, nextRunAt: null }, new Date());
+    expect(tick.status).toBe("skipped");
+    expect(tick.detail).toContain("Already running");
+    expect(callCount).toBe(before);
+
+    // A stale claim (older than the lease) must not park the schedule forever.
+    const stale = new Date(Date.now() - 2 * 60 * 60_000).toISOString();
+    await built.app.db
+      .update(agentSchedules)
+      .set({ lastStatus: "running", lastRunAt: stale, nextRunAt: null })
+      .where(eq(agentSchedules.id, scheduleId));
+    setResponse({
+      findings: [],
+      summary: "Nothing outstanding.",
+      citations: [{ type: "obligation", id: obligationId }],
+      confidence: 0.5,
+    });
+    const recovered = await inject("POST", `/api/v1/agents/schedules/${scheduleId}/run`);
+    expect(recovered.statusCode).toBe(200);
+    expect(recovered.json().status).toBe("done");
   });
 
   it("patches and deletes a schedule", async () => {

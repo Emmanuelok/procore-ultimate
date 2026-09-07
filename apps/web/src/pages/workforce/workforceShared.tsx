@@ -81,6 +81,8 @@ export interface PayrollRow {
   hoursClaimed: number | null;
   grossPay: number;
   deductions: number;
+  /** coded deduction lines, where the payroll file carried them (#682) */
+  deductionLines?: Array<{ code: string; label: string; amount: number }>;
   netPay: number;
   currency: string;
   paidAt: string | null;

@@ -28,7 +28,7 @@ import {
   ZERO_USAGE,
   type EffectivePolicy,
 } from "./policy.js";
-import { dayRange, interleave, targetTool, tzOffsetMinutes } from "./index.js";
+import { dayRange, interleave, refTool, targetTool, toolsForRefs, tzOffsetMinutes } from "./index.js";
 import { isDue, nextRunAt, staleCutoff } from "./schedules.js";
 import {
   ADVERSARIAL_CASES,
@@ -38,7 +38,13 @@ import {
   summariseBias,
   summariseValidation,
 } from "./reports.js";
-import { AGENT_INVENTORY, getAgentDefinition, KNOWN_AGENT_KINDS } from "./registry.js";
+import {
+  AGENT_DEFINITIONS,
+  AGENT_INVENTORY,
+  getAgentDefinition,
+  KNOWN_AGENT_KINDS,
+} from "./registry.js";
+import { TOOLS } from "@constructos/shared";
 
 const policy = (over: Partial<EffectivePolicy> = {}): EffectivePolicy => ({
   ...GLOBAL_POLICY_DEFAULT,
@@ -338,7 +344,140 @@ describe("reviewer tool mapping", () => {
     expect(targetTool("drawing_sheet")).toBe("drawings");
     expect(targetTool("submittal_review")).toBe("submittals");
     expect(targetTool("signal_explanation")).toBe("assurance");
-    expect(targetTool("cost_forecast")).toBeNull();
+  });
+
+  // REGRESSION. An advisory proposal used to map to null, which gated it at
+  // `ai` level: an ai:standard / budget:none member could read every budget
+  // figure out of a cost_forecast proposal body. The body is data, so the tool
+  // that owns the data gates it.
+  it("gates an ADVISORY target type by the tool that owns the data it quotes", () => {
+    expect(targetTool("cost_forecast")).toBe("budget");
+    expect(targetTool("change_impact")).toBe("budget");
+    expect(targetTool("bid_levelling")).toBe("bidding");
+    expect(targetTool("incident_classification")).toBe("safety");
+    expect(targetTool("spec_compliance")).toBe("specifications");
+    expect(targetTool("schedule_risk")).toBe("schedule");
+    expect(targetTool("meeting_minutes")).toBe("meetings");
+    expect(targetTool("risk_finding")).toBe("risk");
+    expect(targetTool("notice_draft")).toBe("contracts");
+    expect(targetTool("obligation_finding")).toBe("contracts");
+    expect(targetTool("claim_narrative")).toBe("forensics");
+    expect(targetTool("rebuttal")).toBe("forensics");
+    expect(targetTool("evidence_assessment")).toBe("assurance");
+    expect(targetTool("counterfactual")).toBe("assurance");
+    expect(targetTool("integrity_memo")).toBe("assurance");
+    expect(targetTool("document_synthesis")).toBe("drawings");
+    // agent_actions.targetType for the photo-intelligence write
+    expect(targetTool("photo")).toBe("photos");
+    // an unknown type still falls back to the `ai` gate at the call site
+    expect(targetTool("something_new")).toBeNull();
+  });
+
+  it("leaves no fleet target type ungated", () => {
+    for (const entry of AGENT_INVENTORY) {
+      for (const t of entry.targetTypes) {
+        expect(targetTool(t), `${entry.kind} → ${t}`).not.toBeNull();
+      }
+    }
+  });
+});
+
+describe("reading a run back is gated by what the run actually read", () => {
+  // REGRESSION. GET /ai/runs/:id used to be gated on `ai:read` alone, so a
+  // field engineer with budget:none could read every budget line out of a
+  // cost forecaster's prompt. The gate is now the tools that own the records
+  // the run RECORDED in inputRefs — precise where the agent's declared union
+  // would be either too wide (refusing a searcher their own partial answer)
+  // or too narrow.
+  it("maps every input-ref type an agent can supply to a real tool", () => {
+    const toolSet = new Set<string>(TOOLS);
+    for (const type of [
+      "file",
+      "drawing_sheet",
+      "drawing_revision",
+      "spec_section",
+      "rfi",
+      "submittal",
+      "daily_log",
+      "punch",
+      "photo",
+      "meeting",
+      "meeting_agenda_item",
+      "meeting_action_item",
+      "contract",
+      "contract_event",
+      "obligation",
+      "forensic_claim",
+      "delay_event",
+      "assertion",
+      "evidence",
+      "reconciliation",
+      "signal",
+      "entity_relationship",
+      "risk",
+      "budget_line_item",
+      "change_event",
+      "commitment",
+      "schedule_task",
+      "safety_incident",
+      "ncr",
+      "bid_package",
+      "bid_submission",
+      "ai_run",
+    ]) {
+      const tool = refTool(type);
+      expect(tool, type).not.toBeNull();
+      expect(toolSet.has(tool!), `${type} → ${tool}`).toBe(true);
+    }
+  });
+
+  it("gates nothing on project metadata, and falls back to `ai` for the unknown", () => {
+    expect(refTool("project")).toBeNull();
+    expect(refTool("company")).toBeNull();
+    // A type nobody mapped is NOT ungated: it lands on the AI tool.
+    expect(refTool("something_new")).toBe("ai");
+  });
+
+  it("collapses a run's refs to the distinct tools that own them", () => {
+    expect(
+      toolsForRefs([
+        { type: "rfi", id: "a" },
+        { type: "rfi", id: "b" },
+        { type: "drawing_sheet", id: "c" },
+        { type: "project", id: "d" },
+        "not a ref",
+        null,
+        { id: "no type" },
+      ]).sort(),
+    ).toEqual(["drawings", "rfis"]);
+    expect(toolsForRefs([])).toEqual([]);
+  });
+
+  it("every tool a fleet agent's evidence can carry is one it declares", () => {
+    // The two lists must not drift: a gather() that starts citing a new
+    // record type without adding its tool to requiredTools would widen what
+    // the prompt holds without widening what it takes to start the run.
+    for (const def of AGENT_DEFINITIONS.values()) {
+      expect(def.requiredTools.length, def.kind).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("every agent declares the tools that own what it reads", () => {
+  it("names at least one real tool per fleet agent", () => {
+    const toolSet = new Set<string>(TOOLS);
+    for (const def of AGENT_DEFINITIONS.values()) {
+      expect(def.requiredTools.length, def.kind).toBeGreaterThan(0);
+      for (const tool of def.requiredTools) {
+        expect(toolSet.has(tool), `${def.kind} requires unknown tool ${tool}`).toBe(true);
+      }
+    }
+  });
+
+  it("publishes them on the inventory so an administrator can see the real gate", () => {
+    for (const entry of AGENT_INVENTORY) {
+      expect(entry.requiredTools.length, entry.kind).toBeGreaterThan(0);
+    }
   });
 });
 
@@ -466,6 +605,33 @@ describe("bias assessment (#1025)", () => {
     expect(biasSubject(null)).toBeNull();
   });
 
+  // REGRESSION. Both reports capped their window and published rates as if
+  // computed over all of it. A partial denominator now produces no figure.
+  it("states no rate at all when the window was truncated", () => {
+    const obs = Array.from({ length: 12 }, (_, i) => ({
+      reviewId: `r${i}`,
+      agentKind: "risk_monitor",
+      targetType: "risk_finding",
+      subjectId: "ven_hot",
+      adverse: i % 2 === 0,
+      status: "pending",
+      confidence: 0.7,
+    }));
+    const whole = summariseBias(obs, new Date(), "2026-08-01T00:00:00.000Z");
+    expect(whole.overallAdverseRate).toBe(0.5);
+    expect(whole.truncated).toBe(false);
+    expect(whole.reasons).toEqual([]);
+
+    const partial = summariseBias(obs, new Date(), "2026-08-01T00:00:00.000Z", 12);
+    expect(partial.truncated).toBe(true);
+    expect(partial.overallAdverseRate).toBeNull();
+    expect(partial.groups[0]!.adverseRate).toBeNull();
+    expect(partial.groups[0]!.reason).toContain("truncated");
+    expect(partial.disparity).toBeNull();
+    expect(partial.reasons[0]).toContain("truncated");
+    expect(partial.verdict).toContain("partial read");
+  });
+
   it("recognises the adverse outputs", () => {
     expect(isAdverse("risk_finding", { severity: "critical" })).toBe(true);
     expect(isAdverse("spec_compliance", { compliant: "no" })).toBe(true);
@@ -518,6 +684,37 @@ describe("model validation (#1027)", () => {
     expect(agent.superseded).toBe(1);
     expect(agent.promptVersions).toEqual(["abc123"]);
     expect(report.totals.runs).toBe(10);
+    expect(report.truncated).toBe(false);
+    expect(report.reasons).toEqual([]);
+  });
+
+  // REGRESSION. buildValidationReport capped each source at 2,000 rows and
+  // said nothing; successRate over 40% of a window is not the window's rate.
+  it("withholds every rate when the window was truncated, and says which half", () => {
+    const runs = Array.from({ length: 10 }, () => run());
+    const reviews = [
+      ...Array.from({ length: 4 }, () => ({ agentKind: "risk_monitor", status: "approved" })),
+      ...Array.from({ length: 2 }, () => ({ agentKind: "risk_monitor", status: "rejected" })),
+    ];
+    const report = summariseValidation(runs, reviews, new Date(), "2026-08-01T00:00:00.000Z", {
+      runs: true,
+      limit: 2000,
+    });
+    const agent = report.agents[0]!;
+    expect(report.truncated).toBe(true);
+    expect(agent.successRate).toBeNull();
+    expect(agent.fabricationRate).toBeNull();
+    // only the RUN side was truncated, so the human-agreement rate survives
+    expect(agent.humanAgreementRate).toBeCloseTo(0.67, 2);
+    expect(agent.reasons.some((r) => r.includes("2000 run(s)"))).toBe(true);
+    expect(report.reasons).toHaveLength(1);
+
+    const both = summariseValidation(runs, reviews, new Date(), "2026-08-01T00:00:00.000Z", {
+      runs: true,
+      reviews: true,
+    });
+    expect(both.agents[0]!.humanAgreementRate).toBeNull();
+    expect(both.reasons).toHaveLength(2);
   });
 });
 

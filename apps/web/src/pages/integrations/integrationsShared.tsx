@@ -621,6 +621,10 @@ export function SharedCustodyNotice({ keySource }: { keySource: KeySource | null
  * changed after the endpoint was created: the secret the operator saved no
  * longer matches what the platform now signs with. The endpoint keeps
  * delivering — with a signature the receiver will reject.
+ *
+ * The remedy changed when rotation landed. It used to be "delete the endpoint",
+ * which cost the subscription and the whole delivery history; rotating derives
+ * a fresh secret under the current key and keeps both.
  */
 export function FingerprintWarning({ endpoint }: { endpoint: EndpointView }) {
   if (endpoint.secretFingerprintMatches) return null;
@@ -633,9 +637,11 @@ export function FingerprintWarning({ endpoint }: { endpoint: EndpointView }) {
       key, which means <strong>the master key was rotated</strong> (WEBHOOK_SIGNING_KEY was set,
       changed, or AUTH_SECRET moved) after this endpoint was created. Deliveries are still being
       signed — with a key the receiver does not hold, so every verification on their side now
-      fails. Secrets are never re-issued: <strong>delete this endpoint and create a new one</strong>,
-      then install the freshly shown secret at the receiver. Restoring the previous master key is
-      the only other way back.
+      fails. The remedy is <strong>Rotate secret</strong> on this endpoint: it derives the next
+      version under the CURRENT master key and shows you a working secret once, keeping the
+      endpoint id, its subscription and its delivery history. Ask for a grace window and both
+      signatures are sent while the receiver is updated. Restoring the previous master key is the
+      alternative, and re-creating the endpoint is no longer necessary.
     </Caveat>
   );
 }

@@ -5,8 +5,11 @@
  * missing daily logs all climb the same three rungs).
  *
  * Honesty rules: the rung counts come from `field_escalations` rows, never
- * from a guess; when the caller is not an admin the settings form is
- * read-only and says so rather than failing at save time.
+ * from a guess; whether the caller may run the ladder or edit the settings
+ * comes from the API's own permission flags (`rfis:admin`, which a project
+ * manager holds without being a company admin) rather than from a
+ * client-side guess, so the form is read-only exactly when the PUT would
+ * refuse it and never hides a capability the caller actually has.
  */
 import { useCallback, useState, type FormEvent } from "react";
 import { api } from "../../lib/api";
@@ -43,6 +46,7 @@ interface EscalationList {
   items: EscalationRow[];
   byLevel: Record<string, number>;
   job: string;
+  permissions?: { canRun: boolean };
 }
 
 interface FieldSettings {
@@ -57,6 +61,7 @@ interface SettingsResponse {
   projectId: string;
   settings: FieldSettings;
   defaults: FieldSettings;
+  permissions?: { canEdit: boolean };
 }
 
 const RUNGS: Array<{ level: number; label: string; hint: string; tone: "gray" | "amber" | "red" }> = [
@@ -67,12 +72,10 @@ const RUNGS: Array<{ level: number; label: string; hint: string; tone: "gray" | 
 
 export default function EscalationsPanel({
   projectId,
-  isAdmin,
   users,
   nameOf,
 }: {
   projectId: string | undefined;
-  isAdmin: boolean;
   users: Array<{ id: string; name: string }>;
   nameOf: (id: string | null | undefined) => string;
 }) {
@@ -107,6 +110,10 @@ export default function EscalationsPanel({
   }
 
   const byLevel = list.data?.byLevel ?? {};
+  // Both flags are computed server-side against the same gate the write
+  // routes enforce (rfis:admin). Until the response lands we offer nothing.
+  const canRun = list.data?.permissions?.canRun ?? false;
+  const canEdit = settings.data?.permissions?.canEdit ?? false;
 
   return (
     <div className="space-y-4">
@@ -115,7 +122,7 @@ export default function EscalationsPanel({
           title="Overdue escalation ladder"
           subtitle={list.data ? `Scheduler job ${list.data.job} — runs daily and can be run on demand.` : "Cross-register: RFIs, submittals, punch, observations and missing daily logs."}
           actions={
-            isAdmin ? (
+            canRun ? (
               <Button size="sm" disabled={runBusy} onClick={() => void runNow()}>
                 {runBusy ? "Running…" : "Run the ladder now"}
               </Button>
@@ -197,7 +204,7 @@ export default function EscalationsPanel({
 
       <SettingsCard
         base={base}
-        isAdmin={isAdmin}
+        canEdit={canEdit}
         users={users}
         data={settings.data}
         loading={settings.loading}
@@ -211,7 +218,7 @@ export default function EscalationsPanel({
 
 function SettingsCard({
   base,
-  isAdmin,
+  canEdit,
   users,
   data,
   loading,
@@ -220,7 +227,7 @@ function SettingsCard({
   onSaved,
 }: {
   base: string | null;
-  isAdmin: boolean;
+  canEdit: boolean;
   users: Array<{ id: string; name: string }>;
   data: SettingsResponse | null;
   loading: boolean;
@@ -283,7 +290,7 @@ function SettingsCard({
     <Card>
       <CardHeader
         title="Field settings for this project"
-        subtitle={isAdmin ? "These knobs drive the ladder, the punch closure gates, submittal allowances and daily-log distribution." : "Read-only — changing these needs admin access to the RFI tool."}
+        subtitle={canEdit ? "These knobs drive the ladder, the punch closure gates, submittal allowances and daily-log distribution." : "Read-only — changing these needs admin access to the RFI tool."}
       />
       <CardBody>
         <ErrorAlert message={saveError} />
@@ -298,14 +305,14 @@ function SettingsCard({
                   min="1"
                   max="30"
                   step="1"
-                  disabled={!isAdmin}
+                  disabled={!canEdit}
                   value={String(value.escalation.stepDays)}
                   onChange={(e) => edit((s) => ({ ...s, escalation: { ...s.escalation, stepDays: num(e.target.value, 3) } }))}
                 />
               </Field>
               <Field label="Notify the responsible person at rung 1">
                 <Select
-                  disabled={!isAdmin}
+                  disabled={!canEdit}
                   value={value.escalation.notifyResponsible ? "yes" : "no"}
                   onChange={(e) => edit((s) => ({ ...s, escalation: { ...s.escalation, notifyResponsible: e.target.value === "yes" } }))}
                 >
@@ -316,7 +323,7 @@ function SettingsCard({
               <Field label="Project managers" hint="Empty = members holding a PM template plus company admins.">
                 <select
                   multiple
-                  disabled={!isAdmin}
+                  disabled={!canEdit}
                   className="h-24 w-full rounded-md border border-ink-200 bg-white px-2 py-1 text-sm disabled:bg-ink-50"
                   value={value.escalation.pmUserIds}
                   onChange={(e) =>
@@ -336,7 +343,7 @@ function SettingsCard({
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <Field label="Require an after photo" hint="Blocks ready-for-review and closure without one (#403).">
                 <Select
-                  disabled={!isAdmin}
+                  disabled={!canEdit}
                   value={value.punch.requireAfterPhoto ? "yes" : "no"}
                   onChange={(e) => edit((s) => ({ ...s, punch: { ...s.punch, requireAfterPhoto: e.target.value === "yes" } }))}
                 >
@@ -346,7 +353,7 @@ function SettingsCard({
               </Field>
               <Field label="Require a verifier before review" hint="Two hands on every closure (#408).">
                 <Select
-                  disabled={!isAdmin}
+                  disabled={!canEdit}
                   value={value.punch.requireVerifier ? "yes" : "no"}
                   onChange={(e) => edit((s) => ({ ...s, punch: { ...s.punch, requireVerifier: e.target.value === "yes" } }))}
                 >
@@ -361,13 +368,13 @@ function SettingsCard({
             <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-400">Submittal allowances</h4>
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
               <Field label="Review allowance (days)" hint="Backward scheduling from required-on-site (#337).">
-                <Input type="number" min="0" max="120" step="1" disabled={!isAdmin} value={String(value.submittal.reviewAllowanceDays)} onChange={(e) => edit((s) => ({ ...s, submittal: { ...s.submittal, reviewAllowanceDays: num(e.target.value, 14) } }))} />
+                <Input type="number" min="0" max="120" step="1" disabled={!canEdit} value={String(value.submittal.reviewAllowanceDays)} onChange={(e) => edit((s) => ({ ...s, submittal: { ...s.submittal, reviewAllowanceDays: num(e.target.value, 14) } }))} />
               </Field>
               <Field label="At-risk window (days)" hint="Flagged when submit-by falls inside this window (#339).">
-                <Input type="number" min="1" max="60" step="1" disabled={!isAdmin} value={String(value.submittal.atRiskDays)} onChange={(e) => edit((s) => ({ ...s, submittal: { ...s.submittal, atRiskDays: num(e.target.value, 7) } }))} />
+                <Input type="number" min="1" max="60" step="1" disabled={!canEdit} value={String(value.submittal.atRiskDays)} onChange={(e) => edit((s) => ({ ...s, submittal: { ...s.submittal, atRiskDays: num(e.target.value, 7) } }))} />
               </Field>
               <Field label="In-court allowance (days)" hint="A reviewer holding longer than this is overdue (#347).">
-                <Input type="number" min="1" max="90" step="1" disabled={!isAdmin} value={String(value.submittal.inCourtAllowanceDays)} onChange={(e) => edit((s) => ({ ...s, submittal: { ...s.submittal, inCourtAllowanceDays: num(e.target.value, 10) } }))} />
+                <Input type="number" min="1" max="90" step="1" disabled={!canEdit} value={String(value.submittal.inCourtAllowanceDays)} onChange={(e) => edit((s) => ({ ...s, submittal: { ...s.submittal, inCourtAllowanceDays: num(e.target.value, 10) } }))} />
               </Field>
             </div>
           </section>
@@ -376,21 +383,21 @@ function SettingsCard({
             <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-400">Daily logs & photos</h4>
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-4">
               <Field label="Weather auto-capture" hint="Open-Meteo archive; needs project coordinates.">
-                <Select disabled={!isAdmin} value={value.dailyLog.weatherAuto ? "yes" : "no"} onChange={(e) => edit((s) => ({ ...s, dailyLog: { ...s.dailyLog, weatherAuto: e.target.value === "yes" } }))}>
+                <Select disabled={!canEdit} value={value.dailyLog.weatherAuto ? "yes" : "no"} onChange={(e) => edit((s) => ({ ...s, dailyLog: { ...s.dailyLog, weatherAuto: e.target.value === "yes" } }))}>
                   <option value="yes">On</option>
                   <option value="no">Off</option>
                 </Select>
               </Field>
               <Field label="Reconciliation threshold (%)" hint="Manpower vs timecards variance that raises a signal.">
-                <Input type="number" min="0" max="100" step="1" disabled={!isAdmin} value={String(value.dailyLog.reconciliationThresholdPct)} onChange={(e) => edit((s) => ({ ...s, dailyLog: { ...s.dailyLog, reconciliationThresholdPct: num(e.target.value, 15) } }))} />
+                <Input type="number" min="0" max="100" step="1" disabled={!canEdit} value={String(value.dailyLog.reconciliationThresholdPct)} onChange={(e) => edit((s) => ({ ...s, dailyLog: { ...s.dailyLog, reconciliationThresholdPct: num(e.target.value, 15) } }))} />
               </Field>
               <Field label="Photo geofence (km)" hint="GPS beyond this from the project raises an integrity signal.">
-                <Input type="number" min="0.1" max="500" step="0.1" disabled={!isAdmin} value={String(value.photos.geofenceKm)} onChange={(e) => edit((s) => ({ ...s, photos: { ...s.photos, geofenceKm: num(e.target.value, 5) } }))} />
+                <Input type="number" min="0.1" max="500" step="0.1" disabled={!canEdit} value={String(value.photos.geofenceKm)} onChange={(e) => edit((s) => ({ ...s, photos: { ...s.photos, geofenceKm: num(e.target.value, 5) } }))} />
               </Field>
               <Field label="Daily-log distribution" hint="Notified on submit and on approval.">
                 <select
                   multiple
-                  disabled={!isAdmin}
+                  disabled={!canEdit}
                   className="h-24 w-full rounded-md border border-ink-200 bg-white px-2 py-1 text-sm disabled:bg-ink-50"
                   value={value.dailyLog.distribution}
                   onChange={(e) => edit((s) => ({ ...s, dailyLog: { ...s.dailyLog, distribution: Array.from(e.target.selectedOptions).map((o) => o.value) } }))}
@@ -403,7 +410,7 @@ function SettingsCard({
             </div>
           </section>
 
-          {isAdmin ? (
+          {canEdit ? (
             <div className="flex justify-end gap-2">
               <Button variant="secondary" disabled={busy || draft === null} onClick={() => { setDraft(null); setSaved(false); }}>
                 Discard changes

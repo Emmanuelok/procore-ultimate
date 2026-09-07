@@ -37,6 +37,7 @@ import {
   titleCase,
   useAction,
   useProfile,
+  useRegimeDef,
   useRegimes,
   useResource,
   useVendors,
@@ -196,6 +197,20 @@ export function CertificateCreateDrawer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
+  // What the rate applies to comes from the regime library, not from a guess:
+  // UK CIS deducts net of materials, IE RCT deducts on the full payment
+  // including them. The field is only offered where materials are actually
+  // excluded — the API refuses a figure on any other base.
+  const schemeDef = useRegimeDef(regime || null);
+  const wht = schemeDef.data?.withholding ?? null;
+  const derivedBase =
+    wht && wht.scheme === scheme && wht.registrationDriven
+      ? wht.registrationDriven.base
+      : scheme === "cis" || scheme === "rct"
+        ? "gross_excl_materials"
+        : "gross_excl_vat";
+  const baseExcludesMaterials = derivedBase === "gross_excl_materials" || derivedBase === "labour_only";
+
   async function submit(e: FormEvent) {
     e.preventDefault();
     const body: Record<string, unknown> = { paymentDate };
@@ -209,7 +224,7 @@ export function CertificateCreateDrawer({
       if (gross.trim() !== "") body["grossAmount"] = Number(gross);
       if (rate.trim() !== "") body["rate"] = Number(rate);
     }
-    if (materials.trim() !== "") body["materialsAmount"] = Number(materials);
+    if (baseExcludesMaterials && materials.trim() !== "") body["materialsAmount"] = Number(materials);
     if (paymentId.trim()) body["paymentId"] = paymentId.trim();
     if (invoiceId.trim()) body["invoiceId"] = invoiceId.trim();
     const created = await action.run("create", () => taxApi.createCertificate(projectId, body));
@@ -296,15 +311,25 @@ export function CertificateCreateDrawer({
               <Field label="Gross" required>
                 <Input type="number" min={0} step="0.01" value={gross} onChange={(e) => setGross(e.target.value)} />
               </Field>
-              <Field label="Materials">
-                <Input type="number" min={0} step="0.01" value={materials} onChange={(e) => setMaterials(e.target.value)} />
+              <Field label="Materials" hint={baseExcludesMaterials ? "excluded from the base" : "not applicable to this scheme"}>
+                <Input
+                  type="number"
+                  min={0}
+                  step="0.01"
+                  value={baseExcludesMaterials ? materials : ""}
+                  onChange={(e) => setMaterials(e.target.value)}
+                  disabled={!baseExcludesMaterials}
+                />
               </Field>
               <Field label="Rate (%)" required>
                 <Input type="number" min={0} max={100} step="0.5" value={rate} onChange={(e) => setRate(e.target.value)} />
               </Field>
             </div>
             <div className="text-2xs text-content-subtle">
-              Without a determination the base is the gross amount (materials are not excluded); draft from a determination to apply the scheme's base rule.
+              {baseExcludesMaterials
+                ? `${scheme.toUpperCase()} deducts on the amount net of materials: base = gross − materials${gross.trim() !== "" ? ` = ${money(Number(gross) - (materials.trim() === "" ? 0 : Number(materials)), currency || "")}` : ""}.`
+                : `${scheme.toUpperCase()} deducts on the whole amount under ${schemeDef.data?.name ?? "this regime"}; there is no materials exclusion on this base.`}{" "}
+              Drafting from a determination carries the engine's base, rate and citations instead of these typed figures.
             </div>
           </>
         ) : null}
@@ -374,8 +399,16 @@ function CertificateDrawer({ projectId, certificateId, onClose, onChanged }: { p
           <dl className="divide-y divide-border">
             <Row label="Payment date">{isoDate(c.paymentDate)}</Row>
             <Row label="Gross">{money(c.grossAmount, c.currency)}</Row>
-            <Row label="Materials excluded">{money(c.materialsAmount, c.currency)}</Row>
-            <Row label="Deduction base">{money(c.baseAmount, c.currency)}</Row>
+            {c.withholdingBase === "gross_excl_materials" || c.withholdingBase === "labour_only" ? (
+              <Row label="Materials excluded">{money(c.materialsAmount, c.currency)}</Row>
+            ) : (
+              <Row label="Materials" hint="not excluded on this base">
+                {DASH}
+              </Row>
+            )}
+            <Row label="Deduction base" hint={c.withholdingBase.replace(/_/g, " ")}>
+              {money(c.baseAmount, c.currency)}
+            </Row>
             <Row label="Rate">{pct(c.rate)}</Row>
             <Row label="Withheld">
               <span className="font-semibold">{money(c.withheldAmount, c.currency)}</span>

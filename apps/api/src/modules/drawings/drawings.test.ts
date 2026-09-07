@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import {
   companyMemberships,
   drawingIssueRecipients,
@@ -861,6 +861,111 @@ describe("drawing set pipeline", () => {
       expect(cancelled.json().status).toBe("cancelled");
       const stranger = await registerActor(built.app);
       expect((await get(`/api/v1/projects/${projectId}/drawing-issues`, stranger.headers)).statusCode).toBe(403);
+    });
+  });
+
+  describe("register-integrity regressions", () => {
+    /**
+     * A distribution names sheets. Their numbers and titles are the same
+     * register metadata every other drawings route withholds under a
+     * segregation rule, so the issue routes must withhold them too — while
+     * still saying how many were withheld, or the acknowledgement is a lie.
+     */
+    it("REGRESSION: a drawing issue does not leak the sheets segregation hides (#265, #282)", async () => {
+      const insider = await addMember("subcontractor");
+      const excluded = await addMember("subcontractor");
+      const [e101] = await built.app.db
+        .select()
+        .from(drawingSheets)
+        .where(and(eq(drawingSheets.projectId, projectId), eq(drawingSheets.number, "E-101")));
+      const rule = await post(`/api/v1/projects/${projectId}/drawing-permissions`, actor.headers, {
+        scope: "discipline",
+        scopeValue: "electrical",
+        subjectType: "user",
+        subjectId: insider.userId,
+      });
+      expect(rule.statusCode).toBe(201);
+
+      const issue = await post(`/api/v1/projects/${projectId}/drawing-issues`, actor.headers, {
+        title: "Power and floor plans",
+        sheetIds: [sheetA101.id, e101!.id],
+        recipientUserIds: [insider.userId, excluded.userId],
+      });
+      expect(issue.statusCode).toBe(201);
+      const id = issue.json().id;
+
+      const asInsider = (await get(`/api/v1/projects/${projectId}/drawing-issues/${id}`, insider.headers)).json();
+      expect(asInsider.sheets.map((s: { number: string }) => s.number).sort()).toEqual(["A-101", "E-101"]);
+      expect(asInsider.hiddenSheets).toBe(0);
+
+      const asExcluded = (await get(`/api/v1/projects/${projectId}/drawing-issues/${id}`, excluded.headers)).json();
+      expect(asExcluded.sheets.map((s: { number: string }) => s.number)).toEqual(["A-101"]);
+      expect(asExcluded.hiddenSheets).toBe(1);
+      expect(JSON.stringify(asExcluded)).not.toContain("E-101");
+
+      const transmittal = (await get(`/api/v1/projects/${projectId}/drawing-issues/${id}/transmittal`, excluded.headers)).json();
+      expect(transmittal.items).toHaveLength(1);
+      expect(transmittal.hiddenItems).toBe(1);
+
+      const asOwner = (await get(`/api/v1/projects/${projectId}/drawing-issues/${id}`, actor.headers)).json();
+      expect(asOwner.sheets).toHaveLength(2);
+      expect(asOwner.hiddenSheets).toBe(0);
+
+      // A restricted user cannot put a sheet they cannot see on a distribution.
+      const smuggle = await post(`/api/v1/projects/${projectId}/drawing-issues`, excluded.headers, {
+        title: "Smuggled",
+        sheetIds: [e101!.id],
+        recipientUserIds: [excluded.userId],
+      });
+      expect([400, 403]).toContain(smuggle.statusCode);
+
+      await built.app.inject({ method: "DELETE", url: `/api/v1/projects/${projectId}/drawing-permissions/${rule.json().id}`, headers: actor.headers });
+      expect((await get(`/api/v1/projects/${projectId}/drawing-issues/${id}`, excluded.headers)).json().sheets).toHaveLength(2);
+    });
+
+    /**
+     * The review endpoint refuses to confirm a page that still carries a
+     * pipeline placeholder number; PATCH `confirmReview` is the second door
+     * into the same flag and has to refuse it too — otherwise a standard user
+     * can put `UNNAMED-1-<set>` in the register and then need an admin to
+     * correct it, because renumbering a confirmed sheet is an admin act.
+     */
+    it("REGRESSION: PATCH confirmReview refuses a placeholder number", { timeout: 60_000 }, async () => {
+      const res = await built.app.inject({
+        method: "POST",
+        url: `/api/v1/projects/${projectId}/drawing-sets`,
+        payload: multipartBody(buildPdf([["a photograph with no readable sheet number"]]), "guard-set.pdf", { name: "Guard Set" }),
+        headers: mpHeaders(actor.headers),
+      });
+      expect(res.statusCode).toBe(201);
+      const [placeholder] = await built.app.db
+        .select()
+        .from(drawingSheets)
+        .where(and(eq(drawingSheets.projectId, projectId), eq(drawingSheets.needsReview, 1)))
+        .orderBy(desc(drawingSheets.createdAt))
+        .limit(1);
+      expect(placeholder!.number).toMatch(/^UNNAMED-/);
+
+      const standard = await addMember("project_manager"); // drawings: standard
+      const blind = await built.app.inject({
+        method: "PATCH",
+        url: `/api/v1/sheets/${placeholder!.id}`,
+        payload: { confirmReview: true },
+        headers: standard.headers,
+      });
+      expect(blind.statusCode).toBe(400);
+      expect(blind.json().message).toMatch(/real number/);
+      const [unchanged] = await built.app.db.select().from(drawingSheets).where(eq(drawingSheets.id, placeholder!.id));
+      expect(unchanged!.needsReview).toBe(1);
+
+      const named = await built.app.inject({
+        method: "PATCH",
+        url: `/api/v1/sheets/${placeholder!.id}`,
+        payload: { number: "A-975", title: "SITE PHOTOGRAPH", confirmReview: true },
+        headers: standard.headers,
+      });
+      expect(named.statusCode).toBe(200);
+      expect(named.json()).toMatchObject({ number: "A-975", needsReview: 0 });
     });
   });
 });

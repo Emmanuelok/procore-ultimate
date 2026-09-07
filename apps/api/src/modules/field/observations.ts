@@ -45,7 +45,9 @@ import {
   assertProjectLocation,
   assertVendor,
   hasToolAdmin,
+  hasToolStandard,
   isCompanyAdmin,
+  requireToolLevel,
 } from "./access.js";
 import { ageInDays, bucketise, daysOverdue } from "./ageingEngine.js";
 import { authorisePunchTransition, validateVerifierChange } from "./punchEngine.js";
@@ -336,6 +338,13 @@ export const observationRoutes: FastifyPluginAsync = async (app) => {
     };
     const can = (to: string) =>
       authorisePunchTransition({ item, actorId: me, isAdmin: admin, to, settings: { requireVerifier: settings.punch.requireVerifier } }).ok;
+    const convertTargets: string[] = [];
+    if (!row.convertedToType && row.status !== "void") {
+      const actor = actorOf(req);
+      if (await hasToolStandard(app, actor, req.projectId!, "punch")) convertTargets.push("punch_item");
+      if (await hasToolStandard(app, actor, req.projectId!, "safety")) convertTargets.push("incident");
+      if (await hasToolStandard(app, actor, req.projectId!, "change_management")) convertTargets.push("change_event");
+    }
     return {
       ...decorate(row, todayISO()),
       links,
@@ -345,7 +354,12 @@ export const observationRoutes: FastifyPluginAsync = async (app) => {
         canReadyForReview: can("ready_for_review"),
         canClose: can("closed"),
         canVoid: can("void"),
-        canConvert: !row.convertedToType && row.status !== "void",
+        canConvert: convertTargets.length > 0,
+        // Per-target, not one boolean: minting a safety incident or a change
+        // event satisfies the owning module's own create gate, so offering
+        // those choices to a caller who only holds `punch` would be a button
+        // that 403s. The UI renders exactly this list.
+        canConvertTo: convertTargets,
         canEditVerifier: admin || row.status !== "ready_for_review",
       },
     };
@@ -378,8 +392,12 @@ export const observationRoutes: FastifyPluginAsync = async (app) => {
       } else set[k] = v;
     }
     const changed = Object.keys(body).filter((k) => body[k as keyof typeof body] !== undefined);
+    // The drawing pin lives in three columns; snapshot those, or a moved pin
+    // would be ledgered as the bare word "pin" with no before/after — exactly
+    // the unrecoverable-edit gap the audit raised for RFI questions.
+    const snapshotKeys = changed.flatMap((k) => (k === "pin" ? ["sheetId", "pinX", "pinY"] : [k]));
     await app.db.update(fieldObservations).set(set).where(eq(fieldObservations.id, observationId));
-    await ledger("update", observationId, req, { changed, before: pick(row, changed), after: pick(set, changed) }, true);
+    await ledger("update", observationId, req, { changed, before: pick(row, snapshotKeys), after: pick(set, snapshotKeys) }, true);
     if (body.assigneeId && body.assigneeId !== row.assigneeId) {
       await notifyAssignment(req, row, [body.assigneeId]);
     }
@@ -449,6 +467,14 @@ export const observationRoutes: FastifyPluginAsync = async (app) => {
     if (row.status === "void") throw badRequest("A void observation cannot be converted");
     if (row.convertedToType) {
       throw badRequest(`Already converted to ${row.convertedToType} ${row.convertedToId ?? ""}`.trim());
+    }
+    // Minting the target record must satisfy the target module's own gate:
+    // holding `punch` is not authority to raise a safety incident or open a
+    // change event (plan §6.3 — the owning module's create gate applies).
+    if (body.target === "incident") {
+      await requireToolLevel(app, actorOf(req), req.projectId!, "safety", "standard");
+    } else if (body.target === "change_event") {
+      await requireToolLevel(app, actorOf(req), req.projectId!, "change_management", "standard");
     }
     const me = req.user!.id;
     const now = nowIso();

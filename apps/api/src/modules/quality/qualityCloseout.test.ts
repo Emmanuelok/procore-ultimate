@@ -244,6 +244,228 @@ describe("sequential sign-off on a hold point", () => {
     expect(register.json().total).toBeGreaterThanOrEqual(1);
     expect((await get(`${base()}/surveillance`, stranger.headers)).statusCode).toBe(403);
   });
+
+  /*
+   * The register used to take 500 rows with no offset and report the length of
+   * that page as the total, so a co-ordinator on a big project was told there
+   * were 500 legs outstanding when there were 900 — and the 400 it dropped
+   * were the ones nobody would chase.
+   */
+  it("pages the surveillance register and reports the real total, not the page length", async () => {
+    const extra = await post(`${base()}/itps/${itpId}/activities`, {
+      activity: "Pressure test witness",
+      interventionPoint: "witness_point",
+      verifyingParties: [{ party: "third_party", name: "Notified Body Ltd" }],
+    });
+    await put(`${base()}/itps/${itpId}/activities/${extra.json().id}/parties`, {
+      parties: [
+        { party: "third_party", organisation: "Notified Body Ltd" },
+        { party: "regulator", organisation: "Building control" },
+      ],
+    });
+
+    const full = await get(`${base()}/surveillance`);
+    const total = full.json().total as number;
+    expect(total).toBeGreaterThanOrEqual(3);
+    expect(full.json().items.length).toBe(total);
+
+    const firstPage = await get(`${base()}/surveillance?pageSize=1&page=1`);
+    expect(firstPage.statusCode).toBe(200);
+    expect(firstPage.json().items).toHaveLength(1);
+    expect(firstPage.json().total).toBe(total);
+    expect(firstPage.json().pageSize).toBe(1);
+
+    const secondPage = await get(`${base()}/surveillance?pageSize=1&page=2`);
+    expect(secondPage.json().items).toHaveLength(1);
+    expect(secondPage.json().items[0].id).not.toBe(firstPage.json().items[0].id);
+    expect(secondPage.json().total).toBe(total);
+    // The head-line counts are computed over the whole where clause, not the page.
+    expect(secondPage.json().awaitingAttendance).toBe(full.json().awaitingAttendance);
+  });
+});
+
+/* ================================================================== */
+/* The chain governs the point it is configured on (#1094)             */
+/* ================================================================== */
+
+describe("the legacy activity-level release against a configured chain", () => {
+  let itpId: string;
+  let activityId: string;
+  let legs: Array<{ id: string; party: string }>;
+
+  beforeAll(async () => {
+    const itp = await post(`${base()}/itps`, { title: "Chain-governed ITP" });
+    itpId = itp.json().id;
+    const activity = await post(`${base()}/itps/${itpId}/activities`, {
+      activity: "Pile cage release before pour",
+      interventionPoint: "hold_point",
+      plannedDate: "2030-06-01",
+      verifyingParties: [{ party: "engineer", userId: engineer.userId }],
+    });
+    activityId = activity.json().id;
+    const chain = await put(`${base()}/itps/${itpId}/activities/${activityId}/parties`, {
+      parties: [
+        { party: "contractor", userId: owner.userId },
+        { party: "engineer", userId: engineer.userId },
+        { party: "client", userId: client.userId },
+      ],
+    });
+    legs = chain.json().items as Array<{ id: string; party: string }>;
+  }, 60_000);
+
+  async function activityRow(): Promise<{
+    status: string;
+    releasedAt: string | null;
+    releaseNote: string | null;
+    signOffChain: { complete: boolean; outstanding: unknown[] };
+  }> {
+    const list = await get(`${base()}/itps/${itpId}/activities`);
+    const row = (
+      list.json().items as Array<{
+        id: string;
+        status: string;
+        releasedAt: string | null;
+        releaseNote: string | null;
+        signOffChain: { complete: boolean; outstanding: unknown[] };
+      }>
+    ).find((a) => a.id === activityId);
+    if (!row) throw new Error("activity not found in the list");
+    return row;
+  }
+
+  /*
+   * THE DEFECT: the activity-level release route never looked at the chain, so
+   * the FIRST nominated party could press it and move the point straight to
+   * `released`. The open-hold-point counter dropped, the plan became closable,
+   * the overdue sweep stopped flagging it, and the engineer's and the client's
+   * legs stayed pending for ever — one signature standing in for three.
+   */
+  it("refuses the activity-level release while required legs are outstanding", async () => {
+    const firstLeg = await post(
+      `${base()}/itps/${itpId}/activities/${activityId}/parties/${legs[0]!.id}/release`,
+      { note: "Contractor QC inspected the cage." },
+      owner.headers,
+    );
+    expect(firstLeg.statusCode).toBe(200);
+    expect(firstLeg.json().activityReleased).toBe(false);
+
+    const bypass = await post(
+      `${base()}/itps/${itpId}/activities/${activityId}/release`,
+      { note: "Looks fine to me." },
+      engineerHeaders,
+    );
+    expect(bypass.statusCode).toBe(400);
+    expect(bypass.json().message).toContain("sign-off chain");
+    expect(bypass.json().message).toContain("parties/");
+
+    const after = await activityRow();
+    expect(["pending", "notified"]).toContain(after.status);
+    expect(after.releasedAt).toBeNull();
+    expect(after.signOffChain.complete).toBe(false);
+    expect(after.signOffChain.outstanding).toHaveLength(2);
+  });
+
+  it("releases the point only when the last required leg signs, and the legs are reconciled", async () => {
+    const second = await post(
+      `${base()}/itps/${itpId}/activities/${activityId}/parties/${legs[1]!.id}/release`,
+      { note: "Engineer inspected." },
+      engineerHeaders,
+    );
+    expect(second.statusCode).toBe(200);
+    expect(second.json().activityReleased).toBe(false);
+
+    const third = await post(
+      `${base()}/itps/${itpId}/activities/${activityId}/parties/${legs[2]!.id}/release`,
+      { note: "Client witnessed." },
+      clientHeaders,
+    );
+    expect(third.statusCode).toBe(200);
+    expect(third.json().activityReleased).toBe(true);
+
+    const after = await activityRow();
+    expect(after.status).toBe("released");
+    expect(after.signOffChain.complete).toBe(true);
+    expect(after.releaseNote).toContain("sign-off chain");
+  });
+});
+
+/* ================================================================== */
+/* Waiving the point is waiving the chain                              */
+/* ================================================================== */
+
+describe("a waiver of a point that carries a sign-off chain", () => {
+  let itpId: string;
+  let activityId: string;
+  let legs: Array<{ id: string; party: string }>;
+
+  beforeAll(async () => {
+    const itp = await post(`${base()}/itps`, { title: "Waiver-and-chain ITP" });
+    itpId = itp.json().id;
+    const activity = await post(`${base()}/itps/${itpId}/activities`, {
+      activity: "Cladding bracket release",
+      interventionPoint: "hold_point",
+      plannedDate: "2030-07-01",
+      verifyingParties: [{ party: "engineer", userId: engineer.userId }],
+    });
+    activityId = activity.json().id;
+    const chain = await put(`${base()}/itps/${itpId}/activities/${activityId}/parties`, {
+      parties: [
+        { party: "contractor", userId: owner.userId },
+        { party: "engineer", userId: engineer.userId },
+        { party: "third_party", organisation: "Notified Body Ltd" },
+      ],
+    });
+    legs = chain.json().items as Array<{ id: string; party: string }>;
+  }, 60_000);
+
+  /*
+   * The release route refuses where a chain exists. Waiving is the legitimate
+   * override of the same chain — but it used to leave the unsigned legs at
+   * `pending` for ever, so the surveillance register went on telling a
+   * co-ordinator to chase a notified body for an inspection that had been
+   * waived, and the chain's record never said what became of them.
+   */
+  it("waives the legs nobody signed, with the same reason and actor", async () => {
+    const first = await post(
+      `${base()}/itps/${itpId}/activities/${activityId}/parties/${legs[0]!.id}/release`,
+      { note: "Contractor QC signed." },
+      owner.headers,
+    );
+    expect(first.statusCode).toBe(200);
+
+    const waived = await post(`${base()}/itps/${itpId}/activities/${activityId}/waive`, {
+      reason: "Element re-designed out; the bracket is no longer installed.",
+    });
+    expect(waived.statusCode).toBe(200);
+    expect(waived.json().status).toBe("waived");
+
+    const chain = await get(`${base()}/itps/${itpId}/activities/${activityId}/parties`);
+    const rows = chain.json().items as Array<{ id: string; status: string; note: string | null }>;
+    expect(rows.find((r) => r.id === legs[0]!.id)!.status).toBe("released");
+    for (const legId of [legs[1]!.id, legs[2]!.id]) {
+      const row = rows.find((r) => r.id === legId)!;
+      expect(row.status).toBe("waived");
+      expect(row.note).toContain("re-designed out");
+    }
+  });
+
+  /*
+   * And the register a co-ordinator works from stops listing them: a leg on a
+   * point that has been waived is not outstanding work, whatever the leg row
+   * says on its own.
+   */
+  it("drops the waived point's legs from the outstanding surveillance register", async () => {
+    const open = await get(`${base()}/surveillance?openOnly=true&pageSize=500`);
+    expect(open.statusCode).toBe(200);
+    const ids = (open.json().items as Array<{ id: string }>).map((r) => r.id);
+    expect(ids).not.toContain(legs[2]!.id);
+
+    // Without openOnly the leg is still readable — it is history, not a secret.
+    const all = await get(`${base()}/surveillance?pageSize=500`);
+    expect((all.json().items as Array<{ id: string }>)).toContainEqual(
+      expect.objectContaining({ id: legs[2]!.id }),
+    );
+  });
 });
 
 /* ================================================================== */
@@ -428,6 +650,32 @@ describe("performance guarantees", () => {
     );
     expect(verified.statusCode).toBe(200);
     expect(verified.json().verifiedBy).toBe(engineer.userId);
+  });
+
+  it("clears the verification when the guarantee is measured again", async () => {
+    /*
+     * The signature was given against 1150 kW. Re-measuring at 900 and keeping
+     * it would leave the register saying an independent person had checked a
+     * reading nobody checked — and the LD exposure computed from the new
+     * shortfall would read as verified. It goes back to unverified.
+     */
+    const remeasured = await post(`${base()}/performance-guarantees/${guaranteeId}/measure`, {
+      measuredValue: 900,
+    });
+    expect(remeasured.statusCode).toBe(200);
+    expect(remeasured.json().verifiedBy).toBeNull();
+    expect(remeasured.json().verifiedAt).toBeNull();
+    expect(remeasured.json().shortfall).toBe(300);
+    expect(remeasured.json().detail.supersededVerification.verifiedBy).toBe(engineer.userId);
+    expect(remeasured.json().detail.supersededVerification.measuredValue).toBe(1150);
+
+    const reverified = await post(
+      `${base()}/performance-guarantees/${guaranteeId}/verify`,
+      {},
+      engineerHeaders,
+    );
+    expect(reverified.statusCode).toBe(200);
+    expect(reverified.json().verifiedBy).toBe(engineer.userId);
   });
 
   it("raises the deferred seasonal test as a scheduled record, once", async () => {

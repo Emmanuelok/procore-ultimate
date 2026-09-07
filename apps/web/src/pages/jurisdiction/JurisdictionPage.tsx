@@ -17,6 +17,7 @@ import { useParams, useSearchParams } from "react-router-dom";
 import { PageHeader } from "../../ui";
 import CurrencyTab from "./CurrencyTab";
 import FxRatesTab from "./FxRatesTab";
+import GroupTab from "./GroupTab";
 import LocalContentTab from "./LocalContentTab";
 import PermitsTab from "./PermitsTab";
 import { TabBar } from "./jurisdictionShared";
@@ -26,6 +27,7 @@ const TABS = [
   { key: "fx", label: "FX rates" },
   { key: "permits", label: "Permits" },
   { key: "local", label: "Local content" },
+  { key: "group", label: "Group & ICV" },
 ];
 
 export default function JurisdictionPage() {
@@ -47,7 +49,7 @@ export default function JurisdictionPage() {
     <div>
       <PageHeader
         title="Jurisdiction"
-        subtitle="Multi-currency exposure, the FX rate register, permits against the schedule, and local content undertakings"
+        subtitle="Multi-currency exposure, the FX rate register, permits against the schedule, local content undertakings, and group consolidation under IAS 21 / IAS 29"
       />
 
       <TabBar tabs={TABS} active={tab} onSelect={selectTab} />
@@ -56,6 +58,7 @@ export default function JurisdictionPage() {
       {tab === "fx" ? <FxRatesTab projectId={projectId} /> : null}
       {tab === "permits" ? <PermitsTab projectId={projectId} /> : null}
       {tab === "local" ? <LocalContentTab projectId={projectId} /> : null}
+      {tab === "group" ? <GroupTab projectId={projectId} /> : null}
     </div>
   );
 }

@@ -4,6 +4,7 @@ import { and, eq } from "drizzle-orm";
 import {
   companyMemberships,
   events,
+  evidence,
   ledgerEntries,
   notifications,
   obligations,
@@ -41,7 +42,7 @@ beforeAll(async () => {
     companyId: owner.companyId,
     name: "Capital Governance Test Project",
   });
-});
+}, 600_000);
 
 afterAll(async () => {
   await built.close();
@@ -225,6 +226,22 @@ describe("business cases", () => {
 /* Stage gates (#408-415)                                              */
 /* ------------------------------------------------------------------ */
 
+/** Seeds an evidence row so a gate criterion marked evidenceRequired can be
+ *  linked to a real artefact (#410 — the pack is frozen at review time). */
+async function seedEvidence(source = "Independent monitor pack") {
+  const id = newId("ev");
+  await app.db.insert(evidence).values({
+    id,
+    companyId: owner.companyId,
+    projectId,
+    kind: "document",
+    source,
+    contentHash: `sha256:${id}`,
+    submittedBy: owner.userId,
+  });
+  return id;
+}
+
 async function createGate(gateNumber: number, over: Json = {}) {
   const res = await post(`/projects/${projectId}/stage-gates`, {
     gateNumber,
@@ -281,13 +298,18 @@ describe("stage gates", () => {
   it("materializes conditions as assurance obligations and closes them to satisfaction (#412-413)", async () => {
     const gate = await createGate(2);
     const criteria = gate.criteria as Json[];
+    const evidenceId = await seedEvidence();
     const due = addDaysISO(todayISO(), 30);
     const res = await post(`/projects/${projectId}/stage-gates/${gate.id}/reviews`, {
       reviewDate: todayISO(),
       rag: "amber_green",
       decision: "proceed_with_conditions",
       narrative: "Proceed subject to funding letter",
-      findings: (gate.criteria as Json[]).map((c) => ({ criterionId: c.id, met: true })),
+      findings: (gate.criteria as Json[]).map((c, i) => ({
+        criterionId: c.id,
+        met: true,
+        ...(i === 0 ? { evidenceIds: [evidenceId] } : {}),
+      })),
       conditions: [{ text: "Provide signed funding letter", dueDate: due }, { text: "Update risk register" }],
     });
     expect(res.statusCode).toBe(201);
@@ -325,10 +347,18 @@ describe("stage gates", () => {
     expect(items[0]!.daysToDue).toBe(30);
     expect(items[1]!.daysToDue).toBeNull();
 
+    // the reviewer who imposed the condition cannot discharge it (#413 SoD)
+    const selfClose = await post(
+      `/projects/${projectId}/gate-reviews/${review.id}/conditions/${conditions[0]!.id}/close`,
+      { note: "Letter received" },
+    );
+    expect(selfClose.statusCode).toBe(403);
+
     // close the first condition — condition closed, obligation satisfied
     const close = await post(
       `/projects/${projectId}/gate-reviews/${review.id}/conditions/${conditions[0]!.id}/close`,
       { note: "Letter received" },
+      reviewerHeaders,
     );
     expect(close.statusCode).toBe(200);
     const closed = ((close.json() as Json).conditions as Json[])[0]!;
@@ -344,6 +374,7 @@ describe("stage gates", () => {
     const again = await post(
       `/projects/${projectId}/gate-reviews/${review.id}/conditions/${conditions[0]!.id}/close`,
       {},
+      reviewerHeaders,
     );
     expect(again.statusCode).toBe(400);
     const dashAfter = (await get(`/projects/${projectId}/governance/conditions`)).json() as Json;
@@ -352,11 +383,16 @@ describe("stage gates", () => {
 
   it("records a stop decision in the project event graph (#412)", async () => {
     const gate = await createGate(3);
+    const evidenceId = await seedEvidence("Stop-decision assurance pack");
     const res = await post(`/projects/${projectId}/stage-gates/${gate.id}/reviews`, {
       reviewDate: todayISO(),
       rag: "red",
       decision: "stop",
-      findings: (gate.criteria as Json[]).map((c) => ({ criterionId: c.id, met: false })),
+      findings: (gate.criteria as Json[]).map((c, i) => ({
+        criterionId: c.id,
+        met: false,
+        ...(i === 0 ? { evidenceIds: [evidenceId] } : {}),
+      })),
     });
     expect(res.statusCode).toBe(201);
     const rows = await app.db

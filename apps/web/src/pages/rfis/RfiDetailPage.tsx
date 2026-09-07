@@ -56,7 +56,7 @@ interface Rfi {
   related: Array<{ id: string; number: number; subject: string; status: string }>;
   daysOverdue: number;
   ageDays: number;
-  permissions: { canRespond: boolean; canAdopt: boolean; canVoid: boolean; canEditQuestion: boolean };
+  permissions: { canRespond: boolean; canAdopt: boolean; canClose: boolean; canVoid: boolean; canEditQuestion: boolean };
 }
 
 interface ResponseForm {
@@ -206,7 +206,7 @@ export default function RfiDetailPage() {
             <Button variant="secondary" disabled={busy} onClick={() => { setForm(emptyResponse); setFormError(null); setRespondOpen("draft"); }}>Propose a response</Button>
           ) : null}
           {canEditMeta ? <Button variant="secondary" disabled={busy} onClick={openEdit}>Edit</Button> : null}
-          {rfi.status === "open" || rfi.status === "answered" ? (
+          {rfi.permissions.canClose ? (
             <Button variant="secondary" disabled={busy} onClick={() => void doAction("close")}>Close</Button>
           ) : null}
           {rfi.permissions.canVoid ? (

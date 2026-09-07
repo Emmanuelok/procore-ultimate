@@ -19,6 +19,9 @@ import { newId } from "../../lib/ids.js";
 import { intelligenceModule } from "./index.js";
 import type { AttentionItem, PulseResponse } from "./types.js";
 
+/** Same reasoning as intelligence.test.ts: PGlite + migrations per file, on a shared box. */
+vi.setConfig({ testTimeout: 180_000, hookTimeout: 900_000 });
+
 const { createMock } = vi.hoisted(() => ({ createMock: vi.fn() }));
 
 vi.mock("@anthropic-ai/sdk", () => ({
@@ -107,11 +110,11 @@ beforeAll(async () => {
   await app.scheduler.runNow("intelligence.health", "interval");
   const feed = (await app.inject({ method: "GET", url: "/api/v1/attention?kind=overdue_rfi", headers: owner.headers })).json() as { items: AttentionItem[] };
   rfiItem = feed.items[0]!;
-}, 120_000);
+}, 900_000); // boots PGlite and applies every migration: generous because this box is shared
 
 afterAll(async () => {
   await built.close();
-}, 60_000);
+}, 180_000);
 
 describe("daily briefing with a mocked model", () => {
   it("writes a cited briefing, drops uncited claims, routes proposals to the review queue and audits everything", async () => {
@@ -161,6 +164,17 @@ describe("daily briefing with a mocked model", () => {
     expect(review?.runId).toBe(body.briefing.runId);
     const [item] = await app.db.select().from(aiReviewQueue).where(eq(aiReviewQueue.id, body.reviewIds[0]!));
     expect(item).toBeDefined();
+
+    // proposals and the briefing they came from are written together: every
+    // queued row points at a briefing that exists (they share one transaction)
+    const queued = await app.db.select().from(aiReviewQueue).where(eq(aiReviewQueue.runId, body.briefing.runId));
+    expect(queued).toHaveLength(1);
+    for (const row of queued) {
+      const briefingId = (row.proposal as { briefingId?: string }).briefingId;
+      expect(briefingId).toBe(body.briefing.id);
+      const [parent] = await app.db.select().from(pulseBriefings).where(eq(pulseBriefings.id, briefingId!));
+      expect(parent).toBeDefined();
+    }
 
     // the run is audited with the platform's own evidence refs
     const [run] = await app.db.select().from(aiRuns).where(eq(aiRuns.id, body.briefing.runId));

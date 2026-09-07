@@ -13,7 +13,7 @@
  * and appraisal are COUNTED rather than costed, because the platform does not
  * hold the inspection hours and a £0 would make the ratio flattering and false.
  */
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import {
   Badge,
   Button,
@@ -29,6 +29,7 @@ import { IconPlus } from "../../ui/icons";
 import { api } from "../../lib/api";
 import {
   CountTile,
+  EditModal,
   LoadError,
   NothingHere,
   ReasonList,
@@ -39,6 +40,8 @@ import {
   num,
   plural,
   useAction,
+  useReason,
+  type EditFieldSpec,
   type Resource,
 } from "./qualityShared";
 import type { CostOfQuality, FirstTimeRight, Paged, ReworkItem, ReworkSummary } from "./types";
@@ -65,6 +68,51 @@ const PHASES = [
   "post_handover",
 ];
 
+/*
+ * What may be corrected on a rework item. Every cost here feeds the project's
+ * cost-of-quality buckets and the first-time-right figure, so a mistyped
+ * labour cost is a mistyped statement about what failure cost — worth
+ * correcting in place rather than by raising a second item. The lifecycle
+ * (approve, start, complete, verify, cancel) is not here: it has its own
+ * routes and its own segregation.
+ */
+const asOptions = (values: readonly string[]) =>
+  values.map((value) => ({ value, label: labelize(value) }));
+
+const REWORK_EDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "title", label: "What had to be done again", kind: "text", nullable: false, wide: true },
+  { key: "description", label: "Description", kind: "textarea" },
+  {
+    key: "causeCategory",
+    label: "Cause",
+    kind: "select",
+    options: asOptions(CAUSES),
+    nullable: false,
+    hint: "The cause drives the trade and phase analysis; a wrong one moves the blame quietly.",
+  },
+  { key: "causeDescription", label: "Cause, in words", kind: "textarea" },
+  {
+    key: "discoveryPhase",
+    label: "Discovered in",
+    kind: "select",
+    options: asOptions(PHASES),
+    nullable: false,
+  },
+  { key: "discoveredAt", label: "Discovered on", kind: "date" },
+  { key: "trade", label: "Trade", kind: "text" },
+  { key: "locationText", label: "Location", kind: "text" },
+  { key: "quantityAffected", label: "Quantity affected", kind: "number" },
+  { key: "unit", label: "Unit", kind: "text" },
+  { key: "scheduleImpactDays", label: "Schedule impact (days)", kind: "number" },
+  { key: "labourHours", label: "Labour hours", kind: "number" },
+  { key: "labourCost", label: "Labour cost", kind: "number" },
+  { key: "materialCost", label: "Material cost", kind: "number" },
+  { key: "plantCost", label: "Plant cost", kind: "number" },
+  { key: "subcontractorCost", label: "Subcontractor cost", kind: "number" },
+  { key: "otherCost", label: "Other cost", kind: "number" },
+];
+
+
 export default function ReworkTab({
   rework,
   summary,
@@ -81,10 +129,63 @@ export default function ReworkTab({
   onMutated: () => void;
 }) {
   const [createOpen, setCreateOpen] = useState(false);
+  const [editId, setEditId] = useState<string | null>(null);
+  const { busy, refusal, clear, run } = useAction();
+  const { ask, dialog } = useReason();
   const rows = rework.data?.items ?? [];
+  const editing = rows.find((r) => r.id === editId) ?? null;
   const s = summary.data;
   const coq = costOfQuality.data;
   const ftr = firstTimeRight.data;
+  const base = `/api/v1/projects/${projectId}/rework-items`;
+
+  /**
+   * The rework item's own lifecycle. It was unreachable from this screen: an
+   * item could be raised and never progressed, so the register filled with
+   * "raised" rows and the verified-rework figure stayed at zero for ever.
+   *
+   * Cancelling removes a cost from the project's failure record, so the API
+   * demands a reason and this asks for one before calling.
+   */
+  const advance = useCallback(
+    async (item: ReworkItem, status: string) => {
+      let note: string | null = null;
+      if (status === "cancelled") {
+        note = await ask({
+          title: `Cancel ${item.reference}`,
+          description:
+            "Cancelling removes this cost from the project's record of what failure cost. Say why it is not rework after all — the note is stored on the item and in the ledger.",
+          label: "Why is it being cancelled?",
+          confirmLabel: "Cancel the item",
+          destructive: true,
+        });
+        if (!note) return;
+      }
+      const done = await run(`${item.id}-${status}`, () =>
+        api.post(`${base}/${item.id}/status`, { status, note }),
+      );
+      if (done) onMutated();
+    },
+    [ask, base, onMutated, run],
+  );
+
+  const verify = useCallback(
+    async (item: ReworkItem) => {
+      const note = await ask({
+        title: `Verify ${item.reference}`,
+        description:
+          "Verification is segregated: the person who recorded the rework may not be the one who confirms it was put right. Say what was checked.",
+        label: "What was checked?",
+        confirmLabel: "Record the verification",
+      });
+      if (!note) return;
+      const done = await run(`${item.id}-verify`, () =>
+        api.post(`${base}/${item.id}/verify`, { note }),
+      );
+      if (done) onMutated();
+    },
+    [ask, base, onMutated, run],
+  );
 
   const columns = useMemo<DataColumns<ReworkItem>>(
     () => [
@@ -166,12 +267,85 @@ export default function ReworkTab({
         width: 120,
         cell: ({ row }) => <span className="text-2xs tabular-nums">{isoDate(row.discoveredAt)}</span>,
       },
+      {
+        id: "progress",
+        header: "Move it on",
+        headerTooltip:
+          "Approve → start → complete → verify. Verification is refused to the person who recorded the item.",
+        accessor: (r) => r.status,
+        type: "text",
+        width: 260,
+        cell: ({ row }) => (
+          <div className="flex flex-wrap items-center gap-1 py-0.5">
+            {row.status === "raised" ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                loading={busy === `${row.id}-approved`}
+                onClick={() => advance(row, "approved")}
+              >
+                Approve
+              </Button>
+            ) : null}
+            {row.status === "raised" || row.status === "approved" ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                loading={busy === `${row.id}-in_progress`}
+                onClick={() => advance(row, "in_progress")}
+              >
+                Start
+              </Button>
+            ) : null}
+            {row.status === "in_progress" || row.status === "approved" ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                loading={busy === `${row.id}-complete`}
+                onClick={() => advance(row, "complete")}
+              >
+                Complete
+              </Button>
+            ) : null}
+            {row.status === "complete" ? (
+              <Button
+                size="xs"
+                variant="primary"
+                loading={busy === `${row.id}-verify`}
+                onClick={() => verify(row)}
+              >
+                Verify
+              </Button>
+            ) : null}
+            {row.status !== "verified" && row.status !== "cancelled" ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                loading={busy === `${row.id}-cancelled`}
+                onClick={() => advance(row, "cancelled")}
+              >
+                Cancel
+              </Button>
+            ) : null}
+            {row.status === "verified" ? (
+              <span className="text-2xs text-content-subtle">
+                verified {isoDate(row.verifiedAt)}
+              </span>
+            ) : null}
+            <Button size="xs" variant="ghost" onClick={() => setEditId(row.id)}>
+              Edit
+            </Button>
+          </div>
+        ),
+      },
     ],
-    [],
+    [advance, busy, verify],
   );
 
   return (
     <div className="space-y-4">
+      {dialog}
+      <RefusalNotice refusal={refusal} onDismiss={clear} />
       {summary.error ? (
         <LoadError message={summary.error} onRetry={summary.reload} />
       ) : (
@@ -368,6 +542,17 @@ export default function ReworkTab({
           <GroupPanel title="By trade" groups={s.byTrade} />
         </div>
       ) : null}
+
+      <EditModal
+        open={editing !== null}
+        onClose={() => setEditId(null)}
+        title={editing ? `Correct ${editing.reference}` : "Correct the rework item"}
+        description="What the rework was and what it cost. These figures are the project's record of what failure cost, so they are worth correcting; the lifecycle and the verification are not editable here."
+        url={`${base}/${editId ?? ""}`}
+        fields={REWORK_EDIT_FIELDS}
+        record={editing as unknown as Record<string, unknown> | null}
+        onSaved={onMutated}
+      />
 
       <CreateRework
         open={createOpen}

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
 import { SignJWT, exportJWK, generateKeyPair, type JSONWebKeySet, type JWK } from "jose";
@@ -9,6 +9,8 @@ import {
   companyMemberships,
   identityProviders,
   ledgerEntries,
+  projectMemberships,
+  projects,
   refreshTokens,
   userIdentities,
   users,
@@ -19,6 +21,7 @@ import { registerSsoHttpClient, type SsoHttpClient, type SsoHttpResponse } from 
 import { decryptSecret, deriveSsoKey } from "./secrets.js";
 import { issuerMatches, pkceChallengeFor, verifyIdToken } from "./oidc.js";
 import { safeReturnTo } from "./policy.js";
+import { base32Decode, totpForStep, totpStep, type TotpParams } from "../mfa/totp.js";
 
 /* ================================================================== */
 /* A fake OpenID Provider, built from the published specs              */
@@ -312,6 +315,37 @@ async function signIn(
   return { flow, res: await callback(flow, code) };
 }
 
+/**
+ * WHAT A RED SUITE HERE MUST MEAN.
+ *
+ * `buildTestApp()` boots PGlite (WASM Postgres) and replays every migration
+ * from 0000, and almost every test below registers an account or two — a
+ * bcrypt hash plus a company, a membership and a project each. On an idle
+ * machine that is seconds; on a shared one it is minutes, and vitest's
+ * 30-second defaults then fail the suite for a reason that has nothing to do
+ * with the code under test. "Hook timed out" and "Test timed out" are the two
+ * failures that teach people to ignore red, so the ceilings are raised to
+ * match the other integration suites in this package. No assertion changes: a
+ * test that is going to pass still passes, it is simply allowed to take
+ * longer, and one that is going to fail still fails on its assertion.
+ */
+/**
+ * WHAT A RED SUITE HERE MUST MEAN.
+ *
+ * `buildTestApp()` boots PGlite (WASM Postgres) and replays every migration
+ * from 0000, and nearly every test registers an account — a bcrypt hash plus a
+ * company, a membership and a project. On an idle machine that is seconds. On
+ * the shared machine this wave runs on, a single run measured 878 seconds of
+ * module IMPORT alone, and vitest's 30-second defaults then fail suites for a
+ * reason that has nothing to do with the code under test. "Hook timed out" and
+ * "Test timed out" are the two failures that teach people to ignore red.
+ *
+ * Raising the ceilings changes no assertion: a test that is going to pass
+ * still passes, and one that is going to fail still fails on its assertion.
+ */
+const HOOK_TIMEOUT_MS = 300_000;
+vi.setConfig({ testTimeout: 120_000, hookTimeout: HOOK_TIMEOUT_MS });
+
 beforeAll(async () => {
   built = await buildTestApp();
   app = built.app;
@@ -341,7 +375,7 @@ beforeAll(async () => {
     userId: bobId,
     role: "member",
   });
-}, 60_000);
+}, HOOK_TIMEOUT_MS);
 
 afterAll(async () => {
   await built.close();
@@ -1403,5 +1437,395 @@ describe("redirect mode never puts a token in a URL", () => {
     });
     expect(replay.statusCode).toBe(400);
     expect(replay.json().message).toContain("single-use");
+  });
+});
+
+/* ================================================================== */
+/* WP-AUTH regressions                                                 */
+/* ================================================================== */
+
+describe("the tenant MFA policy applies to SSO (regression)", () => {
+  /**
+   * THE FINDING. `finishSignIn` → `issueSession` wrote `auth_sessions` with
+   * `mfa_satisfied_at` null and never consulted `companiesRequiringMfa` or the
+   * id_token's amr/acr. A company that set `PUT /auth/mfa/policy
+   * {required:true}` still admitted every SSO user with no second factor,
+   * while password users in the same company were forced to enrol — so the
+   * policy and the coverage figure beside it were cosmetic for exactly the
+   * tenants most likely to have SSO.
+   */
+  async function requireMfa(required: boolean): Promise<void> {
+    const res = await app.inject({
+      method: "PUT",
+      url: "/api/v1/auth/mfa/policy",
+      headers: owner.headers,
+      payload: { required },
+    });
+    expect(res.statusCode).toBe(200);
+  }
+
+  it("returns a challenge instead of tokens when the tenant requires a second factor", async () => {
+    const provider = await createProvider(owner, { displayName: "MFA policy — challenge" });
+    await enableProvider(provider.id);
+    await requireMfa(true);
+    try {
+      const { res } = await signIn(provider.slug, {
+        claims: { sub: "mfa-policy-subject", email: BOB_EMAIL, email_verified: true },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as Record<string, any>;
+      expect(body.mfaRequired).toBe(true);
+      // NO TOKENS. That absence is the whole answer.
+      expect(body.accessToken).toBeUndefined();
+      expect(body.refreshToken).toBeUndefined();
+      expect(typeof body.challengeToken).toBe("string");
+      // A user with no enrolled factor is asked to enrol, exactly as a
+      // password user of the same tenant would be.
+      expect(body.scope).toBe("enrol");
+      expect(body.policy.required).toBe(true);
+      expect(body.policy.companies[0].companyId).toBe(owner.companyId);
+      expect(body.reasons.join(" ")).toContain("not configured to perform multi-factor");
+
+      // and no session row was opened for it
+      const sessions = await app.db
+        .select()
+        .from(authSessions)
+        .where(and(eq(authSessions.userId, bobId), eq(authSessions.authMethod, "sso")));
+      const live = sessions.filter((s) => !s.revokedAt && s.providerId === provider.id);
+      expect(live).toHaveLength(0);
+    } finally {
+      await requireMfa(false);
+    }
+  });
+
+  it("gates the RETURNING user too, not just the sign-in that links the identity", async () => {
+    // THE HALF THE FIRST FIX MISSED. `completeLogin` has two paths: the one
+    // that links a new identity, and the one that recognises an existing one.
+    // Only the first consulted the MFA gate, so the policy held for a user's
+    // FIRST SSO sign-in and was silently absent from every one after it —
+    // which is worse than no policy, because the coverage figure says it
+    // holds. This signs in once to create the identity, then turns the policy
+    // on and signs in again through the same identity.
+    const provider = await createProvider(owner, { displayName: "MFA policy — returning" });
+    await enableProvider(provider.id);
+    const first = await signIn(provider.slug, {
+      claims: { sub: "mfa-returning-subject", email: BOB_EMAIL, email_verified: true },
+    });
+    expect(first.res.statusCode).toBe(200);
+    expect(typeof (first.res.json() as Record<string, unknown>)["accessToken"]).toBe("string");
+
+    await requireMfa(true);
+    try {
+      const { res } = await signIn(provider.slug, {
+        claims: { sub: "mfa-returning-subject", email: BOB_EMAIL, email_verified: true },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as Record<string, any>;
+      expect(body.mfaRequired).toBe(true);
+      expect(body.accessToken).toBeUndefined();
+      expect(typeof body.challengeToken).toBe("string");
+    } finally {
+      await requireMfa(false);
+    }
+  });
+
+  it("accepts the IdP's own MFA when the connection is configured to and amr proves it", async () => {
+    const provider = await createProvider(owner, {
+      displayName: "MFA policy — idp performs",
+      idpPerformsMfa: true,
+      mfaAmrValues: ["mfa", "otp"],
+    });
+    await enableProvider(provider.id);
+    await requireMfa(true);
+    try {
+      const { res } = await signIn(provider.slug, {
+        claims: {
+          sub: "mfa-amr-subject",
+          email: BOB_EMAIL,
+          email_verified: true,
+          amr: ["pwd", "mfa"],
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as Record<string, any>;
+      expect(body.mfaRequired).toBeUndefined();
+      expect(typeof body.accessToken).toBe("string");
+      const [session] = await app.db
+        .select()
+        .from(authSessions)
+        .where(eq(authSessions.id, body.session.id));
+      // the session is marked satisfied, so step-up does not ask again
+      expect(session?.mfaSatisfiedAt).not.toBeNull();
+    } finally {
+      await requireMfa(false);
+    }
+  });
+
+  it("refuses an amr value the administrator did not accept", async () => {
+    const provider = await createProvider(owner, {
+      displayName: "MFA policy — wrong amr",
+      idpPerformsMfa: true,
+      mfaAmrValues: ["hwk"],
+    });
+    await enableProvider(provider.id);
+    await requireMfa(true);
+    try {
+      const { res } = await signIn(provider.slug, {
+        claims: {
+          sub: "mfa-wrong-amr-subject",
+          email: BOB_EMAIL,
+          email_verified: true,
+          amr: ["pwd"],
+        },
+      });
+      const body = res.json() as Record<string, any>;
+      expect(body.mfaRequired).toBe(true);
+      expect(body.accessToken).toBeUndefined();
+      expect(body.reasons.join(" ")).toContain("did not assert one of the accepted");
+    } finally {
+      await requireMfa(false);
+    }
+  });
+
+  /**
+   * THE OTHER HALF OF THE SAME FIX.
+   *
+   * Returning a challenge instead of tokens is only correct if the challenge
+   * can be spent. It reaches the SPA as the ticket payload, /auth/sso/complete
+   * carries it into the sign-in page's navigation state, and the sign-in page
+   * drives exactly the two calls below. Before this test existed the token was
+   * minted and dropped: the user landed on an email/password form that a
+   * JIT-provisioned SSO account has no usable password for, and starting SSO
+   * again just minted another challenge — an SSO tenant that turned the MFA
+   * requirement on locked out every one of its users, with a loop for a way
+   * out. This drives the whole path end to end.
+   */
+  it("hands over a challenge that finishes the sign-in at POST /auth/mfa/challenge", async () => {
+    const email = `carol-mfa-${Date.now()}@acme.test`;
+    const registered = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/register",
+      payload: { email, password: "password-123", name: "Carol Contractor" },
+    });
+    expect(registered.statusCode).toBe(201);
+    const carolId = (registered.json() as { user: { id: string } }).user.id;
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: carolId,
+      role: "member",
+    });
+
+    const provider = await createProvider(owner, { displayName: "MFA policy — redeemed" });
+    await enableProvider(provider.id);
+    await requireMfa(true);
+    try {
+      const { res } = await signIn(provider.slug, {
+        claims: { sub: `mfa-redeem-${carolId}`, email, email_verified: true },
+      });
+      expect(res.statusCode).toBe(200);
+      const envelope = res.json() as {
+        mfaRequired: boolean;
+        challengeToken: string;
+        challengeId: string;
+        scope: string;
+        methods: string[];
+        expiresAt: string;
+        accessToken?: string;
+      };
+      expect(envelope.mfaRequired).toBe(true);
+      expect(envelope.accessToken).toBeUndefined();
+      expect(envelope.scope).toBe("enrol");
+      // Everything the sign-in page's challenge step needs is in the envelope
+      // — this is what SsoCompletePage forwards, so a missing field here is a
+      // page that cannot render.
+      expect(typeof envelope.challengeId).toBe("string");
+      expect(typeof envelope.expiresAt).toBe("string");
+      expect(envelope.methods).toContain("totp");
+
+      const seeded = await app.inject({
+        method: "POST",
+        url: "/api/v1/auth/mfa/challenge/enrol",
+        payload: { challengeToken: envelope.challengeToken },
+      });
+      expect(seeded.statusCode).toBe(201);
+      const secret = (seeded.json() as { secret: string }).secret;
+
+      const params: TotpParams = {
+        secret: base32Decode(secret),
+        algorithm: "SHA1",
+        digits: 6,
+        periodSeconds: 30,
+      };
+      const finished = await app.inject({
+        method: "POST",
+        url: "/api/v1/auth/mfa/challenge",
+        payload: {
+          challengeToken: envelope.challengeToken,
+          code: totpForStep(params, totpStep(Date.now(), 30)),
+        },
+      });
+      expect(finished.statusCode).toBe(200);
+      const session = finished.json() as { accessToken?: string; refreshToken?: string };
+      expect(typeof session.accessToken).toBe("string");
+      expect(typeof session.refreshToken).toBe("string");
+    } finally {
+      await requireMfa(false);
+    }
+  });
+
+  it("signs in normally, unsatisfied, when no tenant requires a second factor", async () => {
+    const provider = await createProvider(owner, { displayName: "MFA policy — off" });
+    await enableProvider(provider.id);
+    const { res } = await signIn(provider.slug, {
+      claims: { sub: "mfa-off-subject", email: BOB_EMAIL, email_verified: true },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Record<string, any>;
+    expect(typeof body.accessToken).toBe("string");
+    const [session] = await app.db
+      .select()
+      .from(authSessions)
+      .where(eq(authSessions.id, body.session.id));
+    expect(session?.mfaSatisfiedAt).toBeNull();
+  });
+});
+
+describe("JIT provisioning applies the permission template (regression)", () => {
+  /**
+   * THE FINDING. `defaultTemplateKey` was resolved, written into the ledger
+   * payload, and applied to nothing: `identity_providers.default_template_key`
+   * says "permission template key applied to a provisioned user's project
+   * access" and no code applied it. A provisioned member held a company
+   * membership and could not open a single :projectId route.
+   */
+  it("creates project memberships for the projects the connection nominates", async () => {
+    const projectId = newId("prj");
+    await app.db.insert(projects).values({
+      id: projectId,
+      companyId: owner.companyId,
+      name: "SSO Provisioned Project",
+      number: `SSO-${Date.now()}`,
+    });
+    const provider = await createProvider(owner, {
+      displayName: "JIT with template",
+      autoProvision: true,
+      defaultTemplateKey: "field_engineer",
+      provisionProjectIds: [projectId],
+    });
+    await verifyDomains(provider.id);
+    await enableProvider(provider.id);
+
+    const email = `jit-${Date.now()}@acme.test`;
+    const { res } = await signIn(provider.slug, {
+      claims: { sub: `jit-subject-${Date.now()}`, email, email_verified: true },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Record<string, any>;
+    expect(body.provisioned).toBe(true);
+    expect(body.projects).toEqual([projectId]);
+
+    const memberships = await app.db
+      .select()
+      .from(projectMemberships)
+      .where(
+        and(
+          eq(projectMemberships.projectId, projectId),
+          eq(projectMemberships.userId, body.user.id),
+        ),
+      );
+    expect(memberships).toHaveLength(1);
+    expect(memberships[0]!.templateKey).toBe("field_engineer");
+  });
+
+  it("refuses to nominate a project belonging to another company", async () => {
+    const provider = await createProvider(owner, { displayName: "JIT foreign project" });
+    const foreign = newId("prj");
+    await app.db.insert(projects).values({
+      id: foreign,
+      companyId: outsider.companyId,
+      name: "Someone else's project",
+      number: `FOR-${Date.now()}`,
+    });
+    const res = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/identity-providers/${provider.id}`,
+      headers: owner.headers,
+      payload: { provisionProjectIds: [foreign] },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toContain("not a project of this company");
+  });
+});
+
+describe("redirect-mode errors do not leak internals (regression)", () => {
+  /**
+   * THE FINDING. `finishError` put `err.message` into the redirect URL for
+   * ANY thrown error, bypassing the production 5xx masking in app.ts — so a
+   * decryption or driver failure landed its message in the browser URL,
+   * browser history and every proxy log in between, and SsoCompletePage
+   * printed it verbatim.
+   */
+  it("forwards a user-facing 4xx message, with no reference", async () => {
+    const provider = await createProvider(owner, { displayName: "Redirect 4xx" });
+    await enableProvider(provider.id);
+    const start = await app.inject({
+      method: "GET",
+      url: `/api/v1/auth/sso/${provider.slug}/start?mode=redirect`,
+    });
+    expect(start.statusCode).toBe(302);
+    const authorizeUrl = new URL(start.headers.location as string);
+    const state = authorizeUrl.searchParams.get("state") ?? "";
+    const cookie = cookieFrom(start.headers["set-cookie"] as string | string[] | undefined);
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/auth/sso/callback?state=${encodeURIComponent(state)}&error=access_denied&error_description=user%20said%20no`,
+      headers: cookie ? { cookie } : {},
+    });
+    expect(res.statusCode).toBe(302);
+    const location = new URL(res.headers.location as string);
+    expect(location.searchParams.get("error")).toBe("401");
+    expect(location.searchParams.get("message")).toContain("access_denied");
+    expect(location.searchParams.get("reference")).toBeNull();
+  });
+
+  it("masks an unexpected internal failure behind a reference", async () => {
+    const provider = await createProvider(owner, { displayName: "Redirect 5xx" });
+    await enableProvider(provider.id);
+    const start = await app.inject({
+      method: "GET",
+      url: `/api/v1/auth/sso/${provider.slug}/start?mode=redirect`,
+    });
+    const authorizeUrl = new URL(start.headers.location as string);
+    const state = authorizeUrl.searchParams.get("state") ?? "";
+    const cookie = cookieFrom(start.headers["set-cookie"] as string | string[] | undefined);
+
+    // A raw, non-AppError failure from deep inside the exchange — what a
+    // decryption or driver fault looks like.
+    const good = idp.client();
+    registerSsoHttpClient(app.db, {
+      get: good.get.bind(good),
+      async post() {
+        throw new Error("pq: could not decrypt column client_secret_ciphertext");
+      },
+    });
+    try {
+      const res = await app.inject({
+        method: "GET",
+        url: `/api/v1/auth/sso/callback?code=whatever&state=${encodeURIComponent(state)}`,
+        headers: cookie ? { cookie } : {},
+      });
+      expect(res.statusCode).toBe(302);
+      const location = new URL(res.headers.location as string);
+      expect(location.searchParams.get("error")).toBe("500");
+      const message = location.searchParams.get("message") ?? "";
+      expect(message).not.toContain("decrypt");
+      expect(message).not.toContain("client_secret_ciphertext");
+      expect(message).toContain("could not be completed");
+      expect(location.searchParams.get("reference")).toMatch(/^ssoerr/);
+    } finally {
+      registerSsoHttpClient(app.db, idp.client());
+    }
   });
 });

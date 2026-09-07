@@ -17,9 +17,22 @@
  * that count as "open" so a scheduled scan stays bounded, and which column
  * an `assign` action writes. Schedule scans never load a table unbounded:
  * they filter by company (+ project), by open status where the type has one,
- * and take at most `SCAN_LIMIT` rows ordered newest first.
+ * and take at most `SCAN_LIMIT` rows.
+ *
+ * SCAN ORDER MATTERS. Every schedule rule the platform ships looks for the
+ * records that have been waiting LONGEST — overdue by 3 days, stale for 14
+ * days, expiring within 30. Ordering a capped scan newest-first would put the
+ * matches outside the cap on any mature tenant, so the scan is ordered by the
+ * type's deadline field ascending (Postgres puts NULL deadlines last) and
+ * falls back to oldest-created-first. The caller may name the field its rule
+ * actually ages on ("open 14+ days" → createdAt), which wins over the type's
+ * deadline. When the cap is reached the scan says so (`truncated`), and the
+ * caller records it on the rule so a capped scan is never a silent miss —
+ * including the case oldest-first still cannot serve, a "due within 30 days"
+ * rule on a type carrying thousands of long-past deadlines: the honest answer
+ * there is the truncation flag, and a narrower rule.
  */
-import { and, desc, eq, inArray, type SQL } from "drizzle-orm";
+import { and, asc, eq, inArray, type SQL } from "drizzle-orm";
 import type { AnyPgTable, PgColumn } from "drizzle-orm/pg-core";
 import {
   changeEvents,
@@ -751,10 +764,40 @@ export async function loadSnapshot(
   return { record: row, projectId, title: rowTitle(entry, row) };
 }
 
+export interface ScanPage {
+  candidates: LoadedSnapshot[];
+  /** the cap was reached: there are more live records than this scan looked at */
+  truncated: boolean;
+  /** the cap that was applied */
+  limit: number;
+  /** how the rows were ordered, so the run log can say what the scan preferred */
+  orderedBy: string;
+}
+
+const EMPTY_SCAN = (limit: number): ScanPage => ({ candidates: [], truncated: false, limit, orderedBy: "none" });
+
+/**
+ * The column a schedule scan should order by, and its name for the report.
+ * `preferField` is the field the RULE ages on (e.g. a "created 14+ days ago"
+ * condition orders by createdAt, not by the type's deadline — a change event
+ * with no due date would otherwise sort last and fall outside the cap).
+ */
+function scanOrderColumn(entry: SnapshotEntry, preferField?: string | null): { column: PgColumn; field: string } | null {
+  const columns = entry.table as unknown as Record<string, PgColumn | undefined>;
+  for (const field of [preferField, entry.dueField]) {
+    if (!field) continue;
+    const col = columns[field];
+    if (col) return { column: col, field };
+  }
+  if (entry.createdAtColumn) return { column: entry.createdAtColumn, field: "createdAt" };
+  return null;
+}
+
 /**
  * Candidate records for a schedule scan: this company's (and optionally this
- * project's) live records of one type, newest first, capped. Types without a
- * status column are scanned whole but still capped.
+ * project's) live records of one type, capped, ORDERED OLDEST-DEADLINE FIRST
+ * (see the file header). Types without a status column are scanned whole but
+ * still capped. `truncated` is true when the cap cut the list short.
  */
 export async function scanCandidates(
   db: Db,
@@ -762,15 +805,17 @@ export async function scanCandidates(
   objectType: string,
   projectId: string | null,
   limit = SCAN_LIMIT,
-): Promise<LoadedSnapshot[]> {
+  preferField: string | null = null,
+): Promise<ScanPage> {
+  const cap = Math.max(1, Math.min(limit, SCAN_LIMIT));
   const entry = BY_TYPE.get(objectType);
-  if (!entry) return [];
+  if (!entry) return EMPTY_SCAN(cap);
   const conds: SQL[] = [];
   if (entry.companyColumn) conds.push(eq(entry.companyColumn, companyId));
   if (projectId) {
     if (entry.selfProject) conds.push(eq(entry.idColumn, projectId));
     else if (entry.projectColumn) conds.push(eq(entry.projectColumn, projectId));
-    else return []; // a company-level type cannot be scanned per project
+    else return EMPTY_SCAN(cap); // a company-level type cannot be scanned per project
   } else if (!entry.companyColumn && entry.projectColumn) {
     // No company column: bound the scan to this company's projects.
     const owned = await db
@@ -778,21 +823,31 @@ export async function scanCandidates(
       .from(projects)
       .where(eq(projects.companyId, companyId));
     const ids = owned.map((p) => p.id);
-    if (ids.length === 0) return [];
+    if (ids.length === 0) return EMPTY_SCAN(cap);
     conds.push(inArray(entry.projectColumn, ids));
   }
   if (entry.statusColumn && entry.openStatuses && entry.openStatuses.length > 0) {
     conds.push(inArray(entry.statusColumn, [...entry.openStatuses]));
   }
+  const order = scanOrderColumn(entry, preferField);
   let q = db.select().from(entry.table).$dynamic();
   if (conds.length > 0) q = q.where(and(...conds));
-  if (entry.createdAtColumn) q = q.orderBy(desc(entry.createdAtColumn));
-  const rows = (await q.limit(Math.min(limit, SCAN_LIMIT))) as Array<Record<string, unknown>>;
-  return rows.map((row) => ({
-    record: row,
-    projectId: rowProject(entry, row),
-    title: rowTitle(entry, row),
-  }));
+  // Ties on a shared deadline are broken by id so paging/ordering is stable.
+  if (order) q = q.orderBy(asc(order.column), asc(entry.idColumn));
+  // One row past the cap tells us whether the scan was truncated without a
+  // second COUNT query.
+  const rows = (await q.limit(cap + 1)) as Array<Record<string, unknown>>;
+  const truncated = rows.length > cap;
+  return {
+    candidates: rows.slice(0, cap).map((row) => ({
+      record: row,
+      projectId: rowProject(entry, row),
+      title: rowTitle(entry, row),
+    })),
+    truncated,
+    limit: cap,
+    orderedBy: order ? `${order.field} asc` : "unordered",
+  };
 }
 
 /**

@@ -9,7 +9,7 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
-import { Badge, Button, ErrorAlert, Select, Spinner, Textarea } from "../../ui";
+import { Badge, Button, ErrorAlert, Input, Select, Spinner, Textarea } from "../../ui";
 import { formatDate, formatDateTime } from "../format";
 import {
   ConfirmStrip,
@@ -356,6 +356,11 @@ export default function PolicyDrawer({
             </>
           ) : null}
 
+          {/* -------------------------------- premium ---------------------------------- */}
+          {viaProject && policy.projectId !== null ? (
+            <PremiumPanel projectId={policy.projectId} policy={policy} />
+          ) : null}
+
           {/* --------------------------------- actions --------------------------------- */}
           <SectionTitle>Status</SectionTitle>
           <ErrorAlert message={actionError} />
@@ -458,5 +463,250 @@ export default function PolicyDrawer({
         </div>
       )}
     </Drawer>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Premium movements (#782)                                            */
+/*                                                                     */
+/* The loss ratio the renewal turns on is computed from premium ROWS,  */
+/* not from a field on the policy — premium is paid in instalments,    */
+/* adjusted at audit and partly returned, and a single "premium"       */
+/* number cannot represent any of that. The programme's experience     */
+/* panel already said "record the premium instalments against each     */
+/* policy"; until now nothing in the app could.                        */
+/* ------------------------------------------------------------------ */
+
+interface PremiumRow {
+  id: string;
+  kind: string;
+  amount: number;
+  currency: string;
+  periodStart: string | null;
+  periodEnd: string | null;
+  dueDate: string | null;
+  paidAt: string | null;
+  reference: string | null;
+  note: string | null;
+}
+
+interface PremiumList {
+  items: PremiumRow[];
+  total: number;
+  experience: {
+    byCurrency: Array<{
+      currency: string;
+      premiumNet: number;
+      claimsIncurred: number;
+      /** claims incurred over net premium, as a PERCENTAGE; null when unknowable */
+      lossRatioPct: number | null;
+      reasons: string[];
+    }>;
+  };
+}
+
+const PREMIUM_KIND_LABELS: Record<string, string> = {
+  premium: "Premium",
+  adjustment: "Adjustment",
+  return_premium: "Return premium",
+  broker_fee: "Broker fee",
+  levy: "Levy",
+};
+
+function PremiumPanel({ projectId, policy }: { projectId: string; policy: PolicyDetail }) {
+  const path = `/api/v1/projects/${projectId}/insurance/policies/${policy.id}/premiums`;
+  const [data, setData] = useState<PremiumList | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [kind, setKind] = useState("premium");
+  const [amount, setAmount] = useState("");
+  const [dueDate, setDueDate] = useState("");
+  const [paidAt, setPaidAt] = useState("");
+  const [reference, setReference] = useState("");
+
+  const load = useCallback(async () => {
+    setError(null);
+    try {
+      setData(await api.get<PremiumList>(path));
+    } catch (err) {
+      setData(null);
+      setError(errMsg(err, "Failed to load the premium record"));
+    }
+  }, [path]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function submit() {
+    const value = Number(amount);
+    if (!Number.isFinite(value) || value <= 0) {
+      setFormError("An amount must be a positive number — a premium of zero is not a movement.");
+      return;
+    }
+    setBusy(true);
+    setFormError(null);
+    try {
+      await api.post(path, {
+        kind,
+        amount: value,
+        currency: policy.currency,
+        dueDate: dueDate || null,
+        paidAt: paidAt || null,
+        reference: reference.trim() || null,
+      });
+      setAmount("");
+      setDueDate("");
+      setPaidAt("");
+      setReference("");
+      setAdding(false);
+      await load();
+    } catch (err) {
+      setFormError(errMsg(err, "The premium movement was refused"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const bucket = data?.experience.byCurrency.find((b) => b.currency === policy.currency) ?? null;
+
+  return (
+    <>
+      <SectionTitle hint="What was actually paid, returned and incurred — the inputs to the loss ratio.">
+        Premium &amp; experience
+      </SectionTitle>
+      <ErrorAlert message={error} />
+      {data === null ? (
+        error ? null : (
+          <Spinner />
+        )
+      ) : (
+        <div className="space-y-2">
+          {data.items.length === 0 ? (
+            <p className="text-sm text-ink-400">
+              No premium movement recorded against this policy, so its loss ratio cannot be
+              computed and reads &quot;—&quot; on the programme experience panel. That is the
+              honest answer, not a ratio of zero.
+            </p>
+          ) : (
+            <div className="space-y-1">
+              {data.items.map((p) => (
+                <div
+                  key={p.id}
+                  className="flex flex-wrap items-center gap-2 rounded-md bg-ink-50 px-2 py-1.5 text-sm"
+                >
+                  <Badge tone={p.kind === "return_premium" ? "amber" : "brand"}>
+                    {PREMIUM_KIND_LABELS[p.kind] ?? p.kind}
+                  </Badge>
+                  <span className="font-medium text-ink-900">
+                    {fmtMoney(p.amount, p.currency, 2)}
+                  </span>
+                  <span className="grow text-xs text-ink-500">
+                    {p.paidAt
+                      ? `paid ${formatDate(p.paidAt)}`
+                      : p.dueDate
+                        ? `due ${formatDate(p.dueDate)}`
+                        : "no date recorded"}
+                    {p.reference ? ` · ${p.reference}` : ""}
+                  </span>
+                  {p.currency !== policy.currency ? (
+                    <Badge tone="red">currency differs from the policy</Badge>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {bucket ? (
+            <p className="text-xs leading-relaxed text-ink-500">
+              Net premium {fmtMoney(bucket.premiumNet, bucket.currency, 0)} against claims incurred{" "}
+              {fmtMoney(bucket.claimsIncurred, bucket.currency, 0)} —{" "}
+              {bucket.lossRatioPct === null ? (
+                <>
+                  loss ratio not available:{" "}
+                  {bucket.reasons[0] ?? "the API gave no reason, which is itself a fault"}
+                </>
+              ) : (
+                <strong>{bucket.lossRatioPct.toFixed(1)}% loss ratio</strong>
+              )}
+              . Never summed across currencies.
+            </p>
+          ) : null}
+
+          <ErrorAlert message={formError} />
+          {adding ? (
+            <div className="space-y-2 rounded-md border border-ink-100 p-2">
+              <div className="flex flex-wrap items-end gap-2">
+                <label className="block">
+                  <span className="mb-1 block text-xs font-medium text-ink-600">Kind</span>
+                  <Select value={kind} onChange={(e) => setKind(e.target.value)} className="w-44">
+                    {Object.entries(PREMIUM_KIND_LABELS).map(([k, label]) => (
+                      <option key={k} value={k}>
+                        {label}
+                      </option>
+                    ))}
+                  </Select>
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-xs font-medium text-ink-600">
+                    Amount ({policy.currency})
+                  </span>
+                  <Input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    className="w-36"
+                    value={amount}
+                    onChange={(e) => setAmount(e.target.value)}
+                  />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-xs font-medium text-ink-600">Due</span>
+                  <Input
+                    type="date"
+                    className="w-40"
+                    value={dueDate}
+                    onChange={(e) => setDueDate(e.target.value)}
+                  />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-xs font-medium text-ink-600">Paid</span>
+                  <Input
+                    type="date"
+                    className="w-40"
+                    value={paidAt}
+                    onChange={(e) => setPaidAt(e.target.value)}
+                  />
+                </label>
+              </div>
+              <Input
+                placeholder="Reference (debit note, instalment number…)"
+                value={reference}
+                onChange={(e) => setReference(e.target.value)}
+              />
+              <div className="flex gap-2">
+                <Button disabled={busy} onClick={() => void submit()}>
+                  {busy ? "Recording…" : "Record it"}
+                </Button>
+                <Button variant="secondary" disabled={busy} onClick={() => setAdding(false)}>
+                  Cancel
+                </Button>
+              </div>
+              <p className="text-xs text-ink-500">
+                The movement is recorded in the policy&apos;s own currency ({policy.currency}); a
+                movement in another currency belongs on a policy written in that currency, because
+                the loss ratio is computed per currency and never across.
+              </p>
+            </div>
+          ) : (
+            <Button variant="secondary" onClick={() => setAdding(true)}>
+              Record a premium movement
+            </Button>
+          )}
+        </div>
+      )}
+    </>
   );
 }

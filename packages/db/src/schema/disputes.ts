@@ -40,7 +40,26 @@ export const disputes = pgTable(
     status: text("status").default("notified").notNull(), // DisputeStatus
     /** procedural timetable (#338): [{ id, name, dueDate, obligationId?, done }] */
     timetable: jsonb("timetable").$type<unknown[]>().default([]).notNull(),
+    /**
+     * Statutory / contractual regime whose timetable was generated
+     * (DisputeJurisdiction, #322-333), and the trigger date the offsets run
+     * from — usually the date of the notice of adjudication.
+     */
+    jurisdiction: text("jurisdiction"),
+    triggerDate: text("trigger_date"), // ISO date
     outcome: text("outcome"),
+    /* ---- structured outcome database (#356-357) ---- */
+    amountClaimed: doublePrecision("amount_claimed"),
+    amountAwarded: doublePrecision("amount_awarded"),
+    costsAwarded: doublePrecision("costs_awarded"),
+    rootCause: text("root_cause"), // DisputeRootCause
+    governingClause: text("governing_clause"),
+    contractFamily: text("contract_family"), // FIDIC / NEC / JCT / bespoke
+    resolvedAt: text("resolved_at"), // ISO date the matter ended
+    /* ---- post-decision enforcement (#333) ---- */
+    enforcementStatus: text("enforcement_status").default("not_applicable").notNull(),
+    complianceDeadline: text("compliance_deadline"), // ISO date
+    nodDeadline: text("nod_deadline"), // notice of dissatisfaction window
     decidedAt: timestamp("decided_at", { withTimezone: true, mode: "string" }),
     createdBy: text("created_by").notNull(),
     createdAt: createdAt(),
@@ -116,4 +135,195 @@ export const settlementOffers = pgTable(
     updatedAt: updatedAt(),
   },
   (t) => [index("settlement_offers_dispute_idx").on(t.disputeId)],
+);
+
+/* ================================================================== */
+/* Platform upgrade wave — dispute depth (#322-333, #340-343, #351-357)  */
+/* ================================================================== */
+
+/**
+ * Frozen content snapshot per bundle item (#343). Without this, `verify`
+ * cannot tell tampering from an ordinary lifecycle change on the source
+ * record, and a produced bundle cannot be re-rendered exactly as served.
+ */
+export const bundleSnapshots = pgTable(
+  "bundle_snapshots",
+  {
+    id: text("id").primaryKey(),
+    bundleId: text("bundle_id").notNull(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    itemId: text("item_id").notNull(),
+    tab: text("tab").notNull(),
+    kind: text("kind").notNull(), // record | file
+    sha256: text("sha256").notNull(),
+    /** canonical JSON of the record at generation; null for file-backed items */
+    snapshot: jsonb("snapshot").$type<Record<string, unknown>>(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    uniqueIndex("bundle_snapshots_uq").on(t.bundleId, t.itemId),
+    index("bundle_snapshots_bundle_idx").on(t.bundleId),
+  ],
+);
+
+/**
+ * Standing dispute board members (#331): FIDIC DAAB / NEC dispute avoidance
+ * board. Independence disclosures are the whole point of the record.
+ */
+export const disputeBoardMembers = pgTable(
+  "dispute_board_members",
+  {
+    id: text("id").primaryKey(),
+    disputeId: text("dispute_id").notNull(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    name: text("name").notNull(),
+    boardRole: text("board_role").default("member").notNull(), // DisputeBoardRole
+    nominatedBy: text("nominated_by"), // employer | contractor | agreed | institution
+    appointedAt: text("appointed_at"), // ISO date
+    independenceDisclosure: text("independence_disclosure"),
+    /** 1 when a conflict was declared — a board with an undeclared conflict is challengeable */
+    conflictDeclared: integer("conflict_declared").default(0).notNull(),
+    feeBasis: text("fee_basis"),
+    recordedBy: text("recorded_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [index("dispute_board_members_dispute_idx").on(t.disputeId)],
+);
+
+/** Standing board site visits and their reports (#331-332). */
+export const disputeBoardVisits = pgTable(
+  "dispute_board_visits",
+  {
+    id: text("id").primaryKey(),
+    disputeId: text("dispute_id").notNull(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    visitDate: text("visit_date").notNull(), // ISO date
+    attendees: jsonb("attendees").$type<string[]>().default([]).notNull(),
+    summary: text("summary"),
+    recommendations: text("recommendations"),
+    reportFileId: text("report_file_id"),
+    recordedBy: text("recorded_by").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [index("dispute_board_visits_dispute_idx").on(t.disputeId)],
+);
+
+/**
+ * Cost of recovery (#354). A claim worth 200k pursued for 260k of fees is
+ * a loss; nothing else on the platform can say so without these rows.
+ */
+export const disputeCosts = pgTable(
+  "dispute_costs",
+  {
+    id: text("id").primaryKey(),
+    disputeId: text("dispute_id").notNull(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    category: text("category").notNull(), // DisputeCostCategory
+    supplier: text("supplier"),
+    description: text("description").notNull(),
+    incurredAt: text("incurred_at").notNull(), // ISO date
+    budgetAmount: doublePrecision("budget_amount"),
+    actualAmount: doublePrecision("actual_amount").notNull(),
+    currency: text("currency").default("GBP").notNull(),
+    /** 1 when the cost is recoverable from the other side if successful */
+    recoverable: integer("recoverable").default(0).notNull(),
+    recordedBy: text("recorded_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index("dispute_costs_dispute_idx").on(t.disputeId),
+    index("dispute_costs_project_idx").on(t.projectId),
+  ],
+);
+
+/**
+ * Persisted decision-tree settlement model (#351-353): outcome branches with
+ * probabilities and awards, per-stage irrecoverable costs, discounting, and
+ * Part 36 / Calderbank costs consequences.
+ */
+export const settlementModels = pgTable(
+  "settlement_models",
+  {
+    id: text("id").primaryKey(),
+    disputeId: text("dispute_id").notNull(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    name: text("name").notNull(),
+    currency: text("currency").default("GBP").notNull(),
+    /** [{ id, kind, label, probability, award, note }] — probabilities sum to 1 */
+    branches: jsonb("branches").$type<unknown[]>().default([]).notNull(),
+    /** [{ id, name, ownCosts, opponentCosts, incurredByDate? }] */
+    stages: jsonb("stages").$type<unknown[]>().default([]).notNull(),
+    discountRatePercent: doublePrecision("discount_rate_percent").default(0).notNull(),
+    yearsToResolution: doublePrecision("years_to_resolution").default(0).notNull(),
+    /** Part 36 style: { enabled, indemnityCostsPercent, enhancedInterestPercent } */
+    costsRules: jsonb("costs_rules").$type<Record<string, unknown>>(),
+    /** engine output, recomputed on every write */
+    computed: jsonb("computed").$type<Record<string, unknown>>(),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [index("settlement_models_dispute_idx").on(t.disputeId)],
+);
+
+/**
+ * Redfern schedule (#340-343): the standard international-arbitration table
+ * for document production. One row per request, carrying the four columns a
+ * tribunal expects — what is asked for, why it is relevant and material,
+ * the objection, and the ruling — so the schedule can be produced as the
+ * document itself rather than rebuilt in a spreadsheet.
+ *
+ * Deliberately NOT modelled: automatic production of the documents a ruling
+ * grants. Granting a request tells a human what to add to the bundle; the
+ * platform will not decide on its own which files answer it.
+ */
+export const documentProductionRequests = pgTable(
+  "document_production_requests",
+  {
+    id: text("id").primaryKey(),
+    disputeId: text("dispute_id").notNull(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    /** sequential within the dispute — the schedule's request number */
+    number: integer("number").notNull(),
+    /** claimant | respondent — who is asking */
+    requestingParty: text("requesting_party").notNull(),
+    /** the documents or category of documents sought */
+    documentsRequested: text("documents_requested").notNull(),
+    /** the requesting party's relevance and materiality case (IBA Art. 3.3) */
+    relevance: text("relevance").notNull(),
+    /** the responding party's objection, if any */
+    objection: text("objection"),
+    /** grounds relied on, e.g. ["privilege", "proportionality", "commercially_sensitive"] */
+    objectionGrounds: jsonb("objection_grounds").$type<string[]>().default([]).notNull(),
+    /** the requesting party's reply to the objection */
+    reply: text("reply"),
+    /** pending | granted | granted_in_part | refused | withdrawn */
+    decision: text("decision").default("pending").notNull(),
+    decisionNote: text("decision_note"),
+    decidedAt: text("decided_at"),
+    decidedBy: text("decided_by"),
+    /** date by which granted documents must be produced */
+    productionDueDate: text("production_due_date"),
+    /** ids of dispute_bundles items or files produced in answer */
+    producedFileIds: jsonb("produced_file_ids").$type<string[]>().default([]).notNull(),
+    /** obligation raised for the production deadline, when one was set */
+    obligationId: text("obligation_id"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    uniqueIndex("document_production_requests_uq").on(t.disputeId, t.number),
+    index("document_production_requests_dispute_idx").on(t.disputeId),
+    index("document_production_requests_project_idx").on(t.projectId),
+    index("document_production_requests_decision_idx").on(t.companyId, t.decision),
+  ],
 );

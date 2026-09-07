@@ -18,10 +18,12 @@
  * What it guarantees instead is that the figure the budget posts is derivable,
  * exact and attributable to individual cards.
  */
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
+import { toast } from "sonner";
 import {
   Alert,
   Badge,
+  Button,
   Card,
   CardBody,
   EmptyState,
@@ -35,6 +37,7 @@ import {
   Tooltip,
   Tr,
 } from "../../ui";
+import { api } from "../../lib/api";
 import { DataTable, type DataColumns } from "../../ui/data";
 import { ChartCard, StackedBarChart } from "../../ui/charts";
 import type { Tone } from "../../ui/tokens";
@@ -43,23 +46,33 @@ import {
   FigureCell,
   LoadError,
   ReasonList,
+  RefusalNotice,
   SectionHeading,
   hoursText,
   labelize,
   money,
+  useAction,
+  useCostCodes,
+  useCrews,
+  useProductivity,
+  useProgressEntries,
   type CostReportLine,
   type LabourCostReport,
+  type LabourPostingResult,
   type Loadable,
 } from "./timecardsShared";
+import { FieldProgressModal } from "./TimecardForms";
 
 const WINDOWS = [7, 14, 30, 60, 90];
 
 export default function CostReportTab({
+  projectId,
   report,
   windowDays,
   onWindowDays,
   onOpenCard,
 }: {
+  projectId: string | undefined;
   report: Loadable<LabourCostReport>;
   windowDays: number;
   onWindowDays: (days: number) => void;
@@ -457,7 +470,453 @@ export default function CostReportTab({
         costed, or where cards in the window are denominated in more than one currency, no single
         figure is stated. A smaller, plausible, wrong number is worse than none.
       </p>
+
+      <ProductivityPanel projectId={projectId} windowDays={windowDays} />
+      <PostToBudgetPanel projectId={projectId} windowDays={windowDays} onDone={report.reload} />
     </div>
+  );
+}
+
+/* ========================================================================== */
+/* Productivity — earned hours against actual                                  */
+/* ========================================================================== */
+
+/**
+ * EARNED HOURS AGAINST ACTUAL, which is the only labour number that says
+ * whether the job is going well rather than how much it cost.
+ *
+ * Earned hours = installed quantity × the budget line's PLANNED unit rate.
+ * That needs three things the platform will not invent: planned hours, planned
+ * quantity and an installed quantity in a MATCHING unit. A line missing any of
+ * them is reported as unmeasurable with the reason, never as a productivity
+ * factor of 1.0 — a factor of 1.0 reads as "exactly on plan", which is the
+ * most reassuring possible way to say "we did not measure it".
+ */
+function ProductivityPanel({
+  projectId,
+  windowDays,
+}: {
+  projectId: string | undefined;
+  windowDays: number;
+}) {
+  const to = useMemo(() => new Date().toISOString().slice(0, 10), []);
+  const from = useMemo(() => {
+    const d = new Date(`${to}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - (windowDays - 1));
+    return d.toISOString().slice(0, 10);
+  }, [to, windowDays]);
+  const productivity = useProductivity(projectId, from, to, Boolean(projectId));
+  const progress = useProgressEntries(projectId, from, to, Boolean(projectId));
+  const crews = useCrews(projectId);
+  const costCodes = useCostCodes(projectId, Boolean(projectId));
+  const [progressOpen, setProgressOpen] = useState(false);
+  const { busy, refusal, clear, run } = useAction();
+  const data = productivity.data;
+
+  const budgetLines = useMemo(
+    () =>
+      (data?.lines ?? []).map((l) => ({
+        id: l.budgetLineItemId,
+        costCode: l.code ?? l.budgetLineItemId.slice(0, 8),
+        description: l.description,
+        unit: l.unit,
+      })),
+    [data],
+  );
+
+  return (
+    <Card>
+      <CardBody className="space-y-3">
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <SectionHeading
+            title="Labour productivity"
+            hint="Earned hours against actual hours, per budget line, per crew and per week. A line that cannot be measured says so rather than reading as on plan."
+            className="mb-0"
+          />
+          <Button size="sm" variant="secondary" onClick={() => setProgressOpen(true)}>
+            Record field progress
+          </Button>
+        </div>
+        {refusal ? <RefusalNotice refusal={refusal} onDismiss={clear} /> : null}
+        {productivity.error ? (
+          <LoadError message={productivity.error} onRetry={productivity.reload} />
+        ) : productivity.loading ? (
+          <SkeletonTable rows={4} />
+        ) : !data ? null : (
+          <>
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+              <Tile label="Actual hours" value={hoursText(data.totals.actualHours)} />
+              <Tile
+                label="Earned hours"
+                value={
+                  data.totals.earnedHours === null
+                    ? "Not available"
+                    : hoursText(data.totals.earnedHours)
+                }
+                hint={
+                  data.totals.earnedHours === null
+                    ? "at least one line contributing hours could not be earned"
+                    : undefined
+                }
+              />
+              <Tile
+                label="Productivity factor"
+                value={
+                  data.totals.productivityFactor === null
+                    ? "Not available"
+                    : data.totals.productivityFactor.toFixed(2)
+                }
+                tone={
+                  data.totals.productivityFactor === null
+                    ? "neutral"
+                    : data.totals.productivityFactor < data.thresholds.floor
+                      ? "danger"
+                      : data.totals.productivityFactor < 1
+                        ? "warning"
+                        : "success"
+                }
+                hint="earned ÷ actual — above 1 the crew is beating the plan"
+              />
+              <Tile
+                label="Lines measured"
+                value={`${data.totals.linesMeasured} of ${data.totals.linesMeasured + data.totals.linesUnmeasurable}`}
+                tone={data.totals.linesUnmeasurable > 0 ? "warning" : "neutral"}
+                hint={
+                  data.totals.linesUnmeasurable > 0
+                    ? `${data.totals.linesUnmeasurable} line(s) carry no measurable quantity`
+                    : undefined
+                }
+              />
+            </div>
+
+            {data.deviation ? (
+              <Alert tone="danger" title="Productivity has been under the floor for a pattern">
+                {data.deviation.explanation}
+              </Alert>
+            ) : null}
+
+            {data.lines.length === 0 ? (
+              <EmptyState
+                icon={<IconCost />}
+                title="Nothing measurable in this window"
+                description="Productivity needs installed quantity against the hours. Record quantity on the allocations, and the budget line's planned hours and quantity, and it becomes computable."
+              />
+            ) : (
+              <Table>
+                <THead>
+                  <Tr>
+                    <Th>Budget line</Th>
+                    <Th align="right">Actual h</Th>
+                    <Th align="right">Installed</Th>
+                    <Th align="right">Earned h</Th>
+                    <Th align="right">Factor</Th>
+                    <Th align="right">Forecast h</Th>
+                    <Th>Why not</Th>
+                  </Tr>
+                </THead>
+                <TBody>
+                  {data.lines.map((line) => (
+                    <Tr key={line.budgetLineItemId}>
+                      <Td>
+                        <span className="font-mono">{line.code ?? "—"}</span>{" "}
+                        <span className="text-content-muted">{line.description}</span>
+                      </Td>
+                      <Td align="right">{hoursText(line.actualHours)}</Td>
+                      <Td align="right">
+                        {line.installedQuantity === null ? (
+                          "—"
+                        ) : (
+                          <Tooltip
+                            content={
+                              line.quantitySource === "field_progress"
+                                ? "Measured in the field, separately from the timesheets that claimed the hours."
+                                : "Typed on the timesheets that claimed the hours — one author on both sides of the ratio. A field measurement supersedes it."
+                            }
+                          >
+                            <span className="inline-flex items-center gap-1">
+                              {line.installedQuantity} {line.unit ?? ""}
+                              <Badge
+                                size="xs"
+                                variant="outline"
+                                tone={
+                                  line.quantitySource === "field_progress" ? "success" : "warning"
+                                }
+                              >
+                                {line.quantitySource === "field_progress" ? "measured" : "claimed"}
+                              </Badge>
+                            </span>
+                          </Tooltip>
+                        )}
+                      </Td>
+                      <Td align="right">
+                        {line.earnedHours === null ? "—" : hoursText(line.earnedHours)}
+                      </Td>
+                      <Td align="right">
+                        {line.productivityFactor === null ? (
+                          <span className="text-content-subtle">—</span>
+                        ) : (
+                          <Badge
+                            size="xs"
+                            tone={
+                              line.productivityFactor < data.thresholds.floor
+                                ? "danger"
+                                : line.productivityFactor < 1
+                                  ? "warning"
+                                  : "success"
+                            }
+                          >
+                            {line.productivityFactor.toFixed(2)}
+                          </Badge>
+                        )}
+                      </Td>
+                      <Td align="right">
+                        {line.forecastHoursAtCompletion === null
+                          ? "—"
+                          : hoursText(line.forecastHoursAtCompletion)}
+                      </Td>
+                      <Td>
+                        <ReasonList reasons={line.reasons} />
+                      </Td>
+                    </Tr>
+                  ))}
+                </TBody>
+              </Table>
+            )}
+
+            {data.crews.length > 0 ? (
+              <div>
+                <SectionHeading title="By crew" hint="The same measure, per gang." />
+                <Table>
+                  <THead>
+                    <Tr>
+                      <Th>Crew</Th>
+                      <Th align="right">Actual h</Th>
+                      <Th align="right">Earned h</Th>
+                      <Th align="right">Factor</Th>
+                    </Tr>
+                  </THead>
+                  <TBody>
+                    {data.crews.map((crew) => (
+                      <Tr key={crew.crewId ?? "none"}>
+                        <Td>{crew.crewName ?? "No crew recorded"}</Td>
+                        <Td align="right">{hoursText(crew.actualHours)}</Td>
+                        <Td align="right">
+                          {crew.earnedHours === null ? "—" : hoursText(crew.earnedHours)}
+                        </Td>
+                        <Td align="right">
+                          {crew.productivityFactor === null
+                            ? "—"
+                            : crew.productivityFactor.toFixed(2)}
+                        </Td>
+                      </Tr>
+                    ))}
+                  </TBody>
+                </Table>
+              </div>
+            ) : null}
+
+            <ReasonList reasons={data.reasons} />
+            <p className="text-2xs text-content-subtle">{data.method}</p>
+          </>
+        )}
+
+        {/*
+          THE MEASUREMENTS THEMSELVES. A productivity factor is only as good
+          as the quantity behind it, so the entries are shown with their
+          method and whether anybody other than their author has seen them —
+          and countersigning is offered here rather than hidden in a drawer.
+        */}
+        <div>
+          <SectionHeading
+            title="Field progress"
+            hint="Installed quantity measured separately from the timesheets. Where it exists the report earns from it and ignores the quantity typed on the cards."
+          />
+          {progress.error ? (
+            <LoadError message={progress.error} onRetry={progress.reload} />
+          ) : progress.loading ? (
+            <SkeletonTable rows={2} />
+          ) : (progress.data?.items.length ?? 0) === 0 ? (
+            <EmptyState
+              icon={<IconCost />}
+              title="Nothing measured in this window"
+              description="Without a field measurement, the only quantity available is the one the person claiming the hours typed on their own timesheet — one author on both sides of the ratio."
+            />
+          ) : (
+            <Table>
+              <THead>
+                <Tr>
+                  <Th>Date</Th>
+                  <Th>Cost code</Th>
+                  <Th align="right">Quantity</Th>
+                  <Th>Method</Th>
+                  <Th>Countersigned</Th>
+                </Tr>
+              </THead>
+              <TBody>
+                {(progress.data?.items ?? []).map((entry) => (
+                  <Tr key={entry.id}>
+                    <Td>{entry.progressDate}</Td>
+                    <Td>
+                      <span className="font-mono">{entry.costCode ?? "—"}</span>
+                    </Td>
+                    <Td align="right">
+                      {entry.quantity} {entry.unit}
+                    </Td>
+                    <Td>{labelize(entry.method)}</Td>
+                    <Td>
+                      {entry.verifiedBy ? (
+                        <Badge size="xs" tone="success" variant="outline">
+                          {entry.verifiedAt?.slice(0, 10) ?? "yes"}
+                        </Badge>
+                      ) : (
+                        <Button
+                          size="xs"
+                          variant="secondary"
+                          loading={busy === entry.id}
+                          onClick={async () => {
+                            const done = await run(entry.id, () =>
+                              api.post(
+                                `/api/v1/projects/${projectId}/labour-progress/${entry.id}/verify`,
+                                {},
+                              ),
+                            );
+                            if (done) {
+                              toast.success("Measurement countersigned");
+                              progress.reload();
+                              productivity.reload();
+                            }
+                          }}
+                        >
+                          Countersign
+                        </Button>
+                      )}
+                    </Td>
+                  </Tr>
+                ))}
+              </TBody>
+            </Table>
+          )}
+        </div>
+      </CardBody>
+
+      {projectId ? (
+        <FieldProgressModal
+          open={progressOpen}
+          onClose={() => setProgressOpen(false)}
+          onDone={() => {
+            progress.reload();
+            productivity.reload();
+          }}
+          projectId={projectId}
+          crews={crews.data?.items ?? []}
+          costCodes={costCodes.data?.items ?? []}
+          budgetLines={budgetLines}
+        />
+      ) : null}
+    </Card>
+  );
+}
+
+/* ========================================================================== */
+/* Posting labour onto the budget                                              */
+/* ========================================================================== */
+
+/**
+ * The join that makes labour a cost rather than a timesheet.
+ *
+ * Only APPROVED and later cards post: a draft is a claim nobody has checked,
+ * and posting it would make the cost report move every time a foreman opened a
+ * form. Hours with no budget line, and hours with no rate, are reported as
+ * excluded with the reason rather than posted at zero. Re-posting the same
+ * window REPLACES this module's contribution, so a second click is safe.
+ */
+function PostToBudgetPanel({
+  projectId,
+  windowDays,
+  onDone,
+}: {
+  projectId: string | undefined;
+  windowDays: number;
+  onDone: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [result, setResult] = useState<LabourPostingResult | null>(null);
+  const to = useMemo(() => new Date().toISOString().slice(0, 10), []);
+  const from = useMemo(() => {
+    const d = new Date(`${to}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - (windowDays - 1));
+    return d.toISOString().slice(0, 10);
+  }, [to, windowDays]);
+
+  if (!projectId) return null;
+
+  return (
+    <Card>
+      <CardBody className="space-y-3">
+        <SectionHeading
+          title="Post labour onto the budget"
+          hint="Writes the window's approved, coded labour cost onto the budget lines it was coded to. Re-posting the same window replaces the figure rather than adding to it."
+          className="mb-0"
+          actions={
+            <Button
+              size="sm"
+              variant="primary"
+              loading={busy === "post"}
+              onClick={async () => {
+                const res = await run("post", () =>
+                  api.post<LabourPostingResult>(
+                    `/api/v1/projects/${projectId}/labour-cost-report/post-to-budget`,
+                    { from, to },
+                  ),
+                );
+                if (res) {
+                  setResult(res);
+                  toast.success(
+                    res.posted === 0
+                      ? "Nothing was posted — the reasons are below"
+                      : `Posted to ${res.posted} budget line(s)`,
+                  );
+                  onDone();
+                }
+              }}
+            >
+              Post {from} to {to}
+            </Button>
+          }
+        />
+        {refusal ? <RefusalNotice refusal={refusal} onDismiss={clear} /> : null}
+        {result ? (
+          <div className="space-y-2 rounded-md border border-border p-3">
+            <div className="text-2xs text-content-muted">
+              {result.posted === 0
+                ? "Nothing was posted."
+                : `Posted to ${result.posted} budget line(s).`}
+            </div>
+            {result.lines.length > 0 ? (
+              <Table>
+                <THead>
+                  <Tr>
+                    <Th>Cost code</Th>
+                    <Th align="right">Labour cost</Th>
+                    <Th align="right">Hours</Th>
+                  </Tr>
+                </THead>
+                <TBody>
+                  {result.lines.map((line) => (
+                    <Tr key={line.budgetLineItemId}>
+                      <Td className="font-mono">{line.costCode}</Td>
+                      <Td align="right">{money(line.labourCost, line.currency)}</Td>
+                      <Td align="right">{hoursText(line.labourHours)}</Td>
+                    </Tr>
+                  ))}
+                </TBody>
+              </Table>
+            ) : null}
+            <ReasonList reasons={result.reasons} />
+          </div>
+        ) : null}
+      </CardBody>
+    </Card>
   );
 }
 

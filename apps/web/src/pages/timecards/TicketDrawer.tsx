@@ -159,6 +159,17 @@ export default function TicketDrawer({
 
           <LinesBlock ticket={ticket} />
 
+          <InternalApprovalBlock
+            projectId={projectId}
+            ticket={ticket}
+            busy={action.busy}
+            onRun={action.run}
+            onDone={() => {
+              detail.reload();
+              onMutated();
+            }}
+          />
+
           <div>
             <SectionHeading
               title="Where it goes next"
@@ -207,6 +218,122 @@ export default function TicketDrawer({
         </div>
       )}
     </Drawer>
+  );
+}
+
+/* ========================================================================== */
+/* Our own approval — not the client's signature                               */
+/* ========================================================================== */
+
+/**
+ * THE INTERNAL SIGN-OFF, which is a different act from the client's
+ * signature and lives in different columns. The client's representative
+ * acknowledges the HOURS; this is us deciding to stand behind the ticket as a
+ * CLAIM. Both, or neither, or one without the other are all real states and
+ * the drawer shows which one this is.
+ *
+ * The person who raised or submitted the ticket cannot approve it. The API
+ * records the attempt and then refuses it, and this panel renders that
+ * refusal verbatim rather than hiding the button — a control the user cannot
+ * see they tripped is a control they will route around.
+ */
+function InternalApprovalBlock({
+  projectId,
+  ticket,
+  busy,
+  onRun,
+  onDone,
+}: {
+  projectId: string;
+  ticket: TicketDetail;
+  busy: string | null;
+  onRun: <T>(key: string, fn: () => Promise<T>) => Promise<T | null>;
+  onDone: () => void;
+}) {
+  const [rejecting, setRejecting] = useState(false);
+  const [comment, setComment] = useState("");
+
+  const decidable =
+    ticket.status === "submitted" ||
+    ticket.status === "signed" ||
+    ticket.status === "signed_under_protest" ||
+    ticket.status === "disputed";
+
+  async function decide(decision: "approved" | "rejected") {
+    const result = await onRun(decision, () =>
+      api.post(`/api/v1/projects/${projectId}/tm-tickets/${ticket.id}/approve`, {
+        decision,
+        comment: comment.trim() === "" ? null : comment.trim(),
+      }),
+    );
+    if (result) {
+      setRejecting(false);
+      setComment("");
+      onDone();
+    }
+  }
+
+  return (
+    <div>
+      <SectionHeading
+        title="Our approval"
+        hint="Separate from the client's signature: they acknowledged the hours, this is us deciding to claim them. Never by the person who raised the ticket."
+      />
+      {ticket.approvedAt ? (
+        <Alert tone="success" size="sm" title="Approved internally">
+          Approved {dateTime(ticket.approvedAt)}
+          {ticket.approvedBy ? " — the approver is recorded on the ledger entry." : "."}
+        </Alert>
+      ) : ticket.status === "draft" && ticket.disputedReason ? (
+        <Alert tone="warning" size="sm" title="Sent back">
+          {ticket.disputedReason}
+        </Alert>
+      ) : !decidable ? (
+        <Alert tone="neutral" size="sm" title="Not yet a decision to take">
+          A ticket is approved once it has been submitted or the client has responded to it. This
+          one is <strong>{labelize(ticket.status)}</strong>.
+        </Alert>
+      ) : (
+        <div className="space-y-2">
+          <div className="flex flex-wrap gap-2">
+            <Button
+              size="sm"
+              variant="primary"
+              loading={busy === "approved"}
+              onClick={() => void decide("approved")}
+            >
+              Approve the claim
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setRejecting(!rejecting)}>
+              Send it back
+            </Button>
+          </div>
+          {rejecting ? (
+            <div className="space-y-2 rounded-md border border-border p-3">
+              <Field label="Why is it going back?" required>
+                <Textarea
+                  rows={2}
+                  value={comment}
+                  onChange={(e) => setComment(e.target.value)}
+                  placeholder="What has to change before this is claimable."
+                />
+              </Field>
+              <div className="flex justify-end">
+                <Button
+                  size="sm"
+                  variant="danger"
+                  disabled={comment.trim() === ""}
+                  loading={busy === "rejected"}
+                  onClick={() => void decide("rejected")}
+                >
+                  Send back
+                </Button>
+              </div>
+            </div>
+          ) : null}
+        </div>
+      )}
+    </div>
   );
 }
 

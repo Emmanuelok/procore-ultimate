@@ -51,7 +51,7 @@ import {
 import { COST_TYPES, ERP_SYSTEMS } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { badRequest, conflict, notFound } from "../../lib/errors.js";
+import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { forEachCompany } from "../../lib/scheduler.js";
 import type { Db } from "../../lib/db.js";
@@ -885,9 +885,11 @@ export const budgetIntelligenceRoutes: FastifyPluginAsync = async (app) => {
     return paginate(filtered.slice(offset, offset + q.pageSize), filtered.length, q);
   });
 
-  async function resolveMapCostCode(companyId: string, projectId: string, input: { costCodeId?: string; costCode?: string }) {
+  async function resolveMapCostCode(companyId: string, projectId: string | null, input: { costCodeId?: string; costCode?: string }) {
     const all = await db.select().from(costCodes).where(eq(costCodes.companyId, companyId));
-    const scoped = all.filter((c) => c.projectId === null || c.projectId === projectId);
+    // A company-wide mapping may only point at a company-standard cost code:
+    // a code that exists on one project cannot govern the import of another.
+    const scoped = all.filter((c) => c.projectId === null || (projectId !== null && c.projectId === projectId));
     const match = input.costCodeId
       ? scoped.find((c) => c.id === input.costCodeId)
       : input.costCode
@@ -962,15 +964,31 @@ export const budgetIntelligenceRoutes: FastifyPluginAsync = async (app) => {
     return rows[0];
   }
 
-  /** A company-wide map row belongs to every project; the gate runs on the project in the query. */
+  /**
+   * Gate a write to one GL mapping.
+   *
+   * A PROJECT-scoped row is gated on its own project, like everything else.
+   * A COMPANY-WIDE row governs the ERP import of every project in the
+   * company, and the caller chooses the project the gate would run on — so
+   * gating it on a project the caller nominates is no gate at all: budget
+   * rights on one small project would let someone repoint (or delete) the
+   * mapping every other project imports through. A company-wide row
+   * therefore takes a company role, and the write is ledgered at company
+   * level (projectId null) because that is the scope it actually has.
+   */
   async function requireMapLevel(req: Parameters<typeof requireBudgetLevel>[1], reply: Parameters<typeof requireBudgetLevel>[2], map: { projectId: string | null }, level: "standard" | "admin") {
-    const q = z.object({ projectId: idRef.optional() }).parse(req.query ?? {});
-    const projectId = map.projectId ?? q.projectId;
-    if (!projectId) {
-      throw badRequest("This mapping is company-wide; pass ?projectId= so the budget tool level can be checked on a project.");
+    if (!map.projectId) {
+      if (req.companyRole !== "owner" && req.companyRole !== "admin") {
+        throw forbidden(
+          "This mapping is company-wide: it governs the ERP import of every project in the " +
+            "company, so only a company owner or admin may change it. Raise a project-scoped " +
+            "mapping instead to override it on one project.",
+        );
+      }
+      return null;
     }
-    await requireBudgetLevel(app, req, reply, projectId, level);
-    return projectId;
+    await requireBudgetLevel(app, req, reply, map.projectId, level);
+    return map.projectId;
   }
 
   app.patch("/gl-cost-code-maps/:mapId", { preHandler: companyGate }, async (req, reply) => {
@@ -996,7 +1014,7 @@ export const budgetIntelligenceRoutes: FastifyPluginAsync = async (app) => {
       action: "update",
       objectType: "gl_cost_code_map",
       objectId: mapId,
-      payload: { changed: Object.keys(body) },
+      payload: { changed: Object.keys(body), scope: map.projectId ? "project" : "company" },
     });
     return fetchMap(mapId, map.companyId);
   });
@@ -1013,7 +1031,7 @@ export const budgetIntelligenceRoutes: FastifyPluginAsync = async (app) => {
       action: "delete",
       objectType: "gl_cost_code_map",
       objectId: mapId,
-      payload: { glAccount: map.glAccount, glSubAccount: map.glSubAccount },
+      payload: { glAccount: map.glAccount, glSubAccount: map.glSubAccount, scope: map.projectId ? "project" : "company" },
     });
     return { ok: true };
   });

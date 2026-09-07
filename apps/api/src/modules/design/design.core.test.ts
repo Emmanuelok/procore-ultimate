@@ -22,6 +22,8 @@ let app: FastifyInstance;
 let owner: TestActor;
 let reviewerActor: TestActor;
 let designer: TestActor;
+/** design:standard on the project and no company admin role: signs at design lead. */
+let standardUser: TestActor;
 let viewerHeaders: Record<string, string>;
 let stranger: TestActor;
 let projectId: string;
@@ -75,6 +77,16 @@ beforeAll(async () => {
     headers: { authorization: third.headers["authorization"]!, "x-company-id": owner.companyId },
   };
 
+  const plain = await registerActor(app);
+  await app.db
+    .insert(companyMemberships)
+    .values({ id: newId("cm"), companyId: owner.companyId, userId: plain.userId, role: "member" });
+  standardUser = {
+    ...plain,
+    companyId: owner.companyId,
+    headers: { authorization: plain.headers["authorization"]!, "x-company-id": owner.companyId },
+  };
+
   const viewer = await registerActor(app);
   await app.db
     .insert(companyMemberships)
@@ -93,6 +105,13 @@ beforeAll(async () => {
     projectId,
     userId: viewer.userId,
     templateKey: "read_only",
+  });
+  await app.db.insert(projectMemberships).values({
+    id: newId("pm"),
+    companyId: owner.companyId,
+    projectId,
+    userId: plain.userId,
+    templateKey: "project_manager",
   });
 
   vendorId = newId("ven");
@@ -273,8 +292,17 @@ describe("design packages", () => {
 /* ================================================================== */
 
 describe("design freeze", () => {
-  it("freezes a package, refuses a second active freeze and lifts deliberately", async () => {
-    const pkg = await makePackage("Frozen package");
+  async function approvedPackage(name: string) {
+    const pkg = await makePackage(name);
+    await post(`${base()}/packages/${pkg.id}/transition`, { to: "in_progress" });
+    await post(`${base()}/packages/${pkg.id}/transition`, { to: "in_review" });
+    const approved = await post(`${base()}/packages/${pkg.id}/transition`, { to: "approved" }, reviewerActor.headers);
+    expect(approved.statusCode).toBe(200);
+    return pkg;
+  }
+
+  it("freezes an approved package, refuses a second active freeze and lifts deliberately", async () => {
+    const pkg = await approvedPackage("Frozen package");
     const created = await post(`${base()}/freezes`, {
       scope: "package",
       packageId: pkg.id,
@@ -296,12 +324,59 @@ describe("design freeze", () => {
     expect((lifted.json() as { status: string }).status).toBe("lifted");
     const again = await post(`${base()}/freezes/${freezeId}/lift`, { reason: "twice" });
     expect(again.statusCode).toBe(409);
+
+    // The lift restores what the package actually held, and the approval it
+    // came back to is still the one a second actor gave it.
+    const restored = (await get(`${base()}/packages/${pkg.id}`)).json() as {
+      status: string;
+      frozenAt: string | null;
+      approvedBy: string | null;
+    };
+    expect(restored.status).toBe("approved");
+    expect(restored.frozenAt).toBeNull();
+    expect(restored.approvedBy).toBe(reviewerActor.userId);
+  });
+
+  it("refuses to freeze a package nobody has approved", async () => {
+    const pkg = await makePackage("Never approved");
+    const res = await post(`${base()}/freezes`, {
+      scope: "package",
+      packageId: pkg.id,
+      title: "Premature freeze",
+      requiredAuthorisation: "client",
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("approve it first");
+    const after = (await get(`${base()}/packages/${pkg.id}`)).json() as { status: string; approvedBy: string | null };
+    expect(after.status).toBe("planned");
+    expect(after.approvedBy).toBeNull();
+  });
+
+  it("declaring and lifting a freeze cannot promote a package to approved", async () => {
+    // The bug this pins: planned → frozen → lift → "approved" with a null
+    // approver, which the register and the readiness engine both counted.
+    const pkg = await makePackage("Promotion attempt");
+    await post(`${base()}/packages/${pkg.id}/transition`, { to: "in_progress" });
+    const refused = await post(`${base()}/freezes`, { scope: "package", packageId: pkg.id, title: "Sneak" });
+    expect(refused.statusCode).toBe(409);
+    const after = (await get(`${base()}/packages/${pkg.id}`)).json() as { status: string; approvedBy: string | null };
+    expect(after.status).toBe("in_progress");
+    expect(after.approvedBy).toBeNull();
   });
 
   it("refuses a package freeze that names no package", async () => {
     const res = await post(`${base()}/freezes`, { scope: "package", title: "Nothing frozen" });
     expect(res.statusCode).toBe(400);
     expect(res.json().message).toContain("fixes nothing");
+  });
+
+  it("a project-scope freeze touches no package status", async () => {
+    const pkg = await makePackage("Untouched by a project freeze");
+    const created = await post(`${base()}/freezes`, { scope: "project", title: "Project-wide freeze" });
+    expect(created.statusCode).toBe(201);
+    const after = (await get(`${base()}/packages/${pkg.id}`)).json() as { status: string };
+    expect(after.status).toBe("planned");
+    await post(`${base()}/freezes/${(created.json() as { id: string }).id}/lift`, { reason: "done" });
   });
 });
 
@@ -326,6 +401,18 @@ describe("review cycles", () => {
     expect(body.reference).toMatch(/^DR-\d{3}$/);
     const dup = await post(`${base()}/reviews`, { packageId: pkgId, title: "Second" });
     expect(dup.statusCode).toBe(409);
+  });
+
+  it("refuses a required reviewer from another company", async () => {
+    // A reviewer with no membership here can never return a code, so naming
+    // one would block the cycle's close check with no way out but force.
+    const res = await post(`${base()}/reviews/${reviewId}/reviewers`, {
+      userId: stranger.userId,
+      discipline: "structural",
+      isRequired: true,
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("not a member of this company");
   });
 
   it("only lets the named reviewer return their own code", async () => {
@@ -556,6 +643,19 @@ describe("issue register", () => {
     expect(res.statusCode).toBe(400);
   });
 
+  it("refuses to assign an issue to a user from another company", async () => {
+    // Ghost assignment: the named person holds no membership here, so they
+    // could never see the issue, act on it or clear it.
+    const res = await post(`${base()}/issues/${issueId}/assign`, {
+      assignedToUserId: stranger.userId,
+      discipline: "mechanical",
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("not a member of this company");
+    const after = (await get(`${base()}/issues/${issueId}`)).json() as { assignedToUserId: string | null };
+    expect(after.assignedToUserId).toBe(designer.userId);
+  });
+
   it("refuses closure by the person who resolved it", async () => {
     const resolved = await post(
       `${base()}/issues/${issueId}/resolve`,
@@ -689,6 +789,36 @@ describe("decision log", () => {
     expect(edit.statusCode).toBe(409);
   });
 
+  it("refuses a decision recorded at an authority the decider does not hold", async () => {
+    // The same rule as a change notice: a level nobody granted is not an
+    // authorisation, and the decision log is read later as evidence of who
+    // could commit the project to this.
+    const created = await post(`${base()}/decisions`, {
+      title: "Roof build-up",
+      question: "Inverted or warm roof?",
+      options: [
+        { key: "inverted", label: "Inverted" },
+        { key: "warm", label: "Warm" },
+      ],
+    });
+    const id = (created.json() as { id: string }).id;
+    const overreach = await post(
+      `${base()}/decisions/${id}/decide`,
+      { decision: "Warm roof", rationale: "Buildability", chosenOptionKey: "warm", authorisationLevel: "board" },
+      standardUser.headers,
+    );
+    expect(overreach.statusCode).toBe(403);
+    expect(overreach.json().message).toContain("you hold design lead");
+
+    const proper = await post(
+      `${base()}/decisions/${id}/decide`,
+      { decision: "Warm roof", rationale: "Buildability", chosenOptionKey: "warm", authorisationLevel: "design_lead" },
+      standardUser.headers,
+    );
+    expect(proper.statusCode).toBe(200);
+    expect((proper.json() as { authorisationLevel: string }).authorisationLevel).toBe("design_lead");
+  });
+
   it("supersedes the earlier decision when the replacement is taken", async () => {
     const created = await post(`${base()}/decisions`, {
       title: "Facade cladding system — revisited",
@@ -787,6 +917,30 @@ describe("register reads and lifecycle edges", () => {
     expect((await get(`${base()}/comments`, stranger.headers)).statusCode).toBe(403);
   });
 
+  it("answers ?open=false with the closed side rather than its opposite", async () => {
+    // z.coerce.boolean() coerced the STRING "false" to true, so this query
+    // used to return exactly what it asked not to see.
+    const closed = await get(`${base()}/comments?open=false`);
+    expect(closed.statusCode).toBe(200);
+    const closedBody = closed.json() as { items: Array<{ status: string }> };
+    for (const comment of closedBody.items) expect(["open", "responded"]).not.toContain(comment.status);
+
+    const closedIssues = await get(`${base()}/issues?open=false`);
+    expect(closedIssues.statusCode).toBe(200);
+    for (const issue of (closedIssues.json() as { items: Array<{ status: string }> }).items) {
+      expect(["open", "assigned", "in_progress"]).not.toContain(issue.status);
+    }
+
+    const closedCycles = await get(`${base()}/reviews?open=false`);
+    expect(closedCycles.statusCode).toBe(200);
+    for (const cycle of (closedCycles.json() as { items: Array<{ status: string }> }).items) {
+      expect(["open", "in_review", "consolidating"]).not.toContain(cycle.status);
+    }
+
+    // And a value that is neither is a 400, not a silent truthy read.
+    expect((await get(`${base()}/comments?open=maybe`)).statusCode).toBe(400);
+  });
+
   it("serves the package lookup the workspace pickers use", async () => {
     const res = await get(`${base()}/packages-lookup`);
     expect(res.statusCode).toBe(200);
@@ -822,15 +976,42 @@ describe("register reads and lifecycle edges", () => {
     expect(afterClose.statusCode).toBe(409);
   });
 
-  it("cancels a cycle that should never have been issued", async () => {
+  it("cancels a cycle that should never have been issued and takes the package back out of review", async () => {
     const pkg = await makePackage("Cancelled cycle");
     const review = await post(`${base()}/reviews`, { packageId: pkg.id, title: "Issued in error" });
     const reviewId = (review.json() as { id: string }).id;
+    // Opening the cycle put the package into review…
+    expect(((await get(`${base()}/packages/${pkg.id}`)).json() as { status: string }).status).toBe("in_review");
+
     const res = await post(`${base()}/reviews/${reviewId}/cancel`, { reason: "Issued against the wrong revision" });
     expect(res.statusCode).toBe(200);
-    expect((res.json() as { status: string }).status).toBe("cancelled");
+    const cancelled = res.json() as { status: string; notes: string | null };
+    expect(cancelled.status).toBe("cancelled");
+    expect(cancelled.notes).toContain("Issued against the wrong revision");
+    // …and cancelling it must take the package back out, or the register shows
+    // a package "in review" with nothing under review.
+    expect(((await get(`${base()}/packages/${pkg.id}`)).json() as { status: string }).status).toBe("in_progress");
+
     const again = await post(`${base()}/reviews/${reviewId}/close`, {});
     expect(again.statusCode).toBe(409);
+    expect((await post(`${base()}/reviews/${reviewId}/cancel`, { reason: "again" })).statusCode).toBe(409);
+  });
+
+  it("a cancelled resubmission leaves the standing an earlier closed cycle gave the package", async () => {
+    const pkg = await makePackage("Two cycle package");
+    const first = await post(`${base()}/reviews`, { packageId: pkg.id, title: "Cycle 1" });
+    const firstId = (first.json() as { id: string }).id;
+    const added = await post(`${base()}/reviews/${firstId}/reviewers`, { userId: reviewerActor.userId, isRequired: true });
+    const participantId = (added.json() as { id: string }).id;
+    await post(`${base()}/reviews/${firstId}/reviewers/${participantId}/return`, { code: "A" }, reviewerActor.headers);
+    await post(`${base()}/reviews/${firstId}/close`, {});
+    expect(((await get(`${base()}/packages/${pkg.id}`)).json() as { status: string }).status).toBe("in_review");
+
+    const second = await post(`${base()}/reviews`, { packageId: pkg.id, title: "Cycle 2", previousReviewId: firstId });
+    const secondId = (second.json() as { id: string }).id;
+    await post(`${base()}/reviews/${secondId}/cancel`, { reason: "Wrong revision issued" });
+    // The closed cycle 1 still stands, so the package keeps "in review".
+    expect(((await get(`${base()}/packages/${pkg.id}`)).json() as { status: string }).status).toBe("in_review");
   });
 
   it("rejects a stage gate with a recorded reason", async () => {

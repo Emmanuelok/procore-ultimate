@@ -565,7 +565,10 @@ describe("site access and payroll ingest", () => {
       },
     ]);
     expect(res.statusCode).toBe(201);
-    expect(res.json().inserted).toBe(1);
+    // `upserted`, not `inserted`: the ingest is idempotent now, so the count
+    // is of rows written, whether they were new or replaced their own run.
+    expect(res.json().upserted).toBe(1);
+    expect(res.json().replaced).toBe(0);
     expect(res.json().unknown).toEqual([{ index: 1, workerReference: "NOT-A-WORKER" }]);
   });
 });

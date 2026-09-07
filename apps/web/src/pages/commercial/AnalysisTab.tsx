@@ -10,8 +10,10 @@
  * comparable rates it says `no benchmark` and explains why, rather than
  * inventing a market price.
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { toast } from "sonner";
 import { api, ApiClientError } from "../../lib/api";
+import { useAuth } from "../../lib/auth";
 import {
   Badge,
   Button,
@@ -21,10 +23,12 @@ import {
   ErrorAlert,
   Field,
   Input,
+  Modal,
   Select,
   Spinner,
   Table,
   Td,
+  Textarea,
   Th,
 } from "../../ui";
 import { formatDate, humanize } from "../format";
@@ -39,9 +43,11 @@ import {
   type BoqRow,
   type FlatBoqItem,
   type FluctuationCalcRow,
+  type FluctuationFormulaInfo,
   type IndexSeriesRow,
   type ListResponse,
   type RateAnalysis,
+  type RateBenchmarkRow,
 } from "./commercialShared";
 
 interface StarRateRow {
@@ -58,6 +64,14 @@ interface StarRateRow {
   currency: string;
 }
 
+export interface BenchmarkSeed {
+  description: string;
+  unit: string;
+  rate: number;
+  currency: string;
+  code?: string | null;
+}
+
 export default function AnalysisTab({
   projectId,
   boqs,
@@ -67,18 +81,51 @@ export default function AnalysisTab({
   boqs: BoqRow[] | null;
   currency: string;
 }) {
+  const [seed, setSeed] = useState<BenchmarkSeed | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [libraryVersion, setLibraryVersion] = useState(0);
+
   return (
     <div className="space-y-8">
-      <RatePanel boqs={boqs} />
+      <RatePanel
+        boqs={boqs}
+        onAddBenchmark={(s) => {
+          setSeed(s);
+          setAddOpen(true);
+        }}
+      />
+      <BenchmarkPanel
+        version={libraryVersion}
+        onAdd={() => {
+          setSeed(null);
+          setAddOpen(true);
+        }}
+      />
       <StarRatePanel projectId={projectId} />
+      <IndexSeriesPanel />
       <FluctuationPanel projectId={projectId} currency={currency} />
+      <AddBenchmarkModal
+        open={addOpen}
+        seed={seed}
+        onClose={() => setAddOpen(false)}
+        onSaved={() => {
+          setAddOpen(false);
+          setLibraryVersion((v) => v + 1);
+        }}
+      />
     </div>
   );
 }
 
 /* ------------------------------- Rate analysis ----------------------------- */
 
-function RatePanel({ boqs }: { boqs: BoqRow[] | null }) {
+function RatePanel({
+  boqs,
+  onAddBenchmark,
+}: {
+  boqs: BoqRow[] | null;
+  onAddBenchmark: (seed: BenchmarkSeed) => void;
+}) {
   const [boqId, setBoqId] = useState("");
   const [items, setItems] = useState<FlatBoqItem[]>([]);
   const [itemId, setItemId] = useState("");
@@ -227,6 +274,24 @@ function RatePanel({ boqs }: { boqs: BoqRow[] | null }) {
                 </Badge>
               </div>
               <p className="text-sm text-ink-600">{analysis.benchmark.basis}</p>
+              {analysis.rate != null && analysis.unit ? (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  className="mt-2"
+                  onClick={() =>
+                    onAddBenchmark({
+                      description: analysis.description,
+                      unit: analysis.unit ?? "",
+                      rate: analysis.rate ?? 0,
+                      currency: analysis.currency,
+                      code: analysis.code,
+                    })
+                  }
+                >
+                  Add a benchmark for this work
+                </Button>
+              ) : null}
               {analysis.benchmark.median != null ? (
                 <div className="mt-3 grid grid-cols-3 gap-2 text-center">
                   <div>
@@ -350,6 +415,550 @@ function StarRatePanel({ projectId }: { projectId: string }) {
   );
 }
 
+/* --------------------------- Benchmark library ----------------------------- */
+
+/**
+ * The comparison set the rate analyser draws on. Without a way to populate it
+ * the analyser could only ever compare against the company's own priced bills,
+ * so a first project got `no_benchmark` for every rate it holds.
+ */
+function BenchmarkPanel({ version, onAdd }: { version: number; onAdd: () => void }) {
+  const { company } = useAuth();
+  const canEdit = company?.role === "owner" || company?.role === "admin";
+  const [rows, setRows] = useState<RateBenchmarkRow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+
+  useEffect(() => {
+    const q = new URLSearchParams({ pageSize: "100" });
+    if (search.trim()) q.set("search", search.trim());
+    api
+      .get<ListResponse<RateBenchmarkRow>>(`/api/v1/commercial/rate-benchmarks?${q.toString()}`)
+      .then((r) => {
+        setRows(r.items);
+        setError(null);
+      })
+      .catch((err: unknown) => {
+        setRows([]);
+        setError(err instanceof Error ? err.message : "Failed to load the benchmark library");
+      });
+  }, [version, search]);
+
+  return (
+    <section>
+      <div className="mb-3 flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold text-ink-900">Benchmark library</h2>
+          <p className="mt-0.5 text-xs text-ink-500">
+            Published or negotiated rates the analyser compares against, alongside the
+            company&rsquo;s own priced history.
+          </p>
+        </div>
+        <div className="flex items-end gap-2">
+          <Input
+            className="w-48"
+            placeholder="Search descriptions"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          {canEdit ? (
+            <Button size="sm" onClick={onAdd}>
+              Add benchmark
+            </Button>
+          ) : null}
+        </div>
+      </div>
+      <ErrorAlert message={error} />
+      {!canEdit ? (
+        <p className="mb-2 text-xs text-ink-400">
+          Only a company owner or admin can maintain the benchmark library.
+        </p>
+      ) : null}
+      {rows === null ? (
+        <Spinner />
+      ) : rows.length === 0 ? (
+        <EmptyState
+          title="No benchmark rates recorded"
+          hint="Add rates from a price book or a negotiated schedule; until then the analyser compares only against your own bills."
+        />
+      ) : (
+        <Table>
+          <thead>
+            <tr>
+              <Th>Code</Th>
+              <Th>Description</Th>
+              <Th>Unit</Th>
+              <Th>Source</Th>
+              <Th>Region</Th>
+              <Th>As of</Th>
+              <Th className="text-right">Rate</Th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-ink-100">
+            {rows.map((b) => (
+              <tr key={b.id}>
+                <Td className="whitespace-nowrap font-mono text-xs">{b.code ?? "—"}</Td>
+                <Td className="max-w-md truncate">{b.description}</Td>
+                <Td>{b.unit}</Td>
+                <Td>
+                  <Badge tone="slate">{humanize(b.source)}</Badge>
+                </Td>
+                <Td className="text-xs text-ink-500">{b.region ?? "—"}</Td>
+                <Td className="whitespace-nowrap text-xs text-ink-500">
+                  {b.asOfDate ? formatDate(b.asOfDate) : "—"}
+                </Td>
+                <Td className="text-right font-medium tabular-nums">
+                  {money(b.rate, b.currency)}
+                </Td>
+              </tr>
+            ))}
+          </tbody>
+        </Table>
+      )}
+    </section>
+  );
+}
+
+function AddBenchmarkModal({
+  open,
+  seed,
+  onClose,
+  onSaved,
+}: {
+  open: boolean;
+  seed: BenchmarkSeed | null;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [description, setDescription] = useState("");
+  const [code, setCode] = useState("");
+  const [unit, setUnit] = useState("");
+  const [rate, setRate] = useState("");
+  const [currency, setCurrency] = useState("USD");
+  const [region, setRegion] = useState("");
+  const [asOfDate, setAsOfDate] = useState("");
+  const [notes, setNotes] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setError(null);
+    setDescription(seed?.description ?? "");
+    setCode(seed?.code ?? "");
+    setUnit(seed?.unit ?? "");
+    setRate(seed?.rate != null ? String(seed.rate) : "");
+    setCurrency(seed?.currency ?? "USD");
+    setRegion("");
+    setAsOfDate("");
+    setNotes("");
+  }, [open, seed]);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    const value = parseNum(rate);
+    if (typeof value !== "number" || value <= 0) {
+      setError("Enter the benchmark rate.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await api.post(`/api/v1/commercial/rate-benchmarks`, {
+        description,
+        unit,
+        rate: value,
+        currency,
+        ...(code.trim() ? { code: code.trim() } : {}),
+        ...(region.trim() ? { region: region.trim() } : {}),
+        ...(asOfDate ? { asOfDate } : {}),
+        ...(notes.trim() ? { notes: notes.trim() } : {}),
+      });
+      toast.success("Benchmark added");
+      onSaved();
+    } catch (err) {
+      setError(err instanceof ApiClientError ? err.message : "Failed to add the benchmark");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal open={open} title="Add a benchmark rate" onClose={onClose}>
+      <ErrorAlert message={error} />
+      <form onSubmit={submit} className="space-y-4">
+        <Field label="Description">
+          <Input value={description} onChange={(e) => setDescription(e.target.value)} />
+        </Field>
+        <div className="grid grid-cols-3 gap-3">
+          <Field label="Code">
+            <Input value={code} onChange={(e) => setCode(e.target.value)} />
+          </Field>
+          <Field label="Unit">
+            <Input value={unit} onChange={(e) => setUnit(e.target.value)} />
+          </Field>
+          <Field label="Rate">
+            <Input inputMode="decimal" value={rate} onChange={(e) => setRate(e.target.value)} />
+          </Field>
+        </div>
+        <div className="grid grid-cols-3 gap-3">
+          <Field label="Currency">
+            <Input value={currency} onChange={(e) => setCurrency(e.target.value.toUpperCase())} />
+          </Field>
+          <Field label="Region">
+            <Input value={region} onChange={(e) => setRegion(e.target.value)} />
+          </Field>
+          <Field label="As of">
+            <Input type="date" value={asOfDate} onChange={(e) => setAsOfDate(e.target.value)} />
+          </Field>
+        </div>
+        <Field label="Notes" hint="Where the rate came from — the analyser shows it as the basis.">
+          <Textarea value={notes} onChange={(e) => setNotes(e.target.value)} />
+        </Field>
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" disabled={busy || !description.trim() || !unit.trim()}>
+            {busy ? "Saving…" : "Add benchmark"}
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+/* ------------------------------ Index series ------------------------------- */
+
+/**
+ * Published index series (BCIS, CPI, a bulletin) are the raw material of every
+ * price-adjustment formula. Until this panel existed the API accepted them and
+ * nothing in the product could create one, so fluctuations were unreachable on
+ * a fresh tenant.
+ */
+function IndexSeriesPanel() {
+  const { company } = useAuth();
+  const canEdit = company?.role === "owner" || company?.role === "admin";
+  const [series, setSeries] = useState<IndexSeriesRow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [editing, setEditing] = useState<IndexSeriesRow | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await api.get<{ items: IndexSeriesRow[] }>(`/api/v1/commercial/index-series`);
+      setSeries(res.items);
+      setError(null);
+    } catch (err) {
+      setSeries([]);
+      setError(err instanceof Error ? err.message : "Failed to load index series");
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  return (
+    <section>
+      <div className="mb-3 flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold text-ink-900">Index series</h2>
+          <p className="mt-0.5 text-xs text-ink-500">
+            The published indices the adjustment formulae read. Every value is stored with its
+            month so an adjustment can be recomputed from its own record.
+          </p>
+        </div>
+        {canEdit ? (
+          <Button size="sm" onClick={() => setCreateOpen(true)}>
+            Add series
+          </Button>
+        ) : null}
+      </div>
+      <ErrorAlert message={error} />
+      {!canEdit ? (
+        <p className="mb-2 text-xs text-ink-400">
+          Only a company owner or admin can maintain index series.
+        </p>
+      ) : null}
+      {series === null ? (
+        <Spinner />
+      ) : series.length === 0 ? (
+        <EmptyState
+          title="No index series recorded"
+          hint="Add the series named in the Table of Adjustment Data before computing an adjustment."
+        />
+      ) : (
+        <Table>
+          <thead>
+            <tr>
+              <Th>Code</Th>
+              <Th>Name</Th>
+              <Th>Source</Th>
+              <Th>Country</Th>
+              <Th className="text-right">Points</Th>
+              <Th>Range</Th>
+              <Th />
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-ink-100">
+            {series.map((s) => {
+              const first = s.values[0];
+              const last = s.values[s.values.length - 1];
+              return (
+                <tr key={s.id}>
+                  <Td className="font-mono text-xs font-medium">{s.code}</Td>
+                  <Td className="max-w-sm truncate">{s.name}</Td>
+                  <Td className="text-xs text-ink-500">{s.source ?? "—"}</Td>
+                  <Td className="text-xs text-ink-500">{s.country ?? "—"}</Td>
+                  <Td className="text-right tabular-nums">{s.values.length}</Td>
+                  <Td className="whitespace-nowrap text-xs text-ink-500">
+                    {first && last ? `${first.period} → ${last.period}` : "— none —"}
+                  </Td>
+                  <Td className="text-right">
+                    {canEdit ? (
+                      <Button size="sm" variant="secondary" onClick={() => setEditing(s)}>
+                        Add values
+                      </Button>
+                    ) : null}
+                  </Td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </Table>
+      )}
+
+      <CreateSeriesModal
+        open={createOpen}
+        onClose={() => setCreateOpen(false)}
+        onSaved={() => {
+          setCreateOpen(false);
+          void load();
+        }}
+      />
+      <SeriesValuesModal
+        series={editing}
+        onClose={() => setEditing(null)}
+        onSaved={() => {
+          setEditing(null);
+          void load();
+        }}
+      />
+    </section>
+  );
+}
+
+/** Parse "2025-01 118.4" / "2025-01,118.4" lines into index points. */
+function parseSeriesValues(raw: string): {
+  values: Array<{ period: string; value: number }>;
+  errors: string[];
+} {
+  const values: Array<{ period: string; value: number }> = [];
+  const errors: string[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const parts = trimmed.split(/[\s,;\t]+/).filter(Boolean);
+    const period = parts[0] ?? "";
+    const value = Number(parts[1]);
+    if (!/^\d{4}-\d{2}$/.test(period)) {
+      errors.push(`"${trimmed}" — the period must be YYYY-MM.`);
+      continue;
+    }
+    if (!Number.isFinite(value) || value <= 0) {
+      errors.push(`"${trimmed}" — the index value must be a positive number.`);
+      continue;
+    }
+    values.push({ period, value });
+  }
+  return { values, errors };
+}
+
+function CreateSeriesModal({
+  open,
+  onClose,
+  onSaved,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [code, setCode] = useState("");
+  const [name, setName] = useState("");
+  const [source, setSource] = useState("");
+  const [country, setCountry] = useState("");
+  const [raw, setRaw] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setCode("");
+    setName("");
+    setSource("");
+    setCountry("");
+    setRaw("");
+    setError(null);
+  }, [open]);
+
+  const parsed = parseSeriesValues(raw);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    if (parsed.errors.length > 0) {
+      setError(parsed.errors.join(" "));
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await api.post(`/api/v1/commercial/index-series`, {
+        code: code.trim(),
+        name: name.trim(),
+        ...(source.trim() ? { source: source.trim() } : {}),
+        ...(country.trim() ? { country: country.trim() } : {}),
+        ...(parsed.values.length > 0 ? { values: parsed.values } : {}),
+      });
+      toast.success("Index series added");
+      onSaved();
+    } catch (err) {
+      setError(err instanceof ApiClientError ? err.message : "Failed to add the series");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal open={open} title="Add an index series" onClose={onClose}>
+      <ErrorAlert message={error} />
+      <form onSubmit={submit} className="space-y-4">
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Code" hint="Used in the Table of Adjustment Data, e.g. LAB.">
+            <Input value={code} onChange={(e) => setCode(e.target.value.toUpperCase())} />
+          </Field>
+          <Field label="Name">
+            <Input value={name} onChange={(e) => setName(e.target.value)} />
+          </Field>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Source" hint="Who publishes it.">
+            <Input value={source} onChange={(e) => setSource(e.target.value)} />
+          </Field>
+          <Field label="Country">
+            <Input value={country} onChange={(e) => setCountry(e.target.value)} />
+          </Field>
+        </div>
+        <Field
+          label="Index values"
+          hint="One per line: YYYY-MM value (e.g. 2025-01 118.4). Optional — values can be added later."
+        >
+          <Textarea rows={6} value={raw} onChange={(e) => setRaw(e.target.value)} />
+        </Field>
+        {parsed.errors.length > 0 ? (
+          <ul className="space-y-0.5 text-xs text-red-700">
+            {parsed.errors.slice(0, 5).map((m) => (
+              <li key={m}>• {m}</li>
+            ))}
+          </ul>
+        ) : parsed.values.length > 0 ? (
+          <p className="text-xs text-ink-500">{parsed.values.length} index points understood.</p>
+        ) : null}
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" disabled={busy || !code.trim() || !name.trim()}>
+            {busy ? "Saving…" : "Add series"}
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function SeriesValuesModal({
+  series,
+  onClose,
+  onSaved,
+}: {
+  series: IndexSeriesRow | null;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [raw, setRaw] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setRaw("");
+    setError(null);
+  }, [series]);
+
+  const parsed = parseSeriesValues(raw);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    if (!series) return;
+    if (parsed.values.length === 0) {
+      setError("Enter at least one index point.");
+      return;
+    }
+    if (parsed.errors.length > 0) {
+      setError(parsed.errors.join(" "));
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await api.put(`/api/v1/commercial/index-series/${series.id}/values`, {
+        values: parsed.values,
+      });
+      toast.success("Index values recorded");
+      onSaved();
+    } catch (err) {
+      setError(err instanceof ApiClientError ? err.message : "Failed to record the values");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      open={series !== null}
+      title={series ? `Index values — ${series.code}` : "Index values"}
+      onClose={onClose}
+    >
+      <ErrorAlert message={error} />
+      <form onSubmit={submit} className="space-y-4">
+        <Field
+          label="Index values"
+          hint="One per line: YYYY-MM value. An existing month is overwritten."
+        >
+          <Textarea rows={8} value={raw} onChange={(e) => setRaw(e.target.value)} />
+        </Field>
+        {parsed.errors.length > 0 ? (
+          <ul className="space-y-0.5 text-xs text-red-700">
+            {parsed.errors.slice(0, 5).map((m) => (
+              <li key={m}>• {m}</li>
+            ))}
+          </ul>
+        ) : parsed.values.length > 0 ? (
+          <p className="text-xs text-ink-500">{parsed.values.length} index points understood.</p>
+        ) : null}
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" disabled={busy || parsed.values.length === 0}>
+            {busy ? "Saving…" : "Record values"}
+          </Button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
 /* ------------------------------- Fluctuations ------------------------------ */
 
 interface FluctuationResult {
@@ -375,6 +984,8 @@ interface FluctuationResult {
 function FluctuationPanel({ projectId, currency }: { projectId: string; currency: string }) {
   const [series, setSeries] = useState<IndexSeriesRow[]>([]);
   const [history, setHistory] = useState<FluctuationCalcRow[]>([]);
+  const [formulae, setFormulae] = useState<FluctuationFormulaInfo[]>([]);
+  const [formula, setFormula] = useState("fidic_13_8");
   const [error, setError] = useState<string | null>(null);
   const [basePeriod, setBasePeriod] = useState("");
   const [currentPeriod, setCurrentPeriod] = useState("");
@@ -386,18 +997,23 @@ function FluctuationPanel({ projectId, currency }: { projectId: string; currency
 
   const load = useCallback(async () => {
     try {
-      const [s, h] = await Promise.all([
+      const [s, h, f] = await Promise.all([
         api.get<{ items: IndexSeriesRow[] }>(`/api/v1/commercial/index-series`),
         api.get<ListResponse<FluctuationCalcRow>>(
           `/api/v1/projects/${projectId}/commercial/fluctuations?pageSize=50`,
         ),
+        api.get<{ items: FluctuationFormulaInfo[] }>(`/api/v1/commercial/fluctuation-formulae`),
       ]);
       setSeries(s.items);
       setHistory(h.items);
+      setFormulae(f.items);
+      if (f.items[0] && !f.items.some((x) => x.formula === formula)) {
+        setFormula(f.items[0].formula);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load index series");
     }
-  }, [projectId]);
+  }, [projectId, formula]);
 
   useEffect(() => {
     void load();
@@ -413,7 +1029,7 @@ function FluctuationPanel({ projectId, currency }: { projectId: string; currency
       const res = await api.post<FluctuationResult & { calculationId: string | null }>(
         `/api/v1/projects/${projectId}/commercial/fluctuations`,
         {
-          formula: "fidic_13_8",
+          formula,
           basePeriod,
           currentPeriod,
           nonAdjustable: parseNum(nonAdjustable) ?? 0,
@@ -448,6 +1064,25 @@ function FluctuationPanel({ projectId, currency }: { projectId: string; currency
       ) : (
         <Card>
           <CardBody>
+            <Field
+              label="Formula"
+              hint={
+                formulae.find((f) => f.formula === formula)?.reference ??
+                "The adjustment rule this contract provides."
+              }
+            >
+              <Select value={formula} onChange={(e) => setFormula(e.target.value)}>
+                {formulae.length === 0 ? <option value={formula}>{humanize(formula)}</option> : null}
+                {formulae.map((f) => (
+                  <option key={f.formula} value={f.formula}>
+                    {f.name}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <p className="mb-3 text-xs text-ink-500">
+              {formulae.find((f) => f.formula === formula)?.description ?? ""}
+            </p>
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
               <Field label="Base period">
                 <Input

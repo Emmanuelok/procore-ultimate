@@ -27,7 +27,7 @@ import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { pushNotifications } from "../notifications/service.js";
-import { addDaysISO, isBusinessDay, isoDateSchema, todayISO } from "./dates.js";
+import { addDaysISO, daysBetween, isBusinessDay, isoDateSchema, todayISO } from "./dates.js";
 import { assertCompanyUsers, assertVendor, hasToolAdmin, isCompanyAdmin } from "./access.js";
 import {
   SECTION_KEYS,
@@ -180,6 +180,22 @@ export const dailyLogRoutes: FastifyPluginAsync = async (app) => {
 
   const weatherEnabled = app.appConfig.NODE_ENV !== "test";
 
+  /**
+   * Bound a reporting window by CALENDAR span, not by the number of business
+   * days it happens to contain. `businessDaysBetween` stops after `maxDays`
+   * calendar steps, so counting its result could never reach 400 and a
+   * multi-year request came back silently truncated — a compliance figure
+   * that looks complete and is not.
+   */
+  const MAX_RANGE_DAYS = 400;
+  function assertRange(from: string, to: string): void {
+    if (from > to) throw badRequest("'from' must not be after 'to'");
+    const span = Math.round(daysBetween(from, to)) + 1;
+    if (span > MAX_RANGE_DAYS) {
+      throw badRequest(`Range too large: ${span} days requested, maximum ${MAX_RANGE_DAYS}`);
+    }
+  }
+
   function parseDateParam(req: { params: unknown }): string {
     const { date } = req.params as { date: string };
     const parsed = isoDateSchema.safeParse(date);
@@ -292,10 +308,17 @@ export const dailyLogRoutes: FastifyPluginAsync = async (app) => {
     if (date > todayISO()) throw badRequest("A daily log cannot be written for a future date");
     const body = upsertSchema.parse(req.body);
     await assertVendor(app.db, req.companyId!, body.vendorId);
-    if (body.logKind === "subcontractor" && !body.vendorId) {
+    const existing = await myLog(req, date);
+    // #396: validate the EFFECTIVE kind/vendor (existing row overlaid with the
+    // patch), not just the fields this request happens to carry. Sending
+    // {vendorId: null} alone against a subcontractor draft used to leave a
+    // self-reported log attributed to no company, which then flows into the
+    // compliance grouping and the timecard reconciliation keyed on vendor.
+    const effectiveKind = body.logKind ?? existing?.logKind ?? "internal";
+    const effectiveVendor = body.vendorId !== undefined ? body.vendorId : (existing?.vendorId ?? null);
+    if (effectiveKind === "subcontractor" && !effectiveVendor) {
       throw badRequest("A subcontractor self-reported log must name its vendor");
     }
-    const existing = await myLog(req, date);
     const now = nowIso();
     const incoming = (body.sections ?? {}) as Record<string, unknown>;
 
@@ -420,9 +443,8 @@ export const dailyLogRoutes: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/daily-logs/missing", { preHandler: readGate }, async (req) => {
     const q = rangeQuery.parse(req.query);
-    if (q.from > q.to) throw badRequest("'from' must not be after 'to'");
-    const days = businessDaysBetween(q.from, q.to, 401);
-    if (days.length > 400) throw badRequest("Range too large (max 400 days)");
+    assertRange(q.from, q.to);
+    const days = businessDaysBetween(q.from, q.to, MAX_RANGE_DAYS);
     const logged = await app.db
       .select({ logDate: dailyLogs.logDate })
       .from(dailyLogs)
@@ -433,8 +455,7 @@ export const dailyLogRoutes: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/daily-logs/compliance", { preHandler: readGate }, async (req) => {
     const q = rangeQuery.parse(req.query);
-    if (q.from > q.to) throw badRequest("'from' must not be after 'to'");
-    if (businessDaysBetween(q.from, q.to, 401).length > 400) throw badRequest("Range too large (max 400 days)");
+    assertRange(q.from, q.to);
     const rows = await app.db
       .select({ createdBy: dailyLogs.createdBy, logDate: dailyLogs.logDate, status: dailyLogs.status, logKind: dailyLogs.logKind })
       .from(dailyLogs)
@@ -451,7 +472,7 @@ export const dailyLogRoutes: FastifyPluginAsync = async (app) => {
     return {
       from: q.from,
       to: q.to,
-      expectedDays: businessDaysBetween(q.from, q.to).length,
+      expectedDays: businessDaysBetween(q.from, q.to, MAX_RANGE_DAYS).length,
       items: byCreator.map((r) => ({ ...r, name: nameOf.get(r.createdBy) ?? null, logKind: kindOf.get(r.createdBy) ?? "internal" })),
       basis: "Expected = Monday–Friday in the window; submitted = a submitted or approved log on that day; creators who have never logged are not listed",
     };

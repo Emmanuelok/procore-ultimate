@@ -156,7 +156,7 @@ export default function LongLeadTab({ projectId, lookups, onChanged }: { project
       </Card>
 
       <ItemForm projectId={projectId} open={createOpen} lookups={lookups} nodes={nodes.data?.items ?? []} onClose={() => setCreateOpen(false)} onCreated={() => { setCreateOpen(false); changed(); }} />
-      <ItemDrawer projectId={projectId} itemId={openId} detail={detail} onClose={() => setOpenId(null)} onChanged={changed} />
+      <ItemDrawer projectId={projectId} itemId={openId} detail={detail} lookups={lookups} nodes={nodes.data?.items ?? []} onClose={() => setOpenId(null)} onChanged={changed} />
     </div>
   );
 }
@@ -294,7 +294,27 @@ function ItemForm({ projectId, open, lookups, nodes, onClose, onCreated }: { pro
   );
 }
 
-function ItemDrawer({ projectId, itemId, detail, onClose, onChanged }: { projectId: string; itemId: string | null; detail: Loadable<LongLeadDetail>; onClose: () => void; onChanged: () => void }) {
+interface ItemEdit {
+  name: string;
+  category: string;
+  scheduleTaskId: string;
+  requiredOnSite: string;
+  leadTimeDays: string;
+  bufferDays: string;
+  supplierNodeId: string;
+  vendorId: string;
+  purchaseOrderRef: string;
+  plannedArrivalDate: string;
+  forecastArrivalDate: string;
+  value: string;
+  currency: string;
+  incoterms: string;
+  customsRequired: boolean;
+}
+
+const EMPTY_ITEM_EDIT: ItemEdit = { name: "", category: "", scheduleTaskId: "", requiredOnSite: "", leadTimeDays: "0", bufferDays: "0", supplierNodeId: "", vendorId: "", purchaseOrderRef: "", plannedArrivalDate: "", forecastArrivalDate: "", value: "", currency: "USD", incoterms: "", customsRequired: false };
+
+function ItemDrawer({ projectId, itemId, detail, lookups, nodes, onClose, onChanged }: { projectId: string; itemId: string | null; detail: Loadable<LongLeadDetail>; lookups: Lookups; nodes: NodeRow[]; onClose: () => void; onChanged: () => void }) {
   const base = `/api/v1/projects/${projectId}/supply-chain/long-lead`;
   const action = useAction();
   const d = detail.data;
@@ -304,6 +324,67 @@ function ItemDrawer({ projectId, itemId, detail, onClose, onChanged }: { project
   const [chaseNote, setChaseNote] = useState("");
   const [promisedDate, setPromisedDate] = useState("");
   const [cancelReason, setCancelReason] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [edit, setEdit] = useState<ItemEdit>(EMPTY_ITEM_EDIT);
+
+  function startEditing() {
+    if (!d) return;
+    setEdit({
+      name: d.name,
+      category: d.category ?? "",
+      scheduleTaskId: d.scheduleTaskId ?? "",
+      // A need date that follows the programme is left blank here: typing one
+      // is what takes the item OFF the programme, so the form must not put
+      // the derived date back in as if it had been typed.
+      requiredOnSite: d.requiredFromSchedule === 1 ? "" : (d.requiredOnSite ?? ""),
+      leadTimeDays: String(d.leadTimeDays),
+      bufferDays: String(d.bufferDays),
+      supplierNodeId: d.supplierNodeId ?? "",
+      vendorId: d.vendorId ?? "",
+      purchaseOrderRef: d.purchaseOrderRef ?? "",
+      plannedArrivalDate: d.plannedArrivalDate ?? "",
+      forecastArrivalDate: d.forecastArrivalDate ?? "",
+      value: d.value === null ? "" : String(d.value),
+      currency: d.currency,
+      incoterms: d.incoterms ?? "",
+      customsRequired: d.customsRequired === 1,
+    });
+    setEditing(true);
+  }
+
+  /**
+   * The register is only as good as its inputs: a lead time of 40 days where
+   * the mill quoted 400 makes the order-by date, the float, the risk level
+   * and the obligation deadline all wrong. Correcting it here keeps the
+   * reference, the milestones and the expediting log; cancelling would not.
+   */
+  async function saveEdit(e: FormEvent) {
+    e.preventDefault();
+    if (!d) return;
+    const payload: Record<string, unknown> = {
+      name: edit.name.trim(),
+      category: edit.category.trim() ? edit.category.trim() : null,
+      scheduleTaskId: edit.scheduleTaskId ? edit.scheduleTaskId : null,
+      requiredOnSite: edit.requiredOnSite ? edit.requiredOnSite : null,
+      leadTimeDays: Number(edit.leadTimeDays || 0),
+      bufferDays: Number(edit.bufferDays || 0),
+      supplierNodeId: edit.supplierNodeId ? edit.supplierNodeId : null,
+      vendorId: edit.vendorId ? edit.vendorId : null,
+      purchaseOrderRef: edit.purchaseOrderRef.trim() ? edit.purchaseOrderRef.trim() : null,
+      plannedArrivalDate: edit.plannedArrivalDate ? edit.plannedArrivalDate : null,
+      forecastArrivalDate: edit.forecastArrivalDate ? edit.forecastArrivalDate : null,
+      value: edit.value.trim() ? Number(edit.value) : null,
+      currency: edit.currency.trim().toUpperCase(),
+      incoterms: edit.incoterms ? edit.incoterms : null,
+      customsRequired: edit.customsRequired,
+    };
+    const r = await action.run("edit", () => api.patch<LongLeadRow & { assessment: LongLeadDetail["assessment"] }>(`${base}/${d.id}`, payload));
+    if (r) {
+      toast.success(`${r.reference} updated · order by ${r.assessment.orderByDate ?? "n/a"}`);
+      setEditing(false);
+      onChanged();
+    }
+  }
 
   async function milestone(m: string) {
     if (!d) return;
@@ -434,6 +515,7 @@ function ItemDrawer({ projectId, itemId, detail, onClose, onChanged }: { project
                 </div>
               </form>
             ) : null}
+            {d.expeditingLogHasMore ? <p className="mt-2 text-2xs text-content-muted">Showing the most recent 200 entries; older chases are not listed.</p> : null}
             {d.expeditingLog.length === 0 ? (
               <p className="mt-2 text-meta italic text-content-muted">No expediting contact has been logged.</p>
             ) : (
@@ -453,19 +535,113 @@ function ItemDrawer({ projectId, itemId, detail, onClose, onChanged }: { project
           </section>
 
           <section>
-            <SectionHeading title="Record" />
-            <KeyValue
-              items={[
-                { label: "Quantity", value: d.quantity === null ? EM_DASH : `${d.quantity} ${d.unit ?? ""}` },
-                { label: "Value", value: money(d.value, d.currency) },
-                { label: "PO", value: d.purchaseOrderRef ?? EM_DASH },
-                { label: "Incoterms", value: d.incoterms ?? EM_DASH },
-                { label: "Origin", value: d.originCountry ?? EM_DASH },
-                { label: "Catalogue item", value: d.materialItemId ?? EM_DASH },
-                { label: "Category", value: d.category ?? EM_DASH },
-                { label: "Assessed", value: dateTime(d.riskAssessedAt) },
-              ]}
+            <SectionHeading
+              title="Record"
+              actions={
+                closed ? null : editing ? (
+                  <Button size="sm" variant="ghost" onClick={() => setEditing(false)}>
+                    Cancel edit
+                  </Button>
+                ) : (
+                  <Button size="sm" variant="secondary" onClick={startEditing}>
+                    Edit item
+                  </Button>
+                )
+              }
             />
+            {editing ? (
+              <form onSubmit={(e) => void saveEdit(e)} className="space-y-3 rounded-md border border-border p-3">
+                <Field label="Item" required>
+                  <Input value={edit.name} onChange={(e) => setEdit({ ...edit, name: e.target.value })} required maxLength={200} />
+                </Field>
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="Feeds schedule task" hint="Required-on-site copies the task start.">
+                    <Select value={edit.scheduleTaskId} onChange={(e) => setEdit({ ...edit, scheduleTaskId: e.target.value })}>
+                      {optionList(lookups.tasks, (t) => `${t.name}${t.startDate ? ` (${t.startDate})` : ""}${t.isCritical === 1 ? " ★" : ""}`).map((o) => (
+                        <option key={o.value} value={o.value}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                  <Field label="Required on site" hint={d.requiredFromSchedule === 1 ? "Empty = follow the programme" : "Typed date overrides the programme"}>
+                    <Input type="date" value={edit.requiredOnSite} onChange={(e) => setEdit({ ...edit, requiredOnSite: e.target.value })} />
+                  </Field>
+                  <Field label="Lead time (days)" required>
+                    <Input type="number" min={0} value={edit.leadTimeDays} onChange={(e) => setEdit({ ...edit, leadTimeDays: e.target.value })} required />
+                  </Field>
+                  <Field label="Buffer (days)">
+                    <Input type="number" min={0} value={edit.bufferDays} onChange={(e) => setEdit({ ...edit, bufferDays: e.target.value })} />
+                  </Field>
+                  <Field label="Supplier node">
+                    <Select value={edit.supplierNodeId} onChange={(e) => setEdit({ ...edit, supplierNodeId: e.target.value })}>
+                      {optionList(nodes, (n) => `T${n.tier} ${n.name}`).map((o) => (
+                        <option key={o.value} value={o.value}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                  <Field label="Vendor">
+                    <Select value={edit.vendorId} onChange={(e) => setEdit({ ...edit, vendorId: e.target.value })}>
+                      {optionList(lookups.vendors, (v) => v.name).map((o) => (
+                        <option key={o.value} value={o.value}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                  <Field label="Planned arrival">
+                    <Input type="date" value={edit.plannedArrivalDate} onChange={(e) => setEdit({ ...edit, plannedArrivalDate: e.target.value })} />
+                  </Field>
+                  <Field label="Forecast arrival" hint="what the supplier last promised">
+                    <Input type="date" value={edit.forecastArrivalDate} onChange={(e) => setEdit({ ...edit, forecastArrivalDate: e.target.value })} />
+                  </Field>
+                  <Field label="Category">
+                    <Input value={edit.category} onChange={(e) => setEdit({ ...edit, category: e.target.value })} />
+                  </Field>
+                  <Field label="PO reference">
+                    <Input value={edit.purchaseOrderRef} onChange={(e) => setEdit({ ...edit, purchaseOrderRef: e.target.value })} />
+                  </Field>
+                  <Field label="Value">
+                    <Input type="number" min={0} step="0.01" value={edit.value} onChange={(e) => setEdit({ ...edit, value: e.target.value })} />
+                  </Field>
+                  <Field label="Currency" hint="ISO 4217">
+                    <Input value={edit.currency} onChange={(e) => setEdit({ ...edit, currency: e.target.value })} maxLength={3} />
+                  </Field>
+                  <Field label="Incoterms">
+                    <Select value={edit.incoterms} onChange={(e) => setEdit({ ...edit, incoterms: e.target.value })}>
+                      <option value="">—</option>
+                      {INCOTERMS.map((i) => (
+                        <option key={i} value={i}>
+                          {i}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                </div>
+                <Checkbox label="Customs clearance required" checked={edit.customsRequired} onChange={(e) => setEdit({ ...edit, customsRequired: e.target.checked })} />
+                <ReasonList reasons={lookups.notes} />
+                <div className="flex justify-end">
+                  <Button type="submit" size="sm" loading={action.busy === "edit"}>
+                    Save changes
+                  </Button>
+                </div>
+              </form>
+            ) : (
+              <KeyValue
+                items={[
+                  { label: "Quantity", value: d.quantity === null ? EM_DASH : `${d.quantity} ${d.unit ?? ""}` },
+                  { label: "Value", value: money(d.value, d.currency) },
+                  { label: "PO", value: d.purchaseOrderRef ?? EM_DASH },
+                  { label: "Incoterms", value: d.incoterms ?? EM_DASH },
+                  { label: "Origin", value: d.originCountry ?? EM_DASH },
+                  { label: "Catalogue item", value: d.materialItemId ?? EM_DASH },
+                  { label: "Category", value: d.category ?? EM_DASH },
+                  { label: "Assessed", value: dateTime(d.riskAssessedAt) },
+                ]}
+              />
+            )}
           </section>
 
           {!closed ? (

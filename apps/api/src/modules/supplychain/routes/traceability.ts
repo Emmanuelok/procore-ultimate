@@ -19,12 +19,14 @@ import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.j
 import { chainCompleteness, traceCoverage, type TraceCertificate } from "../engines/traceability.js";
 import { certificatesOf, persistChain, traceInput, type TraceRow } from "../service.js";
 import {
+  ROLLUP_CAP,
   allocateReference,
   assertLocation,
   assertMaterialItem,
   assertNode,
   assertVendor,
   buildGates,
+  capped,
   countryCodeSchema,
   idSchema,
   isoDateSchema,
@@ -488,11 +490,13 @@ export const traceabilityRoutes: FastifyPluginAsync = async (app) => {
 
   app.get(`${base}/coverage`, { preHandler: readGate }, async (req) => {
     const { projectId } = req.params as { projectId: string };
-    const rows = await app.db
+    const all = await app.db
       .select({ id: materialTraceRecords.id, reference: materialTraceRecords.reference, description: materialTraceRecords.description, materialType: materialTraceRecords.materialType, status: materialTraceRecords.status, chainComplete: materialTraceRecords.chainComplete, certificateCount: materialTraceRecords.certificateCount, chainGaps: materialTraceRecords.chainGaps, installedLocationId: materialTraceRecords.installedLocationId })
       .from(materialTraceRecords)
       .where(and(eq(materialTraceRecords.companyId, req.companyId!), eq(materialTraceRecords.projectId, projectId)))
-      .limit(5000);
+      .limit(ROLLUP_CAP + 1);
+    const capRows = capped(all, "traceability records");
+    const rows = capRows.rows;
     const overall = traceCoverage(rows);
     const byType = new Map<string, typeof rows>();
     for (const r of rows) {
@@ -505,6 +509,8 @@ export const traceabilityRoutes: FastifyPluginAsync = async (app) => {
     for (const r of rows) byStatus[r.status] = (byStatus[r.status] ?? 0) + 1;
     return {
       ...overall,
+      truncated: capRows.notice ? [capRows.notice] : [],
+      reasons: capRows.notice ? [capRows.notice, ...overall.reasons] : overall.reasons,
       byStatus,
       byMaterialType: [...byType.entries()].map(([materialType, list]) => ({ materialType, ...traceCoverage(list) })),
       installedWithoutCertificateItems: rows.filter((r) => r.status === "installed" && r.certificateCount === 0).slice(0, 50).map((r) => ({ id: r.id, reference: r.reference, description: r.description, installedLocationId: r.installedLocationId })),

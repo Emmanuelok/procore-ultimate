@@ -7,7 +7,6 @@ import {
   grievances,
   locations,
   obligations,
-  signals,
 } from "@constructos/db";
 import {
   GRIEVANCE_CHANNELS,
@@ -17,7 +16,7 @@ import {
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { badRequest, notFound } from "../../lib/errors.js";
+import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { addDaysISO, isoDateSchema, todayISO } from "../field/dates.js";
 import {
@@ -25,6 +24,8 @@ import {
   GRIEVANCE_SETTLED_STATUSES,
   GRIEVANCE_SLA,
 } from "./reference.js";
+import { GRIEVANCE_TIER_LABELS, MAX_GRIEVANCE_TIER } from "./grievance-engine.js";
+import { syncPapGrievanceStatus } from "./pap-grievance.js";
 import {
   daysFromDateToInstant,
   daysUntil,
@@ -69,7 +70,18 @@ const verifySchema = z.object({
   complainantSatisfied: z.boolean(),
   note: z.string().max(20000).nullable().optional(),
 });
-const escalateSchema = z.object({ reason: z.string().min(1).max(20000) });
+const escalateSchema = z.object({
+  reason: z.string().min(1).max(20000),
+  /** where on the published ladder this goes; defaults to one tier up */
+  toTier: z.number().int().min(1).max(3).optional(),
+  assigneeId: z.string().min(1).nullable().optional(),
+});
+const rejectSchema = z.object({
+  reason: z.string().min(1).max(20000),
+  /** a withdrawal by the complainant is recorded distinctly from a refusal */
+  outcome: z.enum(["rejected", "withdrawn"]).optional(),
+  complainantNotified: z.boolean().optional(),
+});
 const acknowledgeSchema = z.object({ note: z.string().max(10000).nullable().optional() });
 
 const SETTLED: readonly string[] = GRIEVANCE_SETTLED_STATUSES;
@@ -101,95 +113,21 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
   }
 
   /**
-   * Lazy SLA breach sweep (#572), same shape as the payments deemed-liability
-   * sweep: a grievance whose resolution deadline has passed while it is still
-   * open breaches its obligation and raises a signal — exactly once, keyed on
-   * the grievance id carried in the signal's evidenceRefs so repeated reads
-   * never duplicate it. Severity tracks the grievance: a critical community
-   * grievance left past its deadline is itself a critical integrity signal.
+   * Keep the household's `grievance_open` flag in step with its grievances.
+   * `grievance_open` is a PAP status only the grievance register can produce
+   * — the PAP status route refuses it by hand — so every route here that
+   * opens or settles a grievance naming a household calls this. It is
+   * idempotent and writes nothing when nothing changed.
    */
-  async function sweepSlaBreaches(
+  async function syncPap(
     companyId: string,
     projectId: string,
+    papId: string | null,
     actorId: string,
+    grievanceId: string,
   ): Promise<void> {
-    const today = todayISO();
-    const overdue = await app.db
-      .select()
-      .from(grievances)
-      .where(
-        and(
-          eq(grievances.companyId, companyId),
-          eq(grievances.projectId, projectId),
-          notInArray(grievances.status, [...GRIEVANCE_SETTLED_STATUSES]),
-          isNotNull(grievances.resolveDueAt),
-          lt(grievances.resolveDueAt, today),
-        ),
-      );
-    if (overdue.length === 0) return;
-    const existing = await app.db
-      .select({ evidenceRefs: signals.evidenceRefs })
-      .from(signals)
-      .where(
-        and(
-          eq(signals.companyId, companyId),
-          eq(signals.projectId, projectId),
-          eq(signals.detector, "grievance_sla_breach"),
-        ),
-      );
-    const seen = new Set(
-      existing.map((row) => (row.evidenceRefs as { grievanceId?: string } | null)?.grievanceId ?? ""),
-    );
-    for (const g of overdue) {
-      if (seen.has(g.id)) continue;
-      seen.add(g.id);
-      if (g.obligationId) {
-        await app.db
-          .update(obligations)
-          .set({ status: "breached" })
-          .where(and(eq(obligations.id, g.obligationId), eq(obligations.status, "open")));
-      }
-      const rule = GRIEVANCE_SLA[g.severity as keyof typeof GRIEVANCE_SLA];
-      const overdueBy = g.resolveDueAt ? Math.abs(daysUntil(g.resolveDueAt)) : 0;
-      const sigId = newId("sig");
-      await app.db.insert(signals).values({
-        id: sigId,
-        companyId,
-        projectId,
-        detector: "grievance_sla_breach",
-        severity: g.severity === "critical" ? "critical" : "high",
-        confidence: 1,
-        title: `Grievance GRV-${g.number} past its resolution SLA by ${overdueBy} day(s)`,
-        explanation:
-          `Grievance GRV-${g.number} (${g.category}, severity ${g.severity}) was received on ` +
-          `${g.receivedAt} with a resolution deadline of ${g.resolveDueAt} under the ` +
-          `${rule ? `${rule.resolveDays}-day` : "published"} grievance redress standard, and remains ` +
-          `${g.status}. An unresolved grievance past its published SLA is the single clearest ` +
-          `evidence that the grievance mechanism is not functioning — a reportable finding under ` +
-          `IFC PS1 / ESS10 and a common trigger for community disruption of the works.`,
-        evidenceRefs: {
-          grievanceId: g.id,
-          number: g.number,
-          resolveDueAt: g.resolveDueAt,
-          severity: g.severity,
-        },
-      });
-      await appendLedger(app.db, {
-        companyId,
-        actorId,
-        action: "state_change",
-        objectType: "grievance",
-        objectId: g.id,
-        payload: {
-          event: "sla_breached",
-          number: g.number,
-          resolveDueAt: g.resolveDueAt,
-          status: g.status,
-          obligationId: g.obligationId,
-        },
-        storePayload: true,
-      });
-    }
+    if (!papId) return;
+    await syncPapGrievanceStatus(app.db, { companyId, projectId, papId, actorId, grievanceId });
   }
 
   /** View-model fields the register and the detail view both need. */
@@ -211,6 +149,8 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
       overdue,
       daysOverdue: overdue && g.resolveDueAt ? Math.abs(daysUntil(g.resolveDueAt)) : 0,
       daysUntilDue: !settled && g.resolveDueAt ? daysUntil(g.resolveDueAt) : null,
+      escalationTierLabel: GRIEVANCE_TIER_LABELS[g.escalationTier] ?? null,
+      settled,
     };
   }
 
@@ -227,6 +167,24 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
     const anonymous = body.isAnonymous === true || body.channel === "anonymous";
     const complainantName = anonymous ? null : (body.complainantName ?? null);
     const complainantContact = anonymous ? null : (body.complainantContact ?? null);
+    /*
+     * A household id IS identifying data. Everything downstream treats it as
+     * such: the census row, the PAP detail, the RAP indicator
+     * `householdsUnderOpenGrievance` and the land health metric all name the
+     * household a live complaint is about, and on a scheme with one household
+     * per parcel that names the complainant. Silently dropping a link the
+     * caller asked for would be its own dishonesty, so an anonymous intake
+     * carrying a papId is refused with the reason: the web form clears the
+     * field, but the API is the surface machine tokens and MCP callers use,
+     * and a guarantee only the client enforces is not a guarantee.
+     */
+    if (anonymous && body.papId) {
+      throw badRequest(
+        "An anonymous grievance cannot name a household: a papId identifies the complainant " +
+          "through the census, the RAP dashboard and the household's own record. Submit it " +
+          "without papId, or record it as a named grievance with the complainant's consent.",
+      );
+    }
     if (body.papId) {
       const rows = await app.db
         .select({ id: affectedPersons.id })
@@ -248,48 +206,57 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
     const rule = GRIEVANCE_SLA[body.severity];
     const acknowledgeDueAt = addDaysISO(body.receivedAt, rule.acknowledgeDays);
     const resolveDueAt = addDaysISO(body.receivedAt, rule.resolveDays);
-    const number = await nextRecordNumber(app.db, req.projectId!, "grievance");
 
-    // The resolution deadline materializes as an assurance Obligation so the
-    // GRM clock and the obligation register see the same date (#572).
-    const obligationId = newId("obl");
-    await app.db.insert(obligations).values({
-      id: obligationId,
-      companyId: req.companyId!,
-      projectId: req.projectId!,
-      sourceClause: `Grievance redress mechanism — GRV-${number}`,
-      trigger:
-        `Grievance GRV-${number} (${body.category}, severity ${body.severity}) received ` +
-        `${body.receivedAt} via ${body.channel}`,
-      deadline: `${resolveDueAt}T23:59:59Z`,
-      warnDaysBefore: 2,
-      evidenceRequirement:
-        "Resolution recorded and closure verified with the complainant (#573)",
-      status: "open",
-      createdBy: req.user!.id,
-    });
-
+    /*
+     * Obligation, number, record and ledger are one act. The obligation used
+     * to be inserted first, outside any transaction: a failure in between
+     * (a numbering race, a DB error) left an orphan open obligation carrying
+     * a GRM deadline that the assurance sweep would later breach against a
+     * grievance nobody could find.
+     */
     const id = newId("grv");
-    await app.db.insert(grievances).values({
-      id,
-      companyId: req.companyId!,
-      projectId: req.projectId!,
-      number,
-      channel: body.channel,
-      isAnonymous: anonymous ? 1 : 0,
-      complainantName,
-      complainantContact,
-      papId: body.papId ?? null,
-      category: body.category,
-      severity: body.severity,
-      description: body.description,
-      locationId: body.locationId ?? null,
-      receivedAt: body.receivedAt,
-      acknowledgeDueAt,
-      resolveDueAt,
-      status: "received",
-      obligationId,
-      createdBy: req.user!.id,
+    const { number, obligationId } = await app.db.transaction(async (tx) => {
+      const number = await nextRecordNumber(tx, req.projectId!, "grievance");
+      // The resolution deadline materializes as an assurance Obligation so
+      // the GRM clock and the obligation register see the same date (#572).
+      const obligationId = newId("obl");
+      await tx.insert(obligations).values({
+        id: obligationId,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        sourceClause: `Grievance redress mechanism — GRV-${number}`,
+        trigger:
+          `Grievance GRV-${number} (${body.category}, severity ${body.severity}) received ` +
+          `${body.receivedAt} via ${body.channel}`,
+        deadline: `${resolveDueAt}T23:59:59Z`,
+        warnDaysBefore: 2,
+        evidenceRequirement:
+          "Resolution recorded and closure verified with the complainant (#573)",
+        status: "open",
+        createdBy: req.user!.id,
+      });
+      await tx.insert(grievances).values({
+        id,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        number,
+        channel: body.channel,
+        isAnonymous: anonymous ? 1 : 0,
+        complainantName,
+        complainantContact,
+        papId: body.papId ?? null,
+        category: body.category,
+        severity: body.severity,
+        description: body.description,
+        locationId: body.locationId ?? null,
+        receivedAt: body.receivedAt,
+        acknowledgeDueAt,
+        resolveDueAt,
+        status: "received",
+        obligationId,
+        createdBy: req.user!.id,
+      });
+      return { number, obligationId };
     });
     await appendLedger(app.db, {
       companyId: req.companyId!,
@@ -312,13 +279,20 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
       },
       storePayload: true,
     });
+    /*
+     * A household named by an open grievance is flagged `grievance_open`, so
+     * the census and the RAP dashboard stop showing it as settled while a
+     * complaint about it is live. The flag is reversible: the household's
+     * pre-grievance status is stashed and restored when the last grievance
+     * naming it settles.
+     */
+    await syncPap(req.companyId!, req.projectId!, body.papId ?? null, req.user!.id, id);
     const created = await fetchGrievance(id, req.companyId!, req.projectId!);
     return reply.status(201).send(decorate(created));
   });
 
   app.get("/projects/:projectId/grievances", { preHandler: readGate }, async (req) => {
     const q = grievanceListQuery.parse(req.query);
-    await sweepSlaBreaches(req.companyId!, req.projectId!, req.user!.id);
     const clauses = [
       eq(grievances.companyId, req.companyId!),
       eq(grievances.projectId, req.projectId!),
@@ -348,8 +322,6 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
     { preHandler: readGate },
     async (req) => {
       const { grievanceId } = req.params as { grievanceId: string };
-      await fetchGrievance(grievanceId, req.companyId!, req.projectId!); // 404 before sweeping
-      await sweepSlaBreaches(req.companyId!, req.projectId!, req.user!.id);
       const g = await fetchGrievance(grievanceId, req.companyId!, req.projectId!);
       const obligation = g.obligationId
         ? (
@@ -484,7 +456,15 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
       const now = new Date().toISOString();
       await app.db
         .update(grievances)
-        .set({ status: "resolved", resolution: body.resolution, resolvedAt: now, updatedAt: now })
+        .set({
+          status: "resolved",
+          resolution: body.resolution,
+          resolvedAt: now,
+          // who authored the resolution, so the person who wrote it cannot
+          // also be the one who certifies the complainant accepted it
+          resolvedBy: req.user!.id,
+          updatedAt: now,
+        })
         .where(eq(grievances.id, grievanceId));
       // The obligation is deliberately NOT satisfied here: a resolution the
       // complainant has not accepted is not a closed grievance (#573).
@@ -500,11 +480,15 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
           number: g.number,
           resolution: body.resolution,
           resolvedAt: now,
+          resolvedBy: req.user!.id,
           resolveDueAt: g.resolveDueAt,
           onTime: g.resolveDueAt ? now.slice(0, 10) <= g.resolveDueAt : null,
         },
         storePayload: true,
       });
+      // `resolved` stops the clock, so it settles the household's flag too —
+      // and an unsatisfied complainant reopening the case flags it again.
+      await syncPap(req.companyId!, req.projectId!, g.papId, req.user!.id, grievanceId);
       return decorate(await fetchGrievance(grievanceId, req.companyId!, req.projectId!));
     },
   );
@@ -515,6 +499,21 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
    * grievance and satisfies its obligation; an unsatisfied complainant
    * reopens it into investigation, and the reopen is ledgered so the
    * "closed" statistics can never be laundered.
+   *
+   * SEGREGATION OF DUTIES. A satisfied closure is an ASSERTION about what
+   * the complainant said, and the platform rule is that an assertion and the
+   * evidence that tests it are not authored by the same actor through the
+   * same pathway. Without this the officer who wrote the resolution could
+   * post `complainantSatisfied: true` seconds later, close the grievance,
+   * satisfy its GRM obligation and lift the household's flag unaided — the
+   * SLA compliance and satisfaction rates the lender reads would then be
+   * self-certified. So the resolver (and, where no resolution author is on
+   * file, the assignee) cannot record a SATISFIED verification.
+   *
+   * The unsatisfied branch is deliberately NOT restricted: recording that
+   * the complainant rejected the resolution is adverse to the person who
+   * wrote it, it reopens rather than closes, and blocking it would give an
+   * officer a reason to leave a rejection unrecorded.
    */
   app.post(
     "/projects/:projectId/grievances/:grievanceId/verify-closure",
@@ -526,6 +525,16 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
       if (g.status !== "resolved") {
         throw badRequest(
           `Closure can only be verified on a resolved grievance (this one is ${g.status})`,
+        );
+      }
+      const selfVerifier = g.resolvedBy ?? g.assigneeId;
+      if (body.complainantSatisfied && selfVerifier === req.user!.id) {
+        throw forbidden(
+          g.resolvedBy === req.user!.id
+            ? "You wrote this resolution, so you cannot also certify that the complainant " +
+                "accepted it. Another officer must verify closure with the complainant (#573)."
+            : "You are the assignee on this grievance, so you cannot also certify that the " +
+                "complainant accepted its resolution. Another officer must verify closure (#573).",
         );
       }
       const now = new Date().toISOString();
@@ -560,6 +569,8 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
             number: g.number,
             complainantSatisfied: true,
             verifiedAt: now,
+            verifiedBy: req.user!.id,
+            resolvedBy: g.resolvedBy,
             note: body.note ?? null,
           },
           storePayload: true,
@@ -595,6 +606,70 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
           storePayload: true,
         });
       }
+      await syncPap(req.companyId!, req.projectId!, g.papId, req.user!.id, grievanceId);
+      return decorate(await fetchGrievance(grievanceId, req.companyId!, req.projectId!));
+    },
+  );
+
+  /**
+   * Reject a grievance (#571-573). `rejected` is in the status enum, in the
+   * settled set, in the list filter and zero-filled in the analytics — but
+   * before this route nothing could reach it. An out-of-scope or vexatious
+   * grievance therefore had to be "resolved" with a fabricated resolution and
+   * then "verified", which inflated both the SLA compliance rate and the
+   * satisfaction rate, or left open to breach its SLA and pollute the
+   * integrity feed. A rejection is a real, honest outcome of a functioning
+   * mechanism — provided the reason is recorded and the complainant is told,
+   * which is why the reason is mandatory and stored in the ledger payload.
+   *
+   * The obligation is WAIVED rather than satisfied: nothing was delivered to
+   * the complainant, and recording it as satisfied would be a false claim in
+   * the obligation register.
+   */
+  app.post(
+    "/projects/:projectId/grievances/:grievanceId/reject",
+    { preHandler: standardGate },
+    async (req) => {
+      const { grievanceId } = req.params as { grievanceId: string };
+      const body = rejectSchema.parse(req.body);
+      const g = await fetchGrievance(grievanceId, req.companyId!, req.projectId!);
+      if (SETTLED.includes(g.status)) throw badRequest(`Grievance is already ${g.status}`);
+      const now = new Date().toISOString();
+      const resolution =
+        `${body.outcome === "withdrawn" ? "Withdrawn by the complainant" : "Rejected"}: ${body.reason}`;
+      await app.db
+        .update(grievances)
+        .set({
+          status: "rejected",
+          resolution,
+          resolvedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(grievances.id, grievanceId));
+      if (g.obligationId) {
+        await app.db
+          .update(obligations)
+          .set({ status: "waived" })
+          .where(and(eq(obligations.id, g.obligationId), eq(obligations.status, "open")));
+      }
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "grievance",
+        objectId: grievanceId,
+        payload: {
+          from: g.status,
+          to: "rejected",
+          outcome: body.outcome ?? "rejected",
+          number: g.number,
+          reason: body.reason,
+          complainantNotified: body.complainantNotified ?? false,
+          resolveDueAt: g.resolveDueAt,
+        },
+        storePayload: true,
+      });
+      await syncPap(req.companyId!, req.projectId!, g.papId, req.user!.id, grievanceId);
       return decorate(await fetchGrievance(grievanceId, req.companyId!, req.projectId!));
     },
   );
@@ -607,11 +682,49 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
       const body = escalateSchema.parse(req.body);
       const g = await fetchGrievance(grievanceId, req.companyId!, req.projectId!);
       if (SETTLED.includes(g.status)) throw badRequest(`A ${g.status} grievance cannot be escalated`);
-      if (g.status === "escalated") throw badRequest("Grievance is already escalated");
+      const toTier = body.toTier ?? Math.min(MAX_GRIEVANCE_TIER, g.escalationTier + 1);
+      if (toTier <= g.escalationTier) {
+        throw badRequest(
+          `Grievance is already at tier ${g.escalationTier} (${GRIEVANCE_TIER_LABELS[g.escalationTier]}). ` +
+            `The ladder only climbs: de-escalating would erase the record that it was escalated.`,
+        );
+      }
+      if (body.assigneeId) {
+        const member = await app.db
+          .select({ id: companyMemberships.id })
+          .from(companyMemberships)
+          .where(
+            and(
+              eq(companyMemberships.companyId, req.companyId!),
+              eq(companyMemberships.userId, body.assigneeId),
+            ),
+          )
+          .limit(1);
+        if (!member[0]) throw badRequest("assigneeId is not a member of this company");
+      }
       const now = new Date().toISOString();
+      const history = [
+        ...(g.escalationHistory as unknown[]),
+        {
+          at: now,
+          fromTier: g.escalationTier,
+          toTier,
+          reason: body.reason,
+          breach: "manual",
+          automatic: false,
+          assigneeId: body.assigneeId ?? g.assigneeId,
+        },
+      ];
       await app.db
         .update(grievances)
-        .set({ status: "escalated", updatedAt: now })
+        .set({
+          status: "escalated",
+          escalationTier: toTier,
+          escalatedAt: now,
+          escalationHistory: history,
+          assigneeId: body.assigneeId ?? g.assigneeId,
+          updatedAt: now,
+        })
         .where(eq(grievances.id, grievanceId));
       await appendLedger(app.db, {
         companyId: req.companyId!,
@@ -623,7 +736,12 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
           from: g.status,
           to: "escalated",
           number: g.number,
+          fromTier: g.escalationTier,
+          toTier,
+          tierLabel: GRIEVANCE_TIER_LABELS[toTier],
+          automatic: false,
           reason: body.reason,
+          assigneeId: body.assigneeId ?? g.assigneeId,
           resolveDueAt: g.resolveDueAt,
         },
         storePayload: true,
@@ -637,7 +755,6 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
   /* ---------------------------------------------------------------- */
 
   app.get("/projects/:projectId/grievances/analytics", { preHandler: readGate }, async (req) => {
-    await sweepSlaBreaches(req.companyId!, req.projectId!, req.user!.id);
     const rows = await app.db
       .select()
       .from(grievances)
@@ -657,8 +774,16 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
     const satisfied = verified.filter((g) => g.complainantSatisfied === 1);
     const open = rows.filter((g) => !SETTLED.includes(g.status));
     const openOverdue = open.filter((g) => g.resolveDueAt != null && g.resolveDueAt < today);
-    const withinSla = rows.filter(
-      (g) => g.resolvedAt != null && g.resolveDueAt != null && g.resolvedAt.slice(0, 10) <= g.resolveDueAt,
+    /*
+     * SLA compliance measures the mechanism's promise to DELIVER a
+     * resolution. A rejected (or withdrawn) grievance was never going to be
+     * resolved, so counting it as a hit inflates the rate and counting it as
+     * a miss punishes the officer for saying no honestly: it belongs in
+     * neither the numerator nor the denominator.
+     */
+    const resolvedForSla = rows.filter((g) => g.resolvedAt != null && g.status !== "rejected");
+    const withinSla = resolvedForSla.filter(
+      (g) => g.resolveDueAt != null && g.resolvedAt!.slice(0, 10) <= g.resolveDueAt,
     );
 
     // location names for the "by location" cut of #574
@@ -689,7 +814,19 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
       medianDaysToResolve: median(resolvedDurations),
       medianDaysToAcknowledge: median(ackDurations),
       openOverdue: openOverdue.length,
-      slaComplianceRate: shareOf(withinSla.length, resolvedDurations.length),
+      slaComplianceRate: shareOf(withinSla.length, resolvedForSla.length),
+      slaDenominator: resolvedForSla.length,
+      rejected: rows.filter((g) => g.status === "rejected").length,
+      byEscalationTier: {
+        0: rows.filter((g) => g.escalationTier === 0).length,
+        1: rows.filter((g) => g.escalationTier === 1).length,
+        2: rows.filter((g) => g.escalationTier === 2).length,
+        3: rows.filter((g) => g.escalationTier === 3).length,
+      },
+      escalated: rows.filter((g) => g.escalationTier > 0).length,
+      autoEscalated: rows.filter((g) =>
+        (g.escalationHistory as { automatic?: unknown }[]).some((h) => h?.automatic === true),
+      ).length,
       verifiedClosures: verified.length,
       /** share of verified closures where the complainant said it worked */
       satisfactionRate: shareOf(satisfied.length, verified.length),

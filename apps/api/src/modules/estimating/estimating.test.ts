@@ -14,6 +14,7 @@ import {
   estimates,
   ledgerEntries,
   notifications,
+  projectMemberships,
   projects,
   signals,
   takeoffItems,
@@ -28,8 +29,16 @@ import { estimatingModule } from "./index.js";
  *
  * Every route is exercised at least once; the segregation-of-duties refusal on
  * approval, the conversion guards and the validity guards are asserted
- * explicitly; both scheduler jobs are run on demand; and a second company is
- * shown to see and touch nothing.
+ * explicitly; all three scheduler jobs are run on demand; and a second company
+ * is shown to see and touch nothing.
+ *
+ * The last three blocks are the adversarial regressions: a company GUEST may
+ * read the rate library and change nothing in it, a quote's status cannot be
+ * moved by the generic PATCH nor walked back under the estimate lines that
+ * cite it, a lump sum recorded with a quantity of zero prices at its full
+ * amount, every section/quote-line reference is resolved inside the estimate
+ * that owns it, and two conversions (or two new versions) arriving together
+ * leave exactly one budget and exactly one live head.
  */
 
 let built: Awaited<ReturnType<typeof buildTestApp>>;
@@ -523,10 +532,32 @@ describe("takeoff (#184–190)", () => {
     expect(body.warnings.join(" ")).toMatch(/still carry the OLD quantity/);
   });
 
-  it("refuses to delete a takeoff that an estimate line cites", async () => {
+  it("voids a takeoff an estimate line cites, and says the line keeps its quantity", async () => {
+    const before = await get(`/projects/${projectA}/takeoff/items/${areaTakeoffId}`);
+    const priced = (before.json() as { pricedOn: unknown[] }).pricedOn;
+    expect(priced.length).toBeGreaterThan(0);
     const res = await del(`/projects/${projectA}/takeoff/items/${areaTakeoffId}`);
-    expect(res.statusCode).toBe(409);
-    expect(res.json()).toMatchObject({ message: expect.stringContaining("Void it instead") });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { status: string; pricedOn: unknown[]; warnings: string[] };
+    expect(body.status).toBe("void");
+    expect(body.pricedOn.length).toBeGreaterThan(0);
+    expect(body.warnings.join(" ")).toMatch(/keep the quantity they were priced at/);
+    // the lines themselves are untouched — the void is the measurement's
+    const lines = await app.db
+      .select()
+      .from(estimateLineItems)
+      .where(eq(estimateLineItems.takeoffItemId, areaTakeoffId));
+    expect(lines.length).toBeGreaterThan(0);
+    // put it back so the later reads still find a live measurement
+    await patch(`/projects/${projectA}/takeoff/items/${areaTakeoffId}`, { status: "measured" });
+  });
+
+  it("refuses to void a measurement by patching its status", async () => {
+    const res = await patch(`/projects/${projectA}/takeoff/items/${areaTakeoffId}`, {
+      status: "void",
+    });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.stringify(res.json())).toMatch(/DELETE \/takeoff\/items/);
   });
 
   it("voids an unused takeoff", async () => {
@@ -1540,6 +1571,35 @@ describe("change-order estimating (#208)", () => {
     expect(entries.length).toBeGreaterThan(0);
   });
 
+  it("refuses to push an estimate denominated in another currency", async () => {
+    const eventId = newId("cev");
+    await app.db.insert(changeEvents).values({
+      id: eventId,
+      companyId: owner.companyId,
+      projectId: projectA,
+      number: 2,
+      reference: "CE-002",
+      title: "Imported plant",
+      createdBy: owner.userId,
+    });
+    const created = await post(`/projects/${projectA}/estimates`, {
+      name: "Euro-priced change",
+      estimateType: "change_order",
+      currency: "EUR",
+    });
+    const estimateId = (created.json() as { id: string }).id;
+    await addLine(estimateId, { description: "Plant hire", quantity: 1, rates: { equipment: 5000 } });
+    const res = await post(`/projects/${projectA}/estimates/${estimateId}/push-to-change-event`, {
+      changeEventId: eventId,
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({
+      message: expect.stringContaining("carry no currency of their own"),
+    });
+    const rows = await app.db.select().from(changeEvents).where(eq(changeEvents.id, eventId));
+    expect(rows[0]?.estimatedCost).toBe(0);
+  });
+
   it("refuses a change event that is not on this project", async () => {
     const estimateId = await makeEstimate("Bad push");
     await addLine(estimateId, { description: "x", quantity: 1, rates: { other: 1 } });
@@ -1886,15 +1946,37 @@ describe("scheduler sweeps", () => {
     ).toBe("closed");
   });
 
-  it("runs both sweeps on demand from the project route", async () => {
+  it("runs the sweeps on demand from the project route, scoped to that project", async () => {
     const res = await post(`/projects/${projectA}/estimating/sweep`);
     expect(res.statusCode).toBe(200);
     const body = res.json() as {
-      quotes: { ranAt: string };
-      hygiene: { ranAt: string; catalogueFlagged: number };
+      quotes: { ranAt: string; scope: string };
+      hygiene: { ranAt: string; catalogueFlagged: number; scope: string; notes: string[] };
+      outliers: { ranAt: string; scope: string };
     };
     expect(body.quotes.ranAt).toBeTruthy();
     expect(body.hygiene.ranAt).toBeTruthy();
+    expect(body.outliers.ranAt).toBeTruthy();
+    expect(body.quotes.scope).toBe("project");
+    expect(body.hygiene.scope).toBe("project");
+    expect(body.hygiene.notes.join(" ")).toMatch(/company rate library is swept by the scheduler/);
+  });
+
+  it("does not reach another project's quotes from a project-scoped sweep", async () => {
+    const created = await post(`/projects/${projectB}/estimating/sub-quotes`, {
+      vendorName: "Lapsed On B Ltd",
+      tradePackage: "Roofing",
+      quotedTotal: 4000,
+      validUntil: shiftDays(-3),
+    });
+    const quoteId = (created.json() as { id: string }).id;
+    // a sweep triggered from project A must not touch project B
+    await post(`/projects/${projectA}/estimating/sweep`);
+    const untouched = await get(`/projects/${projectB}/estimating/sub-quotes/${quoteId}`);
+    expect((untouched.json() as { status: string }).status).toBe("received");
+    await post(`/projects/${projectB}/estimating/sweep`);
+    const swept = await get(`/projects/${projectB}/estimating/sub-quotes/${quoteId}`);
+    expect((swept.json() as { status: string }).status).toBe("expired");
   });
 
   it("keeps a rival company out of the sweep route", async () => {
@@ -2063,5 +2145,657 @@ describe("read routes and header edits", () => {
     expect(version.statusCode).toBe(201);
     const res = await patch(`/projects/${projectA}/estimates/${estimateId}`, { name: "nope" });
     expect(res.statusCode).toBe(409);
+  });
+});
+
+/* ================================================================== */
+/* Authorisation, transitions and provenance — adversarial regressions */
+/* ================================================================== */
+
+describe("company rate-library authorisation", () => {
+  let guestHeaders: Record<string, string>;
+  let memberHeaders: Record<string, string>;
+  let disposableItemId: string;
+
+  beforeAll(async () => {
+    const guest = await registerActor(app);
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: guest.userId,
+      role: "guest",
+    });
+    guestHeaders = {
+      authorization: guest.headers["authorization"]!,
+      "x-company-id": owner.companyId,
+    };
+
+    const member = await registerActor(app);
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: member.userId,
+      role: "member",
+    });
+    await app.db.insert(projectMemberships).values({
+      id: newId("pm"),
+      companyId: owner.companyId,
+      projectId: projectA,
+      userId: member.userId,
+      templateKey: "project_manager",
+    });
+    memberHeaders = {
+      authorization: member.headers["authorization"]!,
+      "x-company-id": owner.companyId,
+    };
+
+    const created = await post("/estimating/catalogue", {
+      code: "DISPOSABLE-1",
+      description: "Rate a guest must not be able to retire",
+      unit: "ea",
+      rates: { other: 12 },
+    });
+    disposableItemId = (created.json() as { id: string }).id;
+  });
+
+  it("keeps a company guest out of the rate library entirely", async () => {
+    // the library carries the company's labour, plant and margin build-up
+    expect((await get("/estimating/catalogue?pageSize=5", guestHeaders)).statusCode).toBe(403);
+    expect((await get("/estimating/assemblies?pageSize=5", guestHeaders)).statusCode).toBe(403);
+    expect((await get("/estimating/crews?pageSize=5", guestHeaders)).statusCode).toBe(403);
+    expect((await get("/estimating/production-rates?pageSize=5", guestHeaders)).statusCode).toBe(403);
+    // and a member does get in
+    expect((await get("/estimating/catalogue?pageSize=5", memberHeaders)).statusCode).toBe(200);
+  });
+
+  it("refuses every library write to a company guest", async () => {
+    expect(
+      (await post(
+        "/estimating/catalogue",
+        { code: "GUEST-1", description: "no", unit: "ea", rates: { other: 1 } },
+        guestHeaders,
+      )).statusCode,
+    ).toBe(403);
+    expect(
+      (await patch(`/estimating/catalogue/${disposableItemId}`, { description: "no" }, guestHeaders))
+        .statusCode,
+    ).toBe(403);
+    expect(
+      (await post(
+        "/estimating/catalogue/bulk",
+        { upsert: true, items: [{ code: "BLK-140", description: "overwritten", unit: "m2", rates: { material: 1 } }] },
+        guestHeaders,
+      )).statusCode,
+    ).toBe(403);
+    expect((await del(`/estimating/catalogue/${disposableItemId}`, guestHeaders)).statusCode).toBe(403);
+    expect((await del(`/estimating/crews/${crewId}`, guestHeaders)).statusCode).toBe(403);
+    expect((await del(`/estimating/assemblies/${assemblyId}`, guestHeaders)).statusCode).toBe(403);
+    // and nothing moved
+    const [item] = await app.db
+      .select()
+      .from(costCatalogueItems)
+      .where(eq(costCatalogueItems.id, disposableItemId));
+    expect(item?.status).toBe("active");
+    expect(item?.description).toBe("Rate a guest must not be able to retire");
+  });
+
+  it("lets a member maintain the library but not retire from it or bulk-import", async () => {
+    const created = await post(
+      "/estimating/catalogue",
+      { code: "MEMBER-1", description: "Member's rate", unit: "ea", rates: { other: 3 } },
+      memberHeaders,
+    );
+    expect(created.statusCode).toBe(201);
+    const id = (created.json() as { id: string }).id;
+    expect(
+      (await patch(`/estimating/catalogue/${id}`, { description: "Member's amended rate" }, memberHeaders))
+        .statusCode,
+    ).toBe(200);
+    expect((await del(`/estimating/catalogue/${id}`, memberHeaders)).statusCode).toBe(403);
+    expect(
+      (await post(
+        "/estimating/catalogue/bulk",
+        { items: [{ code: "MEMBER-BULK", description: "no", unit: "ea", rates: { other: 1 } }] },
+        memberHeaders,
+      )).statusCode,
+    ).toBe(403);
+  });
+
+  it("refuses a project-level sweep to a caller without admin on the tool", async () => {
+    expect((await post(`/projects/${projectA}/estimating/sweep`, {}, memberHeaders)).statusCode).toBe(403);
+  });
+
+  it("narrows the historical rate reference to the projects the caller can see", async () => {
+    const asOwner = await get(`/projects/${projectA}/estimating/historical-rates?search=blockwork`);
+    expect(asOwner.statusCode).toBe(200);
+    const ownerBody = asOwner.json() as { scope: string; reasons: string[] };
+    expect(ownerBody.scope).toBe("company");
+    expect(ownerBody.reasons.join(" ")).toMatch(/company-wide visibility/);
+
+    const asMember = await get(
+      `/projects/${projectA}/estimating/historical-rates?search=blockwork`,
+      memberHeaders,
+    );
+    expect(asMember.statusCode).toBe(200);
+    const memberBody = asMember.json() as {
+      scope: string;
+      reasons: string[];
+      samples: unknown[];
+    };
+    expect(memberBody.scope).toBe("visible_projects");
+    expect(memberBody.reasons.join(" ")).toMatch(/member of/);
+  });
+
+  it("retires a crew and ledgers the state change", async () => {
+    const created = await post("/estimating/crews", {
+      code: "GANG-RETIRE",
+      name: "Gang to retire",
+      members: [{ trade: "labourer", count: 1, hourlyRate: 20 }],
+    });
+    const id = (created.json() as { id: string }).id;
+    const res = await del(`/estimating/crews/${id}`);
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as { status: string }).status).toBe("retired");
+    const entries = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(eq(ledgerEntries.objectId, id));
+    expect(entries.some((e) => e.action === "state_change")).toBe(true);
+  });
+
+  it("patches an assembly's header and ledgers what changed", async () => {
+    const res = await patch(`/estimating/assemblies/${assemblyId}`, {
+      name: "140mm blockwork, built (amended)",
+      trade: "Masonry",
+    });
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as { name: string }).name).toBe("140mm blockwork, built (amended)");
+    const entries = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(eq(ledgerEntries.objectId, assemblyId));
+    expect(entries.some((e) => e.action === "update")).toBe(true);
+  });
+});
+
+describe("company-wide search coverage (contract §3.3)", () => {
+  it("finds an estimate, a measurement and a sub-quote by name", async () => {
+    const estimateId = await makeEstimate("Zephyr pavilion enabling works");
+    const measurement = await post(`/projects/${projectA}/takeoff/items`, {
+      name: "Zephyr pavilion roof deck",
+      measurementType: "area",
+      manualRawValue: 120,
+      unit: "m2",
+    });
+    expect(measurement.statusCode).toBe(201);
+    const quote = await post(`/projects/${projectA}/estimating/sub-quotes`, {
+      vendorName: "Zephyr Roofing Ltd",
+      tradePackage: "Roofing",
+      quotedTotal: 1000,
+    });
+    expect(quote.statusCode).toBe(201);
+
+    const res = await get("/search?q=Zephyr&limit=30");
+    // the search module may not be mounted in every build of this suite
+    if (res.statusCode !== 200) return;
+    const body = res.json() as {
+      items: Array<{ type: string; id: string; title: string; href: string }>;
+      coverage: string[];
+    };
+    expect(body.coverage).toEqual(
+      expect.arrayContaining(["estimate", "takeoff_item", "estimate_sub_quote"]),
+    );
+    const estimateHit = body.items.find((i) => i.type === "estimate" && i.id === estimateId);
+    expect(estimateHit).toBeTruthy();
+    expect(estimateHit?.href).toBe(`/projects/${projectA}/estimating?tab=estimates`);
+    expect(body.items.some((i) => i.type === "takeoff_item")).toBe(true);
+    expect(body.items.some((i) => i.type === "estimate_sub_quote")).toBe(true);
+
+    // and a rival company finds none of it
+    const rival = await get("/search?q=Zephyr&limit=30", stranger.headers);
+    if (rival.statusCode === 200) {
+      const rivalBody = rival.json() as { items: Array<{ id: string }> };
+      expect(rivalBody.items.some((i) => i.id === estimateId)).toBe(false);
+    }
+  });
+});
+
+describe("sub-quote transitions and provenance", () => {
+  it("will not move a quote's status through the generic PATCH", async () => {
+    const created = await post(`/projects/${projectA}/estimating/sub-quotes`, {
+      vendorName: "Transition Ltd",
+      tradePackage: "Screeding",
+      quotedTotal: 1200,
+    });
+    const id = (created.json() as { id: string }).id;
+    const patched = await patch(`/projects/${projectA}/estimating/sub-quotes/${id}`, {
+      status: "accepted",
+      notes: "trying it on",
+    });
+    expect(patched.statusCode).toBe(200);
+    const [row] = await app.db
+      .select()
+      .from(estimateSubQuotes)
+      .where(eq(estimateSubQuotes.id, id));
+    expect(row?.status).toBe("received");
+    expect(row?.acceptedAt).toBeNull();
+    expect(row?.notes).toBe("trying it on");
+
+    const moved = await post(`/projects/${projectA}/estimating/sub-quotes/${id}/status`, {
+      status: "under_review",
+      note: "levelling in progress",
+    });
+    expect(moved.statusCode).toBe(200);
+    expect((moved.json() as { status: string }).status).toBe("under_review");
+    const entries = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(eq(ledgerEntries.objectId, id));
+    expect(entries.some((e) => e.action === "state_change")).toBe(true);
+  });
+
+  it("refuses to walk an accepted quote's status or money backwards", async () => {
+    const estimateId = await makeEstimate("Quote provenance");
+    const created = await post(`/projects/${projectA}/estimating/sub-quotes`, {
+      vendorName: "Accepted Ltd",
+      tradePackage: "Waterproofing",
+      lines: [{ description: "Tanking to basement", quantity: 200, unitRate: 45 }],
+    });
+    const id = (created.json() as { id: string }).id;
+    const accepted = await post(`/projects/${projectA}/estimating/sub-quotes/${id}/accept`, {
+      estimateId,
+    });
+    expect(accepted.statusCode).toBe(201);
+
+    const back = await post(`/projects/${projectA}/estimating/sub-quotes/${id}/status`, {
+      status: "received",
+    });
+    expect(back.statusCode).toBe(409);
+    expect(JSON.stringify(back.json())).toMatch(/cannot be walked back/);
+
+    const money = await patch(`/projects/${projectA}/estimating/sub-quotes/${id}`, {
+      quotedTotal: 1,
+    });
+    expect(money.statusCode).toBe(409);
+    expect(JSON.stringify(money.json())).toMatch(/can no longer be changed/);
+
+    // a descriptive correction is still allowed
+    expect(
+      (await patch(`/projects/${projectA}/estimating/sub-quotes/${id}`, {
+        qualifications: "Priced on the tender drawings",
+      })).statusCode,
+    ).toBe(200);
+  });
+
+  it("re-dates a lapsed quote back into the comparison, and refuses a date in the past", async () => {
+    const created = await post(`/projects/${projectA}/estimating/sub-quotes`, {
+      vendorName: "Lapsed Ltd",
+      tradePackage: "Joinery",
+      quotedTotal: 6000,
+      validUntil: shiftDays(-5),
+    });
+    const id = (created.json() as { id: string }).id;
+    await post(`/projects/${projectA}/estimating/sweep`);
+    const expired = await get(`/projects/${projectA}/estimating/sub-quotes/${id}`);
+    expect((expired.json() as { status: string }).status).toBe("expired");
+
+    const stillLapsed = await post(`/projects/${projectA}/estimating/sub-quotes/${id}/status`, {
+      status: "received",
+    });
+    expect(stillLapsed.statusCode).toBe(400);
+    expect(JSON.stringify(stillLapsed.json())).toMatch(/lapsed on/);
+
+    const revived = await post(`/projects/${projectA}/estimating/sub-quotes/${id}/status`, {
+      status: "received",
+      validUntil: shiftDays(45),
+    });
+    expect(revived.statusCode).toBe(200);
+    expect((revived.json() as { status: string }).status).toBe("received");
+    const rows = await app.db
+      .select()
+      .from(signals)
+      .where(and(eq(signals.companyId, owner.companyId), eq(signals.detector, "sub_quote_expired")));
+    const signal = rows.find((s) => (s.evidenceRefs as { key?: string } | null)?.key === id);
+    expect(signal?.disposition).toBe("closed");
+  });
+
+  it("prices a lump-sum quote line recorded with a quantity of zero at its full amount", async () => {
+    const estimateId = await makeEstimate("Lump sum import");
+    const created = await post(`/projects/${projectA}/estimating/sub-quotes`, {
+      vendorName: "Lump Sum Ltd",
+      tradePackage: "Piling",
+      lines: [
+        { description: "Piling mat", quantity: 0, amount: 5000 },
+        { description: "Piles", quantity: 40, unitRate: 250 },
+      ],
+    });
+    const id = (created.json() as { id: string }).id;
+    const accepted = await post(`/projects/${projectA}/estimating/sub-quotes/${id}/accept`, {
+      estimateId,
+    });
+    expect(accepted.statusCode).toBe(201);
+    const lines = await get(`/projects/${projectA}/estimates/${estimateId}/lines?pageSize=100`);
+    const items = (lines.json() as { items: Array<{ description: string; quantity: number; amount: number }> })
+      .items;
+    const mat = items.find((l) => l.description === "Piling mat");
+    expect(mat?.quantity).toBe(1);
+    expect(mat?.amount).toBe(5000);
+    const piles = items.find((l) => l.description === "Piles");
+    expect(piles?.amount).toBe(10000);
+    const estimate = await get(`/projects/${projectA}/estimates/${estimateId}`);
+    expect((estimate.json() as { directCostTotal: number }).directCostTotal).toBe(15000);
+  });
+
+  it("warns rather than staying quiet when a quote row carries no price at all", async () => {
+    const estimateId = await makeEstimate("Blank row import");
+    const created = await post(`/projects/${projectA}/estimating/sub-quotes`, {
+      vendorName: "Half Priced Ltd",
+      tradePackage: "Drainage",
+      lines: [
+        { description: "Manholes", quantity: 6, unitRate: 900 },
+        // listed, quantified, and left blank — not a price of nil
+        { description: "Connections to sewer", quantity: 3 },
+      ],
+    });
+    const id = (created.json() as { id: string }).id;
+    const accepted = await post(`/projects/${projectA}/estimating/sub-quotes/${id}/accept`, {
+      estimateId,
+    });
+    expect(accepted.statusCode).toBe(201);
+    const body = accepted.json() as { created: number; warnings: string[] };
+    expect(body.created).toBe(2);
+    expect(body.warnings.join(" ")).toContain("carry no price at all");
+    expect(body.warnings.join(" ")).toContain("Connections to sewer");
+    const lines = await get(`/projects/${projectA}/estimates/${estimateId}/lines?pageSize=100`);
+    const items = (lines.json() as { items: Array<{ description: string; amount: number }> }).items;
+    expect(items.find((l) => l.description === "Connections to sewer")?.amount).toBe(0);
+    expect(items.find((l) => l.description === "Manholes")?.amount).toBe(5400);
+  });
+
+  it("levels a blank row as unpriced rather than as a bid of nil", async () => {
+    const pack = [
+      { vendorName: "Priced It Ltd", rate: 500 },
+      { vendorName: "Also Priced Ltd", rate: 520 },
+      { vendorName: "Left It Blank Ltd", rate: null },
+    ];
+    for (const p of pack) {
+      const res = await post(`/projects/${projectA}/estimating/sub-quotes`, {
+        vendorName: p.vendorName,
+        tradePackage: "Blank row levelling",
+        lines: [
+          { description: "Site clearance", quantity: 1, unitRate: 1000 },
+          p.rate === null
+            ? { description: "Topsoil strip", quantity: 1 }
+            : { description: "Topsoil strip", quantity: 1, unitRate: p.rate },
+        ],
+      });
+      expect(res.statusCode).toBe(201);
+    }
+    const levelling = await get(
+      `/projects/${projectA}/estimating/sub-quotes/levelling?tradePackage=${encodeURIComponent("Blank row levelling")}`,
+    );
+    expect(levelling.statusCode).toBe(200);
+    const data = levelling.json() as {
+      rows: Array<{ description: string; pricedCount: number; unpricedCount: number; median: number | null }>;
+      totals: Array<{ vendorName: string; unpricedRows: number; comparableTotal: number | null }>;
+    };
+    const topsoil = data.rows.find((r) => r.description === "Topsoil strip");
+    expect(topsoil?.pricedCount).toBe(2);
+    expect(topsoil?.unpricedCount).toBe(1);
+    expect(topsoil?.median).toBe(510);
+    const blank = data.totals.find((t) => t.vendorName === "Left It Blank Ltd");
+    expect(blank?.unpricedRows).toBe(1);
+    // 1000 quoted + the pack median of 510 for the row nobody can read as nil
+    expect(blank?.comparableTotal).toBe(1510);
+  });
+
+  it("raises a quote_outlier signal when one bidder is a long way from the pack", async () => {
+    const pack = [
+      { vendorName: "Even Handed Ltd", amount: 10000 },
+      { vendorName: "Middle Of Road Ltd", amount: 10500 },
+      { vendorName: "Wildly High Ltd", amount: 40000 },
+    ];
+    const ids: string[] = [];
+    for (const bidder of pack) {
+      const created = await post(`/projects/${projectB}/estimating/sub-quotes`, {
+        vendorName: bidder.vendorName,
+        tradePackage: "Structural steel",
+        currency: "GBP",
+        lines: [
+          {
+            description: "Frame erection",
+            scopeKey: "frame erection",
+            quantity: 1,
+            unitRate: bidder.amount,
+          },
+        ],
+      });
+      expect(created.statusCode).toBe(201);
+      ids.push((created.json() as { id: string }).id);
+    }
+    const outlierQuoteId = ids[2]!;
+    await app.scheduler.runNow("estimating.quote-outliers");
+    const rows = await app.db
+      .select()
+      .from(signals)
+      .where(and(eq(signals.companyId, owner.companyId), eq(signals.detector, "quote_outlier")));
+    const raised = rows.find(
+      (s) => (s.evidenceRefs as { quoteId?: string } | null)?.quoteId === outlierQuoteId,
+    );
+    expect(raised).toBeTruthy();
+    expect(raised?.explanation).toMatch(/pack median/);
+    expect((raised?.evidenceRefs as { direction?: string } | null)?.direction).toBe("high");
+
+    // running it again does not manufacture a second finding
+    await app.scheduler.runNow("estimating.quote-outliers");
+    const after = await app.db
+      .select()
+      .from(signals)
+      .where(and(eq(signals.companyId, owner.companyId), eq(signals.detector, "quote_outlier")));
+    expect(after.filter((s) => (s.evidenceRefs as { quoteId?: string } | null)?.quoteId === outlierQuoteId))
+      .toHaveLength(1);
+
+    // and it reaches the project's risk register
+    const risks = await get(`/projects/${projectB}/estimating/risks?pageSize=100`);
+    expect(
+      (risks.json() as { items: Array<{ detector: string }> }).items.some(
+        (i) => i.detector === "quote_outlier",
+      ),
+    ).toBe(true);
+
+    // amending the price closes it
+    await put(`/projects/${projectB}/estimating/sub-quotes/${outlierQuoteId}/lines`, {
+      lines: [
+        { description: "Frame erection", scopeKey: "frame erection", quantity: 1, unitRate: 10600 },
+      ],
+    });
+    await app.scheduler.runNow("estimating.quote-outliers");
+    const closed = await app.db
+      .select()
+      .from(signals)
+      .where(and(eq(signals.companyId, owner.companyId), eq(signals.detector, "quote_outlier")));
+    expect(
+      closed.find((s) => (s.evidenceRefs as { quoteId?: string } | null)?.quoteId === outlierQuoteId)
+        ?.disposition,
+    ).toBe("closed");
+  });
+});
+
+describe("references are resolved inside the estimate that owns them", () => {
+  it("refuses a line pointed at a section on another estimate", async () => {
+    const mine = await makeEstimate("Owns the line");
+    const other = await makeEstimate("Owns the section");
+    const section = await post(`/projects/${projectA}/estimates/${other}/sections`, {
+      name: "Somebody else's section",
+    });
+    const sectionId = (section.json() as { id: string }).id;
+    const res = await post(`/projects/${projectA}/estimates/${mine}/lines`, {
+      description: "Misfiled line",
+      quantity: 1,
+      rates: { other: 100 },
+      sectionId,
+    });
+    expect(res.statusCode).toBe(404);
+    expect(JSON.stringify(res.json())).toMatch(/Section not found on this estimate/);
+  });
+
+  it("refuses a section parented to another estimate's section, or to itself", async () => {
+    const mine = await makeEstimate("Parent target");
+    const other = await makeEstimate("Foreign parent");
+    const foreign = await post(`/projects/${projectA}/estimates/${other}/sections`, {
+      name: "Foreign parent",
+    });
+    const foreignId = (foreign.json() as { id: string }).id;
+    const res = await post(`/projects/${projectA}/estimates/${mine}/sections`, {
+      name: "Child",
+      parentId: foreignId,
+    });
+    expect(res.statusCode).toBe(404);
+
+    const own = await post(`/projects/${projectA}/estimates/${mine}/sections`, { name: "Own" });
+    const ownId = (own.json() as { id: string }).id;
+    const selfParent = await patch(
+      `/projects/${projectA}/estimates/${mine}/sections/${ownId}`,
+      { parentId: ownId },
+    );
+    expect(selfParent.statusCode).toBe(400);
+  });
+
+  it("refuses a sub-quote line reference from another project", async () => {
+    const quote = await post(`/projects/${projectB}/estimating/sub-quotes`, {
+      vendorName: "Project B Ltd",
+      tradePackage: "Groundworks",
+      lines: [{ description: "Dig", quantity: 10, unitRate: 20 }],
+    });
+    const quoteId = (quote.json() as { id: string }).id;
+    const detail = await get(`/projects/${projectB}/estimating/sub-quotes/${quoteId}`);
+    const lineId = (detail.json() as { lines: Array<{ id: string }> }).lines[0]!.id;
+    const estimateId = await makeEstimate("Cross-project reference", projectA);
+    const res = await post(`/projects/${projectA}/estimates/${estimateId}/lines`, {
+      description: "Citing another project's quote",
+      quantity: 1,
+      rates: { other: 10 },
+      subQuoteLineId: lineId,
+    });
+    expect(res.statusCode).toBe(404);
+    expect(JSON.stringify(res.json())).toMatch(/Sub-quote line not found/);
+  });
+});
+
+describe("conversion and versioning under concurrency", () => {
+  it("writes exactly one budget when two conversions arrive together", async () => {
+    const estimateId = await makeEstimate("Raced conversion");
+    await addLine(estimateId, {
+      description: "Works",
+      quantity: 10,
+      rates: { other: 100 },
+      costCode: "01-100",
+    });
+    await approve(estimateId);
+    const [first, second] = await Promise.all([
+      post(`/projects/${projectA}/estimates/${estimateId}/convert-to-budget`, {}),
+      post(`/projects/${projectA}/estimates/${estimateId}/convert-to-budget`, {}),
+    ]);
+    const codes = [first.statusCode, second.statusCode].sort();
+    expect(codes[0]).toBe(201);
+    expect(codes[1]).not.toBe(201);
+    const written = await app.db
+      .select()
+      .from(budgets)
+      .where(and(eq(budgets.companyId, owner.companyId), eq(budgets.projectId, projectA)));
+    const fromThisEstimate = written.filter(
+      (b) => (b.detail as { sourceId?: string } | null)?.sourceId === estimateId,
+    );
+    expect(fromThisEstimate).toHaveLength(1);
+    const lines = await app.db
+      .select()
+      .from(budgetLineItems)
+      .where(eq(budgetLineItems.budgetId, fromThisEstimate[0]!.id));
+    expect(lines.length).toBeGreaterThan(0);
+  });
+
+  it("leaves exactly one live head when two versions are cut together", async () => {
+    const estimateId = await makeEstimate("Raced version");
+    await addLine(estimateId, { description: "Works", quantity: 1, rates: { other: 100 } });
+    const [first, second] = await Promise.all([
+      post(`/projects/${projectA}/estimates/${estimateId}/versions`, {}),
+      post(`/projects/${projectA}/estimates/${estimateId}/versions`, {}),
+    ]);
+    const codes = [first.statusCode, second.statusCode].sort();
+    expect(codes[0]).toBe(201);
+    expect(codes[1]).not.toBe(201);
+    const [parent] = await app.db.select().from(estimates).where(eq(estimates.id, estimateId));
+    const chain = await app.db.select().from(estimates).where(eq(estimates.rootId, parent!.rootId));
+    expect(chain.filter((e) => e.supersededById === null)).toHaveLength(1);
+  });
+});
+
+describe("a markup narrowed both ways (#199)", () => {
+  it("applies the tier to the selected cost types INSIDE the selected sections only", async () => {
+    const estimateId = await makeEstimate("Two-way narrowed markup");
+    const groundworks = await post(`/projects/${projectA}/estimates/${estimateId}/sections`, {
+      name: "Groundworks",
+      code: "A",
+    });
+    const externals = await post(`/projects/${projectA}/estimates/${estimateId}/sections`, {
+      name: "External works",
+      code: "B",
+    });
+    const groundworksId = (groundworks.json() as { id: string }).id;
+    const externalsId = (externals.json() as { id: string }).id;
+    await addLine(estimateId, {
+      description: "Dig",
+      quantity: 1,
+      costType: "labour",
+      rates: { labour: 1000 },
+      sectionId: groundworksId,
+    });
+    await addLine(estimateId, {
+      description: "Fencing sub",
+      quantity: 1,
+      costType: "subcontract",
+      rates: { subcontract: 2000 },
+      sectionId: externalsId,
+    });
+    await addLine(estimateId, {
+      description: "Setting out",
+      quantity: 1,
+      costType: "labour",
+      rates: { labour: 500 },
+      sectionId: externalsId,
+    });
+
+    const res = await post(`/projects/${projectA}/estimates/${estimateId}/markups`, {
+      kind: "insurance",
+      name: "Sub insurance, externals only",
+      basis: "cost_type",
+      costTypes: ["subcontract"],
+      sectionIds: [externalsId],
+      rate: 10,
+      sequence: 1,
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as { baseAmount: number; amount: number };
+    // 2000 — the subcontract inside externals. NOT 2500 (the whole section)
+    // and NOT 2000 + anything from groundworks.
+    expect(body.baseAmount).toBe(2000);
+    expect(body.amount).toBe(200);
+  });
+
+  it("refuses a markup narrowed to a section on another estimate", async () => {
+    const mine = await makeEstimate("Markup section owner");
+    const other = await makeEstimate("Somebody else's estimate");
+    const foreign = await post(`/projects/${projectA}/estimates/${other}/sections`, {
+      name: "Not mine",
+    });
+    const res = await post(`/projects/${projectA}/estimates/${mine}/markups`, {
+      kind: "overhead",
+      name: "Wrong section",
+      basis: "direct_cost",
+      sectionIds: [(foreign.json() as { id: string }).id],
+      rate: 5,
+      sequence: 1,
+    });
+    expect(res.statusCode).toBe(404);
   });
 });

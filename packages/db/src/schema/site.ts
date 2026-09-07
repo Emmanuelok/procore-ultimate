@@ -1118,8 +1118,11 @@ export const siteProgressObservations = pgTable(
     observedByName: text("observed_by_name"),
     claimSourceType: text("claim_source_type").default("manual").notNull(), // SiteProgressClaimSource
     claimSourceId: text("claim_source_id"),
+    /** the party whose claim this tests — resolved against the company's
+     *  users, vendors or entity register before the Assertion is written */
     claimantId: text("claimant_id").notNull(),
     claimantKind: text("claimant_kind").default("user").notNull(),
+    claimantName: text("claimant_name"),
     claimedAt: ts("claimed_at"),
     scanId: text("scan_id"),
     droneFlightId: text("drone_flight_id"),

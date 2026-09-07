@@ -164,7 +164,7 @@ async function handleDailyLog(db: Db, event: LedgerEvent): Promise<void> {
       companyId: event.companyId,
       projectId: log.projectId,
       finding: pattern,
-      key: `daily_log_co_approval:${log.projectId}:${log.createdBy}:${log.approvedBy}:${recent.length}`,
+      key: `daily_log_co_approval:${log.projectId}:${log.createdBy}:${log.approvedBy}`,
       evidence: { projectId: log.projectId, ledgerSeq: event.seq, sample: recent.length, creator: log.createdBy, approver: log.approvedBy },
     });
   }
