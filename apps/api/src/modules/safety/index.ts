@@ -902,6 +902,16 @@ const PRIORITY_TO_SIGNAL_SEVERITY: Record<string, string> = {
  * statutory duty undischarged. Every consumer now reads one shared
  * per-regime state.
  *
+ * ONE OBLIGATION, THREE WAYS BACK. The statutory deadline lives in the
+ * `obligations` register, so the safety screen and that register must never be
+ * able to disagree about whether a duty is live. A reassessment that finds
+ * nothing reportable WITHDRAWS the obligation (`waived`, ledgered, kept
+ * reachable); a reassessment that puts the incident back in scope REINSTATES
+ * the withdrawn one on the new deadline; and a reassessment that adds a duty
+ * to an incident whose obligation was already `satisfied` REOPENS it, because
+ * a second authority nobody has told is not a discharged duty. A `breached`
+ * obligation is never rewritten — a deadline that was missed stays missed.
+ *
  * STATUTORY FORMS (`regulatory.ts`, spec #652). OSHA 300 / 300A / 301 and a
  * RIDDOR F2508 prefill, generated from the determination, frozen, hashed and
  * stored — because a 300A is an assertion made ON A DATE from records as they
