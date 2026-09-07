@@ -180,7 +180,11 @@ export default function SubmittalDetailPage() {
     try {
       const payload: Record<string, unknown> = { responseCode: respondCode };
       if (respondComments.trim()) payload["comments"] = respondComments.trim();
-      await api.post(`${base}/steps/${respondStep.id}/respond`, payload);
+      // The id-addressed route gates on `submittals: read` + "you are the
+      // reviewer"; the project-scoped twin needs `standard`, which a consultant
+      // or field-engineer reviewer does not hold — the Respond button the
+      // permissions block offers them must not 403 at the gate.
+      await api.post(`/api/v1/submittal-steps/${respondStep.id}/respond`, payload);
       setRespondStep(null);
       setRespondComments("");
       await load();

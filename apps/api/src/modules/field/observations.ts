@@ -46,6 +46,7 @@ import {
   assertVendor,
   hasToolAdmin,
   isCompanyAdmin,
+  requireToolLevel,
 } from "./access.js";
 import { ageInDays, bucketise, daysOverdue } from "./ageingEngine.js";
 import { authorisePunchTransition, validateVerifierChange } from "./punchEngine.js";
@@ -449,6 +450,14 @@ export const observationRoutes: FastifyPluginAsync = async (app) => {
     if (row.status === "void") throw badRequest("A void observation cannot be converted");
     if (row.convertedToType) {
       throw badRequest(`Already converted to ${row.convertedToType} ${row.convertedToId ?? ""}`.trim());
+    }
+    // Minting the target record must satisfy the target module's own gate:
+    // holding `punch` is not authority to raise a safety incident or open a
+    // change event (plan §6.3 — the owning module's create gate applies).
+    if (body.target === "incident") {
+      await requireToolLevel(app, actorOf(req), req.projectId!, "safety", "standard");
+    } else if (body.target === "change_event") {
+      await requireToolLevel(app, actorOf(req), req.projectId!, "change_management", "standard");
     }
     const me = req.user!.id;
     const now = nowIso();

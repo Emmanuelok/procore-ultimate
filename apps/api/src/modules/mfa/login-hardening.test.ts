@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { authSecurityEvents, authSessions, users } from "@constructos/db";
@@ -7,17 +7,21 @@ import type { BuiltApp } from "../../app.js";
 import { buildTestApp } from "../../test/helpers.js";
 
 /**
- * How long a suite may take to boot its own embedded Postgres.
+ * WHAT A RED SUITE HERE MUST MEAN.
  *
- * `buildTestApp()` starts PGlite (WASM) and replays every migration from 0000,
- * which is seconds of CPU on an idle machine and a great deal more on a shared
- * one. Vitest's 30-second default hook timeout therefore fails these suites for
- * a reason that has nothing to do with the code under test — and a suite that
- * fails when the machine is busy teaches people to ignore red, which is the
- * expensive failure. The assertions are unaffected: a hook that is going to
- * succeed still succeeds, it is simply allowed to take longer.
+ * `buildTestApp()` boots PGlite (WASM Postgres) and replays every migration
+ * from 0000, and nearly every test registers an account — a bcrypt hash plus a
+ * company, a membership and a project. On an idle machine that is seconds. On
+ * the shared machine this wave runs on, a single run measured 878 seconds of
+ * module IMPORT alone, and vitest's 30-second defaults then fail suites for a
+ * reason that has nothing to do with the code under test. "Hook timed out" and
+ * "Test timed out" are the two failures that teach people to ignore red.
+ *
+ * Raising the ceilings changes no assertion: a test that is going to pass
+ * still passes, and one that is going to fail still fails on its assertion.
  */
-const HOOK_TIMEOUT_MS = 180_000;
+const HOOK_TIMEOUT_MS = 300_000;
+vi.setConfig({ testTimeout: 120_000, hookTimeout: HOOK_TIMEOUT_MS });
 
 
 /**

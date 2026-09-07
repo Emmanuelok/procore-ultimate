@@ -420,6 +420,21 @@ describe("owner_change guards", () => {
     expect(no.statusCode).toBe(400);
     expect(no.json().message).toMatch(/not executed/);
   });
+
+  it("refuses a change order whose PACKAGE already funded the budget, cited under its other name", async () => {
+    // Change management executes a PACKAGE and stamps the budget change as
+    // 'change_order_package'; the same instrument cited as
+    // 'prime_contract_change' must not fund the budget a second time.
+    const pc = newId("pct");
+    await built.app.db.insert(primeContracts).values({ id: pc, companyId: u1.companyId, projectId: proj, number: 2, reference: "PC-002", title: "Owner agreement", status: "approved", executed: 1, currency: "USD", originalContractSum: 1, revisedContractSum: 1, createdBy: u1.userId });
+    const pkg = newId("cop");
+    await built.app.db.insert(changeOrderPackages).values({ id: pkg, companyId: u1.companyId, projectId: proj, kind: "prime_contract", number: 5, reference: "PCO-5", title: "Already funded", status: "executed", amount: 5_000, budgetChangeId: "bch_already", createdBy: u1.userId });
+    const pcco = newId("pcc");
+    await built.app.db.insert(primeContractChanges).values({ id: pcco, companyId: u1.companyId, projectId: proj, primeContractId: pc, number: 3, reference: "PCCO-003", title: "Executed via package", status: "executed", amount: 5_000, changeOrderPackageId: pkg, createdBy: u1.userId });
+    const res = await inject("POST", `/api/v1/budgets/${budgetId}/changes`, u1.headers, { kind: "owner_change", title: "Twice, other name", lines: [{ lineItemId: lineElec, amount: 5_000 }], sourceType: "prime_contract_change", sourceId: pcco });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toMatch(/already funded this/);
+  });
 });
 
 describe("state transitions are claimed atomically", () => {
