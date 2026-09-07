@@ -168,7 +168,7 @@ rather than inventing a parallel hierarchy.
 2. With the service rooted at `/`, Railway reads **`railway.json`** at the repo root
    automatically. You should see, without configuring anything by hand:
    - builder: **Dockerfile** (`Dockerfile` at repo root)
-   - healthcheck path: **`/api/v1/health`**, timeout 180 s
+   - healthcheck path: **`/api/v1/health/ready`**, timeout 300 s
    - restart policy: on-failure, max 5 retries
 3. **Do not let the first deploy finish before variables are set** (next step). Without a
    real `AUTH_SECRET` the container refuses to boot — by design (`apps/api/src/config.ts`
@@ -212,8 +212,9 @@ rate limiting and logs see real client IPs behind Railway's proxy),
 
 Migrations run automatically inside app startup, before the server listens
 (`apps/api/src/lib/db.ts` `createDb` → drizzle `migrate`). **There is no release command
-and no manual migration step.** The healthcheck's 180 s timeout exists to cover first-boot
-migration time.
+and no manual migration step.** The healthcheck's 300 s timeout exists to cover first-boot
+migration time — the current migration set creates 584 tables, and a healthcheck that fires
+during that window restarts the container mid-migration.
 
 1. Deploy logs should show Fastify start: `ConstructOS API listening on 0.0.0.0:4000`.
 2. Hit the health endpoint:
@@ -376,7 +377,7 @@ boot). "Image" = value baked into `Dockerfile`; set in Railway only what §2.5 l
 | `TRUST_PROXY` | `false` | `true` | Must be `true` behind Railway's proxy |
 | `TRUST_PROXY_HOPS` | `1` | — | Raise only when a CDN sits in front of the Railway edge. Each increment is one more hop whose word is taken for the client's address. |
 | `CORS_ORIGINS` | `""` | — | Only when a browser on another origin calls the API. `APP_BASE_URL`'s origin is always allowed. |
-| `ALLOW_EMBEDDED_DB` | `false` | — | Set only for a deliberate throwaway environment — production otherwise refuses to boot without `DATABASE_URL`. |
+| `ALLOW_EMBEDDED_DB` | `false` | — | Set only for a deliberate throwaway environment. Production no longer *refuses* to boot without `DATABASE_URL`: it boots on the embedded database and warns, loudly and on `/api/v1/health/ready`, that the data is wiped on every redeploy. A configuration smell must not be a bigger outage than the problem it warns about. |
 | `ALLOW_LOCAL_STORAGE` | `false` | — | Set only for the volume topology (§1.1). |
 | `UPLOAD_MAX_BYTES` | `268435456` (256 MiB) | — | Bounds memory per in-flight upload (multipart is buffered per request). |
 | `UPLOAD_MAX_FILES` | `25` | — | Optional tuning |
