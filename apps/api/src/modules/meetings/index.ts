@@ -125,12 +125,17 @@ import { aiEnabled, runAgent } from "../ai/service.js";
  *     records `obligationId`. It REFUSES to invent the two things an
  *     obligation cannot exist without — the clause it discharges and the date
  *     it bites — because a fabricated time bar is worse than no time bar.
- *  3. OVERDUE IS FOUND ON READ, NEVER BY A CRON. The list endpoints run an
- *     idempotent lazy sweep (the platform pattern: payments deemed liability,
- *     contract time bars, insurance expiry). A signal is keyed on the action
- *     id, so re-reading the list a hundred times raises it once. A PROMOTED
- *     action is skipped: the obligation owns its time bar from then on, and
- *     two systems warning about one deadline is how a warning gets ignored.
+ *  3. OVERDUE IS FOUND BY A SCHEDULED JOB, NEVER BY A READ. The sweeps used
+ *     to run lazily on the list endpoints, so a project nobody opened was
+ *     never warned and the resulting signals were attributed to whichever
+ *     reader — often a read-only one — happened to trigger them. They are
+ *     `meetings.overdue-actions`, `meetings.carried-items` and
+ *     `meetings.objection-window`, running under the platform scheduler with
+ *     a null (system) actor, plus POST /meeting-reports/sweep for operators;
+ *     reads are pure. A signal is keyed on the action id, so running the
+ *     sweep a hundred times raises it once. A PROMOTED action is skipped: the
+ *     obligation owns its time bar from then on, and two systems warning
+ *     about one deadline is how a warning gets ignored.
  *  4. SEGREGATION AT EVERY SIGN-OFF. Minutes are not approved by the person
  *     who wrote or issued them; a decision is not ratified by the person who
  *     made it; an action is not verified by the person who completed it.

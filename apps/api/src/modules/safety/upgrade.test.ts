@@ -1868,6 +1868,13 @@ describe("statutory form generation", () => {
       form: "osha_301",
     });
     expect(noCase.statusCode).toBe(400);
+
+    // the preview must refuse it the same way rather than reporting that an
+    // incident nobody named could not be found
+    const previewNoCase = await get(
+      `/projects/${gbProject}/safety/regulatory/preview?form=osha_301`,
+    );
+    expect(previewNoCase.statusCode).toBe(400);
   });
 
   it("shuts another company out of the artefact register", async () => {

@@ -3548,23 +3548,50 @@ export const learningModule: FastifyPluginAsync = async (app) => {
         ),
       );
     const ids = [...new Set(edges.map((e) => e.lessonId))];
+    /*
+     * THE SAME VISIBILITY RULE AS THE REGISTER, WHICH THIS ROUTE FORGOT.
+     *
+     * An unpublished lesson is one project's unvalidated account of what went
+     * wrong, naming people, and `assertLessonVisible` keeps it inside the
+     * project that raised it. This query filtered by company alone, so a
+     * caller holding `learning` on THIS project could name a record belonging
+     * to another one and read that project's drafts and rejections back — the
+     * register's own control, bypassed by asking about a record instead of a
+     * lesson.
+     */
     const rows = ids.length
       ? await app.db
           .select()
           .from(lessons)
-          .where(and(eq(lessons.companyId, req.companyId!), inArray(lessons.id, ids)))
+          .where(
+            and(
+              eq(lessons.companyId, req.companyId!),
+              inArray(lessons.id, ids),
+              or(
+                inArray(lessons.status, [...COMPANY_WIDE_LESSON_STATES]),
+                eq(lessons.originProjectId, req.projectId!),
+                eq(lessons.projectId, req.projectId!),
+              ),
+            ),
+          )
       : [];
     const byId = new Map(rows.map((l) => [l.id, l]));
+    const items = edges
+      .map((e) => ({ edge: e, lesson: byId.get(e.lessonId) ?? null }))
+      .filter((i) => i.lesson !== null);
+    const withheld = ids.length - rows.length;
     return {
       record: { type: entry?.recordType ?? q.type, id: q.id, resolvable: entry !== null },
-      items: edges
-        .map((e) => ({ edge: e, lesson: byId.get(e.lessonId) ?? null }))
-        .filter((i) => i.lesson !== null),
-      total: ids.length,
+      items,
+      total: items.length,
+      withheld,
       reason:
-        ids.length === 0
-          ? "No lesson cites this record. That is a fact about the register, not about the record."
-          : `${ids.length} lesson(s) cite this record as their origin, evidence, or the place they were applied.`,
+        items.length === 0
+          ? "No lesson you can see cites this record. That is a fact about the register, not about the record."
+          : `${items.length} lesson(s) cite this record as their origin, evidence, or the place they were applied.` +
+            (withheld > 0
+              ? ` ${withheld} more are unpublished lessons of another project and are not shown.`
+              : ""),
     };
   });
 

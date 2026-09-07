@@ -51,7 +51,7 @@ import {
 import { COST_TYPES, ERP_SYSTEMS } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { badRequest, conflict, notFound } from "../../lib/errors.js";
+import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { forEachCompany } from "../../lib/scheduler.js";
 import type { Db } from "../../lib/db.js";
@@ -885,9 +885,11 @@ export const budgetIntelligenceRoutes: FastifyPluginAsync = async (app) => {
     return paginate(filtered.slice(offset, offset + q.pageSize), filtered.length, q);
   });
 
-  async function resolveMapCostCode(companyId: string, projectId: string, input: { costCodeId?: string; costCode?: string }) {
+  async function resolveMapCostCode(companyId: string, projectId: string | null, input: { costCodeId?: string; costCode?: string }) {
     const all = await db.select().from(costCodes).where(eq(costCodes.companyId, companyId));
-    const scoped = all.filter((c) => c.projectId === null || c.projectId === projectId);
+    // A company-wide mapping may only point at a company-standard cost code:
+    // a code that exists on one project cannot govern the import of another.
+    const scoped = all.filter((c) => c.projectId === null || (projectId !== null && c.projectId === projectId));
     const match = input.costCodeId
       ? scoped.find((c) => c.id === input.costCodeId)
       : input.costCode
@@ -1012,7 +1014,7 @@ export const budgetIntelligenceRoutes: FastifyPluginAsync = async (app) => {
       action: "update",
       objectType: "gl_cost_code_map",
       objectId: mapId,
-      payload: { changed: Object.keys(body) },
+      payload: { changed: Object.keys(body), scope: map.projectId ? "project" : "company" },
     });
     return fetchMap(mapId, map.companyId);
   });
@@ -1029,7 +1031,7 @@ export const budgetIntelligenceRoutes: FastifyPluginAsync = async (app) => {
       action: "delete",
       objectType: "gl_cost_code_map",
       objectId: mapId,
-      payload: { glAccount: map.glAccount, glSubAccount: map.glSubAccount },
+      payload: { glAccount: map.glAccount, glSubAccount: map.glSubAccount, scope: map.projectId ? "project" : "company" },
     });
     return { ok: true };
   });

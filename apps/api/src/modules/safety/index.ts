@@ -7162,6 +7162,18 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
           year: z.coerce.number().int().min(1970).max(2200).optional(),
           incidentId: z.string().max(64).optional(),
         })
+        /* Same requirement as the generate route: a 301 or an F2508 is about
+         * one case. Without this the missing id reached the fetcher as
+         * `undefined`, which drizzle renders as `= NULL`, and the caller was
+         * told "Incident not found" — a false statement about a case they
+         * never named. */
+        .refine(
+          (v) =>
+            v.form === "osha_301" || v.form === "riddor_f2508" || v.form === "riddor_f2508a"
+              ? v.incidentId != null
+              : true,
+          { message: "A 301 or an F2508 is about one case — supply `incidentId`." },
+        )
         .parse(req.query);
       const generatedAt = new Date().toISOString();
       const built = await buildRegulatoryForm(

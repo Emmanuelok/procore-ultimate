@@ -83,6 +83,7 @@ export default function ChangesTab({
   const { busy, refusal, clear, run } = useAction();
   const { ask, dialog: reasonDialog } = useReason();
   const [composing, setComposing] = useState(false);
+  const [approving, setApproving] = useState<PrimeChange | null>(null);
   const [lastExecution, setLastExecution] = useState<ChangeExecution | null>(null);
 
   const cur = contract.currency;
@@ -209,7 +210,7 @@ export default function ChangesTab({
                 <Button
                   size="xs"
                   disabled={busy !== null}
-                  onClick={() => act(row, "approve", "approve")}
+                  onClick={() => setApproving(row)}
                 >
                   Approve
                 </Button>
@@ -413,6 +414,19 @@ export default function ChangesTab({
           aria-label={`Change orders on ${contract.reference}`}
         />
       )}
+
+      <ApproveDialog
+        change={approving}
+        contractId={contract.id}
+        currency={cur}
+        onClose={() => setApproving(null)}
+        onDone={() => {
+          setApproving(null);
+          analytics.reload();
+          changes.reload();
+          onChanged();
+        }}
+      />
 
       <Compose
         open={composing}
@@ -673,6 +687,126 @@ function Compose({
             </ul>
           </Alert>
         ) : null}
+      </div>
+    </Modal>
+  );
+}
+
+/**
+ * Owner approval of a change order (#511). The API records the signer's
+ * identity, the date they signed and the hash of the signed instrument on the
+ * change itself and in the ledger; without this dialog those columns could
+ * only ever be filled by an API client, so the control the module advertises
+ * would exist only on paper.
+ *
+ * The identity is OPTIONAL: an in-house review approval is a real approval and
+ * carries no external signatory. What is refused is inventing one.
+ */
+function ApproveDialog({
+  change,
+  contractId,
+  currency,
+  onClose,
+  onDone,
+}: {
+  change: PrimeChange | null;
+  contractId: string;
+  currency: string;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [name, setName] = useState("");
+  const [signedAt, setSignedAt] = useState(() => new Date().toISOString().slice(0, 10));
+  const [documentHash, setDocumentHash] = useState("");
+  const [notes, setNotes] = useState("");
+
+  async function submit() {
+    if (!change) return;
+    const trimmed = name.trim();
+    const done = await run("approve", () =>
+      api.post(`/api/v1/prime-contracts/${contractId}/changes/${change.id}/approve`, {
+        ...(trimmed.length > 0
+          ? {
+              ownerApproval: {
+                name: trimmed,
+                signedAt,
+                documentHash: documentHash.trim() || null,
+                notes: notes.trim() || null,
+              },
+            }
+          : {}),
+      }),
+    );
+    if (done !== null) {
+      setName("");
+      setDocumentHash("");
+      setNotes("");
+      onDone();
+    }
+  }
+
+  return (
+    <Modal
+      open={change !== null}
+      onClose={onClose}
+      title={change ? `Approve ${change.reference}` : "Approve change order"}
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button onClick={submit} disabled={busy !== null}>
+            Approve
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        <RefusalPanel refusal={refusal} onDismiss={clear} />
+        {change ? (
+          <Alert tone="info" title={`${money(change.amount, currency)} to the contract sum`}>
+            Approving does not move the contract sum — execution does. The approver may be neither
+            the author nor the submitter; the API refuses it if they are.
+          </Alert>
+        ) : null}
+        <Field
+          label="Signed by (owner / owner's representative)"
+          optional
+          hint="Recorded on the change order and in the ledger as the identity behind this approval. Leave empty for an in-house review approval."
+        >
+          <Input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Name on the signed change order"
+          />
+        </Field>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Signed on" optional>
+            <Input
+              type="date"
+              value={signedAt}
+              onChange={(e) => setSignedAt(e.target.value)}
+              disabled={name.trim().length === 0}
+            />
+          </Field>
+          <Field label="Signed document hash" optional hint="sha-256 of the signed instrument, if one was received.">
+            <Input
+              value={documentHash}
+              onChange={(e) => setDocumentHash(e.target.value)}
+              className="font-mono"
+              disabled={name.trim().length === 0}
+            />
+          </Field>
+        </div>
+        <Field label="Approval notes" optional>
+          <Textarea
+            rows={2}
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+            disabled={name.trim().length === 0}
+          />
+        </Field>
       </div>
     </Modal>
   );

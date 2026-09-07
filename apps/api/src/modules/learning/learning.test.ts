@@ -2119,6 +2119,57 @@ describe("knowledge graph, onboarding packs and the feedback libraries", () => {
     expect(items.every((i) => i.lesson !== null)).toBe(true);
   });
 
+  it("[verifier] withholds another project's unpublished lessons from the reverse view", async () => {
+    /* A dispute on a project the caller does NOT hold, and a DRAFT lesson on
+       that project citing it. The reverse view was filtered by company only,
+       so naming the record read the draft back — the register's own
+       visibility rule bypassed by asking about a record instead of a lesson. */
+    const otherProject = newId("prj");
+    await app.db
+      .insert(projects)
+      .values({ id: otherProject, companyId: owner.companyId, name: "Foreign Works", currency: "GBP" });
+    const foreignDispute = newId("dsp");
+    await app.db.insert(disputes).values({
+      id: foreignDispute,
+      companyId: owner.companyId,
+      projectId: otherProject,
+      number: 99,
+      title: "Their adjudication",
+      kind: "adjudication",
+      status: "decided",
+      createdBy: owner.userId,
+    });
+    const draft = await post(
+      `/projects/${otherProject}/learning/lessons`,
+      lessonBody({
+        title: "Unvalidated account naming people",
+        evidenceRefs: [{ tool: "disputes", recordId: foreignDispute }],
+      }),
+    );
+    expect(draft.statusCode).toBe(201);
+    const draftId = (draft.json() as Json).id as string;
+    const rebuilt = await post(`/learning/lessons/${draftId}/graph/rebuild`);
+    expect(rebuilt.statusCode).toBe(200);
+
+    /* Asked from a project that has nothing to do with it. */
+    const res = await get(
+      `/projects/${projectId}/learning/for-record?type=disputes&id=${foreignDispute}`,
+    );
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as Json;
+    expect(body.items).toEqual([]);
+    expect(body.total).toBe(0);
+    expect(body.withheld).toBeGreaterThanOrEqual(1);
+
+    /* Asked from the project that raised it, the draft is visible — the rule
+       is scope, not secrecy. */
+    const own = await get(
+      `/projects/${otherProject}/learning/for-record?type=disputes&id=${foreignDispute}`,
+    );
+    expect(own.statusCode).toBe(200);
+    expect((own.json() as Json).total).toBeGreaterThanOrEqual(1);
+  });
+
   it("says plainly when no lesson cites a record", async () => {
     const res = await get(`/projects/${projectId}/learning/for-record?type=disputes&id=nope`);
     expect(res.statusCode).toBe(200);

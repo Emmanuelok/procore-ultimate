@@ -2110,7 +2110,9 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
             recordedAt: now,
           }
         : null;
-      await app.db
+      // Claimed on the status this route read, so two approvers acting at
+      // once cannot both stamp their own approval on the same change order.
+      const claimedApproval = await app.db
         .update(primeContractChanges)
         .set({
           status: "approved",
@@ -2121,7 +2123,19 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
             ? { detail: { ...((change.detail as Record<string, unknown> | null) ?? {}), ownerApproval } }
             : {}),
         })
-        .where(eq(primeContractChanges.id, change.id));
+        .where(
+          and(
+            eq(primeContractChanges.id, change.id),
+            eq(primeContractChanges.status, change.status),
+          ),
+        )
+        .returning({ id: primeContractChanges.id });
+      if (claimedApproval.length !== 1) {
+        throw conflict(
+          `${change.reference} is no longer ${change.status} — another request moved it first. ` +
+            "Reload the change register before acting on it again.",
+        );
+      }
       await recalcContract(contract.id, req.companyId!);
       await appendLedger(app.db, {
         companyId: req.companyId!,

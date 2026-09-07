@@ -26,7 +26,7 @@
  * set rather than sitting open forever as noise.
  */
 
-import { and, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { landParcels, ledgerEntries, permits, scheduleTasks } from "@constructos/db";
 import type { Db } from "../../lib/db.js";
 import { todayISO } from "../field/dates.js";
@@ -102,7 +102,11 @@ export async function loadObservedDurations(
         inArray(ledgerEntries.objectType, ["land_parcel", "permit"]),
       ),
     )
-    .orderBy(ledgerEntries.seq)
+    // NEWEST first: the bound is "the most recent `limit` state changes", so
+    // the estimator keeps learning. Ordering ascending pinned the sample to
+    // the OLDEST `limit` rows, and a company past that many parcel/permit
+    // transitions would have frozen its median resolution times forever.
+    .orderBy(desc(ledgerEntries.seq))
     .limit(limit);
 
   // objectId → ordered [{ state, at }]
