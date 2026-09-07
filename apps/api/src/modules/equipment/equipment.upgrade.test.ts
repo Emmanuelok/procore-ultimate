@@ -18,6 +18,7 @@ import {
   equipmentReadings,
   equipmentTelematicsReadings,
   evidence,
+  materialDeliveries,
   materialItems,
   projectMemberships,
   projects,
@@ -505,6 +506,149 @@ describe("regressions", () => {
     expect(after?.quantityDelivered).toBe(0);
   });
 
+  it("reads a boolean query flag as the caller wrote it, so ?flag=false means false", async () => {
+    /*
+     * These filters were `z.coerce.boolean()`, which runs JS truthiness over
+     * the raw query STRING: `Boolean("false") === true`. So
+     * `?includeCatalogue=false` folded the company catalogue in and
+     * `?catalogueOnly=false` returned only the catalogue — the exact opposite
+     * of the question, silently, with a 200.
+     */
+    const catalogueId = newId("mat");
+    await app.db.insert(materialItems).values({
+      id: catalogueId,
+      companyId: owner.companyId,
+      projectId: null,
+      number: 990002,
+      reference: "MAT-FLAGCAT",
+      name: "Flag catalogue plate",
+      unit: "t",
+      createdBy: owner.userId,
+    });
+    const projectItem = await post(`/projects/${projectA}/materials`, {
+      name: "Flag project plate",
+      unit: "t",
+      quantityRequired: 5,
+    });
+    expect(projectItem.statusCode).toBe(201);
+    const projectItemId = projectItem.json().id as string;
+
+    const excluded = await get(
+      `/projects/${projectA}/materials?includeCatalogue=false&pageSize=200`,
+    );
+    expect(excluded.statusCode).toBe(200);
+    const excludedIds = (excluded.json().items as Array<{ id: string }>).map((i) => i.id);
+    expect(excludedIds).toContain(projectItemId);
+    expect(excludedIds).not.toContain(catalogueId);
+
+    const included = await get(
+      `/projects/${projectA}/materials?includeCatalogue=true&pageSize=200`,
+    );
+    expect((included.json().items as Array<{ id: string }>).map((i) => i.id)).toContain(
+      catalogueId,
+    );
+
+    const notCatalogueOnly = await get("/companies/current/materials?catalogueOnly=false&pageSize=200");
+    expect(notCatalogueOnly.statusCode).toBe(200);
+    expect(
+      (notCatalogueOnly.json().items as Array<{ id: string }>).map((i) => i.id),
+    ).toContain(projectItemId);
+
+    // An unrecognised value is a 400 rather than a silently wrong answer.
+    const nonsense = await get(`/projects/${projectA}/materials?includeCatalogue=maybe`);
+    expect(nonsense.statusCode).toBe(400);
+  });
+
+  it("commits the delivery header with the stock it guards", async () => {
+    /*
+     * `delivery.receivedAt` IS the "receiving it twice" guard. It used to be
+     * stamped on `app.db` AFTER the transaction that booked the stock had
+     * already committed: a crash in that window left the material in the
+     * compound and the delivery still unreceived, so the operator's retry
+     * sailed past the guard and booked the same load again. Header, lines and
+     * movements now commit together, and a refused receipt leaves all three
+     * exactly as they were.
+     */
+    const item = await post(`/projects/${projectA}/materials`, {
+      name: "Header atomicity blocks",
+      unit: "no",
+      quantityRequired: 40,
+      unitCost: 5,
+      currency: "GBP",
+      isTracked: true,
+    });
+    expect(item.statusCode).toBe(201);
+    const itemId = item.json().id as string;
+    const delivery = await post(`/projects/${projectA}/material-deliveries`, {
+      deliveryNoteNumber: "DN-ATOMIC-HDR",
+      lines: [
+        {
+          materialItemId: itemId,
+          description: "Header line",
+          quantityExpected: 20,
+          unit: "no",
+          unitCost: 5,
+          currency: "GBP",
+        },
+      ],
+    });
+    expect(delivery.statusCode).toBe(201);
+    const deliveryId = delivery.json().id as string;
+    const lineId = (delivery.json().lines as Array<{ id: string }>)[0]!.id;
+
+    // A refused receipt moves nothing at all — not the stock, not the header.
+    const refused = await post(
+      `/projects/${projectA}/material-deliveries/${deliveryId}/receive`,
+      {
+        createStockMovements: true,
+        lines: [
+          { lineId, quantityReceived: 20, quantityAccepted: 18, quantityRejected: 2 },
+        ],
+      },
+    );
+    expect(refused.statusCode).toBe(400);
+    const [untouched] = await app.db
+      .select()
+      .from(materialDeliveries)
+      .where(eq(materialDeliveries.id, deliveryId));
+    expect(untouched?.receivedAt).toBeNull();
+    expect(untouched?.status).toBe("scheduled");
+
+    const ok = await post(`/projects/${projectA}/material-deliveries/${deliveryId}/receive`, {
+      createStockMovements: true,
+      lines: [
+        {
+          lineId,
+          quantityReceived: 20,
+          quantityAccepted: 18,
+          quantityRejected: 2,
+          rejectionReason: "two split bags",
+        },
+      ],
+    });
+    expect(ok.statusCode, ok.body).toBe(200);
+    const [header] = await app.db
+      .select()
+      .from(materialDeliveries)
+      .where(eq(materialDeliveries.id, deliveryId));
+    // Header and stock landed in the same commit.
+    expect(header?.receivedAt).not.toBeNull();
+    expect(header?.hasDiscrepancy).toBe(1);
+    expect(header?.totalValue).toBe(90);
+    const [stocked] = await app.db
+      .select()
+      .from(materialItems)
+      .where(eq(materialItems.id, itemId));
+    expect(stocked?.quantityOnHand).toBe(18);
+
+    // And the guard now holds against the retry it exists for.
+    const again = await post(`/projects/${projectA}/material-deliveries/${deliveryId}/receive`, {
+      createStockMovements: true,
+      lines: [{ lineId, quantityReceived: 20, quantityAccepted: 18, quantityRejected: 0 }],
+    });
+    expect(again.statusCode).toBe(409);
+  });
+
   it("adds up two lines of the same material rather than losing one", async () => {
     const item = await post(`/projects/${projectA}/materials`, {
       name: "Two-pallet rebar",
@@ -691,6 +835,89 @@ describe("plant lifecycle and availability", () => {
       owner.headers,
     );
     expect(res.statusCode).toBe(201);
+  });
+
+  it("does not carry the source project's budget line onto the destination", async () => {
+    // A budget line belongs to ONE project. Copying job A's line onto the
+    // assignment booked on job B coded B's plant days to a line the poster
+    // (which reads lines by projectId) will never find: the days sit uncoded
+    // and never reach B's cost report.
+    const budgetId = newId("bud");
+    await app.db.insert(budgets).values({
+      id: budgetId,
+      companyId: owner.companyId,
+      projectId: projectA,
+      number: 90,
+      reference: "BUD-090",
+      name: "Job A budget",
+      createdBy: owner.userId,
+    });
+    const lineA = newId("bli");
+    await app.db.insert(budgetLineItems).values({
+      id: lineA,
+      companyId: owner.companyId,
+      projectId: projectA,
+      budgetId,
+      costCode: "01-9000",
+      costType: "equipment",
+      description: "Job A plant",
+      originalBudget: 10_000,
+      revisedBudget: 10_000,
+      createdBy: owner.userId,
+    });
+
+    const machineId = await makeMachine({ name: "Coded transfer machine" });
+    const assignmentId = await assign(projectA, machineId);
+    await post(
+      `/projects/${projectA}/equipment/assignments/${assignmentId}/approve`,
+      {},
+      verifier.headers,
+    );
+    await patch(`/projects/${projectA}/equipment/assignments/${assignmentId}`, {
+      budgetLineItemId: lineA,
+    });
+
+    const res = await post(
+      `/projects/${projectA}/equipment/assignments/${assignmentId}/transfer`,
+      { toProjectId: projectB },
+    );
+    expect(res.statusCode).toBe(201);
+    expect(res.json().to.budgetLineItemId).toBeNull();
+    expect((res.json().codingNotes as string[]).join(" ")).toContain("another project");
+  });
+
+  it("refuses a transfer that explicitly codes the destination to another job's budget line", async () => {
+    const budgetId = newId("bud");
+    await app.db.insert(budgets).values({
+      id: budgetId,
+      companyId: owner.companyId,
+      projectId: projectA,
+      number: 91,
+      reference: "BUD-091",
+      name: "Job A budget 2",
+      createdBy: owner.userId,
+    });
+    const lineA = newId("bli");
+    await app.db.insert(budgetLineItems).values({
+      id: lineA,
+      companyId: owner.companyId,
+      projectId: projectA,
+      budgetId,
+      costCode: "01-9100",
+      costType: "equipment",
+      description: "Job A plant 2",
+      originalBudget: 10_000,
+      revisedBudget: 10_000,
+      createdBy: owner.userId,
+    });
+    const machineId = await makeMachine({ name: "Explicit miscoded transfer" });
+    const assignmentId = await mobilise(projectA, machineId);
+    const res = await post(
+      `/projects/${projectA}/equipment/assignments/${assignmentId}/transfer`,
+      { toProjectId: projectB, budgetLineItemId: lineA },
+    );
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("is not on project");
   });
 
   it("refuses a transfer to the project the machine is already on", async () => {

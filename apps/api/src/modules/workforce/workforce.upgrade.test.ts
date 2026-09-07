@@ -548,6 +548,103 @@ describe("wage and working-time compliance", () => {
     expect(again.json().signalsRaised).toBe(0);
   });
 
+  it("raises the recruitment-fee detector from a coded deduction line on a real payroll file", async () => {
+    /*
+     * `deductionLines` were accepted by the ingest schema, collected into a
+     * map and then never read: `payroll_entries` had no column for them and
+     * `assessWagePayment` was called without them. So
+     * `labour_recruitment_fee_deduction` — severity critical, the only
+     * detector that can see a worker repaying a recruitment cost out of wages
+     * (ILO fair recruitment, IFC PS2 debt bondage) — was reachable only from
+     * a unit test. No route could raise it, while the API told the integrator
+     * its coded deductions had landed.
+     */
+    const fee = await post(`/projects/${projectId}/workers`, {
+      reference: "W-FEE",
+      fullName: "Bikash Tamang",
+      vendorId,
+      currency: "AED",
+      agreedDailyRate: 120,
+    });
+    expect(fee.statusCode, fee.body).toBe(201);
+    const feeWorkerId = fee.json().id as string;
+
+    const periodStart = daysAgo(120);
+    const periodEnd = daysAgo(91);
+    const ingest = await post(`/projects/${projectId}/payroll`, {
+      payrollRunRef: "RUN-FEE",
+      entries: [
+        {
+          workerReference: "W-FEE",
+          periodStart,
+          periodEnd,
+          daysClaimed: 26,
+          hoursClaimed: 240,
+          grossPay: 3120,
+          deductions: 300,
+          netPay: 2820,
+          currency: "AED",
+          paidAt: daysAgo(88),
+          deductionLines: [
+            { code: "recruitment_fee", label: "Agency placement recovery", amount: 300 },
+          ],
+        },
+      ],
+    });
+    expect(ingest.statusCode, ingest.body).toBe(201);
+
+    // The lines are on the row, not dropped on the floor.
+    const [stored] = await app.db
+      .select()
+      .from(payrollEntries)
+      .where(
+        and(
+          eq(payrollEntries.workerId, feeWorkerId),
+          eq(payrollEntries.periodStart, periodStart),
+        ),
+      );
+    expect(stored?.deductionLines).toEqual([
+      { code: "recruitment_fee", label: "Agency placement recovery", amount: 300 },
+    ]);
+
+    const run = await post(`/projects/${projectId}/workforce/compliance/run`, {
+      jurisdiction: "ae",
+      periodStart,
+      periodEnd,
+    });
+    expect(run.statusCode, run.body).toBe(201);
+    const findings = run.json().findings as Array<{ detector: string; workerId: string }>;
+    const found = findings.find(
+      (f) => f.detector === "labour_recruitment_fee_deduction" && f.workerId === feeWorkerId,
+    );
+    expect(found).toBeDefined();
+
+    const raised = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "labour_recruitment_fee_deduction"),
+        ),
+      );
+    expect(raised).toHaveLength(1);
+    expect(raised[0]?.severity).toBe("critical");
+
+    // and the flag lands against the EMPLOYER, which is what the vendor score reads.
+    const flags = await app.db
+      .select()
+      .from(labourRiskFlags)
+      .where(
+        and(
+          eq(labourRiskFlags.projectId, projectId),
+          eq(labourRiskFlags.indicator, "recruitment_fee_paid"),
+        ),
+      );
+    expect(flags).toHaveLength(1);
+    expect(flags[0]?.vendorId).toBe(vendorId);
+  });
+
   it("raises a risk flag against the employer, which the vendor score reads", async () => {
     const flags = await app.db
       .select()

@@ -85,7 +85,7 @@ const SYSTEM_EDIT_FIELDS: readonly EditFieldSpec[] = [
   },
   { key: "beneficialUseDate", label: "Beneficial use", kind: "date" },
   { key: "warrantyStartDate", label: "Warranty starts", kind: "date" },
-  { key: "percentComplete", label: "Percent complete", kind: "number" },
+  { key: "percentComplete", label: "Percent complete", kind: "number", nullable: false },
   { key: "description", label: "Description", kind: "textarea" },
 ];
 

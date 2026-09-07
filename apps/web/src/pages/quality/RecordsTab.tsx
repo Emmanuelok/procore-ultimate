@@ -140,12 +140,17 @@ const POUR_EDIT_FIELDS: readonly EditFieldSpec[] = [
     kind: "number",
     hint: "The acceptance verdict is computed against this, so a typo here is a wrong verdict.",
   },
-  { key: "testAgeDays", label: "Test age (days)", kind: "integer" },
+  {
+    key: "testAgeDays",
+    label: "Test age (days)",
+    kind: "integer",
+    nullable: false,
+    hint: "The specimens are judged at this age; the API has no 'unknown' for it.",
+  },
   { key: "batchPlant", label: "Batch plant", kind: "text" },
   { key: "slumpSpecMin", label: "Slump spec min (mm)", kind: "number" },
   { key: "slumpSpecMax", label: "Slump spec max (mm)", kind: "number" },
   { key: "curingMethod", label: "Curing method", kind: "text" },
-  { key: "supervisedBy", label: "Supervised by", kind: "text" },
 ];
 
 const WELD_EDIT_FIELDS: readonly EditFieldSpec[] = [
@@ -191,7 +196,12 @@ const QUAL_EDIT_FIELDS: readonly EditFieldSpec[] = [
   { key: "welderStamp", label: "Stamp", kind: "text" },
   { key: "certificateNumber", label: "Certificate number", kind: "text" },
   { key: "qualificationStandard", label: "Standard", kind: "text", placeholder: "ISO 9606-1" },
-  { key: "processes", label: "Processes", kind: "list" },
+  {
+    key: "processes",
+    label: "Processes",
+    kind: "list",
+    hint: "Comma separated, from: smaw, gmaw, fcaw, gtaw, saw, esw, stud, resistance, other.",
+  },
   { key: "positions", label: "Positions", kind: "list" },
   { key: "materialGroups", label: "Material groups", kind: "list" },
   { key: "thicknessMinMm", label: "Thickness min (mm)", kind: "number" },
@@ -205,7 +215,7 @@ const QUAL_EDIT_FIELDS: readonly EditFieldSpec[] = [
     kind: "date",
     hint: "The lapse sweep reads this date; correcting it moves when the qualification is flagged.",
   },
-  { key: "continuityMonths", label: "Continuity (months)", kind: "integer" },
+  { key: "continuityMonths", label: "Continuity (months)", kind: "integer", nullable: false },
 ];
 
 const CERTIFICATE_EDIT_FIELDS: readonly EditFieldSpec[] = [
@@ -250,6 +260,7 @@ const INSTRUMENT_EDIT_FIELDS: readonly EditFieldSpec[] = [
     key: "calibrationIntervalMonths",
     label: "Interval (months)",
     kind: "integer",
+    nullable: false,
     hint: "The due date is derived from the last certificate and this interval.",
   },
 ];

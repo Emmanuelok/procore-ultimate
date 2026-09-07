@@ -1187,15 +1187,26 @@ export function EditModal({
   onSaved: () => void;
 }) {
   const { busy, refusal, clear, run } = useAction();
+  /*
+   * The seed is keyed on the VALUES, not on the object identity. Several
+   * callers build the record on the fly (a row looked up in a list, a
+   * 0/1 column mapped to a boolean), so a parent re-render — a sibling
+   * button going busy, a register reloading — hands this component a fresh
+   * object with identical contents. Re-seeding on identity would wipe what
+   * the user had typed halfway through an edit; re-seeding on the values
+   * re-seeds only when the record really changed underneath them.
+   */
+  const seed = fields.map((f) => `${f.key}=${editInitialValue(record?.[f.key])}`).join("\u0001");
   const initial = useMemo(() => {
     const out: Record<string, string> = {};
     for (const f of fields) out[f.key] = editInitialValue(record?.[f.key]);
     return out;
-  }, [fields, record]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seed]);
   const [draft, setDraft] = useState<Record<string, string>>(initial);
 
-  // Re-seed whenever the record or the field set changes (a different row, or
-  // a reload after a transition). The draft is a copy, never a live view.
+  // Re-seed whenever the record's own values change (a different row, or a
+  // reload after a transition). The draft is a copy, never a live view.
   useEffect(() => {
     setDraft(initial);
   }, [initial]);

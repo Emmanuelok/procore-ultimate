@@ -390,6 +390,85 @@ describe("the legacy activity-level release against a configured chain", () => {
 });
 
 /* ================================================================== */
+/* Waiving the point is waiving the chain                              */
+/* ================================================================== */
+
+describe("a waiver of a point that carries a sign-off chain", () => {
+  let itpId: string;
+  let activityId: string;
+  let legs: Array<{ id: string; party: string }>;
+
+  beforeAll(async () => {
+    const itp = await post(`${base()}/itps`, { title: "Waiver-and-chain ITP" });
+    itpId = itp.json().id;
+    const activity = await post(`${base()}/itps/${itpId}/activities`, {
+      activity: "Cladding bracket release",
+      interventionPoint: "hold_point",
+      plannedDate: "2030-07-01",
+      verifyingParties: [{ party: "engineer", userId: engineer.userId }],
+    });
+    activityId = activity.json().id;
+    const chain = await put(`${base()}/itps/${itpId}/activities/${activityId}/parties`, {
+      parties: [
+        { party: "contractor", userId: owner.userId },
+        { party: "engineer", userId: engineer.userId },
+        { party: "third_party", organisation: "Notified Body Ltd" },
+      ],
+    });
+    legs = chain.json().items as Array<{ id: string; party: string }>;
+  }, 60_000);
+
+  /*
+   * The release route refuses where a chain exists. Waiving is the legitimate
+   * override of the same chain — but it used to leave the unsigned legs at
+   * `pending` for ever, so the surveillance register went on telling a
+   * co-ordinator to chase a notified body for an inspection that had been
+   * waived, and the chain's record never said what became of them.
+   */
+  it("waives the legs nobody signed, with the same reason and actor", async () => {
+    const first = await post(
+      `${base()}/itps/${itpId}/activities/${activityId}/parties/${legs[0]!.id}/release`,
+      { note: "Contractor QC signed." },
+      owner.headers,
+    );
+    expect(first.statusCode).toBe(200);
+
+    const waived = await post(`${base()}/itps/${itpId}/activities/${activityId}/waive`, {
+      reason: "Element re-designed out; the bracket is no longer installed.",
+    });
+    expect(waived.statusCode).toBe(200);
+    expect(waived.json().status).toBe("waived");
+
+    const chain = await get(`${base()}/itps/${itpId}/activities/${activityId}/parties`);
+    const rows = chain.json().items as Array<{ id: string; status: string; note: string | null }>;
+    expect(rows.find((r) => r.id === legs[0]!.id)!.status).toBe("released");
+    for (const legId of [legs[1]!.id, legs[2]!.id]) {
+      const row = rows.find((r) => r.id === legId)!;
+      expect(row.status).toBe("waived");
+      expect(row.note).toContain("re-designed out");
+    }
+  });
+
+  /*
+   * And the register a co-ordinator works from stops listing them: a leg on a
+   * point that has been waived is not outstanding work, whatever the leg row
+   * says on its own.
+   */
+  it("drops the waived point's legs from the outstanding surveillance register", async () => {
+    const open = await get(`${base()}/surveillance?openOnly=true&pageSize=500`);
+    expect(open.statusCode).toBe(200);
+    const ids = (open.json().items as Array<{ id: string }>).map((r) => r.id);
+    expect(ids).not.toContain(legs[2]!.id);
+
+    // Without openOnly the leg is still readable — it is history, not a secret.
+    const all = await get(`${base()}/surveillance?pageSize=500`);
+    expect((all.json().items as Array<{ id: string }>)).toContainEqual(
+      expect.objectContaining({ id: legs[2]!.id }),
+    );
+  });
+});
+
+/* ================================================================== */
 /* Defects liability periods                                           */
 /* ================================================================== */
 

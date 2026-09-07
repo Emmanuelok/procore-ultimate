@@ -2953,6 +2953,8 @@ CREATE TABLE "meeting_minute_deliveries" (
 	"status" text DEFAULT 'pending' NOT NULL,
 	"delivered_at" timestamp with time zone,
 	"acknowledged_at" timestamp with time zone,
+	"acknowledged_by_id" text,
+	"acknowledgement_note" text,
 	"failure_reason" text,
 	"document_sha256" text,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
@@ -8041,6 +8043,7 @@ ALTER TABLE "grievances" ADD COLUMN "escalation_history" jsonb DEFAULT '[]'::jso
 ALTER TABLE "land_parcels" ADD COLUMN "acquisition_basis" text;--> statement-breakpoint
 ALTER TABLE "land_parcels" ADD COLUMN "acquired_at" text;--> statement-breakpoint
 ALTER TABLE "land_parcels" ADD COLUMN "compensation_payments" jsonb DEFAULT '[]'::jsonb NOT NULL;--> statement-breakpoint
+ALTER TABLE "payroll_entries" ADD COLUMN "deduction_lines" jsonb DEFAULT '[]'::jsonb NOT NULL;--> statement-breakpoint
 ALTER TABLE "payroll_entries" ADD COLUMN "source_ref" text DEFAULT '' NOT NULL;--> statement-breakpoint
 ALTER TABLE "payroll_entries" ADD COLUMN "external_ref" text;--> statement-breakpoint
 ALTER TABLE "payroll_entries" ADD COLUMN "updated_at" timestamp with time zone DEFAULT now() NOT NULL;--> statement-breakpoint

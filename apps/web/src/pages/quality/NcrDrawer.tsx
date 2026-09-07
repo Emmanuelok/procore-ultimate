@@ -75,7 +75,7 @@ import type { CorrectiveAction, NcrDetail } from "./types";
  */
 const NCR_EDIT_FIELDS: readonly EditFieldSpec[] = [
   { key: "title", label: "Title", kind: "text", nullable: false, wide: true },
-  { key: "description", label: "What is non-conforming", kind: "textarea" },
+  { key: "description", label: "What is non-conforming", kind: "textarea", nullable: false },
   {
     key: "severity",
     label: "Severity",
@@ -95,7 +95,7 @@ const NCR_EDIT_FIELDS: readonly EditFieldSpec[] = [
     kind: "number",
     hint: "In the currency below. The register buckets by currency and never sums across them.",
   },
-  { key: "currency", label: "Currency", kind: "text", placeholder: "GBP" },
+  { key: "currency", label: "Currency", kind: "text", nullable: false, placeholder: "GBP" },
   { key: "scheduleImpactDays", label: "Schedule impact (days)", kind: "number" },
 ];
 

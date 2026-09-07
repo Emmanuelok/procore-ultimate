@@ -49,7 +49,7 @@ import {
   summariseActivities,
   type HoldPointActivityLike,
 } from "./holdPoints.js";
-import { chainSummary, legLabel, type ReleaseLegLike } from "./releaseChain.js";
+import { chainSummary, isLegTerminal, legLabel, type ReleaseLegLike } from "./releaseChain.js";
 import { sweepQuality } from "./sweeps.js";
 
 /* ------------------------------------------------------------------ */
@@ -1117,6 +1117,41 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
       const decision = canWaive(activity, body.reason);
       if (!decision.allowed) throw badRequest(decision.reasons.join(" "));
       const at = nowISO();
+      /*
+       * A WAIVER OF THE POINT IS A WAIVER OF EVERY LEG STILL TO SIGN (#1094).
+       *
+       * The release route refuses where a chain exists, because one signature
+       * may not stand in for three. Waiving the point is the legitimate
+       * override of the same chain — it carries a written reason and names
+       * the person taking it — but it left the outstanding legs at `pending`
+       * for ever: nothing reconciled them, so the surveillance register went
+       * on telling a co-ordinator to chase a notified body for an inspection
+       * that had been waived, and the chain's own record never said what
+       * became of the legs nobody signed.
+       *
+       * Each outstanding leg is therefore waived with the same reason, under
+       * the same actor and timestamp, and named in the ledger entry: the
+       * decision was one act and the record says so.
+       */
+      const legs = await chainOf(activityId);
+      const outstanding = legs.filter((l) => !isLegTerminal(l.status));
+      if (outstanding.length > 0) {
+        await app.db
+          .update(itpActivityReleases)
+          .set({
+            status: "waived",
+            releasedBy: req.user!.id,
+            releasedAt: at,
+            note: `Waived with the point: ${body.reason}`,
+            updatedAt: at,
+          })
+          .where(
+            inArray(
+              itpActivityReleases.id,
+              outstanding.map((l) => l.id),
+            ),
+          );
+      }
       await app.db
         .update(itpActivities)
         .set({
@@ -1135,7 +1170,13 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
         action: "state_change",
         objectType: "itp_activity",
         objectId: activityId,
-        payload: { from: activity.status, to: "waived", waivedBy: req.user!.id, reason: body.reason },
+        payload: {
+          from: activity.status,
+          to: "waived",
+          waivedBy: req.user!.id,
+          reason: body.reason,
+          waivedLegs: outstanding.map((l) => ({ id: l.id, party: l.party })),
+        },
         storePayload: true,
       });
       return decorateOne(await fetchActivity(activityId, itpId, req.projectId!));

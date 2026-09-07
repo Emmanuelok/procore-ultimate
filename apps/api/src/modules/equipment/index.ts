@@ -20,6 +20,7 @@ import {
   assuranceGrants,
   budgetLineItems,
   carbonFactors,
+  costCodes,
   equipment,
   equipmentAssignments,
   equipmentCertificates,
@@ -179,6 +180,21 @@ const isoTimestamp = z
 
 const nonEmpty = (max: number) => z.string().min(1).max(max);
 const idRef = z.string().min(1).max(64);
+
+/**
+ * A BOOLEAN QUERY FLAG THAT MEANS WHAT IT SAYS.
+ *
+ * These filters were `z.coerce.boolean()`, which runs JS truthiness over
+ * the raw query string: `Boolean("false") === true`, so `?catalogueOnly=false`
+ * returned ONLY catalogue items and `?unverifiedOnly=false` returned only the
+ * unverified rows — the exact opposite of the question asked, silently, with
+ * a 200. The web pages only ever send the literal `true`, so nothing on the
+ * screen was wrong; an integrator writing `false` was answered with a lie.
+ * Here `false` means false and an unrecognised value is a 400.
+ */
+const boolQuery = z
+  .union([z.boolean(), z.enum(["true", "false", "1", "0", "yes", "no"])])
+  .transform((v) => (typeof v === "boolean" ? v : v === "true" || v === "1" || v === "yes"));
 const money = z.number().finite();
 const hours = z.number().finite().min(0).max(1000);
 
@@ -576,6 +592,95 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           "not only by the one you are standing on.",
       );
     }
+  }
+
+  /**
+   * COST CODING BELONGS TO A PROJECT.
+   *
+   * A cost code with a null projectId is the company standard list and is
+   * valid everywhere; one carrying a projectId, and every budget line item,
+   * is that project's own vocabulary. Coding inherited from somewhere else —
+   * the source assignment on a transfer, or the machine's default coding when
+   * the machine was last on another job — used to be copied onto the new row
+   * unchanged, so plant days on job B were booked against a budget line
+   * belonging to job A. Nothing corrupted job B's budget (the poster reads
+   * lines `eq(projectId)` and reports the miss), but the days sat uncoded
+   * until somebody noticed, which is the "plant coded to nothing never
+   * reaches the cost report" failure the poster itself warns about.
+   *
+   * Coding the CALLER supplied for the wrong project is a mistake and is
+   * refused. Coding INHERITED from elsewhere is dropped with a note, because
+   * refusing the whole transfer over a stale default would strand the machine.
+   */
+  async function resolveCoding(
+    companyId: string,
+    projectId: string,
+    input: {
+      costCodeId: string | null | undefined;
+      budgetLineItemId: string | null | undefined;
+      costCodeExplicit: boolean;
+      budgetLineExplicit: boolean;
+    },
+  ): Promise<{
+    costCodeId: string | null;
+    budgetLineItemId: string | null;
+    notes: string[];
+  }> {
+    const notes: string[] = [];
+    let costCodeId = input.costCodeId ?? null;
+    let budgetLineItemId = input.budgetLineItemId ?? null;
+
+    if (costCodeId) {
+      const [row] = await app.db
+        .select({ id: costCodes.id, projectId: costCodes.projectId, code: costCodes.code })
+        .from(costCodes)
+        .where(and(eq(costCodes.id, costCodeId), eq(costCodes.companyId, companyId)))
+        .limit(1);
+      const belongs = row && (row.projectId === null || row.projectId === projectId);
+      if (!belongs) {
+        if (input.costCodeExplicit) {
+          throw badRequest(
+            `cost code ${costCodeId} is not on project ${projectId} (and is not on the company ` +
+              "standard list). A cost code is a project's own vocabulary; coding work to another " +
+              "job's code puts the cost where nobody is looking for it.",
+          );
+        }
+        notes.push(
+          `The cost code carried over (${row?.code ?? costCodeId}) belongs to another project and ` +
+            "was not applied here. Code these rows to this project's own cost code.",
+        );
+        costCodeId = null;
+      }
+    }
+
+    if (budgetLineItemId) {
+      const [row] = await app.db
+        .select({ id: budgetLineItems.id, projectId: budgetLineItems.projectId })
+        .from(budgetLineItems)
+        .where(
+          and(
+            eq(budgetLineItems.id, budgetLineItemId),
+            eq(budgetLineItems.companyId, companyId),
+          ),
+        )
+        .limit(1);
+      if (!row || row.projectId !== projectId) {
+        if (input.budgetLineExplicit) {
+          throw badRequest(
+            `budget line ${budgetLineItemId} is not on project ${projectId}. Plant posted to ` +
+              "another job's budget line is a cost on a job that never incurred it.",
+          );
+        }
+        notes.push(
+          "The budget line carried over belongs to another project and was not applied here. " +
+            "Until these rows are coded to a line on this project they will not reach its cost " +
+            "report.",
+        );
+        budgetLineItemId = null;
+      }
+    }
+
+    return { costCodeId, budgetLineItemId, notes };
   }
 
   async function holdsAssuranceRole(
@@ -1270,9 +1375,9 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     ownership: z.enum(EQUIPMENT_OWNERSHIPS).optional(),
     status: z.enum(EQUIPMENT_STATUSES).optional(),
     projectId: idRef.optional(),
-    isCritical: z.coerce.boolean().optional(),
+    isCritical: boolQuery.optional(),
     /** only machines whose earliest certificate expiry has passed */
-    outOfCertificate: z.coerce.boolean().optional(),
+    outOfCertificate: boolQuery.optional(),
     q: z.string().max(200).optional(),
   });
 
@@ -1876,6 +1981,15 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
             "cannot be on two projects, and a register that says it is will bill both.",
         );
       }
+      // The machine's default coding belongs to whichever job it was last on.
+      // Inherited coding that is not valid here is dropped with a reason
+      // rather than carried onto this project's assignment.
+      const coding = await resolveCoding(companyId, projectId, {
+        costCodeId: body.costCodeId ?? machine.costCodeId,
+        budgetLineItemId: body.budgetLineItemId ?? machine.budgetLineItemId,
+        costCodeExplicit: body.costCodeId != null,
+        budgetLineExplicit: body.budgetLineItemId != null,
+      });
       const id = newId("eqa");
       await app.db.insert(equipmentAssignments).values({
         id,
@@ -1888,8 +2002,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         assignedTo: body.assignedTo ?? null,
         locationId: body.locationId ?? null,
         scheduleActivityId: body.scheduleActivityId ?? null,
-        costCodeId: body.costCodeId ?? machine.costCodeId,
-        budgetLineItemId: body.budgetLineItemId ?? machine.budgetLineItemId,
+        costCodeId: coding.costCodeId,
+        budgetLineItemId: coding.budgetLineItemId,
         operatorWorkerId: body.operatorWorkerId ?? null,
         crewId: body.crewId ?? null,
         mobilisationCost: body.mobilisationCost ?? null,
@@ -1922,6 +2036,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       return reply.status(201).send({
         ...created,
         equipment: decorateEquipment(machine, todayISO()),
+        codingNotes: coding.notes,
         mobilisationNote:
           body.mobilisationCost === null || body.mobilisationCost === undefined
             ? "no mobilisation cost was recorded — transport is the cost most often forgotten " +
@@ -2334,7 +2449,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     to: isoDateSchema.optional(),
     idleReason: z.enum(IDLE_REASONS).optional(),
     shift: z.enum(SHIFTS).optional(),
-    unverifiedOnly: z.coerce.boolean().optional(),
+    unverifiedOnly: boolQuery.optional(),
   });
 
   function hoursOf(row: {
@@ -2530,6 +2645,20 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         currency: machine.currency,
         hours: h,
       });
+      /*
+       * The MACHINE's default coding is whatever job it was last coded to, so
+       * defaulting it onto this day's row books plant on this project against
+       * another project's budget line — the poster then reports the line as
+       * missing and the day never reaches this job's cost report. Inherited
+       * coding that does not belong here is dropped with a reason; coding the
+       * caller supplied for the wrong project is refused.
+       */
+      const utilisationCoding = await resolveCoding(companyId, projectId, {
+        costCodeId: body.costCodeId ?? machine.costCodeId,
+        budgetLineItemId: body.budgetLineItemId ?? machine.budgetLineItemId,
+        costCodeExplicit: body.costCodeId != null,
+        budgetLineExplicit: body.budgetLineItemId != null,
+      });
       const id = newId("equ");
       await app.db.insert(equipmentUtilisation).values({
         id,
@@ -2562,8 +2691,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         productionUnit: body.productionUnit ?? null,
         operatorWorkerId: body.operatorWorkerId ?? null,
         crewId: body.crewId ?? null,
-        costCodeId: body.costCodeId ?? machine.costCodeId,
-        budgetLineItemId: body.budgetLineItemId ?? machine.budgetLineItemId,
+        costCodeId: utilisationCoding.costCodeId,
+        budgetLineItemId: utilisationCoding.budgetLineItemId,
         locationId: body.locationId ?? null,
         isBillable: body.isBillable ? 1 : 0,
         tmTicketId: body.tmTicketId ?? null,
@@ -2637,6 +2766,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       return reply.status(201).send({
         ...(await decorateUtilisation(created, machine)),
         meter: { advanced: meterAdvanced, note: meterNote },
+        codingNotes: utilisationCoding.notes,
       });
     },
   );
@@ -3274,7 +3404,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     days: z.coerce.number().int().min(2).max(180).optional(),
     thresholdPercent: z.coerce.number().min(0).max(100).optional(),
     sustainedDays: z.coerce.number().int().min(1).max(90).optional(),
-    includeAll: z.coerce.boolean().optional(),
+    includeAll: boolQuery.optional(),
   });
 
   /**
@@ -3777,8 +3907,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
             .min(0)
             .max(365)
             .optional(),
-          inServiceOnly: z.coerce.boolean().optional(),
-          unverifiedOnly: z.coerce.boolean().optional(),
+          inServiceOnly: boolQuery.optional(),
+          unverifiedOnly: boolQuery.optional(),
         })
         .parse(req.query);
       const companyId = req.companyId!;
@@ -4312,8 +4442,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           status: z
             .enum(["active", "due", "overdue", "suspended", "retired"])
             .optional(),
-          criticalOnly: z.coerce.boolean().optional(),
-          statutoryOnly: z.coerce.boolean().optional(),
+          criticalOnly: boolQuery.optional(),
+          statutoryOnly: boolQuery.optional(),
         })
         .parse(req.query);
       const companyId = req.companyId!;
@@ -4958,7 +5088,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const q = pageQuerySchema
         .extend({
           readingType: z.enum(EQUIPMENT_READING_TYPES).optional(),
-          anomalousOnly: z.coerce.boolean().optional(),
+          anomalousOnly: boolQuery.optional(),
         })
         .parse(req.query);
       const clauses = [
@@ -5471,7 +5601,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     async (req) => {
       const q = z
         .object({
-          mapped: z.coerce.boolean().optional(),
+          mapped: boolQuery.optional(),
           providerKey: z.enum(TELEMATICS_PROVIDERS).optional(),
         })
         .parse(req.query);
@@ -5619,7 +5749,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           providerKey: z.enum(TELEMATICS_PROVIDERS).optional(),
           from: isoTimestamp.optional(),
           to: isoTimestamp.optional(),
-          unmappedOnly: z.coerce.boolean().optional(),
+          unmappedOnly: boolQuery.optional(),
         })
         .parse(req.query);
       const clauses = [
@@ -6660,8 +6790,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           status: z.enum(MATERIAL_ITEM_STATUSES).optional(),
           category: z.string().max(120).optional(),
           supplierVendorId: idRef.optional(),
-          belowReorder: z.coerce.boolean().optional(),
-          includeCatalogue: z.coerce.boolean().optional(),
+          belowReorder: boolQuery.optional(),
+          includeCatalogue: boolQuery.optional(),
           q: z.string().max(200).optional(),
         })
         .parse(req.query);
@@ -6710,7 +6840,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     async (req) => {
       const q = pageQuerySchema
         .extend({
-          catalogueOnly: z.coerce.boolean().optional(),
+          catalogueOnly: boolQuery.optional(),
           status: z.enum(MATERIAL_ITEM_STATUSES).optional(),
         })
         .parse(req.query);
@@ -7029,17 +7159,16 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
 
     let signalId: string | null = null;
     if (shortfall.wouldGoNegative) {
-      // ON THE TRANSACTION, NOT ON `app.db`. Both used to run on the outer
-      // handle from inside the open transaction that locks the material row,
-      // which deadlocks: under PGlite the transaction holds the single
-      // connection's mutex, so the read waited for a transaction waiting for
-      // the read and the request never returned.
-      const seen = await alreadySignalled(
-        input.companyId,
-        "material_stock_negative",
-        undefined,
-        tx,
-      );
+      /*
+       * NO DEDUPE LOOKUP HERE. The key is the movement id, minted three
+       * statements ago, so nothing already stored can carry it — the query
+       * used to be issued with no candidate keys, which is the unbounded
+       * "every material_stock_negative this company ever raised" scan
+       * `alreadySignalled` warns about, run inside the transaction that holds
+       * the FOR UPDATE lock on the material row, purely to return a set that
+       * could never contain the key. Every other movement on that item waited
+       * behind it for an answer known in advance.
+       */
       signalId = await raiseSignalOnce({
         db: tx,
         companyId: input.companyId,
@@ -7067,7 +7196,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           balanceAfter: shortfall.projectedBalance,
           shortfall: shortfall.shortfall,
         },
-        seen,
+        seen: new Set<string>(),
       });
       if (signalId) {
         await tx
@@ -7200,8 +7329,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     };
   }
 
-  async function deliveryLines(deliveryId: string) {
-    return app.db
+  async function deliveryLines(deliveryId: string, db: Db = app.db) {
+    return db
       .select()
       .from(materialDeliveryLines)
       .where(eq(materialDeliveryLines.deliveryId, deliveryId))
@@ -7590,6 +7719,20 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         itemDeltas.set(line.materialItemId, held);
       }
 
+      /*
+       * `delivery.receivedAt` IS THE IDEMPOTENCY GUARD, so it must commit with
+       * the stock it guards. The header used to be stamped on `app.db` after
+       * the transaction had already committed: a crash or a dropped connection
+       * in that window left the material booked into stock and the delivery
+       * still unreceived, so the operator's retry sailed past the "receiving
+       * it twice" check at the top of this route and booked the same load a
+       * second time. Header, lines, item roll-up and stock movements now
+       * commit or fail together.
+       */
+      let updatedLines: Awaited<ReturnType<typeof deliveryLines>> = [];
+      let status = delivery.status;
+      let totalValue: number | null = null;
+      let currencies = new Set<string>();
       await app.db.transaction(async (tx) => {
         const itemsById = new Map<
           string,
@@ -7694,50 +7837,51 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
             });
           }
         }
+
+        updatedLines = await deliveryLines(deliveryId, tx);
+        const allRejected =
+          updatedLines.length > 0 &&
+          updatedLines.every(
+            (l) => l.quantityAccepted === 0 && l.quantityReceived > 0,
+          );
+        const anyOutstanding = updatedLines.some(
+          (l) =>
+            l.quantityExpected !== null &&
+            l.quantityReceived < l.quantityExpected,
+        );
+        status = allRejected
+          ? "rejected"
+          : anyOutstanding
+            ? "partially_received"
+            : "received";
+        totalValue = updatedLines.every((l) => l.lineTotal === null)
+          ? null
+          : round2(updatedLines.reduce((s, l) => s + (l.lineTotal ?? 0), 0));
+        currencies = new Set(
+          updatedLines.map((l) => l.currency ?? delivery.currency),
+        );
+        await tx
+          .update(materialDeliveries)
+          .set({
+            status,
+            receivedAt,
+            receivedBy: req.user!.id,
+            receivedByName: body.receivedByName ?? null,
+            waitingMinutes: body.waitingMinutes ?? delivery.waitingMinutes,
+            hasDiscrepancy: discrepancyKinds.size > 0 ? 1 : 0,
+            discrepancyKinds: [...discrepancyKinds],
+            discrepancyNotes: body.discrepancyNotes ?? delivery.discrepancyNotes,
+            inspectionChecklistId:
+              body.inspectionChecklistId ?? delivery.inspectionChecklistId,
+            photoFileIds:
+              body.photoFileIds ?? (delivery.photoFileIds as string[]),
+            totalValue: currencies.size === 1 ? totalValue : null,
+            lineCount: updatedLines.length,
+            updatedAt: now,
+          })
+          .where(eq(materialDeliveries.id, deliveryId));
       });
 
-      const updatedLines = await deliveryLines(deliveryId);
-      const allRejected =
-        updatedLines.length > 0 &&
-        updatedLines.every(
-          (l) => l.quantityAccepted === 0 && l.quantityReceived > 0,
-        );
-      const anyOutstanding = updatedLines.some(
-        (l) =>
-          l.quantityExpected !== null &&
-          l.quantityReceived < l.quantityExpected,
-      );
-      const status = allRejected
-        ? "rejected"
-        : anyOutstanding
-          ? "partially_received"
-          : "received";
-      const totalValue = updatedLines.every((l) => l.lineTotal === null)
-        ? null
-        : round2(updatedLines.reduce((s, l) => s + (l.lineTotal ?? 0), 0));
-      const currencies = new Set(
-        updatedLines.map((l) => l.currency ?? delivery.currency),
-      );
-      await app.db
-        .update(materialDeliveries)
-        .set({
-          status,
-          receivedAt,
-          receivedBy: req.user!.id,
-          receivedByName: body.receivedByName ?? null,
-          waitingMinutes: body.waitingMinutes ?? delivery.waitingMinutes,
-          hasDiscrepancy: discrepancyKinds.size > 0 ? 1 : 0,
-          discrepancyKinds: [...discrepancyKinds],
-          discrepancyNotes: body.discrepancyNotes ?? delivery.discrepancyNotes,
-          inspectionChecklistId:
-            body.inspectionChecklistId ?? delivery.inspectionChecklistId,
-          photoFileIds:
-            body.photoFileIds ?? (delivery.photoFileIds as string[]),
-          totalValue: currencies.size === 1 ? totalValue : null,
-          lineCount: updatedLines.length,
-          updatedAt: now,
-        })
-        .where(eq(materialDeliveries.id, deliveryId));
       await appendLedger(app.db, {
         companyId,
         actorId: req.user!.id,
@@ -7780,8 +7924,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           status: z.enum(DELIVERY_STATUSES).optional(),
           supplierVendorId: idRef.optional(),
           commitmentId: idRef.optional(),
-          hasDiscrepancy: z.coerce.boolean().optional(),
-          invoiceMatched: z.coerce.boolean().optional(),
+          hasDiscrepancy: boolQuery.optional(),
+          invoiceMatched: boolQuery.optional(),
           from: isoDateSchema.optional(),
           to: isoDateSchema.optional(),
         })
@@ -8332,7 +8476,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           movementType: z.enum(STOCK_MOVEMENT_TYPES).optional(),
           from: isoDateSchema.optional(),
           to: isoDateSchema.optional(),
-          lossesOnly: z.coerce.boolean().optional(),
+          lossesOnly: boolQuery.optional(),
         })
         .parse(req.query);
       const clauses = [
@@ -8706,6 +8850,19 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       const at = body.at ?? todayISO();
       const now = new Date().toISOString();
       const newAssignmentId = newId("eqa");
+      /*
+       * The coding does NOT travel with the machine unless it is valid on the
+       * receiving job. Copying the source assignment's cost code and budget
+       * line onto job B booked B's plant days against A's budget line: the
+       * poster refuses them (it reads lines by projectId) and the days sit
+       * uncoded, out of B's cost report, until somebody notices.
+       */
+      const coding = await resolveCoding(companyId, body.toProjectId, {
+        costCodeId: body.costCodeId ?? assignment.costCodeId,
+        budgetLineItemId: body.budgetLineItemId ?? assignment.budgetLineItemId,
+        costCodeExplicit: body.costCodeId != null,
+        budgetLineExplicit: body.budgetLineItemId != null,
+      });
 
       await app.db.transaction(async (tx) => {
         await tx
@@ -8734,8 +8891,8 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           assignedFrom: at,
           assignedTo: body.assignedTo ?? null,
           locationId: body.locationId ?? null,
-          costCodeId: body.costCodeId ?? assignment.costCodeId,
-          budgetLineItemId: body.budgetLineItemId ?? assignment.budgetLineItemId,
+          costCodeId: coding.costCodeId,
+          budgetLineItemId: coding.budgetLineItemId,
           operatorWorkerId: assignment.operatorWorkerId,
           crewId: null,
           mobilisationCost: body.mobilisationCost ?? null,
@@ -8772,12 +8929,18 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           equipmentId: assignment.equipmentId,
           equipmentReference: machine.reference,
           mobilisationCost: body.mobilisationCost ?? null,
+          coding: {
+            costCodeId: coding.costCodeId,
+            budgetLineItemId: coding.budgetLineItemId,
+            notes: coding.notes,
+          },
         },
         storePayload: true,
       });
       return reply.status(201).send({
         from: await fetchAssignment(assignmentId, companyId, projectId),
         to: await fetchAssignment(newAssignmentId, companyId, body.toProjectId),
+        codingNotes: coding.notes,
         note:
           body.mobilisationCost == null
             ? "no transport cost was recorded against the move. It is the cost most often lost " +

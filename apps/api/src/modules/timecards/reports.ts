@@ -61,6 +61,7 @@ import {
 import { attachAccessLinks } from "./cards.js";
 import {
   addDays,
+  boolQuerySchema,
   companyOf,
   crewConfig,
   fetchBatch,
@@ -656,7 +657,7 @@ export const timecardReportRoutes: FastifyPluginAsync = async (app) => {
   const exportQuery = z.object({
     format: z.enum(PAYROLL_EXPORT_FORMATS).default("generic_csv"),
     /** return the file body inline as JSON rather than as a download */
-    inline: z.coerce.boolean().optional(),
+    inline: boolQuerySchema.optional(),
   });
 
   app.get(

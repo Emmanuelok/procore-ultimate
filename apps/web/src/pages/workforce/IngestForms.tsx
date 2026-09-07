@@ -171,6 +171,15 @@ export function PayrollIngestModal({
         .map((r) => {
           const gross = Number(r[3] ?? 0);
           const deductions = Number(r[4] ?? 0);
+          /*
+           * A CODED deduction, where the file carries one. The total alone
+           * cannot tell lawful tax from a recruitment fee, and a recruitment
+           * fee taken out of wages is the debt-bondage mechanism the critical
+           * detector exists to find — it is unreachable unless the code
+           * travels with the money.
+           */
+          const deductionCode = (r[9] ?? "").trim();
+          const codedAmount = r[10] !== undefined && r[10] !== "" ? Number(r[10]) : deductions;
           return {
             workerReference: r[0] ?? "",
             periodStart: r[1] ?? "",
@@ -182,6 +191,17 @@ export function PayrollIngestModal({
             hoursClaimed: numberOrNull(r[7]),
             paidAt: r[8] || null,
             currency: currency.toUpperCase(),
+            ...(deductionCode && codedAmount > 0
+              ? {
+                  deductionLines: [
+                    {
+                      code: deductionCode,
+                      label: (r[11] ?? "").trim(),
+                      amount: codedAmount,
+                    },
+                  ],
+                }
+              : {}),
           };
         });
       if (entries.length === 0) throw new Error("No rows to send.");
@@ -252,16 +272,26 @@ export function PayrollIngestModal({
             />
           </Field>
         </div>
+        <Alert tone="info" size="sm" title="Code the deductions where the file carries them">
+          A deduction total cannot tell lawful tax from a recruitment fee. A line coded
+          <code className="mx-1">recruitment_fee</code>,<code className="mx-1">agency</code> or
+          <code className="mx-1">visa_recovery</code> raises a critical finding against the
+          employer: a worker repaying a recruitment cost out of wages is the textbook debt-bondage
+          mechanism, and a hard breach of IFC PS2 on a financed project.
+        </Alert>
         <Field
           label="CSV"
-          hint="worker_reference, period_start, period_end, gross, deductions, net (blank = gross − deductions), days_claimed, hours_claimed, paid_at."
+          hint="worker_reference, period_start, period_end, gross, deductions, net (blank = gross − deductions), days_claimed, hours_claimed, paid_at, deduction_code (optional), deduction_amount (blank = the whole deduction), deduction_label (optional)."
           required
         >
           <Textarea
             rows={10}
             value={csv}
             onChange={(e) => setCsv(e.target.value)}
-            placeholder={"W-001,2026-03-01,2026-03-31,3120,0,3120,26,240,2026-04-05"}
+            placeholder={
+              "W-001,2026-03-01,2026-03-31,3120,0,3120,26,240,2026-04-05\n" +
+              "W-002,2026-03-01,2026-03-31,3120,300,2820,26,240,2026-04-05,recruitment_fee,300,Agency placement"
+            }
           />
         </Field>
       </div>

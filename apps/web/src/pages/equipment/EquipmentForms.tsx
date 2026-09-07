@@ -505,12 +505,22 @@ export function UtilisationModal({
   const [fuelLitres, setFuelLitres] = useState("");
   const [notes, setNotes] = useState("");
   const [meterNote, setMeterNote] = useState<string | null>(null);
+  /**
+   * The MACHINE's default coding belongs to whichever job it was last coded
+   * to. Coding that does not belong to this project is dropped rather than
+   * carried, and the reason has to reach the person entering the day —
+   * otherwise the plant days sit uncoded and never reach the cost report.
+   */
+  const [codingNotes, setCodingNotes] = useState<string[]>([]);
 
   const num = (v: string) => (v === "" ? undefined : Number(v));
 
   async function submit() {
     const done = await run("save", () =>
-      api.post<{ meter?: { advanced: boolean; note: string | null } }>(
+      api.post<{
+        meter?: { advanced: boolean; note: string | null };
+        codingNotes?: string[];
+      }>(
         `/api/v1/projects/${projectId}/equipment-utilisation`,
         {
           equipmentId,
@@ -529,9 +539,10 @@ export function UtilisationModal({
     );
     if (done) {
       setMeterNote(done.meter?.note ?? null);
+      setCodingNotes(done.codingNotes ?? []);
       toast.success("Day recorded");
       onDone();
-      if (!done.meter?.note) onClose();
+      if (!done.meter?.note && (done.codingNotes ?? []).length === 0) onClose();
     }
   }
 
@@ -551,6 +562,11 @@ export function UtilisationModal({
       {meterNote ? (
         <Alert tone="warning" title="The machine's meter was not moved">
           {meterNote}
+        </Alert>
+      ) : null}
+      {codingNotes.length > 0 ? (
+        <Alert tone="warning" title="These hours are not coded yet">
+          {codingNotes.join(" ")}
         </Alert>
       ) : null}
       <div className="grid gap-3 sm:grid-cols-2">
@@ -900,6 +916,13 @@ export function AssignmentActionModal({
   const [reason, setReason] = useState("hire_not_required");
   const [toProjectId, setToProjectId] = useState("");
   const [requestOffHire, setRequestOffHire] = useState(false);
+  /**
+   * Cost coding is a project's own vocabulary. Coding inherited from the job
+   * the machine is LEAVING is dropped on the receiving assignment rather than
+   * carried onto a budget line that belongs somewhere else — and the person
+   * moving the machine is the one who has to re-code it.
+   */
+  const [codingNotes, setCodingNotes] = useState<string[]>([]);
 
   if (!action || !assignmentId) return null;
   const base = `/api/v1/projects/${projectId}/equipment/assignments/${assignmentId}`;
@@ -929,7 +952,7 @@ export function AssignmentActionModal({
         case "cancel":
           return api.post(`${base}/cancel`, { reason, note: note.trim() || null });
         default:
-          return api.post(`${base}/transfer`, {
+          return api.post<{ codingNotes?: string[] }>(`${base}/transfer`, {
             toProjectId,
             mobilisationCost: amount,
             notes: note.trim() || null,
@@ -937,6 +960,11 @@ export function AssignmentActionModal({
       }
     });
     if (done) {
+      const notes =
+        action === "transfer" && typeof done === "object" && done !== null
+          ? ((done as { codingNotes?: string[] }).codingNotes ?? [])
+          : [];
+      setCodingNotes(notes);
       toast.success(
         action === "approve"
           ? "Hire approved"
@@ -949,7 +977,7 @@ export function AssignmentActionModal({
                 : "Transferred",
       );
       onDone();
-      onClose();
+      if (notes.length === 0) onClose();
     }
   }
 
@@ -997,6 +1025,11 @@ export function AssignmentActionModal({
       disabled={action === "transfer" && toProjectId === ""}
       onSubmit={submit}
     >
+      {codingNotes.length > 0 ? (
+        <Alert tone="warning" title="The plant landed uncoded on the receiving job">
+          {codingNotes.join(" ")}
+        </Alert>
+      ) : null}
       {action === "mobilise" || action === "demobilise" ? (
         <Field
           label={action === "mobilise" ? "Condition on arrival" : "Condition on return"}

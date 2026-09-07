@@ -773,6 +773,21 @@ export default function RegisterTab({
                         {fmtMoney(detail.latestPayroll.netPay, detail.latestPayroll.currency)}
                       </span>
                     </div>
+                    {(detail.latestPayroll.deductionLines ?? []).length > 0 ? (
+                      <div className="space-y-1 border-t border-ink-100 pt-2">
+                        <span className="text-ink-500">Coded deductions</span>
+                        {(detail.latestPayroll.deductionLines ?? []).map((line) => (
+                          <div key={`${line.code}-${line.amount}`} className="flex justify-between">
+                            <span className="text-ink-700">
+                              {line.label ? `${line.label} (${line.code})` : line.code}
+                            </span>
+                            <span className="tabular-nums text-ink-800">
+                              {fmtMoney(line.amount, detail.latestPayroll!.currency)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
                     {detail.latestPayroll.wpsReference ? (
                       <div className="flex justify-between">
                         <span className="text-ink-500">WPS reference</span>

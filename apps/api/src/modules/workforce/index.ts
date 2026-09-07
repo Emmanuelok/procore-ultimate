@@ -297,6 +297,17 @@ interface AuditFinding {
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
+/**
+ * A boolean query flag that means what it says. `z.coerce.boolean()` runs JS
+ * truthiness over the raw query string, so `?overdueOnly=false` arrived as
+ * `true` and returned only the breached grievances — the opposite of the
+ * question. The rest of this module compares the string (`q.open === "true"`);
+ * this is that decision, parsed once.
+ */
+const boolQuery = z
+  .union([z.boolean(), z.enum(["true", "false", "1", "0", "yes", "no"])])
+  .transform((v) => (typeof v === "boolean" ? v : v === "true" || v === "1" || v === "yes"));
+
 /** Signal detectors this module owns; also the reconciliation idempotence keys. */
 const RECONCILIATION_DETECTORS = ["ghost_worker", "payroll_overclaim", "wage_underpayment"] as const;
 
@@ -939,10 +950,6 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
     // Last write wins within one payload: a file that repeats a worker for the
     // same period would otherwise make ON CONFLICT touch the row twice.
     const staged = new Map<string, typeof payrollEntries.$inferInsert>();
-    const deductionLinesByKey = new Map<
-      string,
-      Array<{ code: string; label: string; amount: number }>
-    >();
     body.entries.forEach((e, index) => {
       const workerId = e.workerId
         ? byId.get(e.workerId)
@@ -968,6 +975,19 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
         hoursClaimed: e.hoursClaimed ?? null,
         grossPay: e.grossPay,
         deductions: e.deductions ?? 0,
+        /*
+         * PERSIST THE CODED LINES. They used to be accepted, collected into a
+         * map and never read again: the file's integrator was told its coded
+         * deductions had landed while `labour_recruitment_fee_deduction` —
+         * the only detector on this platform that can see a recruitment fee
+         * being taken out of a worker's wages — could never fire from a real
+         * payroll file, only from a unit test.
+         */
+        deductionLines: (e.deductionLines ?? []).map((d) => ({
+          code: d.code,
+          label: d.label,
+          amount: d.amount,
+        })),
         netPay: e.netPay,
         currency: e.currency ?? "USD",
         paidAt: e.paidAt ?? null,
@@ -976,12 +996,6 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
         externalRef: e.externalRef ?? null,
         submittedBy: req.user!.id,
       });
-      if (e.deductionLines && e.deductionLines.length > 0) {
-        deductionLinesByKey.set(
-          `${workerId}|${e.periodStart}|${e.periodEnd}|${sourceRef}`,
-          e.deductionLines.map((d) => ({ code: d.code, label: d.label, amount: d.amount })),
-        );
-      }
     });
 
     /*
@@ -1038,6 +1052,7 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
             hoursClaimed: sql`excluded.hours_claimed`,
             grossPay: sql`excluded.gross_pay`,
             deductions: sql`excluded.deductions`,
+            deductionLines: sql`excluded.deduction_lines`,
             netPay: sql`excluded.net_pay`,
             currency: sql`excluded.currency`,
             paidAt: sql`excluded.paid_at`,
@@ -2545,7 +2560,7 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
       .extend({
         status: z.enum(WORKER_GRIEVANCE_STATUSES).optional(),
         category: z.enum(WORKER_GRIEVANCE_CATEGORIES).optional(),
-        overdueOnly: z.coerce.boolean().optional(),
+        overdueOnly: boolQuery.optional(),
       })
       .parse(req.query);
     const clauses = [
@@ -2660,7 +2675,11 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
           reference: grievance.reference,
           kind: body.kind,
           status: body.status ?? grievance.status,
-          firstResponse: grievance.firstRespondedAt === null,
+          visibleToReporter: body.visibleToReporter,
+          // Only an update the reporter can read is the first RESPONSE; an
+          // internal note is a note, and the ledger must not record it as an
+          // answer the worker never received.
+          firstResponse: grievance.firstRespondedAt === null && body.visibleToReporter,
         },
         storePayload: true,
       });
@@ -2903,6 +2922,9 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
           daysClaimed: entry.daysClaimed,
           paidAt: entry.paidAt,
           asOf,
+          // The coded lines are what makes the recruitment-fee detector
+          // reachable from a real payroll file rather than only from a test.
+          deductionLines: entry.deductionLines ?? [],
           ...(input.minimumWageOverride ? { minimumWageOverride: input.minimumWageOverride } : {}),
         });
         for (const f of wage.findings) {

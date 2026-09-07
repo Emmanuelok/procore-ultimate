@@ -94,6 +94,18 @@ export const payrollEntries = pgTable(
     hoursClaimed: doublePrecision("hours_claimed"),
     grossPay: doublePrecision("gross_pay").notNull(),
     deductions: doublePrecision("deductions").default(0).notNull(),
+    /**
+     * CODED DEDUCTION LINES, where the payroll file carries them (#682).
+     * The total alone cannot tell a lawful tax deduction from a recruitment
+     * fee, and a recruitment fee taken out of wages is the textbook
+     * debt-bondage mechanism (ILO fair recruitment, IFC PS2). The wage
+     * detector reads these lines, so dropping them would silence
+     * `labour_recruitment_fee_deduction` entirely.
+     */
+    deductionLines: jsonb("deduction_lines")
+      .$type<Array<{ code: string; label: string; amount: number }>>()
+      .default([])
+      .notNull(),
     netPay: doublePrecision("net_pay").notNull(),
     currency: text("currency").default("USD").notNull(),
     paidAt: text("paid_at"),

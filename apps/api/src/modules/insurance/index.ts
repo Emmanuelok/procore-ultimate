@@ -77,6 +77,7 @@ import {
   type VendorAtWork,
 } from "./expiry.js";
 import {
+  BOND_DRAWN_STATUSES,
   buildRenewalPipeline,
   checkRequirement,
   computeExperience,
@@ -91,11 +92,13 @@ import {
   type RequirementLike,
 } from "./programme.js";
 import { forEachCompany } from "../../lib/scheduler.js";
+import { raiseSignalOnce } from "../meetings/signalguard.js";
 import { pushNotifications } from "../notifications/service.js";
 import type { Db } from "../../lib/db.js";
 import {
   companyScopeOf,
   companyToolGate,
+  holdsToolOnProject,
   scopeAllows,
   scopeProjectsOrCompanyWide,
 } from "../meetings/scope.js";
@@ -305,6 +308,12 @@ const bondCreateSchema = z.object({
   reductionSchedule: z.array(reductionStepSchema).max(50).optional(),
   contractId: z.string().max(64).nullable().optional(),
   documentId: z.string().max(64).nullable().optional(),
+  /**
+   * The bonding line this bond draws on (#796). Optional, because a one-off
+   * bond issued outside a facility is a real thing; but without it the
+   * facility record can only state the ceiling, never what is left under it.
+   */
+  facilityId: z.string().max(64).nullable().optional(),
 });
 
 const bondPatchSchema = bondCreateSchema.partial();
@@ -1168,8 +1177,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         // that expires while people are still on site is an uninsured works.
         if (!worksOngoing || seen.has(p.policyId)) continue;
         seen.add(p.policyId);
-        await app.db.insert(signals).values({
-          id: newId("sig"),
+        await raiseSignalOnce(app.db, {
           companyId,
           projectId: p.projectId,
           detector: "policy_lapsed_during_works",
@@ -1220,8 +1228,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         });
         if (seen.has(c.certificateId)) continue;
         seen.add(c.certificateId);
-        await app.db.insert(signals).values({
-          id: newId("sig"),
+        await raiseSignalOnce(app.db, {
           companyId,
           projectId: c.projectId,
           detector: "insurance_certificate_expired",
@@ -1255,8 +1262,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       for (const b of pastDeadline) {
         if (seen.has(b.bondId)) continue;
         seen.add(b.bondId);
-        await app.db.insert(signals).values({
-          id: newId("sig"),
+        await raiseSignalOnce(app.db, {
           companyId,
           projectId: b.projectId,
           detector: "bond_demand_deadline_passed",
@@ -1300,8 +1306,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       for (const b of approaching) {
         if (seen.has(b.bondId)) continue;
         seen.add(b.bondId);
-        await app.db.insert(signals).values({
-          id: newId("sig"),
+        await raiseSignalOnce(app.db, {
           companyId,
           projectId: b.projectId,
           detector: "bond_demand_deadline_approaching",
@@ -1389,8 +1394,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
               : gap.reason === "expired"
                 ? `their last certificate expired on ${gap.lastValidTo}`
                 : `their certificate does not take effect until ${gap.lastValidTo}`;
-          await app.db.insert(signals).values({
-            id: newId("sig"),
+          await raiseSignalOnce(app.db, {
             companyId,
             projectId: gap.projectId,
             detector: "insurance_cover_gap",
@@ -1459,9 +1463,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       for (const gap of gapOut.gaps) {
         if (seen.has(gap.key)) continue;
         seen.add(gap.key);
-        raised += 1;
-        await app.db.insert(signals).values({
-          id: newId("sig"),
+        const out = await raiseSignalOnce(app.db, {
           companyId,
           projectId: project.id,
           detector: "policy_period_gap",
@@ -1482,6 +1484,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
             worksEnd: gap.worksEnd,
           },
         });
+        if (out.raised) raised += 1;
       }
     }
 
@@ -1525,9 +1528,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         for (const f of findings) {
           if (seen.has(f.key)) continue;
           seen.add(f.key);
-          raised += 1;
-          await app.db.insert(signals).values({
-            id: newId("sig"),
+          const out = await raiseSignalOnce(app.db, {
             companyId,
             projectId: f.projectId,
             detector: "uninsured_loss_candidate",
@@ -1554,6 +1555,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
               occurredAt: f.occurredAt,
             },
           });
+          if (out.raised) raised += 1;
         }
       }
     }
@@ -1584,9 +1586,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         const key = `${r.policyId}:${r.periodEnd}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        raised += 1;
-        await app.db.insert(signals).values({
-          id: newId("sig"),
+        const out = await raiseSignalOnce(app.db, {
           companyId,
           projectId: r.projectId,
           detector: "policy_renewal_overdue",
@@ -1606,6 +1606,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
             behindByDays: r.behindByDays,
           },
         });
+        if (out.raised) raised += 1;
       }
     }
 
@@ -1967,6 +1968,15 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       const { policyId } = req.params as { policyId: string };
       const policy = await fetchPolicyForProject(policyId, req.companyId!, req.projectId!);
       const asOf = todayISO();
+      /*
+       * Scoped to THIS project, for the same reason the claims query below
+       * is. A company-level (OCIP) policy is visible from every project, so
+       * an unscoped certificate query handed a member of this project the
+       * vendor certificates collected on every other one — insurer, limit of
+       * indemnity, validity and verification state. A certificate recorded
+       * WITHOUT a project (a company-wide certificate) is a tenant asset and
+       * stays visible, exactly as the company-level policy itself does.
+       */
       const certs = await app.db
         .select()
         .from(insuranceCertificates)
@@ -1974,6 +1984,10 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
           and(
             eq(insuranceCertificates.companyId, req.companyId!),
             eq(insuranceCertificates.policyId, policyId),
+            or(
+              isNull(insuranceCertificates.projectId),
+              eq(insuranceCertificates.projectId, req.projectId!),
+            )!,
           ),
         );
       /*
@@ -1997,6 +2011,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         certificates: certs.map((c) => decorateCertificate(c, asOf)),
         claims: claimRows.map((c) => decorateClaim(c, asOf)),
         claimsScope: "this_project_only" as const,
+        certificatesScope: "this_project_and_company_wide" as const,
         notificationRule:
           policy.notificationDays === null
             ? {
@@ -2623,12 +2638,188 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
   /* BONDS (#790-794)                                                  */
   /* ================================================================ */
 
+  /* ---------------------------------------------------------------- */
+  /* BONDING LINE DRAWDOWN (#796)                                      */
+  /*                                                                   */
+  /* A facility record on its own answers "what ceiling did the surety */
+  /* agree?" — never the question a contractor actually asks before it */
+  /* tenders, which is "how much line is LEFT?". That answer only      */
+  /* exists once each bond names the line it draws on, so `facilityId` */
+  /* is written here, on the bond, and utilisation is derived from the */
+  /* live bonds rather than stored (a stored figure drifts from the    */
+  /* bonds it claims to summarise the first time one is released).     */
+  /*                                                                   */
+  /* Three rules, in the order they bite:                              */
+  /*  1. A closed or expired line cannot take a new drawdown, and a    */
+  /*     line ring-fenced to another project cannot be drawn here.     */
+  /*  2. A currency mismatch or a bond type the line does not permit   */
+  /*     is a WARNING, not a refusal: both happen in the real world    */
+  /*     and `facilityUtilisation` already reports them honestly       */
+  /*     (foreign-currency bonds are excluded from the netting because */
+  /*     no rate is held; off-type bonds still consume line).          */
+  /*  3. Issuing a bond is a money move, so the headroom check runs    */
+  /*     inside a transaction holding `select … for update` on the     */
+  /*     facility row, and a drawdown that would over-draw the line is */
+  /*     refused with the arithmetic printed.                          */
+  /* ---------------------------------------------------------------- */
+
+  type FacilityRow = typeof bondFacilities.$inferSelect;
+  type BondRow = typeof bonds.$inferSelect;
+
+  const facilityLike = (f: FacilityRow) => ({
+    id: f.id,
+    number: f.number,
+    name: f.name,
+    provider: f.provider,
+    projectId: f.projectId,
+    limitAmount: f.limitAmount,
+    currency: f.currency,
+    permittedBondTypes: f.permittedBondTypes,
+    status: f.status,
+    effectiveFrom: f.effectiveFrom,
+    effectiveTo: f.effectiveTo,
+    reviewDate: f.reviewDate,
+  });
+
+  /** Utilisation of one line as at `asOf`, computed from the bonds drawn on it. */
+  async function computeFacilityLine(
+    facility: FacilityRow,
+    asOf: string,
+    db: Db = app.db,
+    override?: { bondId: string; row: BondRow | null },
+  ) {
+    const drawn = await db
+      .select()
+      .from(bonds)
+      .where(and(eq(bonds.companyId, facility.companyId), eq(bonds.facilityId, facility.id)));
+    let rows = drawn;
+    if (override) {
+      rows = drawn.filter((b) => b.id !== override.bondId);
+      if (override.row) rows = [...rows, override.row];
+    }
+    return {
+      rows,
+      utilisation: facilityUtilisation(
+        facilityLike(facility),
+        rows.map((b) => ({ ...b, facilityId: b.facilityId })),
+        (b) => bondCurrentExposure(b, asOf).currentAmount,
+        asOf,
+      ),
+    };
+  }
+
+  /** Resolve the line a bond names, refusing the drawdowns that cannot exist. */
+  async function resolveBondFacility(
+    facilityId: string,
+    companyId: string,
+    projectId: string,
+    bond: { currency: string; bondType: string },
+  ): Promise<{ facility: FacilityRow; warnings: string[] }> {
+    const facility = await fetchFacility(facilityId, companyId);
+    if (facility.status === "closed" || facility.status === "expired") {
+      throw conflict(
+        `Facility ${facility.number} (${facility.provider}) is ${facility.status}, so no further ` +
+          "bond can be drawn against it. Record the replacement line and draw against that.",
+      );
+    }
+    if (facility.projectId && facility.projectId !== projectId) {
+      throw badRequest(
+        `Facility ${facility.number} is ring-fenced to another project, so a bond on this project ` +
+          "cannot draw on it. Use a company-wide line, or a line ring-fenced to this project.",
+      );
+    }
+    const warnings: string[] = [];
+    if (bond.currency !== facility.currency) {
+      warnings.push(
+        `This bond is in ${bond.currency} and facility ${facility.number} is a ${facility.currency} ` +
+          `line. The bond is recorded against the line but EXCLUDED from its utilisation figure: ` +
+          `netting ${bond.currency} against ${facility.currency} needs a rate and none is held.`,
+      );
+    }
+    const permitted = facility.permittedBondTypes ?? [];
+    if (permitted.length > 0 && !permitted.includes(bond.bondType)) {
+      warnings.push(
+        `Facility ${facility.number} permits ${permitted.join(", ")}; this is a ${bond.bondType} ` +
+          "bond. It still consumes line, so it is counted, but the provider may refuse to issue it.",
+      );
+    }
+    return { facility, warnings };
+  }
+
+  /**
+   * Check and record a drawdown against the line, inside a transaction that
+   * holds the facility row for update. Returns the utilisation AFTER the
+   * change so the ledger entry records the headroom the act consumed.
+   */
+  async function drawOnFacility(
+    facilityId: string,
+    companyId: string,
+    bondId: string,
+    nextRow: BondRow | null,
+    asOf: string,
+  ): Promise<{ facility: FacilityRow; utilisation: Awaited<ReturnType<typeof computeFacilityLine>>["utilisation"] }> {
+    return app.db.transaction(async (tx) => {
+      const locked = await tx
+        .select()
+        .from(bondFacilities)
+        .where(and(eq(bondFacilities.id, facilityId), eq(bondFacilities.companyId, companyId)))
+        .for("update");
+      const facility = locked[0];
+      if (!facility) throw notFound("Bond facility not found");
+      const { utilisation } = await computeFacilityLine(facility, asOf, tx as unknown as Db, {
+        bondId,
+        row: nextRow,
+      });
+      if (utilisation.headroom !== null && utilisation.headroom < 0) {
+        throw conflict(
+          `This drawdown would over-draw facility ${facility.number} (${facility.provider}): the ` +
+            `line is ${facility.currency} ${facility.limitAmount}, live bonds against it would be ` +
+            `${facility.currency} ${utilisation.drawnAmount}, leaving ${facility.currency} ` +
+            `${utilisation.headroom}. Increase the line, release a bond that has served its ` +
+            "purpose, or issue this bond outside the facility.",
+        );
+      }
+      return { facility, utilisation };
+    });
+  }
+
+  /** The line summary carried on a bond payload, or null when it draws on none. */
+  async function bondFacilitySummary(bond: BondRow, asOf: string) {
+    if (!bond.facilityId) return null;
+    const rows = await app.db
+      .select()
+      .from(bondFacilities)
+      .where(
+        and(eq(bondFacilities.id, bond.facilityId), eq(bondFacilities.companyId, bond.companyId)),
+      )
+      .limit(1);
+    const facility = rows[0];
+    if (!facility) return null;
+    const { utilisation } = await computeFacilityLine(facility, asOf);
+    return {
+      id: facility.id,
+      number: facility.number,
+      name: facility.name,
+      provider: facility.provider,
+      currency: facility.currency,
+      limitAmount: facility.limitAmount,
+      status: facility.status,
+      utilisation,
+    };
+  }
+
   app.post(
     "/projects/:projectId/insurance/bonds",
     { preHandler: standardGate },
     async (req, reply) => {
       const body = bondCreateSchema.parse(req.body);
       if (body.principalVendorId) await assertVendor(body.principalVendorId, req.companyId!);
+      const line = body.facilityId
+        ? await resolveBondFacility(body.facilityId, req.companyId!, req.projectId!, {
+            currency: body.currency ?? "GBP",
+            bondType: body.bondType,
+          })
+        : null;
       if (body.expiryAt && body.demandDeadline) {
         if (daysBetweenISO(body.demandDeadline, body.expiryAt) < 0) {
           throw badRequest(
@@ -2665,6 +2856,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         })),
         status: "draft",
         documentId: body.documentId ?? null,
+        facilityId: line ? line.facility.id : null,
         createdBy: req.user!.id,
       });
       await appendLedger(app.db, {
@@ -2682,11 +2874,19 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
           isOnDemand: body.isOnDemand ?? false,
           expiryAt: body.expiryAt ?? null,
           demandDeadline: body.demandDeadline ?? null,
+          facilityId: line ? line.facility.id : null,
+          facilityNumber: line ? line.facility.number : null,
         },
         storePayload: true,
       });
       const created = await fetchBond(id, req.companyId!, req.projectId!);
-      return reply.status(201).send(decorateBond(created, todayISO()));
+      const asOf = todayISO();
+      return reply.status(201).send({
+        ...decorateBond(created, asOf),
+        facility: await bondFacilitySummary(created, asOf),
+        /* A draft bond consumes no line: the drawdown happens at issue. */
+        facilityWarnings: line?.warnings ?? [],
+      });
     },
   );
 
@@ -2705,8 +2905,42 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       .orderBy(desc(bonds.createdAt))
       .limit(q.pageSize)
       .offset(pageOffset(q));
+    /* One lookup for the whole page rather than one per row: the register
+       needs the line's identity beside each bond, not its full utilisation. */
+    const facilityIds = [...new Set(rows.map((b) => b.facilityId).filter((v): v is string => !!v))];
+    const facilityById = new Map<string, FacilityRow>(
+      facilityIds.length === 0
+        ? []
+        : (
+            await app.db
+              .select()
+              .from(bondFacilities)
+              .where(
+                and(
+                  eq(bondFacilities.companyId, req.companyId!),
+                  inArray(bondFacilities.id, facilityIds),
+                ),
+              )
+          ).map((f) => [f.id, f] as const),
+    );
     return paginate(
-      rows.map((b) => decorateBond(b, asOf)),
+      rows.map((b) => {
+        const f = b.facilityId ? facilityById.get(b.facilityId) : undefined;
+        return {
+          ...decorateBond(b, asOf),
+          facility: f
+            ? {
+                id: f.id,
+                number: f.number,
+                name: f.name,
+                provider: f.provider,
+                currency: f.currency,
+                limitAmount: f.limitAmount,
+                status: f.status,
+              }
+            : null,
+        };
+      }),
       Number(totalRow?.n ?? 0),
       q,
     );
@@ -2717,14 +2951,18 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
     { preHandler: readGate },
     async (req) => {
       const { bondId } = req.params as { bondId: string };
-      await fetchBond(bondId, req.companyId!, req.projectId!);
       const bond = await fetchBond(bondId, req.companyId!, req.projectId!);
       const calls = await app.db
         .select()
         .from(bondCalls)
         .where(eq(bondCalls.bondId, bondId))
         .orderBy(desc(bondCalls.calledAt));
-      return { ...decorateBond(bond, todayISO()), calls };
+      const asOf = todayISO();
+      return {
+        ...decorateBond(bond, asOf),
+        calls,
+        facility: await bondFacilitySummary(bond, asOf),
+      };
     },
   );
 
@@ -2739,6 +2977,23 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         throw badRequest(`A ${bond.status} bond cannot be edited`);
       }
       if (body.principalVendorId) await assertVendor(body.principalVendorId, req.companyId!);
+      /*
+       * Moving a LIVE bond onto (or off) a line moves money: the drawdown is
+       * re-checked against the new line before the write, and against the old
+       * one after it, so neither register can end up disagreeing with the
+       * bonds it is meant to summarise.
+       */
+      const nextCurrency = body.currency ?? bond.currency;
+      const nextType = body.bondType ?? bond.bondType;
+      const facilityChanged =
+        body.facilityId !== undefined && (body.facilityId ?? null) !== bond.facilityId;
+      const nextLine =
+        body.facilityId === undefined || body.facilityId === null
+          ? null
+          : await resolveBondFacility(body.facilityId, req.companyId!, req.projectId!, {
+              currency: nextCurrency,
+              bondType: nextType,
+            });
       const expiryAt = body.expiryAt ?? bond.expiryAt;
       const demandDeadline = body.demandDeadline ?? bond.demandDeadline;
       if (expiryAt && demandDeadline && daysBetweenISO(demandDeadline, expiryAt) < 0) {
@@ -2766,6 +3021,19 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         }
         set[k] = v;
       }
+      const asOf = todayISO();
+      /* Re-check the line BEFORE writing when the bond is already drawn. */
+      let drawnUtilisation: Awaited<ReturnType<typeof drawOnFacility>> | null = null;
+      const nowDrawn = (BOND_DRAWN_STATUSES as readonly string[]).includes(bond.status);
+      if (nextLine && nowDrawn) {
+        drawnUtilisation = await drawOnFacility(
+          nextLine.facility.id,
+          req.companyId!,
+          bondId,
+          { ...bond, ...(set as Partial<BondRow>), facilityId: nextLine.facility.id },
+          asOf,
+        );
+      }
       await app.db.update(bonds).set(set).where(eq(bonds.id, bondId));
       await appendLedger(app.db, {
         companyId: req.companyId!,
@@ -2773,10 +3041,31 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         action: "update",
         objectType: "bond",
         objectId: bondId,
-        payload: { changed: Object.keys(body) },
+        payload: {
+          changed: Object.keys(body),
+          ...(facilityChanged
+            ? {
+                facilityFrom: bond.facilityId,
+                facilityTo: nextLine ? nextLine.facility.id : null,
+                facilityNumber: nextLine ? nextLine.facility.number : null,
+                ...(drawnUtilisation
+                  ? {
+                      currency: drawnUtilisation.facility.currency,
+                      drawnAmount: drawnUtilisation.utilisation.drawnAmount,
+                      headroom: drawnUtilisation.utilisation.headroom,
+                    }
+                  : {}),
+              }
+            : {}),
+        },
+        storePayload: facilityChanged,
       });
       const updated = await fetchBond(bondId, req.companyId!, req.projectId!);
-      return decorateBond(updated, todayISO());
+      return {
+        ...decorateBond(updated, asOf),
+        facility: await bondFacilitySummary(updated, asOf),
+        facilityWarnings: nextLine?.warnings ?? [],
+      };
     },
   );
 
@@ -2814,6 +3103,22 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       if (body.status === "issued" && !bond.issuedAt) {
         throw badRequest("issuedAt must be recorded before a bond can be marked issued");
       }
+      const asOf = todayISO();
+      /*
+       * Issuing a bond against a line IS the drawdown. It is checked inside a
+       * transaction holding the facility row for update — two bonds issued at
+       * the same moment against the last of a line must not both succeed.
+       */
+      let drawn: Awaited<ReturnType<typeof drawOnFacility>> | null = null;
+      if (bond.facilityId && (BOND_DRAWN_STATUSES as readonly string[]).includes(body.status)) {
+        drawn = await drawOnFacility(
+          bond.facilityId,
+          req.companyId!,
+          bondId,
+          { ...bond, status: body.status },
+          asOf,
+        );
+      }
       await app.db
         .update(bonds)
         .set({ status: body.status, updatedAt: new Date().toISOString() })
@@ -2824,10 +3129,27 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         action: "state_change",
         objectType: "bond",
         objectId: bondId,
-        payload: { from: bond.status, to: body.status },
+        payload: {
+          from: bond.status,
+          to: body.status,
+          ...(drawn
+            ? {
+                facilityId: drawn.facility.id,
+                facilityNumber: drawn.facility.number,
+                currency: drawn.facility.currency,
+                limitAmount: drawn.facility.limitAmount,
+                drawnAmount: drawn.utilisation.drawnAmount,
+                headroom: drawn.utilisation.headroom,
+              }
+            : {}),
+        },
+        storePayload: drawn !== null,
       });
       const updated = await fetchBond(bondId, req.companyId!, req.projectId!);
-      return decorateBond(updated, todayISO());
+      return {
+        ...decorateBond(updated, asOf),
+        facility: await bondFacilitySummary(updated, asOf),
+      };
     },
   );
 
@@ -3077,6 +3399,14 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         .update(bonds)
         .set({ status: "released", releasedAt, updatedAt: new Date().toISOString() })
         .where(eq(bonds.id, bondId));
+      const asOf = todayISO();
+      /* Releasing a bond gives the line back. The headroom AFTER the release
+         goes in the ledger entry: "how much line did this free?" is the whole
+         reason a bonding facility is tracked. */
+      const facility = await bondFacilitySummary(
+        { ...bond, status: "released", releasedAt },
+        asOf,
+      );
       await appendLedger(app.db, {
         companyId: req.companyId!,
         actorId: req.user!.id,
@@ -3090,11 +3420,19 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
           reason: body.reason ?? null,
           amount: bond.amount,
           currency: bond.currency,
+          ...(facility
+            ? {
+                facilityId: facility.id,
+                facilityNumber: facility.number,
+                drawnAmount: facility.utilisation.drawnAmount,
+                headroom: facility.utilisation.headroom,
+              }
+            : {}),
         },
         storePayload: true,
       });
       const updated = await fetchBond(bondId, req.companyId!, req.projectId!);
-      return decorateBond(updated, todayISO());
+      return { ...decorateBond(updated, asOf), facility };
     },
   );
 
@@ -3399,8 +3737,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         // this branch runs at most once per claim. The key is belt and braces.
         const seen = await alreadySignalled(req.companyId!, "insurance_notification_missed");
         if (!seen.has(claimId)) {
-          await app.db.insert(signals).values({
-            id: newId("sig"),
+          await raiseSignalOnce(app.db, {
             companyId: req.companyId!,
             projectId: req.projectId!,
             detector: "insurance_notification_missed",
@@ -4107,6 +4444,28 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
           reserve: z.number().finite().nonnegative().optional(),
         })
         .parse(req.body);
+      /*
+       * This route is gated on `insurance:standard`, and the next thing it
+       * does is read a SAFETY record and copy its narrative into the claim it
+       * returns. A handler gated on one tool that reads a record belonging to
+       * another has widened the first tool's permission by choosing a URL —
+       * the same rule `/meeting-agenda-items/:id/raise` applies before it
+       * creates an RFI. So the caller must hold safety on this project too.
+       *
+       * (The uninsured-loss detector reads the same table without this check
+       * and is right not to have it: it runs as the SYSTEM actor on a
+       * schedule and publishes findings through the signal register, which
+       * has its own visibility rules. The claim evidence pack also reads it,
+       * but only through links already validated on this claim.)
+       */
+      if (!(await holdsToolOnProject(app, req, "safety", "read"))) {
+        throw forbidden(
+          "Raising a claim from an incident reads the safety register — the incident's title, " +
+            "narrative and estimated cost are copied onto the claim — so it needs read access to " +
+            "safety on this project as well as standard access to insurance. Ask someone who " +
+            "holds both, or record the claim directly and link the incident afterwards.",
+        );
+      }
       const [incident] = await app.db
         .select()
         .from(safetyIncidents)
@@ -4716,31 +5075,10 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
   }
 
   async function decorateFacility(facility: typeof bondFacilities.$inferSelect, asOf: string) {
-    const drawn = await app.db
-      .select()
-      .from(bonds)
-      .where(and(eq(bonds.companyId, facility.companyId), eq(bonds.facilityId, facility.id)));
+    const { rows: drawn, utilisation } = await computeFacilityLine(facility, asOf);
     return {
       ...facility,
-      utilisation: facilityUtilisation(
-        {
-          id: facility.id,
-          number: facility.number,
-          name: facility.name,
-          provider: facility.provider,
-          projectId: facility.projectId,
-          limitAmount: facility.limitAmount,
-          currency: facility.currency,
-          permittedBondTypes: facility.permittedBondTypes,
-          status: facility.status,
-          effectiveFrom: facility.effectiveFrom,
-          effectiveTo: facility.effectiveTo,
-          reviewDate: facility.reviewDate,
-        },
-        drawn.map((b) => ({ ...b, facilityId: b.facilityId })),
-        (b) => bondCurrentExposure(b, asOf).currentAmount,
-        asOf,
-      ),
+      utilisation,
       bonds: drawn.map((b) => ({
         id: b.id,
         number: b.number,
@@ -5449,22 +5787,55 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
     },
   );
 
-  async function buildExperience(companyId: string, projectId: string | null, visibleProjectIds: readonly string[] | null) {
+  /**
+   * Claims experience over a BOUNDED window.
+   *
+   * A company-scope roll-up that loads every premium and every claim the
+   * tenant has ever recorded is the unbounded shape PLAN §6.4 forbids, and it
+   * is also the wrong answer: an insurer rates on the last few years, not on
+   * everything since the company was formed. The window is explicit in the
+   * query and echoed in the payload so nobody mistakes a windowed figure for
+   * a lifetime one.
+   */
+  const EXPERIENCE_DEFAULT_YEARS = 6;
+
+  const experienceQuery = z.object({
+    windowYears: z.coerce.number().int().min(1).max(30).default(EXPERIENCE_DEFAULT_YEARS),
+    from: isoDateSchema.optional(),
+    to: isoDateSchema.optional(),
+  });
+
+  async function buildExperience(
+    companyId: string,
+    projectId: string | null,
+    visibleProjectIds: readonly string[] | null,
+    q: z.infer<typeof experienceQuery> = { windowYears: EXPERIENCE_DEFAULT_YEARS },
+  ) {
+    const to = q.to ?? todayISO();
+    const from =
+      q.from ??
+      (() => {
+        const d = new Date(`${to}T00:00:00.000Z`);
+        d.setUTCFullYear(d.getUTCFullYear() - q.windowYears);
+        return d.toISOString().slice(0, 10);
+      })();
     const inScope = <T extends { projectId: string | null }>(rows: readonly T[]): T[] =>
       visibleProjectIds === null
         ? [...rows]
         : rows.filter((r) => r.projectId === null || visibleProjectIds.includes(r.projectId));
+    /* The date a premium BUYS cover for, falling back to when it was booked. */
+    const premiumDate = sql`coalesce(${insurancePremiums.periodStart}, ${insurancePremiums.dueDate}, to_char(${insurancePremiums.createdAt}, 'YYYY-MM-DD'))`;
     const premiumRows = inScope(
       await app.db
         .select()
         .from(insurancePremiums)
         .where(
-          projectId
-            ? and(
-                eq(insurancePremiums.companyId, companyId),
-                eq(insurancePremiums.projectId, projectId),
-              )
-            : eq(insurancePremiums.companyId, companyId),
+          and(
+            eq(insurancePremiums.companyId, companyId),
+            projectId ? eq(insurancePremiums.projectId, projectId) : undefined,
+            sql`${premiumDate} >= ${from}`,
+            sql`${premiumDate} <= ${to}`,
+          ),
         ),
     );
     const claimRows = inScope(
@@ -5472,9 +5843,12 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         .select()
         .from(insuranceClaims)
         .where(
-          projectId
-            ? and(eq(insuranceClaims.companyId, companyId), eq(insuranceClaims.projectId, projectId))
-            : eq(insuranceClaims.companyId, companyId),
+          and(
+            eq(insuranceClaims.companyId, companyId),
+            projectId ? eq(insuranceClaims.projectId, projectId) : undefined,
+            sql`${insuranceClaims.incidentDate} >= ${from}`,
+            sql`${insuranceClaims.incidentDate} <= ${to}`,
+          ),
         ),
     );
     const policyRows = await app.db
@@ -5503,17 +5877,28 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       projectId,
       ...experience,
       byPolicyType,
+      window: { from, to, years: q.windowYears },
+      windowNote:
+        `Premiums are counted by the period they buy (falling back to the due date, then the ` +
+        `date they were booked) and claims by incident date, both between ${from} and ${to}. ` +
+        `Anything outside that window is excluded — this is a ${q.windowYears}-year experience ` +
+        `figure, not a lifetime one.`,
       inputs: { premiumRows: premiumRows.length, claimRows: claimRows.length },
     };
   }
 
   app.get("/projects/:projectId/insurance/experience", { preHandler: readGate }, async (req) =>
-    buildExperience(req.companyId!, req.projectId!, null),
+    buildExperience(req.companyId!, req.projectId!, null, experienceQuery.parse(req.query)),
   );
 
   app.get("/insurance/experience", { preHandler: companyScopedRead }, async (req) => {
     const scope = scopeOf(req);
-    return buildExperience(req.companyId!, null, scope.all ? null : scope.projectIds);
+    return buildExperience(
+      req.companyId!,
+      null,
+      scope.all ? null : scope.projectIds,
+      experienceQuery.parse(req.query),
+    );
   });
 
   /* ================================================================ */
@@ -5966,8 +6351,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
         const key = `${certId}:${file.sha256}`;
         const seen = await alreadySignalled(req.companyId!, "insurance_certificate_mismatch", [key]);
         if (!seen.has(key)) {
-          await app.db.insert(signals).values({
-            id: newId("sig"),
+          await raiseSignalOnce(app.db, {
             companyId: req.companyId!,
             projectId: req.projectId!,
             detector: "insurance_certificate_mismatch",
@@ -6371,8 +6755,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       const key = `${row.certificateId}:not_on_risk`;
       const seen = await alreadySignalled(row.companyId, "insurance_certificate_mismatch", [key]);
       if (!seen.has(key)) {
-        await app.db.insert(signals).values({
-          id: newId("sig"),
+        await raiseSignalOnce(app.db, {
           companyId: row.companyId,
           projectId: row.projectId,
           detector: "insurance_certificate_mismatch",
@@ -6598,8 +6981,7 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       if (seen.has(key)) continue;
       seen.add(key);
       const daysLeft = daysBetweenISO(asOf, claim.notificationDueAt!);
-      await app.db.insert(signals).values({
-        id: newId("sig"),
+      const warned = await raiseSignalOnce(app.db, {
         companyId,
         projectId: claim.projectId,
         detector: "insurance_notification_missed",
@@ -6625,12 +7007,13 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
           daysLeft,
         },
       });
+      if (!warned.raised) continue;
       await appendLedger(app.db, {
         companyId,
         actorId: null,
         action: "create",
         objectType: "signal",
-        objectId: claim.id,
+        objectId: warned.signalId,
         payload: { detector: "insurance_notification_missed", daysLeft, warning: true },
         projectId: claim.projectId,
       });

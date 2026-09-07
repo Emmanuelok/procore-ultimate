@@ -62,6 +62,7 @@ import { appendLedger } from "../../lib/ledger.js";
 import { AppError, badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { forEachCompany } from "../../lib/scheduler.js";
+import { raiseSignalOnce } from "./signalguard.js";
 import { pushNotifications } from "../notifications/service.js";
 import { resolveEmailTransport, type EmailTransport } from "../../lib/email.js";
 import { isoDateSchema, todayISO } from "../field/dates.js";
@@ -791,9 +792,7 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
           : item.priority === "high" || daysOverdue >= 14
             ? "medium"
             : "low";
-      const signalId = newId("sig");
-      await app.db.insert(signals).values({
-        id: signalId,
+      const { raised: signalRaised, signalId } = await raiseSignalOnce(app.db, {
         companyId,
         projectId: item.projectId,
         detector: OVERDUE_DETECTOR,
@@ -822,10 +821,14 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
           carryCount: item.carryCount,
         },
       });
+      /* The back-link is written either way: the action should point at the
+         signal that exists for it, whether this run created it or a parallel
+         one did. Only a genuine first raise is ledgered and counted. */
       await app.db
         .update(meetingActionItems)
         .set({ signalId, updatedAt: nowIso })
         .where(eq(meetingActionItems.id, item.id));
+      if (!signalRaised) continue;
       await appendLedger(app.db, {
         companyId,
         actorId,
@@ -870,9 +873,7 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       const rootId = (detailOf(item)["rootItemId"] as string | undefined) ?? item.id;
       if (seen.has(rootId)) continue;
       seen.add(rootId);
-      const signalId = newId("sig");
-      await app.db.insert(signals).values({
-        id: signalId,
+      const { raised: signalRaised, signalId } = await raiseSignalOnce(app.db, {
         companyId,
         projectId: item.projectId,
         detector: CARRY_DETECTOR,
@@ -896,6 +897,7 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
           carryCount: item.carryCount,
         },
       });
+      if (!signalRaised) continue;
       await appendLedger(app.db, {
         companyId,
         actorId,
@@ -3557,31 +3559,49 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     };
   });
 
-  /** Company-level view: every overdue action across the tenant. */
+  /**
+   * Company-level view: every overdue action across the tenant.
+   *
+   * PAGINATED, and the roll-up is its own aggregate query rather than a tally
+   * of whatever the page happened to load. On a tenant with a few hundred
+   * live projects the unpaginated version was a single response carrying tens
+   * of thousands of rows, and the per-project counts it derived from them
+   * would have started disagreeing with `total` the moment a page was applied.
+   */
   app.get("/meeting-action-items/overdue", { preHandler: companyScopedRead }, async (req) => {
+    const q = pageQuerySchema.parse(req.query);
     const scope = companyScopeOf(req, "meetings");
     const today = todayISO();
+    const where = and(
+      eq(meetingActionItems.companyId, req.companyId!),
+      scopeProjects(scope, meetingActionItems.projectId),
+      inArray(meetingActionItems.status, [...OPEN_ACTION_STATES]),
+      lt(meetingActionItems.dueDate, today),
+    );
+    const [totalRow] = await app.db.select({ n: count() }).from(meetingActionItems).where(where);
     const rows = await app.db
       .select()
       .from(meetingActionItems)
-      .where(
-        and(
-          eq(meetingActionItems.companyId, req.companyId!),
-          scopeProjects(scope, meetingActionItems.projectId),
-          inArray(meetingActionItems.status, [...OPEN_ACTION_STATES]),
-          lt(meetingActionItems.dueDate, today),
-        ),
-      )
-      .orderBy(asc(meetingActionItems.dueDate));
-    const byProject = new Map<string, number>();
-    for (const r of rows) byProject.set(r.projectId, (byProject.get(r.projectId) ?? 0) + 1);
+      .where(where)
+      .orderBy(asc(meetingActionItems.dueDate))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    /* The roll-up covers EVERY overdue action in scope, not this page of
+       them — a summary that only counted the visible rows would understate
+       the tenant's exposure by exactly as much as the reader could not see. */
+    const byProjectRows = await app.db
+      .select({ projectId: meetingActionItems.projectId, overdue: count() })
+      .from(meetingActionItems)
+      .where(where)
+      .groupBy(meetingActionItems.projectId);
     return {
+      ...paginate(rows, Number(totalRow?.n ?? 0), q),
       asOf: today,
       sweptBy: SWEEP_NOTE,
       scope: scope.all ? "all_projects" : `${scope.projectIds.length} project(s) you hold meetings on`,
-      total: rows.length,
-      byProject: [...byProject.entries()].map(([projectId, overdue]) => ({ projectId, overdue })),
-      items: rows,
+      byProject: byProjectRows
+        .map((r) => ({ projectId: r.projectId, overdue: Number(r.overdue) }))
+        .sort((a, b) => b.overdue - a.overdue),
     };
   });
 
@@ -4202,12 +4222,36 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
     },
   );
 
-  /** A recipient confirms receipt — the strongest form of delivery evidence. */
+  const acknowledgeSchema = z.object({
+    /** how a confirmation from an off-platform recipient actually arrived */
+    note: z.string().min(1).max(2000).optional(),
+  });
+
+  /**
+   * A recipient confirms receipt — the strongest form of delivery evidence.
+   *
+   * TWO DIFFERENT ACTS SHARE THIS ROUTE, and the difference is the point.
+   *
+   *  1. A PLATFORM recipient acknowledges their own copy. `readGate` is the
+   *     right level: acknowledging what you were sent is a reader's act, and
+   *     the ownership check below refuses anyone else's row.
+   *
+   *  2. An EXTERNAL recipient (a broker, the employer's agent) has no login,
+   *     so their delivery row carries `userId: null`. The ownership check
+   *     cannot bite on a row nobody here owns, which used to mean any holder
+   *     of `meetings:read` could mark the employer's copy acknowledged — and
+   *     that acknowledgement sets `minutesDeliveredAt`, the timestamp the
+   *     whole deemed-acceptance period is measured from. So logging a
+   *     third party's confirmation is treated as what it is: a record the
+   *     LOGGER makes about a confirmation they received, requiring standard
+   *     access, naming them, and carrying the note that says how it arrived.
+   */
   app.post(
     "/projects/:projectId/meetings/:meetingId/minutes/deliveries/:deliveryId/acknowledge",
     { preHandler: readGate },
     async (req) => {
       const { meetingId, deliveryId } = req.params as { meetingId: string; deliveryId: string };
+      const body = acknowledgeSchema.parse(req.body ?? {});
       const meeting = await fetchMeeting(req, meetingId);
       const [row] = await app.db
         .select()
@@ -4227,11 +4271,36 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
             "else pressed is not evidence of anything.",
         );
       }
+      const onBehalf = row.userId === null;
+      if (onBehalf) {
+        if (!(await holdsToolOnProject(app, req, "meetings", "standard"))) {
+          throw forbidden(
+            `${row.recipientName} is not a platform user, so nobody here can press their ` +
+              "acknowledgement. Recording that they confirmed receipt is a statement YOU make, " +
+              "and it anchors the deemed-acceptance period — so it needs standard access to " +
+              "meetings on this project, not read.",
+          );
+        }
+        if (!body.note) {
+          throw badRequest(
+            `${row.recipientName} received these minutes by ${row.channel}. Logging their ` +
+              "confirmation on their behalf needs a note saying how it reached you (the reply " +
+              "email, the call, the signed return) — an unexplained acknowledgement of somebody " +
+              "else's copy is not evidence.",
+          );
+        }
+      }
       if (row.status === "acknowledged") return row;
       const now = new Date().toISOString();
       await app.db
         .update(meetingMinuteDeliveries)
-        .set({ status: "acknowledged", acknowledgedAt: now, deliveredAt: row.deliveredAt ?? now })
+        .set({
+          status: "acknowledged",
+          acknowledgedAt: now,
+          deliveredAt: row.deliveredAt ?? now,
+          acknowledgedById: onBehalf ? req.user!.id : null,
+          acknowledgementNote: onBehalf ? (body.note ?? null) : (body.note ?? null),
+        })
         .where(eq(meetingMinuteDeliveries.id, deliveryId));
       if (!meeting.minutesDeliveredAt) {
         await app.db
@@ -4241,6 +4310,8 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       }
       await ledger("update", "meeting", meetingId, req, {
         minutesAcknowledgedBy: req.user!.id,
+        acknowledgedOnBehalfOf: onBehalf ? row.recipientName : null,
+        note: body.note ?? null,
         deliveryId,
         minutesVersion: row.minutesVersion,
       });
@@ -5089,9 +5160,7 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       if (msLeft > OBJECTION_WARN_DAYS * 86_400_000) continue;
       seen.add(key);
       const daysLeft = Math.max(0, Math.ceil(msLeft / 86_400_000));
-      const signalId = newId("sig");
-      await app.db.insert(signals).values({
-        id: signalId,
+      const { raised: signalRaised, signalId } = await raiseSignalOnce(app.db, {
         companyId,
         projectId: meeting.projectId,
         detector: OBJECTION_DETECTOR,
@@ -5119,6 +5188,7 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
           openObjections: window.openObjections,
         },
       });
+      if (!signalRaised) continue;
       await appendLedger(app.db, {
         companyId,
         actorId: null,

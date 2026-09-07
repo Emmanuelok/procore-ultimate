@@ -834,6 +834,12 @@ function ApprovalBlock({
   const [adjustHours, setAdjustHours] = useState<number | null>(card.totalHours);
   const [adjustDate, setAdjustDate] = useState("");
   const [adjustReason, setAdjustReason] = useState("");
+  /**
+   * A weekly overtime rule reprices the WHOLE week when an adjustment lands in
+   * it, and the foreman has to be told which other days moved — otherwise the
+   * cards silently disagree with the rule they were classified under.
+   */
+  const [adjustWeekNote, setAdjustWeekNote] = useState<string | null>(null);
 
   return (
     <div>
@@ -1048,13 +1054,34 @@ function ApprovalBlock({
               disabled={adjustHours === null || !adjustReason.trim()}
               onClick={async () => {
                 const result = await onRun("revise", () =>
-                  api.post(`/api/v1/projects/${projectId}/timecards/${card.id}/revise`, {
+                  api.post<{
+                    weekReclassified?: Array<{ reference?: string; skipped?: string }>;
+                  }>(`/api/v1/projects/${projectId}/timecards/${card.id}/revise`, {
                     workedHours: adjustHours,
                     adjustmentDate: adjustDate || undefined,
                     reason: adjustReason.trim(),
                   }),
                 );
                 if (result) {
+                  const moved = result.weekReclassified ?? [];
+                  const repriced = moved.filter((m) => !m.skipped);
+                  const skipped = moved.filter((m) => m.skipped);
+                  setAdjustWeekNote(
+                    moved.length === 0
+                      ? null
+                      : [
+                          repriced.length > 0
+                            ? `${repriced.length} other card(s) in the same pay week were ` +
+                              `repriced (${repriced
+                                .map((m) => m.reference ?? "?")
+                                .join(", ")}): a weekly overtime rule reprices the whole week ` +
+                              "when any day in it changes."
+                            : null,
+                          ...skipped.map((m) => m.skipped as string),
+                        ]
+                          .filter(Boolean)
+                          .join(" "),
+                  );
                   setAdjustReason("");
                   onDone();
                 }
@@ -1062,6 +1089,11 @@ function ApprovalBlock({
             >
               Raise the adjustment
             </Button>
+            {adjustWeekNote ? (
+              <Alert tone="warning" size="sm" title="The pay week was repriced" className="mt-3">
+                {adjustWeekNote}
+              </Alert>
+            ) : null}
           </CardBody>
         </Card>
       ) : null}

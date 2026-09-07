@@ -1730,6 +1730,32 @@ export const timecardRoutes: FastifyPluginAsync = async (app) => {
           allocations: body.allocations,
         });
       }
+      /*
+       * A WEEKLY RULE REPRICES THE WHOLE WEEK — INCLUDING FROM AN ADJUSTMENT.
+       *
+       * Create and PATCH both called this; revise did not. Under a 40-hour
+       * weekly threshold with Mon–Thu already booked at 8h, a +6h adjustment
+       * booked into that week pushes it over 40 on the Friday — but the
+       * Friday card kept its plain-time split, and was costed, allocated and
+       * PAID as plain time. The cards then disagreed with the rule they were
+       * classified under, and payroll pays the cards.
+       *
+       * `reclassifyWeek` refuses to touch approved/locked/exported cards and
+       * reports them as skipped, so a correction never silently reopens a
+       * split a person already signed.
+       */
+      const weekReclassified =
+        overtimeRuleOf(crew).kind === "weekly"
+          ? await reclassifyWeek(
+              projectId,
+              companyId,
+              original.workerId,
+              adjustmentDate,
+              cfg.weekStartsOn,
+              actorId,
+            )
+          : [];
+
       await ledgerTimecards(app.db, req, "create", "timecard_adjustment", id, {
         reference,
         revises: original.reference,
@@ -1737,10 +1763,12 @@ export const timecardRoutes: FastifyPluginAsync = async (app) => {
         adjustmentDate,
         reason: body.reason,
         hours: resolved.split,
+        weekReclassified: weekReclassified.length,
       });
       return reply.status(201).send({
         adjustment: await timecardView(id, companyId, projectId),
         original: await timecardView(original.id, companyId, projectId),
+        weekReclassified,
       });
     },
   );

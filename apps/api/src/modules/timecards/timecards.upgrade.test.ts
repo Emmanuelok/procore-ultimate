@@ -449,6 +449,96 @@ describe("regressions", () => {
     expect(fridayAfter.json().overtimeHours).toBeGreaterThan(0);
   });
 
+  it("reprices the rest of the week when an adjustment card is booked into it", async () => {
+    /*
+     * Audit bug #15 named BOTH paths. Create and PATCH called reclassifyWeek;
+     * revise did not. Mon-Fri at 8 h each sits exactly on a 40 h weekly
+     * threshold with no overtime anywhere. A +6 h adjustment booked into that
+     * week pushes it over 40 before Friday — but Friday kept its plain-time
+     * split and was costed, allocated and PAID as plain time, disagreeing with
+     * the rule it was classified under.
+     */
+    const weekly = await post(`/projects/${projectId}/crews`, {
+      name: "Weekly rule adjustment gang",
+      trade: "groundworks",
+      config: { overtimeRule: "weekly", weeklyOvertimeThresholdHours: 40, weekStartsOn: 1 },
+    });
+    expect(weekly.statusCode, weekly.body).toBe(201);
+    const weeklyCrewId = weekly.json().id as string;
+    const workerId = newId("wkr");
+    await app.db.insert(workers).values({
+      id: workerId,
+      companyId: owner.companyId,
+      projectId,
+      reference: "W-WEEKADJ",
+      fullName: "Weekly adjustment worker",
+      currency: "GBP",
+      createdBy: owner.userId,
+    });
+    await app.db.insert(crewMembers).values({
+      id: newId("crm"),
+      companyId: owner.companyId,
+      projectId,
+      crewId: weeklyCrewId,
+      workerId,
+      fromDate: day(56),
+      hourlyRate: 20,
+      overtimeMultiplier: 1.5,
+      currency: "GBP",
+      createdBy: owner.userId,
+    });
+
+    // day(56) is a Monday. Mon-Fri, 8 h each = exactly 40 h, no overtime.
+    const week: string[] = [];
+    for (let d = 56; d <= 60; d += 1) {
+      const res = await post(`/projects/${projectId}/timecards`, {
+        workerId,
+        crewId: weeklyCrewId,
+        workDate: day(d),
+        workedHours: 8,
+        // Monday is coded because it has to be submitted and signed off before
+        // an adjustment against it is possible at all.
+        ...(d === 56
+          ? {
+              allocations: [
+                { costCodeId, budgetLineItemId: budgetLineId, regularHours: 8 },
+              ],
+            }
+          : {}),
+      });
+      expect(res.statusCode, res.body).toBe(201);
+      week.push(res.json().id as string);
+    }
+    const fridayBefore = await get(`/projects/${projectId}/timecards/${week[4]!}`);
+    expect(fridayBefore.json().overtimeHours).toBe(0);
+
+    // Monday is signed off, so it can only be corrected by an adjustment.
+    expect(
+      (await post(`/projects/${projectId}/timecards/${week[0]!}/submit`, {})).statusCode,
+    ).toBe(200);
+    const approved = await post(
+      `/projects/${projectId}/timecards/${week[0]!}/approve`,
+      { decision: "approved" },
+      approver.headers,
+    );
+    expect(approved.statusCode, approved.body).toBe(200);
+
+    // The correction is booked on the Tuesday night shift — inside the same
+    // pay week, on a slot the day-shift card does not occupy.
+    const revised = await post(`/projects/${projectId}/timecards/${week[0]!}/revise`, {
+      adjustmentDate: day(57),
+      shift: "night",
+      reason: "Monday was 14 h, not 8 h",
+      workedHours: 14,
+    });
+    expect(revised.statusCode, revised.body).toBe(201);
+    const reclassified = revised.json().weekReclassified as Array<{ reference: string }>;
+    expect(reclassified.length).toBeGreaterThan(0);
+
+    const fridayAfter = await get(`/projects/${projectId}/timecards/${week[4]!}`);
+    expect(fridayAfter.json().overtimeHours).toBeGreaterThan(0);
+  });
+
   it("does not match a dated adjustment against the adjustment day's access record", async () => {
     const workerId = newId("wkr");
     await app.db.insert(workers).values({

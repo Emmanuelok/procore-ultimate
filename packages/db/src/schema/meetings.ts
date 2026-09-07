@@ -489,6 +489,20 @@ export const meetingMinuteDeliveries = pgTable(
     status: text("status").default("pending").notNull(), // MinuteDeliveryStatus
     deliveredAt: timestamp("delivered_at", { withTimezone: true, mode: "string" }),
     acknowledgedAt: timestamp("acknowledged_at", { withTimezone: true, mode: "string" }),
+    /*
+     * WHO PRESSED IT.
+     *
+     * A platform recipient acknowledges their OWN copy and this stays null —
+     * the acknowledgement is the recipient's act. An external recipient (a
+     * broker, the employer's agent) has no login, so their confirmation
+     * reaches the platform second-hand: somebody here logs the email or the
+     * phone call. That is a different act with a different evidential weight,
+     * so it names the person who logged it and what they relied on. Without
+     * this, any reader could press an external recipient's acknowledgement
+     * and the record could not tell the two apart.
+     */
+    acknowledgedById: text("acknowledged_by_id"),
+    acknowledgementNote: text("acknowledgement_note"),
     failureReason: text("failure_reason"),
     /** the document actually sent, so a later dispute compares hashes */
     documentSha256: text("document_sha256"),

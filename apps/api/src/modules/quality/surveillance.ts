@@ -17,7 +17,7 @@
  */
 
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, eq, inArray, isNotNull, isNull } from "drizzle-orm";
+import { and, asc, count, eq, inArray, isNotNull, isNull, notInArray } from "drizzle-orm";
 import { z } from "zod";
 import { inspectionTestPlans, itpActivities, itpActivityReleases } from "@constructos/db";
 import { ITP_RESPONSIBLE_PARTIES } from "@constructos/shared";
@@ -33,7 +33,7 @@ import {
   nowISO,
   todayISO,
 } from "./shared.js";
-import { summariseActivities } from "./holdPoints.js";
+import { summariseActivities, TERMINAL_ACTIVITY_STATUSES } from "./holdPoints.js";
 import {
   canReleaseLeg,
   chainSummary,
@@ -618,6 +618,19 @@ export const surveillanceRoutes: FastifyPluginAsync = async (app) => {
     }
     if (query.openOnly) {
       clauses.push(inArray(itpActivityReleases.status, ["pending", "notified", "attended"]));
+      /*
+       * A LEG ON A POINT THAT IS OVER IS NOT OUTSTANDING.
+       *
+       * The register is the list a surveillance co-ordinator chases, and it
+       * judged only the leg. A point that was waived, failed, marked not
+       * applicable or closed leaves its unsigned legs sitting at `pending` for
+       * ever — nothing reconciles them, because the decision was taken about
+       * the point rather than about the leg — so the co-ordinator was being
+       * sent to chase a notified body for an inspection nobody is going to
+       * hold. Those legs still exist and are still readable without
+       * `openOnly`; they are simply not outstanding work.
+       */
+      clauses.push(notInArray(itpActivities.status, [...TERMINAL_ACTIVITY_STATUSES]));
     }
     /*
      * PAGINATED, AND THE TOTAL IS THE REAL TOTAL.
@@ -629,58 +642,45 @@ export const surveillanceRoutes: FastifyPluginAsync = async (app) => {
      * where clause as the page, not over the page.
      */
     const where = and(...clauses);
-    const [totalRow] = await app.db
-      .select({ n: count() })
-      .from(itpActivityReleases)
-      .where(where);
-    const [awaitingRow] = await app.db
-      .select({ n: count() })
-      .from(itpActivityReleases)
-      .where(
-        and(
-          where,
-          inArray(itpActivityReleases.status, ["pending", "notified", "attended"]),
-          isNull(itpActivityReleases.attendedAt),
-        ),
-      );
-    const [notifiedRow] = await app.db
-      .select({ n: count() })
-      .from(itpActivityReleases)
-      .where(
-        and(
-          where,
-          inArray(itpActivityReleases.status, ["pending", "notified", "attended"]),
-          isNotNull(itpActivityReleases.notifiedAt),
-        ),
-      );
+    const joined = () =>
+      app.db
+        .select({ n: count() })
+        .from(itpActivityReleases)
+        .innerJoin(itpActivities, eq(itpActivities.id, itpActivityReleases.activityId));
+    const [totalRow] = await joined().where(where);
+    const [awaitingRow] = await joined().where(
+      and(
+        where,
+        inArray(itpActivityReleases.status, ["pending", "notified", "attended"]),
+        isNull(itpActivityReleases.attendedAt),
+      ),
+    );
+    const [notifiedRow] = await joined().where(
+      and(
+        where,
+        inArray(itpActivityReleases.status, ["pending", "notified", "attended"]),
+        isNotNull(itpActivityReleases.notifiedAt),
+      ),
+    );
     const rows = await app.db
-      .select()
+      .select({ leg: itpActivityReleases, activity: itpActivities })
       .from(itpActivityReleases)
+      .innerJoin(itpActivities, eq(itpActivities.id, itpActivityReleases.activityId))
       .where(where)
       .orderBy(asc(itpActivityReleases.createdAt))
       .limit(query.pageSize)
       .offset(pageOffset(query));
-    const activityIds = [...new Set(rows.map((r) => r.activityId))];
-    const activities = activityIds.length
-      ? await app.db
-          .select()
-          .from(itpActivities)
-          .where(inArray(itpActivities.id, activityIds))
-      : [];
-    const byId = new Map(activities.map((a) => [a.id, a] as const));
     const items = rows.map((r) => ({
-      ...r,
-      activity: byId.get(r.activityId)
-        ? {
-            id: r.activityId,
-            activity: byId.get(r.activityId)!.activity,
-            activityCode: byId.get(r.activityId)!.activityCode,
-            interventionPoint: byId.get(r.activityId)!.interventionPoint,
-            plannedDate: byId.get(r.activityId)!.plannedDate,
-            status: byId.get(r.activityId)!.status,
-            itpId: byId.get(r.activityId)!.itpId,
-          }
-        : null,
+      ...r.leg,
+      activity: {
+        id: r.activity.id,
+        activity: r.activity.activity,
+        activityCode: r.activity.activityCode,
+        interventionPoint: r.activity.interventionPoint,
+        plannedDate: r.activity.plannedDate,
+        status: r.activity.status,
+        itpId: r.activity.itpId,
+      },
     }));
     return {
       ...paginate(items, Number(totalRow?.n ?? 0), query),
