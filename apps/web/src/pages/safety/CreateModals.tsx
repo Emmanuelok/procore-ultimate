@@ -28,6 +28,7 @@ import {
   Select,
   Textarea,
 } from "../../ui";
+import { SAFETY_RECORD_KINDS_ALL } from "@constructos/shared";
 import { api } from "../../lib/api";
 import {
   RefusalNotice,
@@ -81,29 +82,14 @@ const CATEGORIES = [
   "other",
 ];
 
-/** Every kind the programme register accepts — the frozen list plus this wave's. */
-const RECORD_KINDS = [
-  "policy",
-  "risk_assessment",
-  "method_statement",
-  "jha",
-  "permit_to_work",
-  "training_record",
-  "competency_card",
-  "induction_record",
-  "emergency_plan",
-  "statutory_register",
-  "temporary_works_design",
-  "coshh_assessment",
-  "safety_meeting_minutes",
-  "drug_alcohol_policy",
-  "drug_alcohol_test",
-  "lone_worker_procedure",
-  "fatigue_management_plan",
-  "wellbeing_record",
-  "contractor_safety_plan",
-  "other",
-];
+/**
+ * Every kind the programme register accepts — read from the enum the API
+ * validates against rather than retyped here. A hand-written copy offered
+ * three kinds the API rejects (`training_record`, `induction_record`,
+ * `other`) and hid seven it accepts, including the `training_matrix` the
+ * register's own filter lists.
+ */
+const RECORD_KINDS: readonly string[] = SAFETY_RECORD_KINDS_ALL;
 
 const SCORING_METHODS = ["percentage", "weighted", "points", "pass_fail", "none"];
 const ITEM_TYPES = ["pass_fail", "pass_fail_na", "text", "long_text", "number", "photo", "section_header"];

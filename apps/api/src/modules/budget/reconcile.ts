@@ -80,6 +80,8 @@ export const UNSETTLED_PAYMENT_STATUSES: readonly string[] = ["voided", "failed"
 /* ------------------------------------------------------------------ */
 
 export interface InvoiceLineRead {
+  /** The invoice LINE's own id — the posting coordinate for a loose line. */
+  lineId: string;
   invoiceId: string;
   invoiceNumber: number;
   invoiceReference: string;
@@ -366,6 +368,7 @@ export async function readInvoicedSources(db: Db, budget: BudgetRow): Promise<So
   const relevant = rows.filter((r) => r.kind === "subcontractor_invoice" && (INCURRED_INVOICE_STATUSES as readonly string[]).includes(r.status));
   const chosen = latestInvoiceLinePerSovLine(
     relevant.map((r) => ({
+      lineId: r.lineId,
       invoiceId: r.invoiceId,
       invoiceNumber: r.invoiceNumber,
       invoiceReference: r.invoiceReference,
@@ -378,14 +381,20 @@ export async function readInvoicedSources(db: Db, budget: BudgetRow): Promise<So
       currency: r.currency,
     })),
   );
-  const byInvoiceLine = new Map(relevant.map((r) => [`${r.invoiceId}:${r.commitmentSovLineId ?? r.lineId}`, r]));
+  // Both sides of this lookup use ONE coordinate shape. Keying a loose line
+  // (no commitment SOV line) by anything the chosen row cannot reproduce sent
+  // two such lines on the same invoice to the same posting id, and the second
+  // overwrote the first in budget_postings.
+  const coordinateOf = (r: { invoiceId: string; commitmentSovLineId: string | null; lineId: string }): string =>
+    r.commitmentSovLineId ? `${r.invoiceId}:sov:${r.commitmentSovLineId}` : `${r.invoiceId}:line:${r.lineId}`;
+  const byInvoiceLine = new Map(relevant.map((r) => [coordinateOf(r), r]));
   const supersededCount = relevant.length - chosen.length;
   const folded = foldRows(
     chosen.map((c) => {
-      const raw = byInvoiceLine.get(`${c.invoiceId}:${c.commitmentSovLineId ?? ""}`) ?? relevant.find((r) => r.invoiceId === c.invoiceId && r.budgetLineItemId === c.budgetLineItemId);
+      const raw = byInvoiceLine.get(coordinateOf(c));
       return {
         sourceType: "invoice_line" as const,
-        sourceId: c.commitmentSovLineId ? `sov:${c.commitmentSovLineId}` : `line:${raw?.lineId ?? c.invoiceId}`,
+        sourceId: c.commitmentSovLineId ? `sov:${c.commitmentSovLineId}` : `line:${c.lineId}`,
         reference: c.invoiceReference,
         description: raw?.description ?? "Invoice line",
         status: c.invoiceStatus,

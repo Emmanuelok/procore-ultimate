@@ -288,7 +288,8 @@ describe("cashflow.ts — S-curve spreading", () => {
 /* ------------------------------------------------------------------ */
 
 describe("reconcile.ts — job-to-date arithmetic", () => {
-  const inv = (invoiceNumber: number, sov: string | null, total: number, approvedAt = "2026-01-01") => ({
+  const inv = (invoiceNumber: number, sov: string | null, total: number, approvedAt = "2026-01-01", lineId?: string) => ({
+    lineId: lineId ?? `il-${invoiceNumber}-${sov ?? "loose"}`,
     invoiceId: `inv${invoiceNumber}`,
     invoiceNumber,
     invoiceReference: `INV-${invoiceNumber}`,

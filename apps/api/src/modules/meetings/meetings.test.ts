@@ -1664,6 +1664,114 @@ describe("audit bug regressions", () => {
     expect(bogus.statusCode).toBe(404);
   });
 
+  it("[verifier] refuses to move the objection period once the minutes are issued", async () => {
+    const id = await heldMeeting("Objection clock");
+    const issued = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${id}/minutes/issue`,
+      chair.headers,
+      {},
+    );
+    expect(issued.statusCode).toBe(200);
+    expect(issued.json().minutesObjectionWindow.expired).toBe(false);
+
+    /* Shortening the window to nothing closed it instantly, deemed the
+       minutes accepted and locked every recipient out of objecting — with an
+       ordinary field `update` as the only trace. */
+    const shortened = await inject(
+      "PATCH",
+      `/api/v1/projects/${projectId}/meetings/${id}`,
+      chair.headers,
+      { objectionPeriodDays: 0 },
+    );
+    expect(shortened.statusCode).toBe(409);
+    expect(shortened.json().message).toMatch(/objection period cannot be changed/i);
+
+    const after = await inject("GET", `/api/v1/projects/${projectId}/meetings/${id}`, chair.headers);
+    expect(after.json().objectionPeriodDays).toBe(7);
+    expect(after.json().minutesObjectionWindow.expired).toBe(false);
+
+    /* The recipient can still object, which is the point of the guard. */
+    const objected = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${id}/minutes/object`,
+      h2,
+      { note: "The crane sequence is not what was agreed" },
+    );
+    expect(objected.statusCode).toBe(200);
+
+    /* Editing anything else is still allowed, and re-sending the SAME period
+       is not a change. */
+    const ok = await inject("PATCH", `/api/v1/projects/${projectId}/meetings/${id}`, chair.headers, {
+      location: "Site cabin 2",
+      objectionPeriodDays: 7,
+    });
+    expect(ok.statusCode).toBe(200);
+  });
+
+  it("[verifier] refuses to repoint an action item at a meeting outside the request's project", async () => {
+    const stranger = await registerActor(built.app);
+    const foreignProject = newId("prj");
+    await built.app.db
+      .insert(projects)
+      .values({ id: foreignProject, companyId: stranger.companyId, name: "Another tenant" });
+    const foreignMeeting = await inject(
+      "POST",
+      `/api/v1/projects/${foreignProject}/meetings`,
+      stranger.headers,
+      { title: "Their board meeting" },
+    );
+    expect(foreignMeeting.statusCode).toBe(201);
+    const victimId = foreignMeeting.json().id as string;
+
+    const action = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meeting-action-items`,
+      chair.headers,
+      { title: "Injected action", ownerName: "Nobody" },
+    );
+    expect(action.statusCode).toBe(201);
+    const actionId = action.json().id as string;
+
+    /* The meeting detail route lists action items by meetingId alone, so an
+       unvalidated PATCH put this row on another tenant's agenda. */
+    const injected = await inject(
+      "PATCH",
+      `/api/v1/projects/${projectId}/meeting-action-items/${actionId}`,
+      chair.headers,
+      { meetingId: victimId },
+    );
+    expect(injected.statusCode).toBe(404);
+
+    const victim = await inject(
+      "GET",
+      `/api/v1/projects/${foreignProject}/meetings/${victimId}`,
+      stranger.headers,
+    );
+    expect(victim.statusCode).toBe(200);
+    expect(victim.json().actionItems).toEqual([]);
+
+    /* The same guard for the other two parents, and a legitimate move still
+       works and keeps seriesId consistent with the meeting it moved to. */
+    const bogusItem = await inject(
+      "PATCH",
+      `/api/v1/projects/${projectId}/meeting-action-items/${actionId}`,
+      chair.headers,
+      { agendaItemId: "magi_not_real" },
+    );
+    expect(bogusItem.statusCode).toBe(404);
+
+    const home = await heldMeeting("Action rehoming");
+    const moved = await inject(
+      "PATCH",
+      `/api/v1/projects/${projectId}/meeting-action-items/${actionId}`,
+      chair.headers,
+      { meetingId: home },
+    );
+    expect(moved.statusCode).toBe(200);
+    expect(moved.json().meetingId).toBe(home);
+  });
+
   it("[#5] scopes the company-wide overdue register to the caller's own projects", async () => {
     const res = await inject("GET", "/api/v1/meeting-action-items/overdue", hRead);
     expect(res.statusCode).toBe(200);

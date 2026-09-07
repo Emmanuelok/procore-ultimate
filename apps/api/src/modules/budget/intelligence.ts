@@ -962,15 +962,31 @@ export const budgetIntelligenceRoutes: FastifyPluginAsync = async (app) => {
     return rows[0];
   }
 
-  /** A company-wide map row belongs to every project; the gate runs on the project in the query. */
+  /**
+   * Gate a write to one GL mapping.
+   *
+   * A PROJECT-scoped row is gated on its own project, like everything else.
+   * A COMPANY-WIDE row governs the ERP import of every project in the
+   * company, and the caller chooses the project the gate would run on — so
+   * gating it on a project the caller nominates is no gate at all: budget
+   * rights on one small project would let someone repoint (or delete) the
+   * mapping every other project imports through. A company-wide row
+   * therefore takes a company role, and the write is ledgered at company
+   * level (projectId null) because that is the scope it actually has.
+   */
   async function requireMapLevel(req: Parameters<typeof requireBudgetLevel>[1], reply: Parameters<typeof requireBudgetLevel>[2], map: { projectId: string | null }, level: "standard" | "admin") {
-    const q = z.object({ projectId: idRef.optional() }).parse(req.query ?? {});
-    const projectId = map.projectId ?? q.projectId;
-    if (!projectId) {
-      throw badRequest("This mapping is company-wide; pass ?projectId= so the budget tool level can be checked on a project.");
+    if (!map.projectId) {
+      if (req.companyRole !== "owner" && req.companyRole !== "admin") {
+        throw forbidden(
+          "This mapping is company-wide: it governs the ERP import of every project in the " +
+            "company, so only a company owner or admin may change it. Raise a project-scoped " +
+            "mapping instead to override it on one project.",
+        );
+      }
+      return null;
     }
-    await requireBudgetLevel(app, req, reply, projectId, level);
-    return projectId;
+    await requireBudgetLevel(app, req, reply, map.projectId, level);
+    return map.projectId;
   }
 
   app.patch("/gl-cost-code-maps/:mapId", { preHandler: companyGate }, async (req, reply) => {
