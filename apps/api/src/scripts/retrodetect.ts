@@ -1150,7 +1150,9 @@ async function seedCleanControl(): Promise<void> {
 
   // A critical grievance (same 7-day SLA as the planted one) received three
   // days ago, acknowledged, resolved and closed WITH the complainant — the
-  // full #572-573 ladder, well inside its deadline.
+  // full #572-573 ladder, well inside its deadline. The assignee resolves and
+  // a different officer verifies closure: #573 refuses a verifier who wrote
+  // the resolution, so the honest ladder needs two people, like the real one.
   const settled = (await post(ctx.ownerA, `/projects/${projectId}/grievances`, {
     channel: "in_person",
     complainantName: "Mr K. Whitlock",
@@ -1166,7 +1168,7 @@ async function seedCleanControl(): Promise<void> {
   await post(ctx.ownerA, `/projects/${projectId}/grievances/${settled.id}/assign`, {
     assigneeId: ctx.memberB.userId,
   });
-  await post(ctx.ownerA, `/projects/${projectId}/grievances/${settled.id}/resolve`, {
+  await post(ctx.memberB, `/projects/${projectId}/grievances/${settled.id}/resolve`, {
     resolution: "Signed pedestrian diversion installed via Harbour Street; route reopened.",
   });
   await post(ctx.ownerA, `/projects/${projectId}/grievances/${settled.id}/verify-closure`, {
@@ -1218,8 +1220,18 @@ async function seedCleanControl(): Promise<void> {
     evidenceIds: [payment.id],
     note: "Compensation at valuation, paid to the registered proprietor.",
   });
-  await post(ctx.ownerA, `/projects/${projectId}/parcels/${parcel.id}/status`, {
-    status: "acquired",
+  // Acquisition goes through the evidenced route: title passes on a recorded
+  // basis with the transfer deed attached, never by flipping a status.
+  const deed = (await post(ctx.ownerA, `/projects/${projectId}/evidence`, {
+    kind: "document",
+    source: "HM Land Registry TR1 transfer, Harbour Quay Estates Ltd to the employer",
+    independenceScore: 0.9,
+    metadata: { title: "Registered transfer HQ-LP-007", reference: "TR1/HQ/0442" },
+  })) as unknown as { id: string };
+  await post(ctx.ownerA, `/projects/${projectId}/parcels/${parcel.id}/acquire`, {
+    acquisitionBasis: "purchase",
+    acquiredAt: addDaysISO(today, -14),
+    evidenceIds: [deed.id],
     note: "Transfer registered; possession taken.",
   });
 
