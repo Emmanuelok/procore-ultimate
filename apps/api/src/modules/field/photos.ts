@@ -704,8 +704,21 @@ export const photoRoutes: FastifyPluginAsync = async (app) => {
       .from(photos)
       .innerJoin(files, eq(files.id, photos.fileId))
       .where(and(scope(req), inArray(photos.id, body.photoIds)));
-    const allowed = [];
-    for (const r of rows) if (await canSeeAlbum(req, req.projectId!, r.photo.album)) allowed.push(r);
+    // Album privacy resolved with two queries rather than two per photo: a
+    // 100-photo selection used to issue 200 round trips before a byte moved.
+    const admin = await isPhotosAdmin(req, req.projectId!);
+    const privateAlbums = await app.db
+      .select()
+      .from(photoAlbums)
+      .where(and(eq(photoAlbums.companyId, req.companyId!), eq(photoAlbums.projectId, req.projectId!), eq(photoAlbums.isPrivate, 1)));
+    const me = req.user!.id;
+    const visible = (album: string | null) => {
+      if (!album) return true;
+      const rec = privateAlbums.find((a) => a.name === album);
+      if (!rec) return true;
+      return admin || rec.createdBy === me || rec.allowedUserIds.includes(me);
+    };
+    const allowed = rows.filter((r) => visible(r.photo.album));
     if (allowed.length === 0) throw notFound("No downloadable photos in the selection");
     const total = allowed.reduce((s, r) => s + r.sizeBytes, 0);
     if (total > BULK_DOWNLOAD_MAX_BYTES) {
