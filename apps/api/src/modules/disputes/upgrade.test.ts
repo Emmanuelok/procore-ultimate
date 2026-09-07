@@ -19,7 +19,14 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq, inArray } from "drizzle-orm";
-import { companyMemberships, files, obligations, projects, settlementOffers } from "@constructos/db";
+import {
+  companyMemberships,
+  files,
+  obligations,
+  projectMemberships,
+  projects,
+  settlementOffers,
+} from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
 import { newId } from "../../lib/ids.js";
 import { addDaysISO, todayISO } from "../field/dates.js";
@@ -864,6 +871,62 @@ describe("outcome analytics and drafting recommendations", () => {
     } else {
       expect(recs.json().reason).toBeTruthy();
     }
+  });
+
+  /**
+   * REGRESSION (verifier): `?projectId=` used to REPLACE the caller's
+   * visible scope instead of narrowing it, so a member holding disputes
+   * access on project A could read project B's whole outcome database —
+   * amounts claimed and awarded, win rates, root causes — simply by naming
+   * it. Scope is now always applied and the filter can only narrow within
+   * it.
+   */
+  it("REGRESSION: ?projectId cannot widen the caller's visible scope", async () => {
+    const mine = await makeProject("Analytics Scope Mine");
+    const theirs = await makeProject("Analytics Scope Theirs");
+    const hidden = await createDispute(theirs, { currency: "GBP", amountInDispute: 900_000 });
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${theirs}/disputes/${hidden.id}/status`,
+      headers: owner.headers,
+      payload: { status: "decided", outcome: "Award", amountAwarded: 900_000 },
+    });
+
+    const member = await registerActor(app);
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: member.userId,
+      role: "member",
+    });
+    await app.db.insert(projectMemberships).values({
+      id: newId("pm"),
+      companyId: owner.companyId,
+      projectId: mine,
+      userId: member.userId,
+      templateKey: "read_only",
+      overrides: { disputes: "read" },
+    });
+    const memberHeaders = {
+      authorization: member.headers["authorization"]!,
+      "x-company-id": owner.companyId,
+    };
+
+    const leak = await app.inject({
+      method: "GET",
+      url: `/api/v1/disputes/analytics?groupBy=rootCause&projectId=${theirs}`,
+      headers: memberHeaders,
+    });
+    expect(leak.statusCode).toBe(200);
+    expect(leak.json().overall === null || leak.json().overall.disputes === 0).toBe(true);
+
+    // The owner, who can see everything, still gets the row.
+    const allowed = await app.inject({
+      method: "GET",
+      url: `/api/v1/disputes/analytics?groupBy=rootCause&projectId=${theirs}`,
+      headers: owner.headers,
+    });
+    expect(allowed.json().overall.disputes).toBe(1);
   });
 
   it("returns dispute health inputs with reasons rather than fabricated zeroes", async () => {

@@ -1635,6 +1635,9 @@ export interface VendorBidHistoryRow {
   onTime: boolean | null;
   rank: number | null;
   fieldSize: number;
+  /** the tender is still sealed and unopened: the figures are withheld here */
+  sealed: boolean;
+  sealNote: string | null;
   deviationFromMedianPercent: number | null;
   deviationFromEstimatePercent: number | null;
   won: boolean;

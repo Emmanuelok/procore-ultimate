@@ -1677,8 +1677,50 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
             ),
           );
       }
-      // Every bid the award knocked out comes back into contention: the
-      // package is live again and they are entitled to be considered.
+      /*
+       * THE BUDGET HAS TO HEAR ABOUT THIS TOO.
+       *
+       * Approval ran `syncBudgetCommitted`, so the awarded sum is sitting on
+       * the budget line as committed (or pending) exposure. Voiding the
+       * commitment removes it from the rollup's arithmetic but does not
+       * RECOMPUTE the rollup, so without this the budget line kept reporting
+       * money committed against a commitment that no longer exists — and the
+       * figure only corrected itself the next time somebody happened to
+       * touch another commitment on the same line.
+       */
+      if (award.commitmentId) {
+        const budgetLines = await budgetLineIdsFor(db, award.commitmentId);
+        if (budgetLines.length > 0) {
+          await syncBudgetCommitted(db, award.companyId, award.projectId, budgetLines);
+        }
+      }
+
+      /*
+       * A WITHDRAWAL UNWINDS THIS AWARD AND NOTHING ELSE.
+       *
+       * On a split package the other partial awards are still live, still
+       * approved and still carry their own commitments. Restoring every
+       * "awarded" submission on the package would take the OTHER winners out
+       * of "awarded" while their award stood, and dropping the package to
+       * "under_evaluation" would forget that part of the scope is bought.
+       * So: the submissions the surviving awards hold are left alone, and
+       * the package's status is recomputed from what is still live.
+       */
+      const siblingAwards = await db
+        .select()
+        .from(bidAwards)
+        .where(eq(bidAwards.packageId, award.packageId));
+      const otherLive = siblingAwards.filter(
+        (a) => a.id !== award.id && !TERMINAL_AWARD_STATUSES.includes(a.status),
+      );
+      const heldByOthers = new Set(otherLive.map((a) => a.submissionId));
+      const scopeHeldByOthers = new Set(
+        otherLive.flatMap((a) => ((a.scopeLevellingItemIds as string[] | null) ?? [])),
+      );
+
+      // Every bid THIS award knocked out comes back into contention: that
+      // part of the package is live again and they are entitled to be
+      // considered.
       const subs = await db
         .select()
         .from(bidSubmissions)
@@ -1686,20 +1728,41 @@ export const awardRoutes: FastifyPluginAsync = async (app) => {
       for (const sub of subs) {
         if (sub.status !== "unsuccessful" && sub.status !== "awarded") continue;
         if (sub.supersededById) continue;
+        if (heldByOthers.has(sub.id)) continue;
         await db
           .update(bidSubmissions)
           .set({ status: "under_review", updatedAt: now })
           .where(eq(bidSubmissions.id, sub.id));
         restored.push(sub.id);
       }
+
+      let packageStatusAfter: "under_evaluation" | "partially_awarded" | "awarded" =
+        "under_evaluation";
+      if (otherLive.length > 0) {
+        const scopeItems = await db
+          .select()
+          .from(bidLevellingItems)
+          .where(eq(bidLevellingItems.packageId, award.packageId));
+        const stillUnplaced = scopeItems.filter(
+          (i) => i.isMandatory === 1 && !scopeHeldByOthers.has(i.id),
+        );
+        packageStatusAfter = stillUnplaced.length > 0 ? "partially_awarded" : "awarded";
+      }
+      // The package-level winner columns describe ONE winner for the whole
+      // scope; they are cleared only when they describe THIS award.
+      const clearsHeadline = pkg.awardedSubmissionId === award.submissionId;
       await db
         .update(bidPackages)
         .set({
-          status: "under_evaluation",
-          awardedSubmissionId: null,
-          awardedVendorId: null,
-          awardedAmount: null,
-          awardedAt: null,
+          status: packageStatusAfter,
+          ...(clearsHeadline
+            ? {
+                awardedSubmissionId: null,
+                awardedVendorId: null,
+                awardedAmount: null,
+                awardedAt: null,
+              }
+            : {}),
           updatedAt: now,
         })
         .where(eq(bidPackages.id, award.packageId));

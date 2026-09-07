@@ -393,7 +393,13 @@ const routeSchema = z.object({ signers: z.array(signerSchema).min(1).max(10) });
 
 const signSchema = z.object({
   order: z.number().int().min(1).max(10),
-  signedAt: z.string().min(4).optional(),
+  /* refined here: `new Date(x).toISOString()` on an unparseable string throws
+     a RangeError, which would surface as an unhandled 500 rather than a 400 */
+  signedAt: z
+    .string()
+    .min(4)
+    .refine((v) => !Number.isNaN(Date.parse(v)), "signedAt is not a parseable timestamp")
+    .optional(),
   method: z.enum(["wet_ink", "e_signature", "notarized"]).default("wet_ink"),
   reference: z.string().max(300).nullable().optional(),
 });
@@ -643,8 +649,10 @@ export const contractDocumentRoutes: FastifyPluginAsync = async (app) => {
     if (earlier.length > 0) {
       throw conflict(`Signers sign in order; ${earlier.map((s) => `#${s.order} ${s.name}`).join(", ")} have not signed yet.`);
     }
+    if (body.signedAt && Number.isNaN(Date.parse(body.signedAt))) {
+      throw badRequest("signedAt is not a valid timestamp");
+    }
     const signedAt = body.signedAt ? new Date(body.signedAt).toISOString() : new Date().toISOString();
-    if (Number.isNaN(Date.parse(signedAt))) throw badRequest("signedAt is not a valid timestamp");
     const next = signers.map((s) => (s.order === body.order ? { ...s, signedAt, method: body.method, reference: body.reference ?? null } : s));
     await app.db
       .update(contractDocuments)

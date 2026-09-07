@@ -482,7 +482,15 @@ function VendorHistoryPanel({ data }: { data: VendorBidHistory }) {
                 ) : null}
               </Td>
               <Td align="right" className="tabular-nums">
-                {r.amount === null || r.currency === null ? "—" : money(r.amount, r.currency)}
+                {r.sealed ? (
+                  <span className="text-2xs text-content-subtle" title={r.sealNote ?? undefined}>
+                    sealed
+                  </span>
+                ) : r.amount === null || r.currency === null ? (
+                  "—"
+                ) : (
+                  money(r.amount, r.currency)
+                )}
               </Td>
               <Td align="right" className="tabular-nums">
                 {r.deviationFromMedianPercent === null

@@ -130,6 +130,9 @@ export default function InspectionAnswerForm({
     if (item.photoRequired !== true) return false;
     const d = draft(item.id);
     const answered = d.isPass !== undefined || d.response.trim() !== "";
+    // N/A is the answer for a feature that is not present — there is nothing
+    // to photograph, and the API does not ask for one either.
+    if (d.isPass === null) return false;
     return answered && d.photoFileIds.length === 0;
   });
   const failures = items.filter((item) => draft(item.id).isPass === false);
@@ -208,6 +211,7 @@ export default function InspectionAnswerForm({
           const failed = d.isPass === false;
           const photoMissing =
             item.photoRequired === true &&
+            d.isPass !== null &&
             (d.isPass !== undefined || d.response.trim() !== "") &&
             d.photoFileIds.length === 0;
           return (

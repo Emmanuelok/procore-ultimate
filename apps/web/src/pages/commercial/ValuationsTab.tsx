@@ -206,7 +206,10 @@ export default function ValuationsTab({
   const [boqId, setBoqId] = useState("");
   const [valuationDate, setValuationDate] = useState(todayIso());
   const [basis, setBasis] = useState<string>("remeasure");
-  const [retention, setRetention] = useState("5");
+  // Blank means "use the contract's retention percentage": the API defaults
+  // retentionPercent (and its cap) from the linked contract. Pre-filling 5 here
+  // overrode that on every application raised from the web.
+  const [retention, setRetention] = useState("");
   const [createError, setCreateError] = useState<string | null>(null);
 
   const [matOn, setMatOn] = useState("0");
@@ -463,9 +466,13 @@ export default function ValuationsTab({
                   ))}
                 </Select>
               </Field>
-              <Field label="Retention %">
+              <Field
+                label="Retention %"
+                hint="Leave blank to use the contract's retention percentage and cap."
+              >
                 <Input
                   inputMode="decimal"
+                  placeholder="From the contract"
                   value={retention}
                   onChange={(e) => setRetention(e.target.value)}
                 />

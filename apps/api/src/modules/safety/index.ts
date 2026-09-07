@@ -1184,10 +1184,52 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
         `${OBLIGATION_PREFIX} ${determination.governingRuleId ?? "statutory notification"} — ` +
         `${governing?.citation ?? "statutory reporting duty"}`;
       if (obligationId) {
-        await app.db
+        const touched = await app.db
           .update(obligations)
           .set({ deadline: due, trigger, sourceClause, warnDaysBefore: warnDays })
-          .where(and(eq(obligations.id, obligationId), eq(obligations.status, "open")));
+          .where(and(eq(obligations.id, obligationId), eq(obligations.status, "open")))
+          .returning({ id: obligations.id });
+        if (touched.length === 0) {
+          /* The duty was WITHDRAWN by an earlier reassessment (the else branch
+           * below) and the facts have now changed back — nine days off
+           * corrected to five and then corrected back to nine. Updating a
+           * waived row's deadline touches nothing, so without this the
+           * incident would be reportable, carry a live `reportDueAt`, and have
+           * NO open obligation: the statutory deadline would be missing from
+           * the register the rest of the platform reads while the safety
+           * screen showed it. A withdrawn duty that applies again is
+           * reinstated on the new deadline; a `satisfied` or `breached` one is
+           * left exactly as it is, because those record what actually happened
+           * to a duty that was answered or missed. */
+          const reinstated = await app.db
+            .update(obligations)
+            .set({ status: "open", deadline: due, trigger, sourceClause, warnDaysBefore: warnDays })
+            .where(and(eq(obligations.id, obligationId), eq(obligations.status, "waived")))
+            .returning({ id: obligations.id });
+          if (reinstated.length > 0) {
+            await appendLedger(app.db, {
+              companyId: row.companyId,
+              projectId: row.projectId,
+              actorId,
+              action: "state_change",
+              objectType: "obligation",
+              objectId: obligationId,
+              payload: {
+                act: "reinstate",
+                from: "waived",
+                to: "open",
+                source: "safety_incident",
+                incidentId: row.id,
+                reference: row.reference,
+                reason: "reportability_reassessed_reportable",
+                deadline: due,
+                ruleId: determination.governingRuleId,
+                regimes: determination.regimes,
+              },
+              storePayload: true,
+            });
+          }
+        }
       } else {
         obligationId = newId("obl");
         await app.db.insert(obligations).values({
@@ -6369,6 +6411,19 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
             )
             .limit(1);
           if (existing[0]) {
+            /* The idempotency key is unique per COMPANY (a device fleet moves
+             * between sites), so the row already holding it may belong to a
+             * project this caller has no access to. Returning it would hand a
+             * member of one project another project's alarm — location,
+             * worker and raw device payload — for the price of guessing an
+             * external id. The collision is reported without the row. */
+            if (existing[0].projectId !== req.projectId!) {
+              throw conflict(
+                `externalId \`${body.externalId}\` is already held by a device alarm on another ` +
+                  `project in this company. Device event ids are unique per company — send the ` +
+                  `device's own event id, which no other device shares.`,
+              );
+            }
             duplicates.push({ externalId: body.externalId, id: existing[0].id });
             accepted.push(decorateSensorEvent(existing[0], nowISO));
             continue;

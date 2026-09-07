@@ -12,6 +12,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import {
+  assuranceGrants,
   benefits,
   companyMemberships,
   evidence,
@@ -939,6 +940,54 @@ describe("assurance actions", () => {
     };
     expect(ws.gates.length).toBeGreaterThan(0);
     expect(ws.actions.some((a) => a.projectId === pid)).toBe(true);
+  });
+
+  /**
+   * REGRESSION (verifier): `assurance_grants.project_id` is the grant's
+   * SCOPE — null means the whole tenant, a value means that project alone.
+   * The workspace treated ANY live grant as read-all, so a reviewer granted
+   * assurance over one project saw every gate, condition and action in the
+   * company.
+   */
+  it("REGRESSION: a project-scoped assurance grant does not open the whole company", async () => {
+    const covered = await makeProject("Grant covers this");
+    const other = await makeProject("Grant does not cover this");
+    await post(`/projects/${covered}/stage-gates`, {
+      gateNumber: 2,
+      name: "Covered gate",
+      criteria: [{ text: "In scope" }],
+    });
+    await post(`/projects/${other}/stage-gates`, {
+      gateNumber: 2,
+      name: "Out of scope gate",
+      criteria: [{ text: "Not in scope" }],
+    });
+
+    const auditor = await registerActor(app);
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: auditor.userId,
+      role: "member",
+    });
+    await app.db.insert(assuranceGrants).values({
+      id: newId("agr"),
+      companyId: owner.companyId,
+      projectId: covered,
+      userId: auditor.userId,
+      role: "integrity_reviewer",
+      grantedBy: owner.userId,
+    });
+    const auditorHeaders = {
+      authorization: auditor.headers["authorization"]!,
+      "x-company-id": owner.companyId,
+    };
+
+    const ws = (await get(`/governance/reviewer-workspace`, auditorHeaders)).json() as {
+      gates: Array<{ projectId: string }>;
+    };
+    expect(ws.gates.some((g) => g.projectId === covered)).toBe(true);
+    expect(ws.gates.some((g) => g.projectId === other)).toBe(false);
   });
 });
 

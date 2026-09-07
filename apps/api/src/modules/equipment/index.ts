@@ -636,10 +636,20 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
 
   /** Keys already raised for a detector in this company — the idempotence
    *  guard the whole lazy-sweep pattern rests on. */
+  /*
+   * `db` defaults to `app.db`, and a caller INSIDE a transaction MUST pass
+   * its `tx`. PGlite (the test and local database) is one connection behind
+   * an exclusive mutex: a query issued on the outer handle while a
+   * transaction is open on it waits for a transaction that is itself waiting
+   * for the query, and the process hangs with no error. The same call on a
+   * pooled Postgres would take a second client and block on the row locks
+   * the transaction holds. Either way it is a deadlock, not a slow query.
+   */
   async function alreadySignalled(
     companyId: string,
     detector: string,
     candidateKeys?: string[],
+    db: Db = app.db,
   ): Promise<Set<string>> {
     // Bounded by the keys we are about to consider: an unbounded scan of
     // every signal a detector ever raised runs on every list read.
@@ -657,7 +667,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     } else if (candidateKeys) {
       return new Set<string>();
     }
-    const rows = await app.db
+    const rows = await db
       .select({ refs: signals.evidenceRefs })
       .from(signals)
       .where(and(...clauses));
@@ -679,11 +689,13 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
     explanation: string;
     refs: Record<string, unknown>;
     seen: Set<string>;
+    /** the caller's transaction, when there is one — see alreadySignalled */
+    db?: Db;
   }): Promise<string | null> {
     if (input.seen.has(input.key)) return null;
     input.seen.add(input.key);
     const id = newId("sig");
-    await app.db.insert(signals).values({
+    await (input.db ?? app.db).insert(signals).values({
       id,
       companyId: input.companyId,
       projectId: input.projectId,
@@ -6999,11 +7011,19 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
 
     let signalId: string | null = null;
     if (shortfall.wouldGoNegative) {
+      // ON THE TRANSACTION, NOT ON `app.db`. Both used to run on the outer
+      // handle from inside the open transaction that locks the material row,
+      // which deadlocks: under PGlite the transaction holds the single
+      // connection's mutex, so the read waited for a transaction waiting for
+      // the read and the request never returned.
       const seen = await alreadySignalled(
         input.companyId,
         "material_stock_negative",
+        undefined,
+        tx,
       );
       signalId = await raiseSignalOnce({
+        db: tx,
         companyId: input.companyId,
         projectId: input.projectId,
         detector: "material_stock_negative",

@@ -14,6 +14,7 @@ import {
 } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
 import { newId } from "../../lib/ids.js";
+import { round2 } from "./shared.js";
 
 /**
  * PARTIAL AWARDS — one package, several winners.
@@ -170,6 +171,7 @@ beforeAll(async () => {
     number: 1,
     reference: "BUD-0001",
     name: "Baseline",
+    currency: "GBP",
     status: "active",
     createdBy: owner.userId,
   });
@@ -438,6 +440,93 @@ describe("partial award — approval", () => {
     expect(pkgRow?.awardedSubmissionId).toBe(bidB.id);
     const [loser] = await app.db.select().from(bidSubmissions).where(eq(bidSubmissions.id, bidA.id));
     expect(loser?.status).toBe("unsuccessful");
+  });
+
+  /**
+   * Withdrawing one award on a split package must unwind THAT award and
+   * nothing else. Restoring every "awarded" submission took the other
+   * winner out of contention while their award still stood — and the
+   * package dropped to "under_evaluation", forgetting that part of the
+   * scope was bought and paid for. The budget has to hear about it too:
+   * approval put the awarded sum on the budget line, and voiding the
+   * commitment without recomputing the rollup left money committed
+   * against a commitment that no longer exists.
+   */
+  it("withdrawing one partial award leaves the other winner, the package and the budget intact", async () => {
+    const { pkg, bidA, bidB, row } = await splitPackage("Two live partials");
+    const first = await post(`/projects/${projectA}/bid-packages/${pkg.id}/award/recommend`, {
+      submissionId: bidA.id,
+      recommendationBasis: BASIS,
+      scopeLevellingItemIds: [row("G10")],
+    });
+    expect(first.statusCode).toBe(201);
+    expect(
+      (
+        await post(
+          `/bid-awards/${first.json().id}/approve`,
+          { budgetLineItemId: budgetLineId },
+          approver.headers,
+        )
+      ).statusCode,
+    ).toBe(200);
+    const second = await post(`/projects/${projectA}/bid-packages/${pkg.id}/award/recommend`, {
+      submissionId: bidB.id,
+      recommendationBasis: BASIS,
+      scopeLevellingItemIds: [row("F10")],
+      integrityAcknowledgement:
+        "The approval-velocity finding was checked with the approver: the recommendation and " +
+        "the approval were taken together in the same minuted tender board.",
+    });
+    expect(second.statusCode).toBe(201);
+    expect(
+      (
+        await post(
+          `/bid-awards/${second.json().id}/approve`,
+          { budgetLineItemId: budgetLineId },
+          approver.headers,
+        )
+      ).statusCode,
+    ).toBe(200);
+
+    const [lineBefore] = await app.db
+      .select()
+      .from(budgetLineItems)
+      .where(eq(budgetLineItems.id, budgetLineId));
+    // Both draft commitments are on the line; other tests in this file share
+    // it, so the DELTA is what this test can assert.
+
+    const voidsBefore = (
+      await app.db.select().from(commitments).where(eq(commitments.projectId, projectA))
+    ).filter((c) => c.status === "void").length;
+
+    const withdrawn = await post(
+      `/bid-awards/${second.json().id}/withdraw`,
+      { reason: "Bravo went into administration and cannot contract for the frame." },
+      approver.headers,
+    );
+    expect(withdrawn.statusCode).toBe(200);
+
+    const subs = await app.db
+      .select()
+      .from(bidSubmissions)
+      .where(eq(bidSubmissions.packageId, pkg.id));
+    // Alpha still holds a live approved award over the groundworks.
+    expect(subs.find((s) => s.id === bidA.id)?.status).toBe("awarded");
+    expect(subs.find((s) => s.id === bidB.id)?.status).toBe("under_review");
+    const [pkgRow] = await app.db.select().from(bidPackages).where(eq(bidPackages.id, pkg.id));
+    expect(pkgRow?.status).toBe("partially_awarded");
+    const [lineAfter] = await app.db
+      .select()
+      .from(budgetLineItems)
+      .where(eq(budgetLineItems.id, budgetLineId));
+    // Bravo's 80,000 came back off the line when its commitment was voided.
+    expect(
+      round2((lineBefore?.pendingCommitments ?? 0) - (lineAfter?.pendingCommitments ?? 0)),
+    ).toBe(80_000);
+    const voidsAfter = (
+      await app.db.select().from(commitments).where(eq(commitments.projectId, projectA))
+    ).filter((c) => c.status === "void").length;
+    expect(voidsAfter).toBe(voidsBefore + 1);
   });
 
   it("frees the scope again when a partial award is withdrawn", async () => {

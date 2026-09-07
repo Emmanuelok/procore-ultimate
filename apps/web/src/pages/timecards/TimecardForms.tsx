@@ -431,6 +431,7 @@ export function BatchActions({
   const [comment, setComment] = useState("");
   const [payrollRef, setPayrollRef] = useState("");
   const [asking, setAsking] = useState<"reject" | "export" | null>(null);
+  const [approvalProgress, setApprovalProgress] = useState<string | null>(null);
   const [downloading, setDownloading] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const base = `/api/v1/projects/${projectId}/timecard-batches/${batch.id}`;
@@ -473,9 +474,18 @@ export function BatchActions({
   }
 
   async function act(key: string, path: string, body?: unknown, message?: string) {
-    const done = await run(key, () => api.post(`${base}${path}`, body ?? {}));
+    const done = await run<{ approvalProgress?: string | null }>(key, () =>
+      api.post(`${base}${path}`, body ?? {}),
+    );
     if (done) {
-      toast.success(message ?? "Done");
+      /*
+       * A crew configured for two approval tiers needs two DIFFERENT
+       * approvers, and the batch stays "submitted" after the first. The
+       * server says so in `approvalProgress`; showing "Done" instead left
+       * the approver believing the week was signed off.
+       */
+      toast.success(done.approvalProgress ?? message ?? "Done");
+      setApprovalProgress(done.approvalProgress ?? null);
       setAsking(null);
       setComment("");
       onDone();
@@ -488,6 +498,11 @@ export function BatchActions({
   return (
     <div className="space-y-2">
       {refusal ? <RefusalNotice refusal={refusal} onDismiss={clear} /> : null}
+      {approvalProgress ? (
+        <p className="text-meta text-content-muted" role="status">
+          {approvalProgress}
+        </p>
+      ) : null}
       <div className="flex flex-wrap gap-2">
         {collectable ? (
           <>

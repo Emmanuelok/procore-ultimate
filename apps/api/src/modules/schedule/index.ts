@@ -1934,7 +1934,13 @@ export const scheduleModule: FastifyPluginAsync = async (app) => {
       const [activeBudget] = await app.db
         .select({ currency: budgets.currency })
         .from(budgets)
-        .where(and(eq(budgets.projectId, req.projectId!), eq(budgets.status, "active")))
+        .where(
+          and(
+            eq(budgets.companyId, req.companyId!),
+            eq(budgets.projectId, req.projectId!),
+            eq(budgets.isActive, 1),
+          ),
+        )
         .limit(1);
       const reasons: string[] = [];
       if (!activeBudget) {

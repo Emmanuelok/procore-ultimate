@@ -218,6 +218,8 @@ function TaskDetailsEditor({
   const [constraintDate, setConstraintDate] = useState(task.constraintDate ?? "");
   const [actualStart, setActualStart] = useState(task.actualStart ?? "");
   const [actualFinish, setActualFinish] = useState(task.actualFinish ?? "");
+  const [isKeyMilestone, setIsKeyMilestone] = useState(task.isKeyMilestone === 1);
+  const [contractualDate, setContractualDate] = useState(task.contractualDate ?? "");
   const [localError, setLocalError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -225,6 +227,8 @@ function TaskDetailsEditor({
     setConstraintDate(task.constraintDate ?? "");
     setActualStart(task.actualStart ?? "");
     setActualFinish(task.actualFinish ?? "");
+    setIsKeyMilestone(task.isKeyMilestone === 1);
+    setContractualDate(task.contractualDate ?? "");
     setLocalError(null);
   }, [task]);
 
@@ -232,7 +236,9 @@ function TaskDetailsEditor({
     constraintType !== (task.constraintType ?? "") ||
     constraintDate !== (task.constraintDate ?? "") ||
     actualStart !== (task.actualStart ?? "") ||
-    actualFinish !== (task.actualFinish ?? "");
+    actualFinish !== (task.actualFinish ?? "") ||
+    isKeyMilestone !== (task.isKeyMilestone === 1) ||
+    contractualDate !== (task.contractualDate ?? "");
 
   async function save() {
     setLocalError(null);
@@ -248,18 +254,24 @@ function TaskDetailsEditor({
       setLocalError("The actual finish must be on or after the actual start.");
       return;
     }
+    if (contractualDate && !isKeyMilestone) {
+      setLocalError("Only a key milestone carries a contractual date — tick “Key milestone” first.");
+      return;
+    }
     await onSave({
       constraintType: constraintType || null,
       constraintDate: constraintType && constraintDate ? constraintDate : null,
       actualStart: actualStart || null,
       actualFinish: actualFinish || null,
+      isKeyMilestone,
+      contractualDate: isKeyMilestone && contractualDate ? contractualDate : null,
     });
   }
 
   return (
     <div className="space-y-2 bg-ink-50/70 px-4 py-3">
       {localError ? <div className="text-xs text-red-600">{localError}</div> : null}
-      <div className="grid grid-cols-2 items-end gap-3 lg:grid-cols-5">
+      <div className="grid grid-cols-2 items-end gap-3 lg:grid-cols-4 xl:grid-cols-7">
         <Field label="Constraint">
           <Select
             value={constraintType}
@@ -299,6 +311,25 @@ function TaskDetailsEditor({
             className="py-1.5 text-xs"
           />
         </Field>
+        <Field label="Key milestone">
+          <label className="flex h-[34px] items-center gap-2 text-xs text-ink-600">
+            <input
+              type="checkbox"
+              checked={isKeyMilestone}
+              onChange={(e) => setIsKeyMilestone(e.target.checked)}
+            />
+            Track against a contractual date
+          </label>
+        </Field>
+        <Field label="Contractual date">
+          <Input
+            type="date"
+            value={contractualDate}
+            onChange={(e) => setContractualDate(e.target.value)}
+            className="py-1.5 text-xs"
+            disabled={!isKeyMilestone}
+          />
+        </Field>
         <div className="flex items-center gap-2 pb-0.5">
           <Button size="sm" disabled={busy || !dirty} onClick={() => void save()}>
             Save details
@@ -307,7 +338,8 @@ function TaskDetailsEditor({
       </div>
       <p className="text-[11px] text-ink-400">
         Actuals pin the CPM pass — actual start pins the start, actual finish pins the finish and
-        overrides duration. Duration 0 renders as a milestone.
+        overrides duration. Duration 0 renders as a milestone. A key milestone with a contractual
+        date is swept for slip and raises an attention signal when it moves past it (#362).
       </p>
     </div>
   );

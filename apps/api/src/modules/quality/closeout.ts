@@ -973,6 +973,13 @@ export const closeoutRoutes: FastifyPluginAsync = async (app) => {
    * Record what the test measured. The verdict, the shortfall and the damages
    * are computed — never typed in — and the basis is written out so the number
    * can be argued from rather than asserted.
+   *
+   * A RE-MEASUREMENT CLEARS THE VERIFICATION. The independent verification was
+   * given against a reading; replacing the reading and keeping the signature
+   * would leave the register asserting that somebody checked a number nobody
+   * checked — and the LD exposure hanging off it would read as verified. The
+   * guarantee goes back to measured-but-unverified and has to be verified
+   * again, by somebody other than whoever measured it.
    */
   app.post(
     "/projects/:projectId/performance-guarantees/:id/measure",
@@ -1005,7 +1012,21 @@ export const closeoutRoutes: FastifyPluginAsync = async (app) => {
           shortfallPercent: assessment.shortfallPercent,
           ldAmount: assessment.ldAmount,
           ldBasis: assessment.basis,
-          detail: { ...(row.detail as Record<string, unknown>), measurementNote: body.note ?? null },
+          verifiedBy: null,
+          verifiedAt: null,
+          detail: {
+            ...(row.detail as Record<string, unknown>),
+            measurementNote: body.note ?? null,
+            ...(row.verifiedAt
+              ? {
+                  supersededVerification: {
+                    verifiedBy: row.verifiedBy,
+                    verifiedAt: row.verifiedAt,
+                    measuredValue: row.measuredValue,
+                  },
+                }
+              : {}),
+          },
           updatedAt: nowISO(),
         })
         .where(eq(performanceGuarantees.id, id));
@@ -1023,6 +1044,9 @@ export const closeoutRoutes: FastifyPluginAsync = async (app) => {
           ldAmount: assessment.ldAmount,
           basis: assessment.basis,
           reasons: assessment.reasons,
+          clearedVerification: row.verifiedAt
+            ? { verifiedBy: row.verifiedBy, verifiedAt: row.verifiedAt, measuredValue: row.measuredValue }
+            : null,
         },
         storePayload: true,
       });

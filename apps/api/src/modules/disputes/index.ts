@@ -2881,9 +2881,13 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
     scope: string[] | null,
     projectId?: string,
   ): Promise<DisputeOutcomeRow[]> {
+    // The caller's visible scope is ALWAYS applied. A `projectId` filter
+    // narrows within that scope — it never widens it: asking for a project
+    // the caller holds no disputes access on must return nothing, not that
+    // project's outcome database.
     const clauses = [eq(disputes.companyId, companyId)];
+    if (scope !== null) clauses.push(inArray(disputes.projectId, scope));
     if (projectId) clauses.push(eq(disputes.projectId, projectId));
-    else if (scope !== null) clauses.push(inArray(disputes.projectId, scope));
     const rows = await app.db
       .select()
       .from(disputes)

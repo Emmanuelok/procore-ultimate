@@ -774,6 +774,11 @@ function ApprovalBlock({
   onDone: () => void;
 }) {
   const [comment, setComment] = useState("");
+  /** the server's "approved 1 of 2 tiers" message, cleared when the card moves */
+  const [approvalProgress, setApprovalProgress] = useState<string | null>(null);
+  useEffect(() => {
+    setApprovalProgress(null);
+  }, [card.id, card.status]);
 
   const items = useMemo<TimelineItem[]>(
     () =>
@@ -874,6 +879,12 @@ function ApprovalBlock({
         </Alert>
       ) : null}
 
+      {approvalProgress ? (
+        <Alert tone="info" size="sm" title="Approval progress" className="mb-3">
+          {approvalProgress}
+        </Alert>
+      ) : null}
+
       {canSubmit || canApprove ? (
         <Card className="mb-3">
           <CardBody className="space-y-2">
@@ -915,14 +926,29 @@ function ApprovalBlock({
                     size="sm"
                     loading={busy === "approve"}
                     onClick={async () => {
-                      const result = await onRun("approve", () =>
-                        api.post(`/api/v1/projects/${projectId}/timecards/${card.id}/approve`, {
-                          decision: "approved",
-                          comment: comment.trim() || null,
-                        }),
+                      /*
+                       * A CREW CONFIGURED FOR TWO TIERS NEEDS TWO DIFFERENT
+                       * APPROVERS, and the card stays "submitted" after the
+                       * first. The server says so in `approvalProgress`
+                       * ("approved 1 of 2 tiers — tier 2 still has to sign");
+                       * without rendering it, the approver pressed Approve,
+                       * nothing visible happened, and there was no message
+                       * anywhere explaining why.
+                       */
+                      const result = await onRun<{ approvalProgress?: string | null }>(
+                        "approve",
+                        () =>
+                          api.post(
+                            `/api/v1/projects/${projectId}/timecards/${card.id}/approve`,
+                            {
+                              decision: "approved",
+                              comment: comment.trim() || null,
+                            },
+                          ),
                       );
                       if (result) {
                         setComment("");
+                        setApprovalProgress(result.approvalProgress ?? null);
                         onDone();
                       }
                     }}

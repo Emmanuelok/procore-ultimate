@@ -645,24 +645,30 @@ export const assetRoutes: FastifyPluginAsync = async (app) => {
 
       const created: Array<{ id: string; tagCode: string; globalId: string }> = [];
       const skipped: string[] = [];
+      // A pattern that does not contain {seq} renders the same string for
+      // every element, so bumping seq and re-rendering could never break a
+      // collision: the loop below would spin forever and wedge the event
+      // loop for every tenant. When the pattern cannot vary, disambiguate
+      // with a numeric suffix instead.
+      const patternVariesWithSeq = body.tagPattern.includes("{seq}");
       let seq = 1;
       for (const element of elements) {
         if (linkedSet.has(element.globalId)) {
           skipped.push(element.globalId);
           continue;
         }
-        let tagCode = body.tagPattern
-          .replace(/\{storey\}/g, (element.storey ?? "NA").replace(/\s+/g, ""))
-          .replace(/\{type\}/g, element.ifcType.replace(/^IFC/, ""))
-          .replace(/\{name\}/g, (element.name ?? "").replace(/\s+/g, ""))
-          .replace(/\{seq\}/g, String(seq).padStart(3, "0"));
-        while (existingTags.has(tagCode)) {
-          seq += 1;
-          tagCode = body.tagPattern
+        const renderTag = (n: number) =>
+          body.tagPattern
             .replace(/\{storey\}/g, (element.storey ?? "NA").replace(/\s+/g, ""))
             .replace(/\{type\}/g, element.ifcType.replace(/^IFC/, ""))
             .replace(/\{name\}/g, (element.name ?? "").replace(/\s+/g, ""))
-            .replace(/\{seq\}/g, String(seq).padStart(3, "0"));
+            .replace(/\{seq\}/g, String(n).padStart(3, "0"));
+        let tagCode = renderTag(seq);
+        while (existingTags.has(tagCode)) {
+          seq += 1;
+          tagCode = patternVariesWithSeq
+            ? renderTag(seq)
+            : `${renderTag(seq)}-${String(seq).padStart(3, "0")}`;
         }
         existingTags.add(tagCode);
         seq += 1;

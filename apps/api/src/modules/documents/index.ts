@@ -74,6 +74,16 @@ import { buildEml, classifyUpload, parseFolderAlias, safeFilename } from "./inbo
 /* Schemas                                                             */
 /* ------------------------------------------------------------------ */
 
+/**
+ * A date or date-time filter. Postgres compares these against `timestamptz`
+ * columns, so an unparseable string is a 22007 from the driver (a 500) rather
+ * than the 400 the caller deserves — validate it here instead.
+ */
+const dateParam = z
+  .string()
+  .max(40)
+  .refine((v) => !Number.isNaN(Date.parse(v)), "Expected an ISO date or date-time");
+
 const folderCreateSchema = z.object({
   name: z.string().min(1).max(200).refine((v) => !v.includes("/"), "Folder names cannot contain '/'"),
   parentId: z.string().max(64).nullable().optional(),
@@ -99,8 +109,8 @@ const filesQuerySchema = pageQuerySchema.extend({
   uploadedBy: z.string().max(64).optional(),
   contentType: z.string().max(120).optional(),
   checkedOut: z.enum(["0", "1"]).optional(),
-  updatedAfter: z.string().max(40).optional(),
-  updatedBefore: z.string().max(40).optional(),
+  updatedAfter: dateParam.optional(),
+  updatedBefore: dateParam.optional(),
   /** recycle bin (documents admin only) */
   deleted: z.enum(["0", "1"]).optional(),
   /** include files owned by the drawing/spec pipelines */
@@ -145,7 +155,7 @@ const inboundSchema = z.object({
 });
 
 const accessReportQuery = z.object({
-  since: z.string().max(40).optional(),
+  since: dateParam.optional(),
   fileId: z.string().max(64).optional(),
   userId: z.string().max(64).optional(),
   limit: z.coerce.number().int().min(1).max(500).default(100),

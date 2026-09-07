@@ -22,6 +22,7 @@ import {
   bimModels,
   clashResults,
   clashTests,
+  companyMemberships,
   coordinationIssues,
   federationMembers,
 } from "@constructos/db";
@@ -602,6 +603,24 @@ export const clashRoutes: FastifyPluginAsync = async (app) => {
       const body = raiseIssueSchema.parse(req.body);
       const test = await getClashTest(testId, req.companyId!);
       if (test.projectId !== req.projectId) throw notFound("Clash test not found");
+      // the same rule the issue register enforces: an issue is never assigned
+      // to an id from outside the tenant (the register resolves assignee
+      // names and emails, so a foreign id would leak another tenant's user)
+      if (body.assigneeId) {
+        const member = await app.db
+          .select({ userId: companyMemberships.userId })
+          .from(companyMemberships)
+          .where(
+            and(
+              eq(companyMemberships.companyId, req.companyId!),
+              eq(companyMemberships.userId, body.assigneeId),
+            ),
+          )
+          .limit(1);
+        if (!member[0]) {
+          throw badRequest(`User "${body.assigneeId}" is not a member of this company`);
+        }
+      }
 
       const results = await app.db
         .select()

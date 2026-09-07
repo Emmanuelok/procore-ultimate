@@ -430,6 +430,32 @@ describe("performance guarantees", () => {
     expect(verified.json().verifiedBy).toBe(engineer.userId);
   });
 
+  it("clears the verification when the guarantee is measured again", async () => {
+    /*
+     * The signature was given against 1150 kW. Re-measuring at 900 and keeping
+     * it would leave the register saying an independent person had checked a
+     * reading nobody checked — and the LD exposure computed from the new
+     * shortfall would read as verified. It goes back to unverified.
+     */
+    const remeasured = await post(`${base()}/performance-guarantees/${guaranteeId}/measure`, {
+      measuredValue: 900,
+    });
+    expect(remeasured.statusCode).toBe(200);
+    expect(remeasured.json().verifiedBy).toBeNull();
+    expect(remeasured.json().verifiedAt).toBeNull();
+    expect(remeasured.json().shortfall).toBe(300);
+    expect(remeasured.json().detail.supersededVerification.verifiedBy).toBe(engineer.userId);
+    expect(remeasured.json().detail.supersededVerification.measuredValue).toBe(1150);
+
+    const reverified = await post(
+      `${base()}/performance-guarantees/${guaranteeId}/verify`,
+      {},
+      engineerHeaders,
+    );
+    expect(reverified.statusCode).toBe(200);
+    expect(reverified.json().verifiedBy).toBe(engineer.userId);
+  });
+
   it("raises the deferred seasonal test as a scheduled record, once", async () => {
     await app.scheduler.runNow("quality.seasonal-commissioning");
     await app.scheduler.runNow("quality.seasonal-commissioning");

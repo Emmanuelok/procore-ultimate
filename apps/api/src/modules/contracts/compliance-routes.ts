@@ -17,7 +17,7 @@ import {
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, notFound } from "../../lib/errors.js";
-import { pageQuerySchema } from "../../lib/pagination.js";
+import { pageOffset, pageQuerySchema } from "../../lib/pagination.js";
 import { isoDateSchema, todayISO } from "../field/dates.js";
 import {
   complianceTemplatesForForm,
@@ -211,7 +211,8 @@ export const complianceRoutes: FastifyPluginAsync = async (app) => {
           ),
         )
         .orderBy(asc(contractComplianceChecks.kind), asc(contractComplianceChecks.clauseRef))
-        .limit(q.pageSize);
+        .limit(q.pageSize)
+        .offset(pageOffset(q));
       const byStatus: Record<string, number> = {};
       for (const c of items) byStatus[c.status] = (byStatus[c.status] ?? 0) + 1;
       return {

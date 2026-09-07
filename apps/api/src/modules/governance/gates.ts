@@ -125,20 +125,43 @@ export async function holdsToolLevel(
   return held.length > 0;
 }
 
-/** Whether a live assurance grant covers anything at all (read-only visibility). */
-export async function assuranceCoverage(
+/** Every live assurance grant held by the caller in this company. */
+async function liveGrants(
   app: FastifyInstance,
   req: FastifyRequest,
-): Promise<AssuranceRole | null> {
+): Promise<{ projectId: string | null; role: AssuranceRole }[]> {
   const grants = await app.db
-    .select()
+    .select({ projectId: assuranceGrants.projectId, role: assuranceGrants.role, expiresAt: assuranceGrants.expiresAt })
     .from(assuranceGrants)
     .where(
       and(eq(assuranceGrants.companyId, req.companyId!), eq(assuranceGrants.userId, req.user!.id)),
     );
   const now = Date.now();
-  const live = grants.filter((g) => !isExpired(g.expiresAt, now));
-  return live.length > 0 ? ((live[0]!.role as AssuranceRole) ?? null) : null;
+  return grants
+    .filter((g) => !isExpired(g.expiresAt, now))
+    .map((g) => ({ projectId: g.projectId, role: g.role as AssuranceRole }));
+}
+
+/**
+ * Whether a live assurance grant covers the caller (read-only visibility).
+ *
+ * `assuranceGrants.projectId` is the grant's SCOPE — null means the whole
+ * tenant, a value means that project alone (the same rule
+ * modules/intelligence/visibility.ts follows). Passing `projectId` asks
+ * "does a grant cover THIS project"; omitting it asks "is there any grant at
+ * all", which is what a company-level route needs before it then narrows the
+ * rows with `visibleProjectIds`.
+ */
+export async function assuranceCoverage(
+  app: FastifyInstance,
+  req: FastifyRequest,
+  projectId?: string | null,
+): Promise<AssuranceRole | null> {
+  const live = await liveGrants(app, req);
+  const covering = projectId
+    ? live.filter((g) => g.projectId === null || g.projectId === projectId)
+    : live;
+  return covering.length > 0 ? (covering[0]!.role ?? null) : null;
 }
 
 /**
@@ -152,9 +175,14 @@ export async function isIndependentReviewer(
   app: FastifyInstance,
   req: FastifyRequest,
 ): Promise<{ independent: boolean; basis: string }> {
-  const role = await assuranceCoverage(app, req);
+  // Scoped to THIS project: a grant covering project A does not make its
+  // holder the independent reviewer of project B's gate.
+  const role = await assuranceCoverage(app, req, req.projectId ?? null);
   if (role === "integrity_reviewer" || role === "auditor") {
-    return { independent: true, basis: `Holds the ${role} assurance grant for this company.` };
+    return {
+      independent: true,
+      basis: `Holds the ${role} assurance grant covering this project.`,
+    };
   }
   if (req.companyRole === "owner" || req.companyRole === "admin") {
     return { independent: true, basis: `Company ${req.companyRole}.` };
@@ -203,8 +231,15 @@ export async function visibleProjectIds(
 ): Promise<string[] | null> {
   if (req.companyRole === "owner" || req.companyRole === "admin") return null;
   const held = await projectsWithTool(app, req, tool, "read");
-  if (held.length > 0) return held;
-  const role = await assuranceCoverage(app, req);
-  if (role) return null; // an assurance grant is read-all by design
-  return [];
+  const visible = new Set(held);
+  // An assurance grant ADDS to what a membership already gives, and only
+  // within its own scope: a tenant-wide grant (projectId null) is read-all,
+  // a project-scoped grant adds that one project. Returning "all" for a
+  // grant pinned to a single project would show that reviewer every other
+  // project in the company.
+  for (const grant of await liveGrants(app, req)) {
+    if (grant.projectId === null) return null;
+    visible.add(grant.projectId);
+  }
+  return [...visible];
 }

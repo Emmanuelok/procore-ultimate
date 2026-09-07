@@ -251,52 +251,78 @@ export async function recordReceipt(
   if (!["certified", "partially_certified", "paid"].includes(a.status)) {
     throw new AppError(409, `Application ${a.reference} is ${a.status} — only a certified application is payable.`);
   }
-  const certified = round2(a.certifiedAmount ?? a.currentPaymentDue);
-  const existing = await db
-    .select({ amount: ownerPaymentReceipts.amount, status: ownerPaymentReceipts.status })
-    .from(ownerPaymentReceipts)
-    .where(eq(ownerPaymentReceipts.paymentApplicationId, a.id));
-  const alreadyPaid = round2(existing.filter((r) => r.status !== "void").reduce((s, r) => s + r.amount, 0));
-  const outstanding = round2(certified - alreadyPaid);
-  const amount = round2(input.amount ?? outstanding);
-  if (amount <= 0.005) {
-    throw new AppError(400, `A receipt must carry an amount. ${a.reference} has ${outstanding.toFixed(2)} ${a.currency} outstanding.`);
-  }
-  if (amount - outstanding > 0.005) {
-    throw new AppError(
-      400,
-      `Receipt of ${amount.toFixed(2)} ${a.currency} exceeds the ${outstanding.toFixed(2)} ${a.currency} still outstanding on the ` +
-        `${certified.toFixed(2)} certified (${alreadyPaid.toFixed(2)} already received).`,
-      { certified, alreadyPaid, outstanding, requested: amount, currency: a.currency },
-    );
-  }
+  // The number is an atomic upsert of its own and is safe outside the money
+  // transaction; a rolled-back receipt leaves a gap in the sequence, which is
+  // preferable to holding that row's lock for the whole settlement.
   const number = await nextNumber();
   const id = newReceiptId();
   const now = nowIso();
-  await db.insert(ownerPaymentReceipts).values({
-    id,
-    companyId: contract.companyId,
-    projectId: contract.projectId,
-    primeContractId: contract.id,
-    paymentApplicationId: a.id,
-    number,
-    reference: `RCT-${String(number).padStart(3, "0")}`,
-    status: "recorded",
-    amount,
-    currency: a.currency,
-    receivedDate: input.receivedDate ?? today(),
-    method: input.method ?? "ach",
-    paymentReference: input.paymentReference ?? null,
-    bankReference: input.bankReference ?? null,
-    notes: input.notes ?? null,
-    recordedBy: actorId,
-    createdAt: now,
-    updatedAt: now,
+
+  /*
+   * One transaction with the APPLICATION ROW LOCKED. The over-payment guard
+   * is only a guard if the read that feeds it and the insert that follows it
+   * cannot be interleaved: two concurrent remittances of 300,000 against a
+   * 350,000 certificate would otherwise both see nothing paid and both land.
+   * The second caller waits here, then sees the first receipt.
+   */
+  const settled = await db.transaction(async (tx) => {
+    const locked = await tx
+      .select({ status: paymentApplications.status, certifiedAmount: paymentApplications.certifiedAmount, currentPaymentDue: paymentApplications.currentPaymentDue, currency: paymentApplications.currency, reference: paymentApplications.reference })
+      .from(paymentApplications)
+      .where(eq(paymentApplications.id, a.id))
+      .for("update");
+    const live = locked[0];
+    if (!live) throw notFound("Payment application not found");
+    if (!["certified", "partially_certified", "paid"].includes(live.status)) {
+      throw new AppError(409, `Application ${live.reference} is ${live.status} — only a certified application is payable.`);
+    }
+    const certified = round2(live.certifiedAmount ?? live.currentPaymentDue);
+    const existing = await tx
+      .select({ amount: ownerPaymentReceipts.amount, status: ownerPaymentReceipts.status })
+      .from(ownerPaymentReceipts)
+      .where(eq(ownerPaymentReceipts.paymentApplicationId, a.id));
+    const alreadyPaid = round2(existing.filter((r) => r.status !== "void").reduce((s, r) => s + r.amount, 0));
+    const outstanding = round2(certified - alreadyPaid);
+    const amount = round2(input.amount ?? outstanding);
+    if (amount <= 0.005) {
+      throw new AppError(400, `A receipt must carry an amount. ${live.reference} has ${outstanding.toFixed(2)} ${live.currency} outstanding.`);
+    }
+    if (amount - outstanding > 0.005) {
+      throw new AppError(
+        400,
+        `Receipt of ${amount.toFixed(2)} ${live.currency} exceeds the ${outstanding.toFixed(2)} ${live.currency} still outstanding on the ` +
+          `${certified.toFixed(2)} certified (${alreadyPaid.toFixed(2)} already received).`,
+        { certified, alreadyPaid, outstanding, requested: amount, currency: live.currency },
+      );
+    }
+    await tx.insert(ownerPaymentReceipts).values({
+      id,
+      companyId: contract.companyId,
+      projectId: contract.projectId,
+      primeContractId: contract.id,
+      paymentApplicationId: a.id,
+      number,
+      reference: `RCT-${String(number).padStart(3, "0")}`,
+      status: "recorded",
+      amount,
+      currency: live.currency,
+      receivedDate: input.receivedDate ?? today(),
+      method: input.method ?? "ach",
+      paymentReference: input.paymentReference ?? null,
+      bankReference: input.bankReference ?? null,
+      notes: input.notes ?? null,
+      recordedBy: actorId,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const settlement = await settleApplication(tx as unknown as Db, a.id);
+    const recalculated = await recalcContract(tx as unknown as Db, contract.id, contract.companyId);
+    return { settlement, contract: recalculated };
   });
-  const settlement = await settleApplication(db, a.id);
-  const recalculated = await recalcContract(db, contract.id, contract.companyId);
   const rows = await db.select().from(ownerPaymentReceipts).where(eq(ownerPaymentReceipts.id, id)).limit(1);
-  return { receipt: rows[0]!, settlement, contract: recalculated };
+  const receipt = rows[0];
+  if (!receipt) throw new AppError(500, "Receipt was not recorded");
+  return { receipt, settlement: settled.settlement, contract: settled.contract };
 }
 
 function newReceiptId(): string {

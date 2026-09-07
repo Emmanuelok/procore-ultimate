@@ -284,6 +284,19 @@ describe("inspection scoring — photo-required items", () => {
     expect(s.unansweredRequired).toEqual(["i1"]);
     expect(s.missingPhotos).toEqual([]);
   });
+
+  it("does not demand a photograph of something that is not there", () => {
+    // N/A is the answer for an absent feature. Demanding a photograph of it
+    // leaves the inspector unable to complete the form at all — and the
+    // refusal's own advice is to answer the item not-applicable.
+    const answers: InspectionAnswer[] = [
+      { itemId: "i1", isPass: null, note: "No leading edge on this level yet." },
+      { itemId: "i2", isPass: true },
+    ];
+    const s = scoreInspection(items, answers, "percentage", 80);
+    expect(s.missingPhotos).toEqual([]);
+    expect(s.unansweredRequired).toEqual([]);
+  });
 });
 
 /* ================================================================== */
@@ -1169,6 +1182,57 @@ describe("reportability reassessment", () => {
     const row = await app.db.select().from(safetyIncidents).where(eq(safetyIncidents.id, id));
     expect(row[0]?.obligationId).toBe(obligationId);
   });
+
+  it("puts the statutory duty back on the obligations register when the facts change back", async () => {
+    const created = await post(`/projects/${gbProject}/safety/incidents`, {
+      incidentType: "injury",
+      title: "Crush injury on the loading bay",
+      description: "Nine days off initially recorded, corrected down, then corrected back.",
+      occurredAt: hoursAgo(30),
+      workerId,
+      injuredPersonType: "employee",
+      injuryNature: "sprain_strain",
+      bodyPart: "back_lower",
+      severity: "serious",
+      isLostTime: true,
+      lostTimeDays: 9,
+    });
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+    const obligationId = created.json().obligationId as string;
+    expect(obligationId).toBeTruthy();
+
+    // corrected down — the duty is withdrawn
+    await patch(`/projects/${gbProject}/safety/incidents/${id}`, { lostTimeDays: 5 });
+    const withdrawn = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, obligationId));
+    expect(withdrawn[0]?.status).toBe("waived");
+
+    // and corrected back — the incident is reportable again, so a LIVE
+    // obligation has to exist for it. Leaving the withdrawn one waived takes
+    // the statutory deadline off the register the rest of the platform reads.
+    const restored = await patch(`/projects/${gbProject}/safety/incidents/${id}`, {
+      lostTimeDays: 9,
+    });
+    expect(restored.statusCode).toBe(200);
+    expect(restored.json().isReportable).toBe(true);
+    expect(restored.json().reportDueAt).toBeTruthy();
+
+    const incidentRow = await app.db
+      .select()
+      .from(safetyIncidents)
+      .where(eq(safetyIncidents.id, id));
+    const liveObligationId = incidentRow[0]?.obligationId as string;
+    expect(liveObligationId).toBeTruthy();
+    const live = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, liveObligationId));
+    expect(live[0]?.status).toBe("open");
+    expect(live[0]?.deadline).toBe(restored.json().reportDueAt);
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -1561,6 +1625,22 @@ describe("device and lone-worker alarms", () => {
     expect(retry.statusCode).toBe(201);
     expect(retry.json().duplicates).toHaveLength(1);
     expect(retry.json().events[0].id).toBe(alarmId);
+  });
+
+  it("does not hand another project's alarm back through the idempotency key", async () => {
+    /* `externalId` is unique per COMPANY, and it is caller-supplied. A member
+     * of the US project must not be able to read the GB project's alarm — its
+     * worker, its location and its raw device payload — by guessing the id. */
+    const res = await post(`/projects/${usProject}/safety/sensor-events`, {
+      kind: "man_down",
+      source: "lone_worker_device",
+      deviceId: "LW-4471",
+      occurredAt: hoursAgo(1),
+      externalId: "dev-evt-1",
+    });
+    expect(res.statusCode).toBe(409);
+    expect(JSON.stringify(res.json())).not.toContain(alarmId);
+    expect(JSON.stringify(res.json())).not.toContain(workerId);
   });
 
   it("refuses an alarm timestamped in the future", async () => {

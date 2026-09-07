@@ -721,6 +721,54 @@ describe("materials supply", () => {
     expect(again.json().raised).toBe(0);
   });
 
+  it("returns from a forced-negative movement instead of deadlocking on the signal write", async () => {
+    // The signal that records a knowingly forced negative used to be read and
+    // written on the OUTER database handle from inside the open transaction
+    // that locks the material row. PGlite is one connection behind an
+    // exclusive mutex, so the write waited for the transaction and the
+    // transaction waited for the write: the request never returned, and every
+    // later request in the process hung behind it.
+    const created = await post(`/projects/${projectB}/materials`, {
+      name: "Deadlock ballast",
+      unit: "t",
+      quantityRequired: 10,
+      unitCost: 40,
+      currency: "GBP",
+      isTracked: true,
+    });
+    expect(created.statusCode).toBe(201);
+    const materialItemId = created.json().id as string;
+
+    const forced = await post(`/projects/${projectB}/material-stock-movements`, {
+      materialItemId,
+      movementType: "issue",
+      quantity: 6,
+      reason: "Poured before the delivery was booked in",
+      allowNegative: true,
+    });
+    expect(forced.statusCode).toBe(201);
+    expect(forced.json().forcedNegative).toBe(true);
+    expect(forced.json().balance.after).toBe(-6);
+    expect(forced.json().signalId).toBeTruthy();
+
+    // The signal landed, and it landed inside the movement's transaction.
+    const raised = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "material_stock_negative"),
+          eq(signals.id, forced.json().signalId as string),
+        ),
+      );
+    expect(raised).toHaveLength(1);
+
+    // And the connection is free: the next request answers rather than hanging.
+    const after = await get(`/projects/${projectB}/materials`);
+    expect(after.statusCode).toBe(200);
+  });
+
   it("says an item with no lead time has no order-by date, rather than guessing one", async () => {
     const item = await post(`/projects/${projectB}/materials`, {
       name: "Unknown lead item",

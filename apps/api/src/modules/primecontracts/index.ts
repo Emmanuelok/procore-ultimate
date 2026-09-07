@@ -2217,12 +2217,38 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         throw conflict(`${change.reference} is already void.`);
       }
       const now = nowIso();
-      await app.db
+      // The void reason lives in `detail`, not in `rejectionReason`: a
+      // rejected change order carries the reviewer's reason for refusing it,
+      // and that is exactly the audit trail this register exists to keep.
+      // The UPDATE is claimed on the status we read, and a claim that matches
+      // nothing means someone executed it in between — refuse rather than
+      // report a void that did not happen.
+      const claimed = await app.db
         .update(primeContractChanges)
-        .set({ status: "void", rejectionReason: body.reason, updatedAt: now })
+        .set({
+          status: "void",
+          detail: {
+            ...((change.detail as Record<string, unknown> | null) ?? {}),
+            voidReason: body.reason,
+            voidedBy: req.user!.id,
+            voidedAt: now,
+            statusBeforeVoid: change.status,
+          },
+          updatedAt: now,
+        })
         .where(
-          and(eq(primeContractChanges.id, change.id), ne(primeContractChanges.status, "executed")),
+          and(
+            eq(primeContractChanges.id, change.id),
+            eq(primeContractChanges.status, change.status),
+          ),
+        )
+        .returning({ id: primeContractChanges.id });
+      if (claimed.length !== 1) {
+        throw conflict(
+          `${change.reference} is no longer ${change.status} — another request moved it first. ` +
+            "Reload the change register before acting on it again.",
         );
+      }
       await recalcContract(contract.id, req.companyId!);
       await appendLedger(app.db, {
         companyId: req.companyId!,
@@ -2242,7 +2268,6 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
     budgetId: string;
     budgetStatus: string;
     legs: Array<{ lineItemId: string; costCode: string; costType: string; amount: number }>;
-    rows: Map<string, typeof budgetLineItems.$inferSelect>;
   }
 
   /** Why the last plan produced nothing — set by planOwnerChange, read by the ledger. */
@@ -2321,7 +2346,7 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         );
       }
     }
-    return { budgetId: budget.id, budgetStatus: budget.status, legs: [...merged.values()], rows: byId };
+    return { budgetId: budget.id, budgetStatus: budget.status, legs: [...merged.values()] };
   }
 
   /** Re-derive the budget's materialized rollups after an owner change lands. */
@@ -2602,9 +2627,36 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
             detail: { primeContractChangeId: change.id, changeOrderPackageId: change.changeOrderPackageId },
             createdBy: change.createdBy,
           });
+          // The lines were planned outside this transaction; they are RE-READ
+          // here under a row lock (in a stable id order so two executions
+          // queue rather than deadlock), because the write below stores an
+          // absolute figure — a change order executed a millisecond earlier on
+          // the same line would otherwise be overwritten instead of added to.
+          const lockedRows = new Map<string, typeof budgetLineItems.$inferSelect>();
+          for (const lineItemId of plan.legs.map((l) => l.lineItemId).sort()) {
+            const fresh = await tx
+              .select()
+              .from(budgetLineItems)
+              .where(eq(budgetLineItems.id, lineItemId))
+              .for("update");
+            if (fresh[0]) lockedRows.set(lineItemId, fresh[0]);
+          }
           for (const leg of plan.legs) {
-            const row = plan.rows.get(leg.lineItemId)!;
+            const row = lockedRows.get(leg.lineItemId);
+            if (!row || row.budgetId !== plan.budgetId || row.status === "void") {
+              throw conflict(
+                `Budget line ${leg.costCode} / ${leg.costType} is no longer available on this ` +
+                  "budget — it was removed or voided while this change order was being executed. " +
+                  "Re-point the change order's lines and execute again.",
+              );
+            }
             const approvedChanges = round2(row.approvedChanges + leg.amount);
+            if (round2(row.originalBudget + row.budgetModifications + approvedChanges) < 0) {
+              throw conflict(
+                `Executing this change would take budget line ${row.costCode} / ${row.costType} ` +
+                  "to a negative revised budget. A budget line cannot hold one.",
+              );
+            }
             const derived = deriveBudgetColumns({
               originalBudget: row.originalBudget,
               budgetModifications: row.budgetModifications,
@@ -3502,7 +3554,10 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
             .set({ ...rolled, updatedAt: now })
             .where(eq(primeContractSovLines.id, line.id));
         }
-        await tx
+        // Claimed on the status this route read: two certifiers acting at
+        // once would otherwise both roll the schedule of values forward and
+        // the second certification would silently overwrite the first.
+        const claimed = await tx
           .update(paymentApplications)
           .set({
             status: partial ? "partially_certified" : "certified",
@@ -3516,7 +3571,16 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
               : {}),
             updatedAt: now,
           })
-          .where(eq(paymentApplications.id, a.id));
+          .where(
+            and(eq(paymentApplications.id, a.id), eq(paymentApplications.status, "submitted")),
+          )
+          .returning({ id: paymentApplications.id });
+        if (claimed.length !== 1) {
+          throw conflict(
+            `Application ${a.reference} is no longer submitted — another request certified, ` +
+              "rejected or voided it first. Reload before acting on it again.",
+          );
+        }
         await tx
           .update(invoices)
           .set({

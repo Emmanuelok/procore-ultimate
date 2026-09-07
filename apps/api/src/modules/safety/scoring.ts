@@ -258,8 +258,21 @@ export function scoreInspection(
     /* The photo duty attaches to an ANSWERED item, required or not: a pass
      * recorded against a photo-required question with no photograph is the
      * case the flag exists to catch. An unanswered item is already caught
-     * above, and reporting it twice would just make the refusal noisier. */
-    if (item.photoRequired === true && answered && (a?.photoFileIds ?? []).length === 0) {
+     * above, and reporting it twice would just make the refusal noisier.
+     *
+     * NOT-APPLICABLE is excluded, exactly as the quality engine excludes it
+     * (checklistItems.ts returns before the photoRequired check on an N/A
+     * answer). There is nothing to photograph where the feature is not
+     * present, and demanding one there leaves the inspector with no way to
+     * complete the form at all — the refusal's own advice is to answer the
+     * item not-applicable. */
+    const notApplicable = a !== undefined && a.isPass === null;
+    if (
+      item.photoRequired === true &&
+      answered &&
+      !notApplicable &&
+      (a?.photoFileIds ?? []).length === 0
+    ) {
       missingPhotos.push(item.id);
     }
   }

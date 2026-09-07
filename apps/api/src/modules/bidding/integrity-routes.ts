@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, like } from "drizzle-orm";
 import { z } from "zod";
 import { bidPackages, signals } from "@constructos/db";
 import { badRequest, notFound } from "../../lib/errors.js";
@@ -263,15 +263,27 @@ export const integrityRoutes: FastifyPluginAsync = async (app) => {
       })
       .parse(req.query ?? {});
 
+    /*
+     * The detector filter belongs in the STATEMENT, not in the array that
+     * comes back. Reading the newest 1000 signals of every kind and then
+     * keeping the bidding ones meant that on a company whose other detectors
+     * are busy — safety, assurance, field — this register silently showed
+     * nothing at all, because every bid-integrity finding had been pushed
+     * past the limit by rows this endpoint was never going to display.
+     */
     const rows = await app.db
       .select()
       .from(signals)
-      .where(eq(signals.companyId, req.companyId!))
+      .where(
+        and(
+          eq(signals.companyId, req.companyId!),
+          like(signals.detector, "bid_integrity_%"),
+        ),
+      )
       .orderBy(desc(signals.createdAt))
       .limit(1000);
     const mine = rows.filter(
       (r) =>
-        r.detector.startsWith("bid_integrity_") &&
         (!q.detector || r.detector === q.detector) &&
         (!q.severity || r.severity === q.severity) &&
         (!q.openOnly || (r.disposition !== "false_positive" && r.disposition !== "closed")),
@@ -504,8 +516,13 @@ export const integrityRoutes: FastifyPluginAsync = async (app) => {
         createdAt: signals.createdAt,
       })
       .from(signals)
-      .where(eq(signals.companyId, req.companyId!));
-    const mine = rows.filter((r) => r.detector.startsWith("bid_integrity_"));
+      .where(
+        and(
+          eq(signals.companyId, req.companyId!),
+          like(signals.detector, "bid_integrity_%"),
+        ),
+      );
+    const mine = rows;
     const byDetector = new Map<
       string,
       { raised: number; confirmed: number; falsePositive: number; escalated: number; open: number }

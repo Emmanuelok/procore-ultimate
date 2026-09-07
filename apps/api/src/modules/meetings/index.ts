@@ -1603,6 +1603,30 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       }
     }
 
+    /*
+     * THE DEEMED-ACCEPTANCE CLOCK IS NOT A SETTING ONCE IT IS RUNNING.
+     *
+     * `objectionPeriodDays` is what `computeObjectionWindow` measures the
+     * objection window from. Left editable after issue, a standard user could
+     * PATCH it to 0 and the window closed instantly: /minutes/object then
+     * refused every recipient with "the objection period closed", and the
+     * minutes read as deemed accepted — all recorded as an ordinary field
+     * `update`. The period is settled at issue; changing it means withdrawing
+     * the minutes and re-issuing them, which tells the recipients.
+     */
+    if (
+      body.objectionPeriodDays !== undefined &&
+      body.objectionPeriodDays !== meeting.objectionPeriodDays &&
+      meeting.minutesIssuedAt
+    ) {
+      throw conflict(
+        "The objection period cannot be changed once the minutes have been issued — it is the " +
+          "window the recipients were given, and shortening it would deem accepted a record " +
+          "nobody has had the chance to object to. Withdraw them with POST /minutes/correct and " +
+          "re-issue with the period you mean.",
+      );
+    }
+
     const identityChanges: Record<string, unknown> = {};
     const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
     for (const [k, v] of Object.entries(body)) {
@@ -2925,12 +2949,35 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
           );
         }
       }
+      /*
+       * THE PARENTS A POST VALIDATES AND A PATCH DID NOT.
+       *
+       * `meetingId`, `agendaItemId` and `decisionId` were written straight
+       * from the body. The meeting detail route lists an occurrence's action
+       * items by `meetingId` alone, so writing an id belonging to another
+       * project — or another tenant — moved this row onto a meeting the
+       * author holds no permission on and it rendered there. Resolved through
+       * the same fetchers the create route uses, which scope by company AND
+       * project, so an unreachable id is a 404 rather than an injection.
+       */
+      let nextSeriesId: string | null | undefined;
+      if (body.meetingId !== undefined && body.meetingId !== row.meetingId) {
+        nextSeriesId = body.meetingId ? (await fetchMeeting(req, body.meetingId)).seriesId : null;
+      }
+      if (body.agendaItemId != null && body.agendaItemId !== row.agendaItemId) {
+        await fetchAgendaItem(req, body.agendaItemId);
+      }
+      if (body.decisionId != null && body.decisionId !== row.decisionId) {
+        await fetchDecision(req, body.decisionId);
+      }
+
       const now = new Date().toISOString();
       const set: Record<string, unknown> = { updatedAt: now };
       for (const [k, v] of Object.entries(body)) {
         if (v === undefined) continue;
         set[k] = v;
       }
+      if (nextSeriesId !== undefined) set["seriesId"] = nextSeriesId;
       /*
        * Moving a due date is SLIPPAGE and is kept as evidence: the original
        * date survives in `originalDueDate` and every move increments
@@ -2949,6 +2996,10 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
       }
       await app.db.update(meetingActionItems).set(set).where(eq(meetingActionItems.id, actionId));
       if (row.meetingId) await refreshMeetingCounts(row.meetingId);
+      /* The meeting it moved TO has one more action than it did a moment ago. */
+      if (body.meetingId && body.meetingId !== row.meetingId) {
+        await refreshMeetingCounts(body.meetingId);
+      }
       await ledger("update", "meeting_action_item", actionId, req, {
         changed: Object.keys(body),
         ...(body.dueDate !== undefined && body.dueDate !== row.dueDate

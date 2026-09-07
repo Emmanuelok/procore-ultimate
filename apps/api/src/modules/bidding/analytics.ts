@@ -21,6 +21,7 @@ import {
   type Unknowable,
 } from "./shared.js";
 import { batchVendorPrequalStatus } from "./prequal-status.js";
+import { sealState } from "./sealing.js";
 import { competitorProfiles, type PricingObservation } from "./analytics-math.js";
 import { medianUnsorted } from "./integrity.js";
 
@@ -98,7 +99,18 @@ async function loadObservations(
       ),
     );
   return packages.map((pkg) => {
-    const mine = subs.filter((s) => s.packageId === pkg.id);
+    /*
+     * THE SEAL BINDS THE ANALYTICS TOO.
+     *
+     * A sealed, unopened package's prices are withheld on every submission
+     * read path; an aggregate built from the same rows is the same
+     * disclosure wearing a percentage sign, and with one bidder in a trade
+     * it is the price itself. A live sealed tender contributes nothing here
+     * until it has been lawfully opened.
+     */
+    const mine = sealState(pkg).amountsWithheld
+      ? []
+      : subs.filter((s) => s.packageId === pkg.id);
     const allLevelled =
       mine.length > 0 &&
       mine
@@ -455,6 +467,16 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
             )
         : [];
       const packagesById = new Map(packages.map((p) => [p.id, p] as const));
+      /*
+       * Packages whose bids are sealed and unopened are read-blocked on
+       * every submission path, and this history is a submission path: it
+       * carries the bidder's own amount and its deviation from the
+       * pre-tender estimate. Before the opening, the row says that a bid
+       * was made and nothing about what it said.
+       */
+      const withheldPackageIds = new Set(
+        packages.filter((p) => sealState(p).amountsWithheld).map((p) => p.id),
+      );
       const fieldSubs = packageIds.length
         ? await app.db
             .select({
@@ -471,18 +493,21 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
 
       const rows = invites.map((inv) => {
         const pkg = packagesById.get(inv.packageId);
+        const sealed = withheldPackageIds.has(inv.packageId);
         const sub = subs.find((s) => s.packageId === inv.packageId && !s.supersededById);
         const award = awards.find((a) => a.packageId === inv.packageId);
-        const field = fieldSubs.filter(
-          (f) => f.packageId === inv.packageId && f.totalAmount !== null,
-        );
+        const field = sealed
+          ? []
+          : fieldSubs.filter(
+              (f) => f.packageId === inv.packageId && f.totalAmount !== null,
+            );
         const sameCurrency =
           sub && field.every((f) => f.currency.toUpperCase() === sub.currency.toUpperCase());
         const median =
           sameCurrency && field.length >= 2
             ? medianUnsorted(field.map((f) => f.normalisedAmount ?? f.totalAmount ?? 0))
             : null;
-        const mine = sub?.normalisedAmount ?? sub?.totalAmount ?? null;
+        const mine = sealed ? null : (sub?.normalisedAmount ?? sub?.totalAmount ?? null);
         return {
           packageId: inv.packageId,
           projectId: inv.projectId,
@@ -499,14 +524,20 @@ export const analyticsRoutes: FastifyPluginAsync = async (app) => {
           amount: mine,
           currency: sub?.currency ?? pkg?.currency ?? null,
           onTime: sub ? sub.isLate !== 1 : null,
-          rank: sub?.rank ?? null,
+          rank: sealed ? null : (sub?.rank ?? null),
           fieldSize: field.length,
+          sealed,
+          sealNote: sealed
+            ? `${pkg?.reference ?? "This package"} is sealed and has not been opened, so this ` +
+              "bidder's amount and its place in the field are withheld here exactly as they " +
+              "are on the submission itself."
+            : null,
           deviationFromMedianPercent:
             median !== null && median > 0 && mine !== null
               ? round2(((mine - median) / median) * 100)
               : null,
           deviationFromEstimatePercent:
-            pkg?.engineersEstimate && pkg.engineersEstimate > 0 && mine !== null
+            !sealed && pkg?.engineersEstimate && pkg.engineersEstimate > 0 && mine !== null
               ? round2(((mine - pkg.engineersEstimate) / pkg.engineersEstimate) * 100)
               : null,
           won: award ? ["approved", "letter_of_intent", "contract_issued", "executed"].includes(award.status) : false,
