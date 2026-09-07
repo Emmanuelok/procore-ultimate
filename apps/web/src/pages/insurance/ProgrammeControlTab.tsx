@@ -216,6 +216,8 @@ interface RenewalReport {
   leadTimeDays: number;
   items: RenewalRow[];
   total: number;
+  page: number;
+  pageSize: number;
   byUrgency: { overdue: number; critical: number; warning: number; on_track: number };
   note: string | null;
 }
@@ -1233,6 +1235,13 @@ function RenewalsPanel({ projectId }: { projectId: string }) {
           description={data.note ?? `No policy expires within ${data.horizonDays} days.`}
         />
       ) : (
+        <>
+        {data.total > data.items.length ? (
+          <p className="text-xs text-ink-500">
+            Showing {fmtNum(data.items.length)} of {fmtNum(data.total)} policies in the renewal
+            window. The counts above cover all {fmtNum(data.total)}.
+          </p>
+        ) : null}
         <Card>
           <CardBody className="p-0">
             <Table>
@@ -1286,6 +1295,7 @@ function RenewalsPanel({ projectId }: { projectId: string }) {
             </Table>
           </CardBody>
         </Card>
+        </>
       )}
 
       {editing ? (

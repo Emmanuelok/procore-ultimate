@@ -514,6 +514,11 @@ const renewalPatchSchema = z.object({
 const renewalQuery = z.object({
   horizonDays: z.coerce.number().int().min(1).max(730).default(120),
   leadTimeDays: z.coerce.number().int().min(0).max(365).default(30),
+  /* The pipeline is already narrowed by the horizon, but on a tenant with
+     hundreds of live policies the company-scope view is still a list that
+     wants a page. `total` and `byUrgency` stay whole-scope figures. */
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(500).default(200),
 });
 
 const holdQuery = z.object({
@@ -5930,12 +5935,15 @@ export const insuranceModule: FastifyPluginAsync = async (app) => {
       leadTimeDays: q.leadTimeDays,
       horizonDays: q.horizonDays,
     });
+    const offset = (q.page - 1) * q.pageSize;
     return {
       asOf: todayISO(),
       horizonDays: q.horizonDays,
       leadTimeDays: q.leadTimeDays,
-      items: rows,
+      items: rows.slice(offset, offset + q.pageSize),
       total: rows.length,
+      page: q.page,
+      pageSize: q.pageSize,
       byUrgency: {
         overdue: rows.filter((r) => r.urgency === "overdue").length,
         critical: rows.filter((r) => r.urgency === "critical").length,

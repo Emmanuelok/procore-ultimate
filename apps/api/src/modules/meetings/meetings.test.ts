@@ -1182,6 +1182,52 @@ describe("action items, promotion and the overdue sweep", () => {
     expect(row[0]!.status).toBe("open");
   });
 
+  it("will not raise a second signal for a finding already in the register", async () => {
+    /*
+     * The in-memory prefilter matches on `evidenceRefs->>'key'`. A row that
+     * carries the fingerprint but not the key slips past it — which is
+     * exactly the shape a concurrent runner's half-written insert has. The
+     * fingerprint guard inside `raiseSignalOnce` is what must catch it.
+     */
+    const created = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meeting-action-items`,
+      chair.headers,
+      {
+        title: "Already flagged elsewhere",
+        meetingId,
+        ownerName: "Concurrent owner",
+        dueDate: addDaysISO(todayISO(), -15),
+      },
+    );
+    const actionId = created.json().id as string;
+    await built.app.db.insert(signals).values({
+      id: newId("sig"),
+      companyId: chair.companyId,
+      projectId,
+      detector: "meeting_action_overdue",
+      severity: "medium",
+      confidence: 1,
+      title: "Raised by a parallel sweep",
+      explanation: "Inserted without the evidenceRefs key the prefilter reads",
+      fingerprint: `meeting_action_overdue:${actionId}`,
+      evidenceRefs: {},
+    });
+
+    await inject("POST", `/api/v1/projects/${projectId}/meeting-reports/sweep`, chair.headers, {});
+    const rows = await built.app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, chair.companyId),
+          eq(signals.fingerprint, `meeting_action_overdue:${actionId}`),
+        ),
+      );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.occurrences).toBe(2);
+  });
+
   it("leaves a promoted action to its obligation rather than double-warning", async () => {
     const created = await inject(
       "POST",
@@ -1322,6 +1368,62 @@ describe("action items, promotion and the overdue sweep", () => {
     expect(res.json().byProject.some((p: { projectId: string }) => p.projectId === projectId)).toBe(
       true,
     );
+  });
+
+  it("paginates the tenant-wide register and rolls up over the whole scope, not the page", async () => {
+    /*
+     * The unbounded version returned every overdue action in the tenant in
+     * one response, and derived its per-project counts from whatever it had
+     * loaded. Both are now separate queries: the page is a page, and the
+     * roll-up covers everything in scope.
+     */
+    for (let i = 0; i < 3; i += 1) {
+      const created = await inject(
+        "POST",
+        `/api/v1/projects/${projectId}/meeting-action-items`,
+        chair.headers,
+        {
+          title: `Bounded register filler ${i}`,
+          meetingId,
+          ownerName: "Filler owner",
+          dueDate: addDaysISO(todayISO(), -20 - i),
+        },
+      );
+      expect(created.statusCode).toBe(201);
+    }
+
+    const all = await built.app.inject({
+      method: "GET",
+      url: `/api/v1/meeting-action-items/overdue?pageSize=500`,
+      headers: chair.headers,
+    });
+    const total = all.json().total as number;
+    expect(total).toBeGreaterThanOrEqual(3);
+
+    const page = await built.app.inject({
+      method: "GET",
+      url: `/api/v1/meeting-action-items/overdue?pageSize=2&page=1`,
+      headers: chair.headers,
+    });
+    expect(page.statusCode).toBe(200);
+    expect((page.json().items as unknown[]).length).toBe(2);
+    expect(page.json().total).toBe(total);
+    expect(page.json().pageSize).toBe(2);
+
+    /* The roll-up is NOT a tally of the two rows that fitted on the page. */
+    const forProject = (page.json().byProject as { projectId: string; overdue: number }[]).find(
+      (p) => p.projectId === projectId,
+    );
+    expect(forProject!.overdue).toBeGreaterThan(2);
+
+    const second = await built.app.inject({
+      method: "GET",
+      url: `/api/v1/meeting-action-items/overdue?pageSize=2&page=2`,
+      headers: chair.headers,
+    });
+    const firstIds = (page.json().items as { id: string }[]).map((i) => i.id);
+    const secondIds = (second.json().items as { id: string }[]).map((i) => i.id);
+    expect(secondIds.some((id) => firstIds.includes(id))).toBe(false);
   });
 
   it("blocks and escalates an action without losing its history", async () => {
@@ -1898,6 +2000,89 @@ describe("minutes as a real document (#422, #425)", () => {
     );
     expect(acked.statusCode).toBe(200);
     expect(acked.json().status).toBe("acknowledged");
+  });
+
+  it("will not let a reader forge an external recipient's acknowledgement", async () => {
+    /*
+     * An external attendee has no login, so their delivery row carries
+     * userId: null and the "only the recipient" check cannot bite on it. That
+     * used to mean any holder of meetings:read could mark the employer's copy
+     * acknowledged — and that acknowledgement sets minutesDeliveredAt, the
+     * timestamp the whole deemed-acceptance period is measured from.
+     */
+    const created = await inject("POST", `/api/v1/projects/${projectId}/meetings`, chair.headers, {
+      title: "External distribution",
+      scheduledStart: new Date().toISOString(),
+      minuteTakerId: chair.userId,
+      objectionPeriodDays: 7,
+    });
+    const meetingId = created.json().id as string;
+    const attendees = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${meetingId}/attendees`,
+      chair.headers,
+      {
+        attendees: [
+          { name: "Employer's Agent", email: "agent@employer.example", organisation: "Employer" },
+        ],
+      },
+    );
+    expect(attendees.statusCode).toBe(201);
+    await inject("POST", `/api/v1/projects/${projectId}/meetings/${meetingId}/hold`, chair.headers, {});
+    await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${meetingId}/minutes`,
+      chair.headers,
+      { minutesBody: "The employer's agent was present throughout." },
+    );
+    const issued = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${meetingId}/minutes/issue`,
+      chair.headers,
+      {},
+    );
+    expect(issued.statusCode).toBe(200);
+
+    const deliveries = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/meetings/${meetingId}/minutes/deliveries`,
+      chair.headers,
+    );
+    const external = (
+      deliveries.json().items as { id: string; userId: string | null; status: string }[]
+    ).find((d) => d.userId === null);
+    expect(external).toBeDefined();
+
+    /* A read-only member cannot press somebody else's acknowledgement. */
+    const forged = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${meetingId}/minutes/deliveries/${external!.id}/acknowledge`,
+      hRead,
+      { note: "They said it was fine" },
+    );
+    expect(forged.statusCode).toBe(403);
+    expect(forged.json().message).toMatch(/standard access/i);
+
+    /* Nor can a standard user log it silently: the note is the evidence. */
+    const noNote = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${meetingId}/minutes/deliveries/${external!.id}/acknowledge`,
+      chair.headers,
+      {},
+    );
+    expect(noNote.statusCode).toBe(400);
+    expect(noNote.json().message).toMatch(/note/i);
+
+    const logged = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/meetings/${meetingId}/minutes/deliveries/${external!.id}/acknowledge`,
+      chair.headers,
+      { note: "Reply email from agent@employer.example received 09:14" },
+    );
+    expect(logged.statusCode).toBe(200);
+    expect(logged.json().status).toBe("acknowledged");
+    expect(logged.json().acknowledgedById).toBe(chair.userId);
+    expect(logged.json().acknowledgementNote).toMatch(/Reply email/);
   });
 
   it("returns objections on the detail route and resolves them so sign-off can proceed", async () => {

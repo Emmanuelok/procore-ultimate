@@ -1876,6 +1876,37 @@ describe("premium and claims experience (#782)", () => {
     );
     expect(res.statusCode).toBe(403);
   });
+
+  it("bounds the roll-up to a stated window instead of everything ever recorded", async () => {
+    /*
+     * A company-scope experience report that loads every premium and every
+     * claim the tenant has ever recorded is the unbounded roll-up PLAN §6.4
+     * forbids — and it is also the wrong answer, because an insurer rates on
+     * the last few years. The window is explicit in the query and echoed in
+     * the payload so a windowed figure is never mistaken for a lifetime one.
+     */
+    const old = await post(`/projects/${expProject}/insurance/policies/${expPolicy}/premiums`, {
+      amount: 1_000_000,
+      periodStart: addDaysISO(todayISO(), -365 * 9),
+      periodEnd: addDaysISO(todayISO(), -365 * 8),
+    });
+    expect(old.statusCode).toBe(201);
+
+    const inside = await get(`/projects/${expProject}/insurance/experience?windowYears=6`);
+    expect(inside.json().window.years).toBe(6);
+    expect(inside.json().windowNote).toMatch(/6-year experience figure/);
+    const gbpInside = (inside.json().byCurrency as { currency: string; premiumNet: number }[]).find(
+      (b) => b.currency === "GBP",
+    )!;
+    expect(gbpInside.premiumNet).toBe(180_000);
+
+    const wide = await get(`/projects/${expProject}/insurance/experience?windowYears=20`);
+    const gbpWide = (wide.json().byCurrency as { currency: string; premiumNet: number }[]).find(
+      (b) => b.currency === "GBP",
+    )!;
+    expect(gbpWide.premiumNet).toBe(1_180_000);
+    expect(wide.json().window.from < inside.json().window.from).toBe(true);
+  });
 });
 
 describe("renewal pipeline (#775)", () => {
@@ -2483,6 +2514,79 @@ describe("claim documentation pack and the adjuster's task list", () => {
       policyId: packPolicy,
     });
     expect(res.statusCode).toBe(404);
+  });
+
+  it("refuses to read the safety register on behalf of a caller who does not hold safety", async () => {
+    /*
+     * This route is gated on insurance:standard and then copies an incident's
+     * title, narrative and estimated cost onto the claim it returns. Without
+     * a second check, holding insurance on a project would silently confer
+     * read access to the safety register through a choice of URL — the same
+     * rule `/meeting-agenda-items/:id/raise` applies before it creates an RFI.
+     */
+    const insuranceOnly = await registerActor(app);
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: insuranceOnly.userId,
+      role: "member",
+    });
+    await app.db.insert(projectMemberships).values({
+      id: newId("pm"),
+      companyId: owner.companyId,
+      projectId: packProject,
+      userId: insuranceOnly.userId,
+      templateKey: "read_only",
+      overrides: { insurance: "standard", safety: "none" },
+    });
+    const headers = {
+      authorization: insuranceOnly.headers["authorization"]!,
+      "x-company-id": owner.companyId,
+    };
+
+    const secondIncident = newId("sin");
+    await app.db.insert(safetyIncidents).values({
+      id: secondIncident,
+      companyId: owner.companyId,
+      projectId: packProject,
+      number: 92,
+      reference: "INC-0092",
+      incidentType: "near_miss",
+      severity: "serious",
+      title: "Scaffold tie failure",
+      description: "Confidential narrative nobody without safety should read",
+      occurredAt: new Date(Date.now() - 4 * 86_400_000).toISOString(),
+      reportedAt: new Date(Date.now() - 3 * 86_400_000).toISOString(),
+      estimatedCost: 15_000,
+      createdBy: owner.userId,
+    });
+
+    const denied = await post(
+      `/projects/${packProject}/insurance/claims/from-incident`,
+      { incidentId: secondIncident, policyId: packPolicy },
+      headers,
+    );
+    expect(denied.statusCode).toBe(403);
+    expect(denied.json().message).toMatch(/safety/i);
+    expect(JSON.stringify(denied.json())).not.toContain("Confidential narrative");
+
+    /* With safety read restored, the same caller succeeds. */
+    await app.db
+      .update(projectMemberships)
+      .set({ overrides: { insurance: "standard", safety: "read" } })
+      .where(
+        and(
+          eq(projectMemberships.projectId, packProject),
+          eq(projectMemberships.userId, insuranceOnly.userId),
+        ),
+      );
+    const allowed = await post(
+      `/projects/${packProject}/insurance/claims/from-incident`,
+      { incidentId: secondIncident, policyId: packPolicy },
+      headers,
+    );
+    expect(allowed.statusCode).toBe(201);
+    expect(allowed.json().title).toContain("INC-0092");
   });
 
   it("records an adjuster request as a dated obligation and notifies its owner", async () => {

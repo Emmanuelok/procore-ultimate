@@ -4298,8 +4298,10 @@ export const meetingsModule: FastifyPluginAsync = async (app) => {
           status: "acknowledged",
           acknowledgedAt: now,
           deliveredAt: row.deliveredAt ?? now,
+          /* null when the recipient confirmed their own copy: the row's
+             own userId already names them. Set only for a logged one. */
           acknowledgedById: onBehalf ? req.user!.id : null,
-          acknowledgementNote: onBehalf ? (body.note ?? null) : (body.note ?? null),
+          acknowledgementNote: body.note ?? null,
         })
         .where(eq(meetingMinuteDeliveries.id, deliveryId));
       if (!meeting.minutesDeliveredAt) {
