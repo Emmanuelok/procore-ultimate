@@ -22,7 +22,7 @@ import {
 } from "@constructos/shared";
 import { forbidden, unauthorized } from "../lib/errors.js";
 import { isExpired } from "../lib/time.js";
-import { loadSession } from "../modules/account/sessions.js";
+import { loadSession, touchSession } from "../modules/account/sessions.js";
 // Vol I §0.7 #120 — machine callers. This gate needed four small additions,
 // all marked below: resolve an OAuth2 access token to a machine identity in
 // `authenticate`, branch to the machine equivalents in `requireCompany` and
@@ -111,6 +111,20 @@ const authPlugin: FastifyPluginAsync = async (app) => {
         throw unauthorized("Session has expired");
       }
       req.accountSessionId = session.id;
+      /*
+       * Freshness belongs on EVERY authenticated request, not on the handful
+       * that happen to sit behind the account module's own prehandler. Before
+       * this, `last_seen_at` was bumped only by `requireLiveSession`, so the
+       * device list told a user who never opened /account/security that their
+       * session was last seen when they signed in — and the tenant idle
+       * timeout (#23) went unenforced for exactly the same reason.
+       *
+       * `touchSession` is gated on a once-a-minute staleness check, so the
+       * common path costs one comparison and no query. It throws
+       * `unauthorized` when the session has timed out, having revoked it and
+       * written the `session_idle_timeout` record first.
+       */
+      await touchSession(app, req, session, Date.now());
     }
   });
 

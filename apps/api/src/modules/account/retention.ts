@@ -1,5 +1,5 @@
-import { and, eq, inArray, isNotNull, lte, ne, or } from "drizzle-orm";
-import { authSecurityEvents, emailDispatches } from "@constructos/db";
+import { and, eq, inArray, isNotNull, isNull, lte, ne, or } from "drizzle-orm";
+import { authSecurityEvents, emailDispatches, legalHolds } from "@constructos/db";
 import type { Db } from "../../lib/db.js";
 import { recordAuthEvent } from "./events.js";
 import { loadCompanyPolicy } from "./policy.js";
@@ -33,10 +33,12 @@ import { loadCompanyPolicy } from "./policy.js";
  *    The message log IS deleted, because a redacted preview of a message
  *    nobody can now identify is not evidence of anything.
  *
- * 3. A LEGAL HOLD BEATS A RETENTION POLICY, ALWAYS. `legalHold` skips the
- *    tenant entirely and the sweep SAYS SO in what it returns, rather than
- *    reporting zero rows and letting an operator conclude there was nothing
- *    to do.
+ * 3. A LEGAL HOLD BEATS A RETENTION POLICY, ALWAYS. Either the Security
+ *    page's own switch (`company_security_policies.legal_hold`) or an active
+ *    tenant-wide row in the general `legal_holds` register skips the tenant
+ *    entirely, and the sweep SAYS SO in what it returns — naming the hold
+ *    that applied — rather than reporting zero rows and letting an operator
+ *    conclude there was nothing to do.
  *
  * WHAT THIS DELIBERATELY DOES NOT DO: it does not touch `auth_events` (the
  * legacy thin table), the ledger, or anything a company cannot already read
@@ -91,14 +93,41 @@ export async function applyRetention(
   const limit = options.limit ?? 2000;
   const policy = await loadCompanyPolicy(db, companyId);
 
-  if (policy.legalHold) {
+  /*
+   * Two hold mechanisms exist and BOTH stop the sweep.
+   *
+   * `company_security_policies.legal_hold` is the auth-specific switch an
+   * owner sets from the Security page. `legal_holds` is the general,
+   * matter-scoped register. Neither subsumes the other — a matter-level hold
+   * placed by counsel should stop an authentication sweep just as surely as
+   * the switch, and the switch should keep working when no matter exists —
+   * so the sweep fails closed on either, and reports which one applied.
+   *
+   * A tenant-wide row here is one with no objectType: a hold scoped to a
+   * particular object type is not a reason to stop pseudonymising unrelated
+   * authentication records.
+   */
+  const [matterHold] = await db
+    .select({ id: legalHolds.id, name: legalHolds.name, reason: legalHolds.reason })
+    .from(legalHolds)
+    .where(
+      and(
+        eq(legalHolds.companyId, companyId),
+        eq(legalHolds.status, "active"),
+        isNull(legalHolds.objectType),
+      ),
+    )
+    .limit(1);
+
+  if (policy.legalHold || matterHold) {
     const held: RetentionOutcome = {
       companyId,
       skipped: true,
       skipReason: "legal_hold",
-      reason:
-        policy.legalHoldReason ??
-        "This organisation is under a legal hold; no authentication record was removed.",
+      reason: policy.legalHold
+        ? (policy.legalHoldReason ??
+          "This organisation is under a legal hold; no authentication record was removed.")
+        : `Legal hold "${matterHold!.name}" is active: ${matterHold!.reason}. No authentication record was removed.`,
       securityEventsPseudonymised: 0,
       emailDispatchesDeleted: 0,
     };

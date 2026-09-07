@@ -41,7 +41,6 @@ import {
   listLiveSessions,
   loadSession,
   requestContext,
-  requireLiveSession,
   revokeAllUserSessions,
   revokeSessions,
   sessionIdFromRequest,
@@ -99,7 +98,7 @@ import { enqueueSecurityEvent, sweepSecurityWebhooks } from "./webhooks.js";
  *  3. Completing a reset destroys every session and every refresh token,
  *     because a reset is the moment you must assume the attacker holds one.
  *  4. A revoked session is refused on its NEXT request, not at the next
- *     refresh — see `requireLiveSession` in sessions.ts.
+ *     refresh — `app.authenticate` calls `touchSession` on every request.
  *  5. Nothing claims to have sent a message it did not send. Every route that
  *     composes mail returns `deliveryReport(...)`, and when no transport is
  *     configured it says so and names the environment variable.
@@ -110,11 +109,17 @@ const passwordSchema = z.string().min(1).max(PASSWORD_MAX_LENGTH);
 const tokenSchema = z.string().min(20).max(512);
 
 export const accountModule: FastifyPluginAsync = async (app) => {
-  const liveSession = requireLiveSession(app);
-  const signedIn = [app.authenticate, liveSession];
+  /*
+   * `app.authenticate` now calls `touchSession` itself, so last-seen and the
+   * tenant idle timeout are enforced on every authenticated request rather
+   * than only on this module's routes. The `requireLiveSession` prehandler
+   * that used to carry that job here is therefore redundant and gone; keeping
+   * it would have re-run the same once-a-minute check a second time per
+   * request for no additional guarantee.
+   */
+  const signedIn = [app.authenticate];
   const companyAdmin = [
     app.authenticate,
-    liveSession,
     app.requireCompany,
     app.requireCompanyRole(["owner", "admin"]),
   ];

@@ -403,24 +403,6 @@ export const photoRoutes: FastifyPluginAsync = async (app) => {
           uploadedBy: req.user!.id,
         });
       });
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "create",
-        objectType: "photo",
-        objectId: photoId,
-        payload: {
-          fileId,
-          sha256: saved.sha256,
-          sizeBytes: saved.sizeBytes,
-          contentType: mediaType,
-          album: meta.album ?? null,
-          takenAt,
-          hasGps: latitude !== null && longitude !== null,
-          exif: Boolean(exif),
-        },
-        projectId: req.projectId!,
-      });
     } catch (err) {
       const others = await app.db
         .select({ id: files.id })
@@ -430,6 +412,26 @@ export const photoRoutes: FastifyPluginAsync = async (app) => {
       if (others.length === 0) await app.storage.remove(saved.storageKey).catch(() => undefined);
       throw err;
     }
+    // Outside the rollback guard on purpose: the rows above are committed, so a
+    // ledger failure here must NOT delete the blob they now reference.
+    await appendLedger(app.db, {
+      companyId: req.companyId!,
+      actorId: req.user!.id,
+      action: "create",
+      objectType: "photo",
+      objectId: photoId,
+      payload: {
+        fileId,
+        sha256: saved.sha256,
+        sizeBytes: saved.sizeBytes,
+        contentType: mediaType,
+        album: meta.album ?? null,
+        takenAt,
+        hasGps: latitude !== null && longitude !== null,
+        exif: Boolean(exif),
+      },
+      projectId: req.projectId!,
+    });
 
     const row = (await app.db.select().from(photos).where(eq(photos.id, photoId)).limit(1))[0]!;
     if (aiStatus === "pending") {
