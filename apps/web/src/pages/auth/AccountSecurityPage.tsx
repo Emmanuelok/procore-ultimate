@@ -21,7 +21,7 @@
  *                 assurance ledger: that records what was done to PROJECT
  *                 records, this records what happened to this ACCOUNT.
  */
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useState } from "react";
 import {
   ActivityFeed,
   Alert,
@@ -66,6 +66,24 @@ import {
   type AuthFailure,
   type ProviderDiscovery,
 } from "./authShared";
+
+/**
+ * THE COMPANY SECURITY WORKSPACE, MOUNTED HERE SO IT IS REACHABLE.
+ *
+ * `SecurityPage` carries the whole owner/admin surface — the tenant policy
+ * (sessions, passwords, lockout, IP allowlist, retention, legal hold), the
+ * sign-in audit and its export, deactivation and session revocation, SCIM
+ * tokens and the SIEM webhooks. It wants its own route at `/security`, which
+ * is two lines in App.tsx and layouts/shell/nav.ts — files this package may
+ * not edit (WIRING note 11). Built and unreachable is not delivered, so it is
+ * also a tab here, on a route that exists, for the two roles the API lets
+ * through anyway.
+ *
+ * `lazy` matters: the workspace is a large module and most people who open
+ * their own account settings are not administrators. It is fetched when the
+ * tab is opened and never before.
+ */
+const CompanySecurityWorkspace = lazy(() => import("./SecurityPage"));
 
 /* ================================================================== */
 /* Wire shapes                                                         */
@@ -268,7 +286,7 @@ function deviceOf(session: SessionView): string {
 /* Page                                                                */
 /* ================================================================== */
 
-type TabKey = "sessions" | "mfa" | "methods" | "activity";
+type TabKey = "sessions" | "mfa" | "methods" | "activity" | "organisation";
 
 const TABS: Array<{ value: TabKey; label: string }> = [
   { value: "sessions", label: "Sessions & devices" },
@@ -277,8 +295,18 @@ const TABS: Array<{ value: TabKey; label: string }> = [
   { value: "activity", label: "Activity" },
 ];
 
+/** Only the roles the company-security API admits see the tab at all. */
+const ORGANISATION_TAB: { value: TabKey; label: string } = {
+  value: "organisation",
+  label: "Organisation",
+};
+
 export default function AccountSecurityPage() {
-  const { user } = useAuth();
+  const { user, company } = useAuth();
+  // The API refuses these routes to anyone else (owner/admin), so showing the
+  // tab to a member would only offer them a panel of 403s.
+  const isCompanyAdmin = company?.role === "owner" || company?.role === "admin";
+  const tabs = isCompanyAdmin ? [...TABS, ORGANISATION_TAB] : TABS;
   const [tab, setTab] = useState<TabKey>("sessions");
   const [nonce, setNonce] = useState(0);
   const refresh = () => setNonce((n) => n + 1);
@@ -296,7 +324,7 @@ export default function AccountSecurityPage() {
         tabs={
           <Tabs
             aria-label="Account security"
-            items={TABS.map((t) => ({
+            items={tabs.map((t) => ({
               value: t.value,
               label: t.label,
               ...(t.value === "sessions" && sessions.data
@@ -318,6 +346,10 @@ export default function AccountSecurityPage() {
         <MfaPanel status={mfa.data} loading={mfa.loading} onChanged={refresh} />
       ) : tab === "methods" ? (
         <MethodsPanel nonce={nonce} onChanged={refresh} />
+      ) : tab === "organisation" ? (
+        <Suspense fallback={<Skeleton className="h-64" />}>
+          <CompanySecurityWorkspace embedded />
+        </Suspense>
       ) : (
         <ActivityPanel nonce={nonce} />
       )}

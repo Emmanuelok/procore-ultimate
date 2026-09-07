@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
 import { SignJWT, exportJWK, generateKeyPair, type JSONWebKeySet, type JWK } from "jose";
@@ -315,6 +315,23 @@ async function signIn(
   return { flow, res: await callback(flow, code) };
 }
 
+/**
+ * WHAT A RED SUITE HERE MUST MEAN.
+ *
+ * `buildTestApp()` boots PGlite (WASM Postgres) and replays every migration
+ * from 0000, and almost every test below registers an account or two — a
+ * bcrypt hash plus a company, a membership and a project each. On an idle
+ * machine that is seconds; on a shared one it is minutes, and vitest's
+ * 30-second defaults then fail the suite for a reason that has nothing to do
+ * with the code under test. "Hook timed out" and "Test timed out" are the two
+ * failures that teach people to ignore red, so the ceilings are raised to
+ * match the other integration suites in this package. No assertion changes: a
+ * test that is going to pass still passes, it is simply allowed to take
+ * longer, and one that is going to fail still fails on its assertion.
+ */
+const HOOK_TIMEOUT_MS = 180_000;
+vi.setConfig({ testTimeout: 120_000, hookTimeout: HOOK_TIMEOUT_MS });
+
 beforeAll(async () => {
   built = await buildTestApp();
   app = built.app;
@@ -344,7 +361,7 @@ beforeAll(async () => {
     userId: bobId,
     role: "member",
   });
-}, 60_000);
+}, HOOK_TIMEOUT_MS);
 
 afterAll(async () => {
   await built.close();

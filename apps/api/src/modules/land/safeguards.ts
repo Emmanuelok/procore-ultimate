@@ -67,6 +67,7 @@ import { computeReplacementCost, round2, summariseReplacement } from "./replacem
 import { loadConsentView } from "./consent-service.js";
 import { runLandDetectors } from "./detectors.js";
 import { GRIEVANCE_SETTLED_STATUSES, PHYSICAL_DISPLACEMENT } from "./reference.js";
+import { GRIEVANCE_OPEN_STATUS, effectivePapStatus } from "./pap-grievance.js";
 import {
   percentOf,
   validateEvidence,
@@ -1189,8 +1190,16 @@ export async function registerSafeguardRoutes(app: FastifyInstance): Promise<voi
     const today = todayISO();
     const physical = paps.filter((p) => PHYSICAL_DISPLACEMENT.includes(p.displacementType));
     const compensated = paps.filter((p) => p.compensationPaidAt != null);
+    /*
+     * Every household indicator below reads the SUBSTANTIVE status, with the
+     * `grievance_open` overlay removed. Reading the raw column would let a
+     * single dust complaint hide a "resettled with no payment on file" —
+     * the one PS5 para 20 indicator a supervision mission is looking for —
+     * and drop a genuinely restored household out of the restoration rate.
+     */
+    const papStatus = (p: (typeof paps)[number]): string => effectivePapStatus(p);
     const restored = paps.filter(
-      (p) => p.livelihoodRestoredAt != null || p.status === "livelihood_restored",
+      (p) => p.livelihoodRestoredAt != null || papStatus(p) === "livelihood_restored",
     );
     const openGrievances = grv.filter(
       (g) => !(GRIEVANCE_SETTLED_STATUSES as readonly string[]).includes(g.status),
@@ -1228,12 +1237,14 @@ export async function registerSafeguardRoutes(app: FastifyInstance): Promise<voi
         vulnerable: paps.filter((p) => p.vulnerabilities.length > 0).length,
         compensated: compensated.length,
         compensatedPercent: percentOf(compensated.length, paps.length),
-        resettled: paps.filter((p) => p.status === "resettled").length,
+        resettled: paps.filter((p) => papStatus(p) === "resettled").length,
         livelihoodRestored: restored.length,
         livelihoodRestoredPercent: percentOf(restored.length, paps.length),
         resettledWithoutPayment: paps.filter(
-          (p) => p.status === "resettled" && p.compensationPaidAt == null,
+          (p) => papStatus(p) === "resettled" && p.compensationPaidAt == null,
         ).length,
+        /** households with a live complaint against them (#569-574) */
+        underOpenGrievance: paps.filter((p) => p.status === GRIEVANCE_OPEN_STATUS).length,
       },
       replacementCost: {
         studies: studies.length,
@@ -1462,6 +1473,7 @@ export async function registerSafeguardRoutes(app: FastifyInstance): Promise<voi
         householdsCompensatedPercent: i.households.compensatedPercent,
         livelihoodRestoredPercent: i.households.livelihoodRestoredPercent,
         resettledWithoutPayment: i.households.resettledWithoutPayment,
+        householdsUnderOpenGrievance: i.households.underOpenGrievance,
         replacementShortfalls: i.replacementCost.shortfalls,
         grievancesOpen: i.grievances.open,
         grievancesOverdue: i.grievances.overdue,

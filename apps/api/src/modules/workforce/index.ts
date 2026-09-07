@@ -354,6 +354,30 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
     app.requireTool("workforce", "standard"),
   ];
 
+  /*
+   * THE TWO UNAUTHENTICATED ROUTES ARE METERED HARDER THAN THE REST.
+   *
+   * `POST /worker-voice/reports` is admitted on an intake token alone and
+   * `GET /worker-voice/reports/:trackingCode` on a tracking code alone —
+   * deliberately, because a channel that needs the employer's account is a
+   * channel the employer controls. Both are therefore guessing surfaces, and
+   * the platform's default 300/minute is a budget for a signed-in SPA, not
+   * for an unauthenticated credential check. Same shape as the credential
+   * endpoints in modules/identity, and disabled under test for the same
+   * reason.
+   */
+  const anonymousLimited =
+    app.appConfig.RATE_LIMIT_ENABLED && app.appConfig.NODE_ENV !== "test"
+      ? {
+          config: {
+            rateLimit: {
+              max: app.appConfig.AUTH_RATE_LIMIT_MAX_PER_MINUTE,
+              timeWindow: "1 minute",
+            },
+          },
+        }
+      : {};
+
   /* ---------------------------------------------------------------- */
   /* Fetch helpers                                                     */
   /* ---------------------------------------------------------------- */
@@ -2332,7 +2356,7 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
    * gets a tracking code; the platform keeps only its hash, so nobody can
    * list reports by reporter.
    */
-  app.post("/worker-voice/reports", async (req, reply) => {
+  app.post("/worker-voice/reports", anonymousLimited, async (req, reply) => {
     const header = req.headers["x-intake-token"];
     const token = typeof header === "string" ? header.trim() : "";
     if (!token) {
@@ -2492,7 +2516,7 @@ export const workforceModule: FastifyPluginAsync = async (app) => {
   });
 
   /** Anonymous status check by tracking code — no account, no identity. */
-  app.get("/worker-voice/reports/:trackingCode", async (req) => {
+  app.get("/worker-voice/reports/:trackingCode", anonymousLimited, async (req) => {
     const { trackingCode } = req.params as { trackingCode: string };
     const rows = await app.db
       .select()

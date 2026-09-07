@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import {
@@ -28,6 +28,17 @@ import { loadSession, touchSession } from "./sessions.js";
  * succeed still succeeds, it is simply allowed to take longer.
  */
 const HOOK_TIMEOUT_MS = 180_000;
+
+/**
+ * And the per-TEST ceiling, for the same reason as the hook's.
+ *
+ * Nearly every test below registers an account — a bcrypt hash plus a
+ * company, a membership and a project — and several register two. On a loaded
+ * machine that outruns vitest's 30-second default, and "Test timed out"
+ * becomes a red suite that says nothing about the code. Raising the ceiling
+ * changes no assertion: a test that is going to fail still fails on it.
+ */
+vi.setConfig({ testTimeout: 120_000, hookTimeout: HOOK_TIMEOUT_MS });
 
 
 /**

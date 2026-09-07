@@ -72,6 +72,7 @@ import {
   type SweepResult,
 } from "./signals.js";
 import { sweepConsent } from "./consent-service.js";
+import { effectivePapStatus, sweepPapGrievanceStatus } from "./pap-grievance.js";
 
 /* ------------------------------------------------------------------ */
 /* Project settings: who each escalation tier goes to                  */
@@ -396,7 +397,11 @@ export async function sweepPs5(
       id: p.id,
       reference: p.reference,
       householdHead: p.householdHead,
-      status: p.status,
+      // the SUBSTANTIVE status: an open complaint about a household must not
+      // clear the "resettled before compensation" finding against it, nor
+      // manufacture a "livelihood not restored" one against a household whose
+      // livelihood was restored (see effectivePapStatus)
+      status: effectivePapStatus(p),
       displacementType: p.displacementType,
       vulnerabilities: p.vulnerabilities ?? [],
       entitlements: (p.entitlements as unknown[]) ?? [],
@@ -671,6 +676,15 @@ export async function runLandDetectors(
   projectId: string,
   today = todayISO(),
 ): Promise<SweepResult> {
+  /*
+   * Not a finding, a repair: the household `grievance_open` flag is written
+   * by the grievance routes, so a write that failed halfway, a grievance
+   * removed directly, or a row created before the coupling existed leaves a
+   * household that looks settled while a complaint about it is live — or
+   * flagged long after the complaint closed. Healed here as the SYSTEM actor
+   * before the findings run, so PS5 conformance reads a true census.
+   */
+  await sweepPapGrievanceStatus(db, companyId, projectId);
   return mergeSweeps(
     await sweepGrievances(db, companyId, projectId, today),
     await sweepPs5(db, companyId, projectId, today),

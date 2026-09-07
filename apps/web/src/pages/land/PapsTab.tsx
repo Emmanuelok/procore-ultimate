@@ -514,7 +514,16 @@ export default function PapsTab({
                 </Td>
                 <Td className="tabular-nums">{formatDate(p.censusDate)}</Td>
                 <Td>
-                  <Badge tone={papTone(p.status)}>{humanize(p.status)}</Badge>
+                  <div className="flex flex-wrap items-center gap-1">
+                    <Badge tone={papTone(p.effectiveStatus ?? p.status)}>
+                      {humanize(p.effectiveStatus ?? p.status)}
+                    </Badge>
+                    {p.underOpenGrievance ? (
+                      <span title="A grievance naming this household is open; its lifecycle status is unchanged">
+                        <Badge tone="red">Grievance</Badge>
+                      </span>
+                    ) : null}
+                  </div>
                 </Td>
               </tr>
             ))}
@@ -694,7 +703,20 @@ export default function PapsTab({
           <div className="space-y-4">
             <ErrorAlert message={actError} />
             <div className="flex flex-wrap items-center gap-2">
-              <Badge tone={papTone(selected.status)}>{humanize(selected.status)}</Badge>
+              {/*
+                * Both facts, separately. A live complaint about a household
+                * does not undo its resettlement, so the lifecycle badge shows
+                * where the register really has it and the complaint shows as
+                * an overlay next to it.
+                */}
+              <Badge tone={papTone(selected.effectiveStatus ?? selected.status)}>
+                {humanize(selected.effectiveStatus ?? selected.status)}
+              </Badge>
+              {selected.underOpenGrievance ? (
+                <span title="A grievance naming this household is open. Its lifecycle status is unchanged; the flag clears when the last grievance settles.">
+                  <Badge tone="red">Grievance open</Badge>
+                </span>
+              ) : null}
               <Badge tone="gray">{humanize(selected.displacementType)}</Badge>
               {selected.vulnerabilities.map((v) => (
                 <Badge key={v} tone="violet">
@@ -808,8 +830,16 @@ export default function PapsTab({
               ))}
               {(selected.allowedTransitions ?? []).length === 0 ? (
                 <span className="text-xs text-ink-400">
-                  No further status change is available from {humanize(selected.status)}.
+                  No further status change is available from{" "}
+                  {humanize(selected.effectiveStatus ?? selected.status)}.
                 </span>
+              ) : null}
+              {selected.underOpenGrievance ? (
+                <p className="basis-full text-xs text-ink-400">
+                  Work on this household continues while the grievance is open: a status change
+                  here advances the lifecycle and leaves the complaint flag in place until the
+                  last grievance naming the household settles.
+                </p>
               ) : null}
             </div>
           </div>

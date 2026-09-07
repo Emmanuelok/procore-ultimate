@@ -153,6 +153,7 @@ import {
 import {
   companyScopeOf,
   companyToolGate,
+  projectsWithTool,
   scopeProjectFilter,
   type CompanyScope,
 } from "./gates.js";
@@ -548,6 +549,33 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       .limit(1);
     if (!rows[0])
       throw badRequest("projectId is not a project in this company");
+  }
+
+  /**
+   * THE TOOL, ON A PROJECT THE ROUTE DID NOT NAME.
+   *
+   * `requireTool` gates on `:projectId`, which is the project the caller is
+   * standing on. A transfer WRITES to a second project — it books an
+   * assignment there and moves the machine onto it — and the gate on the
+   * source job says nothing about whether the caller may touch the
+   * destination. Without this, `equipment` standard on one job was enough to
+   * push plant, its hire cost and its cost coding onto any other job in the
+   * company. Owners and admins bypass, as they do in `requireTool` itself.
+   */
+  async function assertToolOnProject(
+    req: FastifyRequest,
+    projectId: string,
+    level: "read" | "standard" | "admin",
+  ): Promise<void> {
+    if (req.companyRole === "owner" || req.companyRole === "admin") return;
+    const held = await projectsWithTool(app, req, "equipment", level);
+    if (!held.includes(projectId)) {
+      throw forbidden(
+        `Requires ${level} access to equipment on project ${projectId}. Moving plant onto a job ` +
+          "puts its hire cost on that job's budget, so it is gated by that job's permissions and " +
+          "not only by the one you are standing on.",
+      );
+    }
   }
 
   async function holdsAssuranceRole(
@@ -2952,26 +2980,6 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       }
 
       const lineIds = [...byLine.keys()];
-      const lines = lineIds.length
-        ? await app.db
-            .select()
-            .from(budgetLineItems)
-            .where(
-              and(
-                eq(budgetLineItems.projectId, projectId),
-                inArray(budgetLineItems.id, lineIds),
-              ),
-            )
-        : [];
-      const found = new Set(lines.map((l) => l.id));
-      for (const id of lineIds) {
-        if (!found.has(id)) {
-          reasons.push(
-            `Budget line ${id} is coded on plant days but does not exist on this project, so ` +
-              "those days were not posted.",
-          );
-        }
-      }
       const posted: Array<{
         budgetLineItemId: string;
         costCode: string;
@@ -2982,6 +2990,38 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
       }> = [];
       const now = new Date().toISOString();
       await app.db.transaction(async (tx) => {
+        /*
+         * THE LINES ARE READ AND LOCKED INSIDE THE TRANSACTION.
+         *
+         * `directCosts` is a read-modify-write: the new value is the old one
+         * less this module's previous posting plus the new figure. Reading it
+         * outside the transaction meant the timecards module's labour posting
+         * (which writes the same two columns on the same lines) and a second
+         * plant posting could interleave and silently erase each other — the
+         * cost report would show plant OR labour, whichever landed last, with
+         * no error anywhere. `FOR UPDATE` serialises the two.
+         */
+        const lines = lineIds.length
+          ? await tx
+              .select()
+              .from(budgetLineItems)
+              .where(
+                and(
+                  eq(budgetLineItems.projectId, projectId),
+                  inArray(budgetLineItems.id, lineIds),
+                ),
+              )
+              .for("update")
+          : [];
+        const found = new Set(lines.map((l) => l.id));
+        for (const id of lineIds) {
+          if (!found.has(id)) {
+            reasons.push(
+              `Budget line ${id} is coded on plant days but does not exist on this project, so ` +
+                "those days were not posted.",
+            );
+          }
+        }
         for (const line of lines) {
           const held = byLine.get(line.id)!;
           const detail = { ...(line.detail as Record<string, unknown>) };
@@ -8595,6 +8635,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         throw badRequest("a machine cannot be transferred to the project it is already on");
       }
       await assertProject(body.toProjectId, companyId);
+      await assertToolOnProject(req, body.toProjectId, "standard");
       const assignment = await fetchAssignment(assignmentId, companyId, projectId);
       if (!["approved", "mobilising", "on_site"].includes(assignment.status)) {
         throw conflict(

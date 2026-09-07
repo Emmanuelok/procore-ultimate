@@ -2208,7 +2208,12 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
       }
     } else if (sourceType === "prime_contract_change") {
       const rows = await app.db
-        .select({ id: primeContractChanges.id, reference: primeContractChanges.reference, status: primeContractChanges.status })
+        .select({
+          id: primeContractChanges.id,
+          reference: primeContractChanges.reference,
+          status: primeContractChanges.status,
+          changeOrderPackageId: primeContractChanges.changeOrderPackageId,
+        })
         .from(primeContractChanges)
         .where(
           and(
@@ -2227,6 +2232,53 @@ export const budgetModule: FastifyPluginAsync = async (app) => {
           `${pcco.reference} is ${pcco.status}, not executed. An owner_change needs an executed ` +
             "instrument behind it.",
         );
+      }
+      // The same instrument reached here under two names: change management
+      // executes a PACKAGE and stamps the budget change as
+      // 'change_order_package', while the prime module executes the CHANGE
+      // and stamps it 'prime_contract_change'. Without this, one executed
+      // PCCO raised through change management could be funded a second time
+      // by citing the change itself.
+      if (pcco.changeOrderPackageId) {
+        const pkgRows = await app.db
+          .select({ id: changeOrderPackages.id, reference: changeOrderPackages.reference, budgetChangeId: changeOrderPackages.budgetChangeId })
+          .from(changeOrderPackages)
+          .where(
+            and(
+              eq(changeOrderPackages.id, pcco.changeOrderPackageId),
+              eq(changeOrderPackages.projectId, budget.projectId),
+            ),
+          )
+          .limit(1);
+        const pkg = pkgRows[0];
+        if (pkg?.budgetChangeId && pkg.budgetChangeId !== excludeChangeId) {
+          throw conflict(
+            `${pcco.reference} belongs to package ${pkg.reference}, which already funded this ` +
+              `budget (budget change ${pkg.budgetChangeId}). One executed instrument funds the ` +
+              "budget once.",
+          );
+        }
+        const viaPackage = await app.db
+          .select({ id: budgetChanges.id, reference: budgetChanges.reference, status: budgetChanges.status })
+          .from(budgetChanges)
+          .where(
+            and(
+              eq(budgetChanges.projectId, budget.projectId),
+              eq(budgetChanges.kind, "owner_change"),
+              eq(budgetChanges.sourceType, "change_order_package"),
+              eq(budgetChanges.sourceId, pcco.changeOrderPackageId),
+              ne(budgetChanges.status, "void"),
+              ne(budgetChanges.status, "rejected"),
+            ),
+          );
+        const clash = viaPackage.find((d) => d.id !== excludeChangeId);
+        if (clash) {
+          throw conflict(
+            `${clash.reference} (${clash.status}) already carries ${pcco.reference}'s package into ` +
+              "the budget. One executed change order funds the budget once — void that change " +
+              "first if it is wrong.",
+          );
+        }
       }
     } else {
       throw badRequest(

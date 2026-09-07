@@ -26,6 +26,7 @@ import {
 } from "../../ui";
 import { formatDate, humanize } from "../format";
 import { Donut, HBars, MonthlyBars, type Datum } from "./charts";
+import TriagePanel from "./TriagePanel";
 import {
   GRIEVANCE_RAIL,
   dueBadge,
@@ -886,6 +887,20 @@ export default function GrievancesTab({
                 (#573).
               </p>
             ) : null}
+
+            {/*
+              * Triage: precedent first, the rule second, the assistant third
+              * and last. The officer's classification is the only write —
+              * severity IS the SLA, so re-grading moves the promise made to
+              * the complainant and is ledgered with the before and after.
+              */}
+            <TriagePanel
+              projectId={projectId}
+              grievanceId={selected.id}
+              settled={["resolved", "closed_verified", "rejected"].includes(selected.status)}
+              users={users}
+              onDecided={() => void reload(selected.id)}
+            />
 
             {/* ------------------------------ per-state acts ----------------------------- */}
             <div className="space-y-3 border-t border-ink-100 pt-3">

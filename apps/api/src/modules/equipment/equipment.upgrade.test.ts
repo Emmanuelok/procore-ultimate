@@ -37,6 +37,8 @@ let verifier: TestActor;
 let guestHeaders: Record<string, string>;
 /** read-only member of one project — may read the fleet, may not write it */
 let readerHeaders: Record<string, string>;
+/** project_manager on projectA ONLY — the transfer-destination case */
+let moverHeaders: Record<string, string>;
 let stranger: TestActor;
 let projectA: string;
 let projectB: string;
@@ -154,6 +156,18 @@ beforeAll(async () => {
     "x-company-id": owner.companyId,
   };
 
+  const mover = await registerActor(app);
+  await app.db.insert(companyMemberships).values({
+    id: newId("cm"),
+    companyId: owner.companyId,
+    userId: mover.userId,
+    role: "member",
+  });
+  moverHeaders = {
+    authorization: mover.headers["authorization"]!,
+    "x-company-id": owner.companyId,
+  };
+
   stranger = await registerActor(app);
 
   projectA = await makeProject("Upgrade A");
@@ -164,6 +178,13 @@ beforeAll(async () => {
     projectId: projectA,
     userId: reader.userId,
     templateKey: "read_only",
+  });
+  await app.db.insert(projectMemberships).values({
+    id: newId("pm"),
+    companyId: owner.companyId,
+    projectId: projectA,
+    userId: mover.userId,
+    templateKey: "project_manager",
   });
 
   vendorId = newId("ven");
@@ -600,6 +621,38 @@ describe("plant lifecycle and availability", () => {
     expect(res.json().to.projectId).toBe(projectB);
     expect(res.json().to.status).toBe("approved");
     expect(res.json().to.fromProjectId).toBe(projectA);
+  });
+
+  it("refuses a transfer onto a project the caller holds no equipment permission on", async () => {
+    const machineId = await makeMachine({ name: "Cross-project push" });
+    const assignmentId = await mobilise(projectA, machineId);
+    // `mover` is project_manager on projectA (equipment standard) and holds
+    // nothing at all on projectB. The gate on :projectId is satisfied; the
+    // destination is where the hire cost lands.
+    const res = await post(
+      `/projects/${projectA}/equipment/assignments/${assignmentId}/transfer`,
+      { toProjectId: projectB },
+      moverHeaders,
+    );
+    expect(res.statusCode).toBe(403);
+    expect(res.json().message).toContain("equipment on project");
+    // and nothing moved
+    const [row] = await app.db
+      .select({ projectId: equipment.projectId })
+      .from(equipment)
+      .where(eq(equipment.id, machineId));
+    expect(row!.projectId).toBe(projectA);
+  });
+
+  it("allows the same transfer once the caller holds the tool on the destination", async () => {
+    const machineId = await makeMachine({ name: "Cross-project allowed" });
+    const assignmentId = await mobilise(projectA, machineId);
+    const res = await post(
+      `/projects/${projectA}/equipment/assignments/${assignmentId}/transfer`,
+      { toProjectId: projectB },
+      owner.headers,
+    );
+    expect(res.statusCode).toBe(201);
   });
 
   it("refuses a transfer to the project the machine is already on", async () => {

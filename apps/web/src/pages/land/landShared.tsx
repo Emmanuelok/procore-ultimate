@@ -93,6 +93,16 @@ export interface PapRow {
   livelihoodProgramme: string | null;
   livelihoodRestoredAt: string | null;
   status: string;
+  /**
+   * `grievance_open` is an OVERLAY the grievance register imposes, not a step
+   * in the resettlement lifecycle. `effectiveStatus` is where the register
+   * actually has the household — a household under a live complaint is still
+   * a compensated, resettled one — and `underOpenGrievance` says the overlay
+   * is on. Rendering only `status` would make a dust complaint look like a
+   * household that lost its resettlement.
+   */
+  effectiveStatus?: string;
+  underOpenGrievance?: boolean;
   censusDate: string | null;
   createdAt: string;
   updatedAt: string;

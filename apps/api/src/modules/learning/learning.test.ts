@@ -617,6 +617,69 @@ describe("mandatory-capture triggers", () => {
     expect(((await post(`/projects/${projectId}/learning/triggers/sweep`)).json() as Json).created).toBe(0);
   });
 
+  /*
+   * [#7] The idempotence used to live only in a `seen` Set held for the length
+   * of one request, so two writers running the sweep at the same moment both
+   * observed "no trigger for this record" and both inserted one: two triggers,
+   * two obligations, and a capture-rate denominator quietly doubled with no
+   * way to tell which row was the real one. The guard now lives in the
+   * DATABASE — a unique index on (project_id, kind, source_key) — and the
+   * sweep writes the trigger FIRST, creating the obligation only when that
+   * insert actually won. This test plays the losing writer: the row is already
+   * there when the sweep runs.
+   */
+  it("[#7] two simultaneous sweeps produce one trigger and one obligation, not two", async () => {
+    const racedProjectId = newId("prj");
+    await app.db.insert(projects).values({
+      id: racedProjectId,
+      companyId: owner.companyId,
+      name: "Contended Closeout Works",
+      currency: "GBP",
+      stage: "closed",
+    });
+
+    const [a, b] = await Promise.all([
+      post(`/projects/${racedProjectId}/learning/triggers/sweep`),
+      post(`/projects/${racedProjectId}/learning/triggers/sweep`),
+    ]);
+    expect(a.statusCode).toBe(200);
+    expect(b.statusCode).toBe(200);
+    const bodies = [a.json() as Json, b.json() as Json];
+    /* Exactly one of the two wrote it, whichever order they interleaved in. */
+    expect(bodies.reduce((n, r) => n + Number(r.created), 0)).toBe(1);
+
+    const rows = await app.db
+      .select()
+      .from(lessonTriggers)
+      .where(eq(lessonTriggers.projectId, racedProjectId));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.obligationId).not.toBeNull();
+
+    /* One duty, not two. A doubled denominator is how a capture rate lies. */
+    const obs = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.projectId, racedProjectId));
+    expect(obs).toHaveLength(1);
+    expect(obs[0]!.id).toBe(rows[0]!.obligationId);
+
+    /* And the guard is in the DATABASE, not only in the request's memory:
+       the index itself refuses the duplicate. */
+    await expect(
+      app.db.insert(lessonTriggers).values({
+        id: newId("ltr"),
+        companyId: owner.companyId,
+        projectId: racedProjectId,
+        kind: "project_closeout",
+        sourceRef: { tool: "projects", recordId: racedProjectId },
+        sourceKey: racedProjectId,
+        rationale: "A duplicate the index must refuse",
+        dueAt: "2030-01-01",
+        status: "open",
+      }),
+    ).rejects.toThrow();
+  });
+
   it("reads the backlog purely — the sweep is a scheduled job, not a side effect", async () => {
     const res = await get(`/projects/${bareProjectId}/learning/triggers`);
     expect(res.statusCode).toBe(200);

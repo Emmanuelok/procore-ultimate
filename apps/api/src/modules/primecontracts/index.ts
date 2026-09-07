@@ -1969,6 +1969,24 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
                 "back to revise_and_resubmit (or void it) and raise the corrected figure."),
         );
       }
+      // Same check the create route makes: a package id is a tenant-scoped
+      // reference, and execute later WRITES to the package row it names.
+      if (body.changeOrderPackageId) {
+        const pkg = await app.db
+          .select({ id: changeOrderPackages.id })
+          .from(changeOrderPackages)
+          .where(
+            and(
+              eq(changeOrderPackages.id, body.changeOrderPackageId),
+              eq(changeOrderPackages.companyId, contract.companyId),
+              eq(changeOrderPackages.projectId, contract.projectId),
+            ),
+          )
+          .limit(1);
+        if (!pkg[0]) {
+          throw badRequest("changeOrderPackageId does not reference a package on this project");
+        }
+      }
       const lines = (body.lines ?? (change.lines as Array<{ amount: number }>)) as Array<{
         amount: number;
       }>;
@@ -2616,7 +2634,13 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
           await tx
             .update(changeOrderPackages)
             .set({ primeContractChangeId: change.id, budgetChangeId, updatedAt: now })
-            .where(eq(changeOrderPackages.id, change.changeOrderPackageId));
+            .where(
+              and(
+                eq(changeOrderPackages.id, change.changeOrderPackageId),
+                eq(changeOrderPackages.companyId, contract.companyId),
+                eq(changeOrderPackages.projectId, contract.projectId),
+              ),
+            );
         }
       });
       if (plan) await recomputeBudgetTotals(plan.budgetId);

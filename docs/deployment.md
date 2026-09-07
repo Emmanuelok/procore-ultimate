@@ -397,6 +397,47 @@ boot). "Image" = value baked into `Dockerfile`; set in Railway only what §2.5 l
 | `AI_MODEL` | `claude-opus-5` | — | Optional |
 | `LOG_LEVEL` | `info` | — | Optional (`debug`, `warn`, …) |
 
+#### 4.1.1 Message delivery
+
+Nothing in the table above makes the platform send a message. `EMAIL_PROVIDER` defaults to
+`none`, and under `none` every invitation, verification link, password reset, new-device
+notice and "a second factor was enrolled" message is **composed, recorded in
+`email_dispatches`, and never sent**. That is the right default for a local checkout and
+the wrong one for a deployment: the trail will show a dispatch the recipient never got.
+`GET /api/v1/health/ready` reports it as a configuration warning; check it after the first
+deploy rather than discovering it when somebody cannot accept an invitation.
+
+| Variable | Default (`config.ts`) | Required when |
+|---|---|---|
+| `EMAIL_PROVIDER` | `none` | Set to `resend`, `postmark` or `smtp` in any environment where a human receives mail. |
+| `EMAIL_API_KEY` | unset | `resend` / `postmark` |
+| `EMAIL_FROM_ADDRESS` | unset | Whenever a provider is set. Must be on a domain the provider has verified, or everything is rejected or spam-filed. |
+| `EMAIL_FROM_NAME` | `ConstructOS` | Optional |
+| `EMAIL_REPLY_TO` | unset | Optional |
+| `EMAIL_API_BASE_URL` | the provider's own | Only for a self-hosted gateway or a test double. |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_SECURE` | unset / `587` / unset / unset / `false` | `EMAIL_PROVIDER=smtp`. The SMTP adapter is a reserved slot: the configuration surface is stable, the transport is not yet implemented, so treat `smtp` as unsupported until `lib/email.ts` says otherwise. |
+
+#### 4.1.2 Platform defaults a tenant inherits (and may tighten)
+
+These are the values a tenant that has set no security policy of its own gets. A tenant
+may tighten any of them at `PUT /api/v1/company/security-policy` (§4.6); none of them can
+be loosened below the platform floor, and the floors are in code, not here.
+
+| Variable | Default (`config.ts`) | Notes |
+|---|---|---|
+| `BCRYPT_COST` | `10` | Floored at **12** in every non-test environment by `passwordHashCost` — the config default is the test value. Raising it upgrades existing hashes transparently on the next sign-in. |
+| `SESSION_ABSOLUTE_TTL_DAYS` | `30` | Absolute ceiling on a device session regardless of refresh activity. A tenant's `sessionAbsoluteTimeoutHours` narrows it. |
+| `LOGIN_MAX_FAILED_ATTEMPTS` | `5` | Per address; the per-IP scope allows a multiple of it. |
+| `LOGIN_FAILURE_WINDOW_MINUTES` | `15` | How far back failures count. |
+| `LOGIN_LOCKOUT_MINUTES` | `15` | How long a lock lasts. Not a rate limit — see §4.6. |
+| `MFA_MAX_FAILED_ATTEMPTS` | `5` | Wrong second factors before the factor itself locks. |
+| `MFA_LOCKOUT_MINUTES` | `15` | — |
+| `MFA_RECOVERY_CODE_COUNT` | `10` | Issued once, at enrolment, and shown once. |
+| `MFA_CHALLENGE_TTL_MINUTES` | `10` | How long a half-finished sign-in stays answerable. Challenges are also single-use and revocable — §4.10. |
+| `EMAIL_VERIFICATION_TTL_HOURS` | `48` | Also bounds an `email_change` link (§4.9). |
+| `PASSWORD_RESET_TTL_MINUTES` | `60` | — |
+| `INVITATION_TTL_DAYS` | `14` | The `account.session-sweep` job expires them; see §4.5. |
+
 There are deliberately **no environment variables** for the session timeout, password
 policy, lockout thresholds or IP allowlist. Those are **per tenant**, set by an owner or
 admin at `PUT /api/v1/company/security-policy` (web app → Security). The `LOGIN_*`,
@@ -496,6 +537,18 @@ every tenant the holder belongs to.
 refused (`login_blocked_ip`, outcome `pending`) without refusing anything, so you can
 read a week of real traffic before enforcing. The API refuses to enable `enforce` from an
 address the new list would itself refuse.
+
+**Where each of these actually bites, so the table is not read as more than it is.**
+`sessionAbsoluteTimeoutHours`, the password rules, the lockout thresholds and
+`mfaRequired` are enforced on every request or at sign-in and need no caveat. The
+allowlist is evaluated at sign-in and again in `requireCompany` on every company-scoped
+request, so a session opened inside the network stops working when it leaves.
+`sessionIdleTimeoutMinutes` is the one to check against the code you are running: the
+logic lives in `touchSession` (`modules/account/sessions.ts`), and whether it runs on
+every authenticated request or only on `/account/*` depends on whether
+`plugins/auth.ts` calls it — grep for `touchSession` there. Until it does, a person who
+works all day in `/projects` and never opens their account settings is bounded by the
+absolute lifetime rather than the idle one.
 
 ### 4.7 SCIM 2.0 provisioning (spec #21)
 

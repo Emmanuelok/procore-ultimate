@@ -920,17 +920,6 @@ export const timecardReportRoutes: FastifyPluginAsync = async (app) => {
       }
 
       const lineIds = [...byLine.keys()];
-      const lines = lineIds.length
-        ? await app.db
-            .select()
-            .from(budgetLineItems)
-            .where(
-              and(
-                eq(budgetLineItems.projectId, projectId),
-                inArray(budgetLineItems.id, lineIds),
-              ),
-            )
-        : [];
       const posted: Array<{
         budgetLineItemId: string;
         costCode: string;
@@ -939,45 +928,79 @@ export const timecardReportRoutes: FastifyPluginAsync = async (app) => {
         currency: string;
       }> = [];
       const now = nowIso();
-      for (const line of lines) {
-        const held = byLine.get(line.id)!;
-        const detail = { ...(line.detail as Record<string, unknown>) };
-        const priorPosting = (detail["labourPosting"] ?? null) as {
-          labourCost?: number;
-        } | null;
-        const previous = typeof priorPosting?.labourCost === "number" ? priorPosting.labourCost : 0;
-        detail["labourPosting"] = {
-          from,
-          to,
-          labourCost: held.cost,
-          labourHours: held.hours,
-          currency: held.currency,
-          postedAt: now,
-          postedBy: req.user!.id,
-          note:
-            "posted from approved timecard allocations; re-posting the same window REPLACES this " +
-            "figure rather than adding to it",
-        };
-        await app.db
-          .update(budgetLineItems)
-          .set({
-            // `directCosts` is the budget's column for cost booked outside a
-            // commitment — labour is exactly that. Re-posting the same window
-            // replaces this module's contribution rather than adding to it.
-            directCosts: round2(line.directCosts - previous + held.cost),
-            jobToDateCosts: round2(line.jobToDateCosts - previous + held.cost),
-            detail,
-            updatedAt: now,
-          })
-          .where(eq(budgetLineItems.id, line.id));
-        posted.push({
-          budgetLineItemId: line.id,
-          costCode: line.costCode,
-          labourCost: held.cost,
-          labourHours: held.hours,
-          currency: held.currency,
-        });
-      }
+      /*
+       * ONE TRANSACTION, AND THE LINES ARE LOCKED INSIDE IT.
+       *
+       * `directCosts` is a read-modify-write: the new value is the old one
+       * less this module's previous posting plus the new figure. The
+       * equipment module's plant posting writes the same two columns on the
+       * same lines, so a stale read here meant one posting silently erased
+       * the other and the cost report showed plant OR labour, whichever
+       * landed last, with no error anywhere.
+       */
+      await app.db.transaction(async (tx) => {
+        const lines = lineIds.length
+          ? await tx
+              .select()
+              .from(budgetLineItems)
+              .where(
+                and(
+                  eq(budgetLineItems.projectId, projectId),
+                  inArray(budgetLineItems.id, lineIds),
+                ),
+              )
+              .for("update")
+          : [];
+        const found = new Set(lines.map((l) => l.id));
+        for (const id of lineIds) {
+          if (!found.has(id)) {
+            reasons.push(
+              `Budget line ${id} is coded on approved hours but does not exist on this project, ` +
+                "so those hours were not posted.",
+            );
+          }
+        }
+        for (const line of lines) {
+          const held = byLine.get(line.id)!;
+          const detail = { ...(line.detail as Record<string, unknown>) };
+          const priorPosting = (detail["labourPosting"] ?? null) as {
+            labourCost?: number;
+          } | null;
+          const previous =
+            typeof priorPosting?.labourCost === "number" ? priorPosting.labourCost : 0;
+          detail["labourPosting"] = {
+            from,
+            to,
+            labourCost: held.cost,
+            labourHours: held.hours,
+            currency: held.currency,
+            postedAt: now,
+            postedBy: req.user!.id,
+            note:
+              "posted from approved timecard allocations; re-posting the same window REPLACES " +
+              "this figure rather than adding to it",
+          };
+          await tx
+            .update(budgetLineItems)
+            .set({
+              // `directCosts` is the budget's column for cost booked outside a
+              // commitment — labour is exactly that. Re-posting the same window
+              // replaces this module's contribution rather than adding to it.
+              directCosts: round2(line.directCosts - previous + held.cost),
+              jobToDateCosts: round2(line.jobToDateCosts - previous + held.cost),
+              detail,
+              updatedAt: now,
+            })
+            .where(eq(budgetLineItems.id, line.id));
+          posted.push({
+            budgetLineItemId: line.id,
+            costCode: line.costCode,
+            labourCost: held.cost,
+            labourHours: held.hours,
+            currency: held.currency,
+          });
+        }
+      });
       const runId = newId("lcp");
       await ledgerTimecards(app.db, req, "update", "labour_cost_posting", runId, {
         from,

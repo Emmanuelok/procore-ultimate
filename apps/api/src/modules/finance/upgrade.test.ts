@@ -377,6 +377,35 @@ describe("headroom and draw-stops", () => {
     expect((await submit(pid, withinAvailable.json().id as string)).statusCode).toBe(200);
   });
 
+  it("REGRESSION: two simultaneous submits cannot both consume the same headroom", async () => {
+    // The audit's production blocker: siblings were read, the totals computed
+    // in memory and the status flipped, with no transaction and no lock — two
+    // 6M requests against 10M available both passed and 12M entered the
+    // pipeline. Submitting both at once now serialises on the facility row:
+    // one passes, one is refused, and the pipeline never exceeds the
+    // committed amount.
+    const pid = await makeProject("Concurrent Headroom");
+    const facility = await createFacility(pid, { committedAmount: 10_000_000 });
+
+    const a = (await createRequest(pid, facility.id, { amount: 6_000_000 })).json().id as string;
+    const b = (await createRequest(pid, facility.id, { amount: 6_000_000 })).json().id as string;
+
+    const results = await Promise.all([submit(pid, a), submit(pid, b)]);
+    const codes = results.map((r) => r.statusCode).sort();
+    expect(codes).toEqual([200, 409]);
+    const refused = results.find((r) => r.statusCode === 409)!;
+    expect(refused.json().message).toMatch(/exceeds the undisbursed balance/i);
+
+    // and the ledger of record agrees: exactly one request left draft
+    const rows = await app.db
+      .select({ status: disbursements.status, amount: disbursements.amount })
+      .from(disbursements)
+      .where(eq(disbursements.facilityId, facility.id));
+    const inPipeline = rows.filter((r) => r.status !== "draft" && r.status !== "rejected");
+    expect(inPipeline).toHaveLength(1);
+    expect(inPipeline.reduce((s, r) => s + r.amount, 0)).toBeLessThanOrEqual(10_000_000);
+  });
+
   it("REGRESSION: refuses a submission after the availability period ends", async () => {
     const pid = await makeProject("Closed Facility");
     const facility = await createFacility(pid, {

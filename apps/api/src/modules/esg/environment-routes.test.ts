@@ -13,7 +13,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import {
   boqItems,
   boqs,
@@ -207,6 +207,12 @@ describe("BoQ carbon import idempotence", () => {
       headers: owner.headers,
       payload: { boqId, mappings: [{ boqItemCodePrefix: "C10", factorId: factor.id }] },
     });
+    /*
+     * Ordered by seq and narrowed to THIS import's own bill. A bare select
+     * returns rows in whatever order the planner chooses, so `entries.at(-1)`
+     * over every bulk import the suite has ever done was picking an arbitrary
+     * row — it passed by luck and failed the moment the plan changed.
+     */
     const entries = await app.db
       .select()
       .from(ledgerEntries)
@@ -214,9 +220,12 @@ describe("BoQ carbon import idempotence", () => {
         and(
           eq(ledgerEntries.companyId, owner.companyId),
           eq(ledgerEntries.objectType, "carbon_entry_bulk"),
+          eq(ledgerEntries.objectId, boqId),
         ),
-      );
-    const payload = entries.at(-1)!.payload as { mode: string; replaced: number };
+      )
+      .orderBy(asc(ledgerEntries.seq));
+    expect(entries.length).toBe(1);
+    const payload = entries[0]!.payload as { mode: string; replaced: number };
     expect(payload.mode).toBe("append");
     expect(payload.replaced).toBe(0);
   });
@@ -374,7 +383,10 @@ describe("carbon intensity per m² GIA (#491)", () => {
       .from(ledgerEntries)
       .where(
         and(eq(ledgerEntries.objectId, pid), eq(ledgerEntries.objectType, "project")),
-      );
+      )
+      // three settings writes happened above; "the last one" only means
+      // anything when the rows are ordered by the chain's own sequence
+      .orderBy(asc(ledgerEntries.seq));
     const payload = entries.at(-1)!.payload as { before: unknown; after: unknown };
     expect(payload.before).toBe(1_000);
     expect(payload.after).toBeNull();
@@ -743,7 +755,8 @@ describe("environmental incidents", () => {
           eq(ledgerEntries.objectId, incident.id),
           eq(ledgerEntries.action, "state_change"),
         ),
-      );
+      )
+      .orderBy(asc(ledgerEntries.seq));
     const payload = entries.at(-1)!.payload as {
       hoursFromOccurrence: number;
       withinWindow: boolean;

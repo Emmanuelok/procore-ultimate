@@ -68,6 +68,15 @@ import {
   type OpenConditionLite,
 } from "./financeShared";
 
+/** One entry of the server-side covenant formula library (#743). */
+interface FormulaSpec {
+  formula: string;
+  label: string;
+  inputs: string[];
+  definition: string;
+  higherIsBetter: boolean;
+}
+
 function todayIso(): string {
   return new Date().toISOString().slice(0, 10);
 }
@@ -418,6 +427,32 @@ export default function FacilityDetail({
   const [vThreshold, setVThreshold] = useState("");
   const [vUnit, setVUnit] = useState("");
   const [vFormula, setVFormula] = useState<string>("custom");
+
+  /**
+   * The formula library, so the picker can say what a named ratio actually
+   * divides and which period inputs it needs. Definitions live on the server
+   * (they are what the computation uses); repeating them in the client would
+   * be a second source of truth that could drift from the arithmetic. If the
+   * reference call fails the picker still works — it just cannot explain
+   * itself, and says so rather than inventing a definition.
+   */
+  const [formulaSpecs, setFormulaSpecs] = useState<FormulaSpec[] | null>(null);
+  const [formulaSpecsError, setFormulaSpecsError] = useState(false);
+  useEffect(() => {
+    let live = true;
+    api
+      .get<{ formulas: FormulaSpec[] }>("/api/v1/finance/covenant-formulas")
+      .then((res) => {
+        if (live) setFormulaSpecs(res.formulas);
+      })
+      .catch(() => {
+        if (live) setFormulaSpecsError(true);
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+  const selectedSpec = formulaSpecs?.find((f) => f.formula === vFormula) ?? null;
 
   function openCovModal() {
     setCovError(null);
@@ -1195,10 +1230,30 @@ export default function FacilityDetail({
             <Select value={vFormula} onChange={(e) => setVFormula(e.target.value)}>
               {COVENANT_FORMULAS.map((f) => (
                 <option key={f} value={f}>
-                  {humanize(f)}
+                  {formulaSpecs?.find((s) => s.formula === f)?.label ?? humanize(f)}
                 </option>
               ))}
             </Select>
+            {selectedSpec && selectedSpec.inputs.length > 0 ? (
+              <p className="mt-1 text-xs text-ink-500">
+                {selectedSpec.definition} Needs{" "}
+                {selectedSpec.inputs.map((i) => humanize(i)).join(" and ")} on each period, entered
+                under “Period cashflow inputs”.{" "}
+                {selectedSpec.higherIsBetter
+                  ? "Higher is safer, so the test is normally ≥."
+                  : "Lower is safer, so the test is normally ≤."}
+              </p>
+            ) : selectedSpec ? (
+              <p className="mt-1 text-xs text-ink-500">{selectedSpec.definition}</p>
+            ) : vFormula === "custom" ? (
+              <p className="mt-1 text-xs text-ink-500">
+                Readings are entered by hand; nothing is computed from cashflows.
+              </p>
+            ) : formulaSpecsError ? (
+              <p className="mt-1 text-xs text-ink-500">
+                The formula reference could not be loaded, so its definition is not shown here.
+              </p>
+            ) : null}
           </Field>
           <Field label="Description">
             <Textarea

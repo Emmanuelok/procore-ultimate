@@ -4,6 +4,7 @@ import { registerSearchSource, tableSource } from "../search/registry.js";
 import { registerParcelRoutes } from "./parcels.js";
 import { registerPapRoutes } from "./paps.js";
 import { registerGrievanceRoutes } from "./grievances.js";
+import { registerGrievanceTriageRoutes } from "./grievances-triage.js";
 import { registerEngagementRoutes } from "./engagement.js";
 import { registerSafeguardRoutes } from "./safeguards.js";
 import { registerLandJobs } from "./detectors.js";
@@ -46,7 +47,15 @@ import {
  *    anonymous, a severity-driven SLA materialized as an assurance
  *    Obligation, a lazy breach sweep, closure verified WITH the complainant
  *    (a resolution the complainant rejects reopens the grievance), and the
- *    analytics an E&S supervision mission asks for.
+ *    analytics an E&S supervision mission asks for. Intake is assisted, not
+ *    automated: `grievances-triage.ts` ranks the closest precedents this
+ *    project has already handled (tf-idf, no external service, works with
+ *    the model switched off), cites the published SLA rule behind a proposed
+ *    severity, and records the proposal against the officer's decision so
+ *    the assistant's agreement rate is measured rather than assumed. A
+ *    grievance naming a household also flags that household
+ *    (`pap-grievance.ts`), reversibly: the flag is an overlay on the
+ *    resettlement lifecycle, never a replacement for it.
  *
  *  - Stakeholders & engagement (#579-584): the register with influence /
  *    interest mapping and the consultation log carrying feedback
@@ -141,6 +150,7 @@ export const landModule: FastifyPluginAsync = async (app) => {
   await registerParcelRoutes(app);
   await registerPapRoutes(app);
   await registerGrievanceRoutes(app);
+  await registerGrievanceTriageRoutes(app);
   await registerEngagementRoutes(app);
   await registerSafeguardRoutes(app);
 

@@ -170,6 +170,8 @@ interface RapIndicators {
     livelihoodRestored: number;
     livelihoodRestoredPercent: number | null;
     resettledWithoutPayment: number;
+    /** households with a live complaint against them (#569-574) */
+    underOpenGrievance: number;
   };
   replacementCost: {
     studies: number;
@@ -1544,6 +1546,17 @@ function AuditPanel({ base, reference }: { base: string; reference: Reference | 
                     "Resettled with no payment on file",
                     indicators.households.resettledWithoutPayment,
                     indicators.households.resettledWithoutPayment > 0,
+                  ],
+                  [
+                    "Livelihood restored",
+                    indicators.households.livelihoodRestoredPercent === null
+                      ? "—"
+                      : `${indicators.households.livelihoodRestored} (${indicators.households.livelihoodRestoredPercent}%)`,
+                  ],
+                  [
+                    "Under an open grievance",
+                    indicators.households.underOpenGrievance,
+                    indicators.households.underOpenGrievance > 0,
                   ],
                 ]}
               />

@@ -927,32 +927,40 @@ export const financeModule: FastifyPluginAsync = async (app) => {
       }
       await validateEvidence(req.companyId!, req.projectId!, body.evidenceIds);
       const now = new Date().toISOString();
-      await app.db
-        .update(facilityConditions)
-        .set({
-          status: "satisfied",
-          evidenceIds: body.evidenceIds,
-          satisfiedAt: now,
-          satisfiedBy: req.user!.id,
-          updatedAt: now,
-        })
-        .where(eq(facilityConditions.id, conditionId));
-      if (cond.obligationId) {
-        // A late satisfaction does not rewrite the register: only a still-
-        // open obligation flips to satisfied; a breached one stays breached.
-        await app.db
-          .update(obligations)
-          .set({ status: "satisfied", satisfiedEvidenceId: body.evidenceIds[0] })
-          .where(and(eq(obligations.id, cond.obligationId), eq(obligations.status, "open")));
-      }
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "state_change",
-        objectType: "facility_condition",
-        objectId: conditionId,
-        payload: { from: cond.status, to: "satisfied", evidenceIds: body.evidenceIds },
-        storePayload: true,
+      // The condition, its obligation and the ledger entry move together.
+      // Three loose statements meant a failure after the first left a
+      // "satisfied" condition whose obligation was still open on the
+      // assurance register — the register disagreeing with the record it
+      // was created from.
+      await app.db.transaction(async (tx) => {
+        await tx
+          .update(facilityConditions)
+          .set({
+            status: "satisfied",
+            evidenceIds: body.evidenceIds,
+            satisfiedAt: now,
+            satisfiedBy: req.user!.id,
+            updatedAt: now,
+          })
+          .where(eq(facilityConditions.id, conditionId));
+        if (cond.obligationId) {
+          // A late satisfaction does not rewrite the register: only a still-
+          // open obligation flips to satisfied; a breached one stays breached.
+          await tx
+            .update(obligations)
+            .set({ status: "satisfied", satisfiedEvidenceId: body.evidenceIds[0] })
+            .where(and(eq(obligations.id, cond.obligationId), eq(obligations.status, "open")));
+        }
+        await appendLedger(tx as never, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "facility_condition",
+          objectId: conditionId,
+          payload: { from: cond.status, to: "satisfied", evidenceIds: body.evidenceIds },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
       });
       return fetchCondition(conditionId, req.companyId!, req.projectId!);
     },
@@ -969,30 +977,33 @@ export const financeModule: FastifyPluginAsync = async (app) => {
         throw badRequest(`A ${cond.status} condition cannot be waived`);
       }
       const now = new Date().toISOString();
-      await app.db
-        .update(facilityConditions)
-        .set({ status: "waived", updatedAt: now })
-        .where(eq(facilityConditions.id, conditionId));
-      if (cond.obligationId) {
-        // An explicit lender waiver supersedes the breach state.
-        await app.db
-          .update(obligations)
-          .set({ status: "waived" })
-          .where(
-            and(
-              eq(obligations.id, cond.obligationId),
-              inArray(obligations.status, ["open", "breached"]),
-            ),
-          );
-      }
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "state_change",
-        objectType: "facility_condition",
-        objectId: conditionId,
-        payload: { from: cond.status, to: "waived", reason: body.reason },
-        storePayload: true,
+      await app.db.transaction(async (tx) => {
+        await tx
+          .update(facilityConditions)
+          .set({ status: "waived", updatedAt: now })
+          .where(eq(facilityConditions.id, conditionId));
+        if (cond.obligationId) {
+          // An explicit lender waiver supersedes the breach state.
+          await tx
+            .update(obligations)
+            .set({ status: "waived" })
+            .where(
+              and(
+                eq(obligations.id, cond.obligationId),
+                inArray(obligations.status, ["open", "breached"]),
+              ),
+            );
+        }
+        await appendLedger(tx as never, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "facility_condition",
+          objectId: conditionId,
+          payload: { from: cond.status, to: "waived", reason: body.reason },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
       });
       return fetchCondition(conditionId, req.companyId!, req.projectId!);
     },
@@ -1830,7 +1841,11 @@ export const financeModule: FastifyPluginAsync = async (app) => {
       const compliant = covenantCompliant(covenant.operator, body.value, covenant.threshold);
       const headroom = covenantHeadroom(covenant.operator, body.value, covenant.threshold);
       const id = newId("cvr");
-      await app.db.insert(covenantReadings).values({
+      // Reading, breach signal and ledger entry are one act. Split across
+      // three statements, a failure after the insert left a breach nobody
+      // was told about — or a signal for a reading that was never stored.
+      await app.db.transaction(async (tx) => {
+      await tx.insert(covenantReadings).values({
         id,
         covenantId,
         companyId: req.companyId!,
@@ -1845,7 +1860,7 @@ export const financeModule: FastifyPluginAsync = async (app) => {
         // A covenant breach is a lender event of default risk — critical
         // signal, no obligation (the covenant is continuous, not dated).
         const opText = covenant.operator === "gte" ? "≥" : "≤";
-        await app.db.insert(signals).values({
+        await tx.insert(signals).values({
           id: newId("sig"),
           companyId: req.companyId!,
           projectId: req.projectId!,
@@ -1863,7 +1878,7 @@ export const financeModule: FastifyPluginAsync = async (app) => {
             `under the facility agreement and may suspend further disbursements.`,
         });
       }
-      await appendLedger(app.db, {
+      await appendLedger(tx as never, {
         companyId: req.companyId!,
         actorId: req.user!.id,
         action: "create",
@@ -1877,6 +1892,8 @@ export const financeModule: FastifyPluginAsync = async (app) => {
           headroom,
         },
         storePayload: true,
+        projectId: req.projectId!,
+      });
       });
       const created = (
         await app.db.select().from(covenantReadings).where(eq(covenantReadings.id, id)).limit(1)
@@ -2228,7 +2245,12 @@ export const financeModule: FastifyPluginAsync = async (app) => {
               actualFinish: scheduleTasks.actualFinish,
             })
             .from(scheduleTasks)
-            .where(inArray(scheduleTasks.id, milestoneIds))
+            .where(
+              and(
+                inArray(scheduleTasks.id, milestoneIds),
+                eq(scheduleTasks.projectId, req.projectId!),
+              ),
+            )
         : [];
       const finished = new Map(tasks.map((t) => [t.id, t.actualFinish !== null]));
       const periods: ForecastPeriod[] = rows.map((r) => ({

@@ -448,6 +448,13 @@ const csvCell = (v: string | null | undefined): string => {
  * and expected-value settlement modelling (#352).
  */
 export const disputesModule: FastifyPluginAsync = async (app) => {
+  /**
+   * Either the pooled handle or a transaction's handle. Helpers that may be
+   * called from inside a transaction take one of these so their writes join
+   * the caller's transaction instead of escaping it.
+   */
+  type TxHandle = typeof app.db | Parameters<Parameters<typeof app.db.transaction>[0]>[0];
+
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("disputes", "read")];
   const standardGate = [
     app.authenticate,
@@ -587,6 +594,11 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
    * The adjudication/arbitration timetable engine (#330, #338): every dated
    * step materializes as an assurance Obligation so the dispute clock and
    * the obligation register agree on the deadline.
+   *
+   * `handle` lets a caller that is already inside a transaction write the
+   * obligation on the same handle. Writing it on `app.db` from inside a
+   * transaction would both escape the atomicity the caller wants and, on a
+   * single-connection deployment, deadlock against the open transaction.
    */
   async function materializeStepObligation(
     companyId: string,
@@ -594,9 +606,10 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
     actorId: string,
     dispute: { kind: string; number: number },
     step: { name: string; dueDate: string },
+    handle: TxHandle = app.db,
   ): Promise<string> {
     const id = newId("obl");
-    await app.db.insert(obligations).values({
+    await handle.insert(obligations).values({
       id,
       companyId,
       projectId,
@@ -1010,6 +1023,11 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       to: string;
       obligationId: string;
     }> = [];
+    // Everything below — obligations materialised, extended, waived, the
+    // dispute row itself and the ledger entry — is one act. Written as loose
+    // statements, a failure part-way left the timetable and the obligation
+    // register disagreeing about the same deadlines.
+    await app.db.transaction(async (tx) => {
     if (body.timetable !== undefined) {
       const existing = dispute.timetable as TimetableStep[];
       const byId = new Map(existing.map((s) => [s.id, s]));
@@ -1029,6 +1047,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
               req.user!.id,
               { kind: dispute.kind, number: dispute.number },
               { name: s.name, dueDate },
+              tx,
             );
           } else if (dueDate && prior.obligationId && dueDate !== prior.dueDate) {
             // A tribunal that grants an extension has moved the deadline,
@@ -1039,7 +1058,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
             // its breached obligation forever, with no way back short of
             // deleting and re-adding the step.
             const extendedIntoFuture = dueDate >= todayISO();
-            await app.db
+            await tx
               .update(obligations)
               .set({
                 deadline: `${dueDate}T23:59:59Z`,
@@ -1063,7 +1082,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
               });
             }
           } else if (!dueDate && prior.obligationId) {
-            await app.db
+            await tx
               .update(obligations)
               .set({ status: "waived" })
               .where(and(eq(obligations.id, prior.obligationId), eq(obligations.status, "open")));
@@ -1088,6 +1107,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
               req.user!.id,
               { kind: dispute.kind, number: dispute.number },
               { name: s.name, dueDate: s.dueDate },
+              tx,
             );
           }
           next.push({
@@ -1104,7 +1124,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       // steps dropped from the timetable release their open obligations
       for (const prior of existing) {
         if (!kept.has(prior.id) && prior.obligationId) {
-          await app.db
+          await tx
             .update(obligations)
             .set({ status: "waived" })
             .where(and(eq(obligations.id, prior.obligationId), eq(obligations.status, "open")));
@@ -1113,8 +1133,8 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       set["timetable"] = next;
     }
 
-    await app.db.update(disputes).set(set).where(eq(disputes.id, disputeId));
-    await appendLedger(app.db, {
+    await tx.update(disputes).set(set).where(eq(disputes.id, disputeId));
+    await appendLedger(tx as never, {
       companyId: req.companyId!,
       actorId: req.user!.id,
       action: "update",
@@ -1126,6 +1146,7 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       },
       storePayload: extensionsCleared.length > 0,
       projectId: req.projectId!,
+    });
     });
     return fetchDispute(disputeId, req.companyId!, req.projectId!);
   });
@@ -1258,23 +1279,29 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
       const now = new Date().toISOString();
       step.done = true;
       step.doneAt = now;
-      if (step.obligationId) {
-        await app.db
-          .update(obligations)
-          .set({ status: "satisfied" })
-          .where(and(eq(obligations.id, step.obligationId), eq(obligations.status, "open")));
-      }
-      await app.db
-        .update(disputes)
-        .set({ timetable: steps, updatedAt: now })
-        .where(eq(disputes.id, disputeId));
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "state_change",
-        objectType: "dispute_timetable_step",
-        objectId: stepId,
-        payload: { disputeId, step: step.name, status: "done", obligationId: step.obligationId },
+      // The obligation, the timetable and the ledger move together: a step
+      // recorded as done whose obligation stayed open would leave the
+      // assurance register contradicting the dispute record.
+      await app.db.transaction(async (tx) => {
+        if (step.obligationId) {
+          await tx
+            .update(obligations)
+            .set({ status: "satisfied" })
+            .where(and(eq(obligations.id, step.obligationId), eq(obligations.status, "open")));
+        }
+        await tx
+          .update(disputes)
+          .set({ timetable: steps, updatedAt: now })
+          .where(eq(disputes.id, disputeId));
+        await appendLedger(tx as never, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "dispute_timetable_step",
+          objectId: stepId,
+          payload: { disputeId, step: step.name, status: "done", obligationId: step.obligationId },
+          projectId: req.projectId!,
+        });
       });
       return fetchDispute(disputeId, req.companyId!, req.projectId!);
     },
@@ -2329,12 +2356,21 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
           .where(eq(projects.id, req.projectId!))
           .limit(1)
       )[0];
+      // Both lookups are company-filtered as well as id-filtered. The ids
+      // were validated against this company when the dispute was written,
+      // but a query on a tenant table that trusts a stored id is one data
+      // migration away from reading another tenant's row.
       const counterparty = dispute.counterpartyEntityId
         ? (
             await app.db
               .select({ name: entities.name })
               .from(entities)
-              .where(eq(entities.id, dispute.counterpartyEntityId))
+              .where(
+                and(
+                  eq(entities.id, dispute.counterpartyEntityId),
+                  eq(entities.companyId, req.companyId!),
+                ),
+              )
               .limit(1)
           )[0]
         : null;
@@ -2343,7 +2379,13 @@ export const disputesModule: FastifyPluginAsync = async (app) => {
             await app.db
               .select({ name: contracts.name, form: contracts.form })
               .from(contracts)
-              .where(eq(contracts.id, dispute.contractId))
+              .where(
+                and(
+                  eq(contracts.id, dispute.contractId),
+                  eq(contracts.companyId, req.companyId!),
+                  eq(contracts.projectId, req.projectId!),
+                ),
+              )
               .limit(1)
           )[0]
         : null;

@@ -268,7 +268,20 @@ type TabId = (typeof TABS)[number]["id"];
 
 /* ================================================================== */
 
-export default function SecurityPage() {
+/**
+ * THE COMPANY SECURITY WORKSPACE.
+ *
+ * Rendered two ways, and the reason is worth stating rather than inferring
+ * from a prop name. Its own route (`/security`) is a one-line addition to
+ * App.tsx and layouts/shell/nav.ts, which this package may not edit — see
+ * WIRING note 11 in the package report. Until that lands, nothing in this
+ * file is reachable by any user, so `AccountSecurityPage` (which IS routed,
+ * at /account/security) mounts it as an "Organisation" tab for owners and
+ * admins. `embedded` suppresses only the page chrome — the header and the
+ * stat row belong to whoever owns the page — and changes no behaviour, so
+ * once the route exists both entry points show the same workspace.
+ */
+export default function SecurityPage({ embedded = false }: { embedded?: boolean }) {
   const [tab, setTab] = useState<TabId>("policy");
   const [nonce, setNonce] = useState(0);
   const refresh = useCallback(() => setNonce((n) => n + 1), []);
@@ -280,15 +293,27 @@ export default function SecurityPage() {
 
   return (
     <div className="space-y-4">
-      <PageHeader
-        title="Security"
-        subtitle={
-          policy.data?.companyName
-            ? `Authentication policy, audit and provisioning for ${policy.data.companyName}`
-            : "Authentication policy, audit and provisioning"
-        }
-        icon={IconSecurity}
-      />
+      {embedded ? (
+        // Embedded, the page chrome belongs to the host — but the tenant this
+        // workspace is acting on must never be implicit: an administrator of
+        // several companies changes a password policy here, and "which one"
+        // is the first thing they have to be able to answer.
+        <Alert tone="info" size="sm" title="Organisation-wide settings">
+          {policy.data?.companyName
+            ? `Authentication policy, audit and provisioning for ${policy.data.companyName}. These settings apply to everybody in that organisation, not to your own account.`
+            : "Authentication policy, audit and provisioning for the organisation you are working in. These settings apply to everybody in it, not to your own account."}
+        </Alert>
+      ) : (
+        <PageHeader
+          title="Security"
+          subtitle={
+            policy.data?.companyName
+              ? `Authentication policy, audit and provisioning for ${policy.data.companyName}`
+              : "Authentication policy, audit and provisioning"
+          }
+          icon={IconSecurity}
+        />
+      )}
 
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <Stat

@@ -1768,6 +1768,31 @@ CREATE TABLE "chance_finds" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
+CREATE TABLE "grievance_triages" (
+	"id" text PRIMARY KEY NOT NULL,
+	"company_id" text NOT NULL,
+	"project_id" text NOT NULL,
+	"grievance_id" text NOT NULL,
+	"run_id" text,
+	"method" text DEFAULT 'precedent' NOT NULL,
+	"proposed_category" text NOT NULL,
+	"proposed_severity" text NOT NULL,
+	"proposed_assignee_id" text,
+	"confidence" double precision DEFAULT 0 NOT NULL,
+	"rationale" text NOT NULL,
+	"rule_citations" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"precedents" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"citations" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"decided_category" text,
+	"decided_severity" text,
+	"decided_assignee_id" text,
+	"decision_note" text,
+	"decided_at" timestamp with time zone,
+	"decided_by" text,
+	"created_by" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
 CREATE TABLE "heritage_plans" (
 	"id" text PRIMARY KEY NOT NULL,
 	"company_id" text NOT NULL,
@@ -8008,6 +8033,7 @@ ALTER TABLE "disputes" ADD COLUMN "enforcement_status" text DEFAULT 'not_applica
 ALTER TABLE "disputes" ADD COLUMN "compliance_deadline" text;--> statement-breakpoint
 ALTER TABLE "disputes" ADD COLUMN "nod_deadline" text;--> statement-breakpoint
 ALTER TABLE "affected_persons" ADD COLUMN "currency" text DEFAULT 'USD' NOT NULL;--> statement-breakpoint
+ALTER TABLE "affected_persons" ADD COLUMN "status_before_grievance" text;--> statement-breakpoint
 ALTER TABLE "grievances" ADD COLUMN "escalation_tier" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE "grievances" ADD COLUMN "escalated_at" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "grievances" ADD COLUMN "escalation_history" jsonb DEFAULT '[]'::jsonb NOT NULL;--> statement-breakpoint
@@ -8316,6 +8342,8 @@ CREATE INDEX "document_production_requests_decision_idx" ON "document_production
 CREATE INDEX "settlement_models_dispute_idx" ON "settlement_models" USING btree ("dispute_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "chance_finds_uq" ON "chance_finds" USING btree ("project_id","number");--> statement-breakpoint
 CREATE INDEX "chance_finds_project_idx" ON "chance_finds" USING btree ("project_id","status");--> statement-breakpoint
+CREATE INDEX "grievance_triages_grievance_idx" ON "grievance_triages" USING btree ("grievance_id","created_at");--> statement-breakpoint
+CREATE INDEX "grievance_triages_project_idx" ON "grievance_triages" USING btree ("company_id","project_id","decided_at");--> statement-breakpoint
 CREATE INDEX "heritage_plans_project_idx" ON "heritage_plans" USING btree ("project_id");--> statement-breakpoint
 CREATE INDEX "heritage_plans_status_idx" ON "heritage_plans" USING btree ("project_id","status");--> statement-breakpoint
 CREATE INDEX "livelihood_activities_project_idx" ON "livelihood_activities" USING btree ("project_id");--> statement-breakpoint

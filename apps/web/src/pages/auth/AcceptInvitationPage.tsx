@@ -4,9 +4,10 @@
  * The flow has TWO shapes and the difference is the security of the whole
  * thing, so the page asks the server which one applies rather than guessing:
  *
- *  - The invitation CREATED the account (a new hire). The invitee sets their
- *    own password here; every session opened with the temporary password the
- *    administrator was handed is destroyed, and they are signed in.
+ *  - The invitation CREATED the account (a new hire). The invite route left it
+ *    unusable — inactive, with a hash no password can verify against — and the
+ *    password chosen HERE is the first one it has ever had. The administrator
+ *    was never handed a temporary credential for it.
  *  - The address ALREADY had an account. The invitation may NOT set a password;
  *    the current one has to be presented. Otherwise an administrator holding an
  *    undispatched accept link could take over a stranger's account by inviting

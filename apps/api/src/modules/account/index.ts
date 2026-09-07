@@ -790,9 +790,12 @@ export const accountModule: FastifyPluginAsync = async (app) => {
    *
    * TWO SHAPES, and the difference is the security of the whole flow:
    *
-   *  - the invitation CREATED the account (a new hire): the invitee sets their
-   *    own password here, every session opened with the temporary password the
-   *    administrator was handed is destroyed, and they are signed in.
+   *  - the invitation CREATED the account (a new hire): the invite route left
+   *    it `isActive: false` with a hash no password can verify against, and
+   *    THIS is where the invitee sets a real one and the account becomes
+   *    usable. Nobody — the inviter included — was ever handed a credential
+   *    for it, and any session that somehow exists against the stub is
+   *    destroyed here anyway.
    *  - the address ALREADY had an account: the invitation may not set a
    *    password. The current one must be presented. Otherwise an administrator
    *    holding an undispatched accept link could take over a stranger's
@@ -1063,9 +1066,13 @@ export const accountModule: FastifyPluginAsync = async (app) => {
       await recordPasswordHistory(app.db, userId, previousHash, "invitation", historyDepth);
     }
     if (existing && newPasswordHash) {
-      // The administrator was handed a temporary password for this account.
-      // Setting a real one is the moment that credential stops working, so
-      // anything already signed in with it is cut off here.
+      // Setting the FIRST real password on an account that existed only as an
+      // unusable stub is still a credential change, and a credential change
+      // ends every session that predates it. Nothing should be signed in
+      // against the stub — the invite route no longer hands the inviter a
+      // temporary password — but "should" is not an access control, and the
+      // cost of being wrong is somebody else's live session surviving the
+      // acceptance.
       await revokeAllUserSessions(app.db, userId, {
         reason: "password_changed",
         byUser: true,

@@ -45,7 +45,7 @@ import {
 import { analyticMean, distributionSchema } from "./distributions.js";
 import { checkRiskTransition } from "./transitions.js";
 import { expectedValueOf, registerRiskJobs, toAppetiteRiskInput } from "./jobs.js";
-import { companyToolGate, holdsToolLevel, visibleProjectIds } from "../governance/gates.js";
+import { companyToolGate, holdsToolLevel } from "../governance/gates.js";
 import {
   OPTIMISM_BIAS_TABLE,
   referenceClassForecast,

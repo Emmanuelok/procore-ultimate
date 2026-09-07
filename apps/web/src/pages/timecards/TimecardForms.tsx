@@ -17,7 +17,7 @@
 import { useState, type ReactNode } from "react";
 import { toast } from "sonner";
 import { Button, Field, Input, Modal, Select, Textarea } from "../../ui";
-import { api } from "../../lib/api";
+import { api, fetchBlobUrl } from "../../lib/api";
 import {
   RefusalNotice,
   labelize,
@@ -431,7 +431,46 @@ export function BatchActions({
   const [comment, setComment] = useState("");
   const [payrollRef, setPayrollRef] = useState("");
   const [asking, setAsking] = useState<"reject" | "export" | null>(null);
+  const [downloading, setDownloading] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const base = `/api/v1/projects/${projectId}/timecard-batches/${batch.id}`;
+
+  /*
+   * THE EXPORT IS BEHIND `gates.admin`, AND THE BEARER TOKEN IS IN
+   * LOCALSTORAGE.
+   *
+   * These four formats used to be plain <a href> links to the API. A
+   * top-level navigation carries neither the Authorization header nor
+   * `x-company-id`, so every one of them opened a blank tab holding a 401
+   * — the whole payroll export, including the WH-347 certified payroll, was
+   * unreachable from the UI. `fetchBlobUrl` is the client's own download
+   * path and is what every other export in this app uses.
+   */
+  async function download(format: string, label: string) {
+    setDownloading(format);
+    setDownloadError(null);
+    try {
+      const url = await fetchBlobUrl(`${base}/payroll-export?format=${format}`);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `payroll-${batch.reference}-${format}.${
+        format === "json" ? "json" : "csv"
+      }`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      toast.success(`${label} downloaded`);
+    } catch (err) {
+      setDownloadError(
+        err instanceof Error
+          ? err.message
+          : `The ${label} export could not be downloaded.`,
+      );
+    } finally {
+      setDownloading(null);
+    }
+  }
 
   async function act(key: string, path: string, body?: unknown, message?: string) {
     const done = await run(key, () => api.post(`${base}${path}`, body ?? {}));
@@ -505,20 +544,25 @@ export function BatchActions({
         {batch.status === "exported" || batch.status === "locked" ? (
           <>
             {PAYROLL_FORMATS.map((format) => (
-              <a
+              <Button
                 key={format.value}
-                className="inline-flex items-center rounded-md border border-border px-2 py-1 text-meta text-content-muted hover:bg-surface-sunken"
-                href={`/api/v1/projects/${projectId}/timecard-batches/${batch.id}/payroll-export?format=${format.value}`}
-                target="_blank"
-                rel="noreferrer"
+                size="sm"
+                variant="ghost"
+                loading={downloading === format.value}
                 title={format.hint}
+                onClick={() => void download(format.value, format.label)}
               >
                 {format.label}
-              </a>
+              </Button>
             ))}
           </>
         ) : null}
       </div>
+      {downloadError ? (
+        <p className="text-meta text-danger" role="alert">
+          {downloadError}
+        </p>
+      ) : null}
 
       {asking === "reject" ? (
         <div className="space-y-2 rounded-md border border-border p-3">

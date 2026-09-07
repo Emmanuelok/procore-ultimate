@@ -190,10 +190,17 @@ export const LIVELIHOOD_REQUIRED_DISPLACEMENT: readonly string[] = ["economic", 
  *
  * Two statuses are deliberately unreachable from this table:
  *  - `compensated` — only via the evidenced /compensate route.
- *  - `grievance_open` — set by the grievance module when a grievance naming
- *    the household is opened, and cleared on verified closure. It describes
- *    something that happened elsewhere; typing it in asserts a grievance
- *    exists that does not.
+ *  - `grievance_open` — set by the grievance module (see pap-grievance.ts)
+ *    when a grievance naming the household is opened, and cleared when the
+ *    last such grievance settles. It describes something that happened
+ *    elsewhere; typing it in asserts a grievance exists that does not.
+ *
+ * `grievance_open` is an OVERLAY, not a step: the household's substantive
+ * position is stashed in `statusBeforeGrievance` and restored exactly, and
+ * every rule that reads the column as a lifecycle fact goes through
+ * `effectivePapStatus`. The route therefore evaluates this table from the
+ * effective status, and the `grievance_open` row below only ever applies to
+ * rows flagged before the stash existed.
  */
 export const PAP_TRANSITIONS: Record<PapStatus, readonly PapStatus[]> = {
   registered: ["surveyed"],

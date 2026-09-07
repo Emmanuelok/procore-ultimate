@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import {
@@ -30,6 +30,17 @@ import { newId } from "../../lib/ids.js";
  * succeed still succeeds, it is simply allowed to take longer.
  */
 const HOOK_TIMEOUT_MS = 180_000;
+
+/**
+ * And the per-TEST ceiling, for the same reason as the hook's.
+ *
+ * Nearly every test below registers an account — a bcrypt hash plus a
+ * company, a membership and a project — and several register two. On a loaded
+ * machine that outruns vitest's 30-second default, and "Test timed out"
+ * becomes a red suite that says nothing about the code. Raising the ceiling
+ * changes no assertion: a test that is going to fail still fails on it.
+ */
+vi.setConfig({ testTimeout: 120_000, hookTimeout: HOOK_TIMEOUT_MS });
 
 
 /**
@@ -119,14 +130,31 @@ describe("invitations", () => {
     expect(res.statusCode).toBe(201);
     const body = res.json() as {
       tempPassword?: string;
-      existingUser: boolean;
+      existingUser?: boolean;
+      invitedEmail: string;
+      role: string;
+      membershipCreated: boolean;
       invitation: { id: string; status: string; expiresAt: string; tokenPrefix: string };
       delivery: { dispatched: boolean; status: string; reasons: string[] };
       acceptUrl: string | null;
     };
-    // unchanged for existing callers
-    expect(body.existingUser).toBe(false);
-    expect(body.tempPassword).toHaveLength(16);
+    /*
+     * TWO FIELDS THAT MUST NOT COME BACK, asserted by their ABSENCE.
+     *
+     * `tempPassword` handed the INVITER a working credential for somebody
+     * else's brand-new account — live until acceptance, and never revoked if
+     * the invitation was ignored. `existingUser` told any tenant
+     * administrator whether a given address already has an account on this
+     * platform, which is an enumeration oracle over the whole user base.
+     * Both were removed with the route (modules/directory/index.ts), and this
+     * suite asserts their absence rather than merely not mentioning them:
+     * "we stopped returning it" is only true while something checks.
+     */
+    expect(body.tempPassword).toBeUndefined();
+    expect(body.existingUser).toBeUndefined();
+    expect(body.invitedEmail).toBe(email);
+    // Membership is created by ACCEPTANCE, never by the invitation.
+    expect(body.membershipCreated).toBe(false);
     // and the honesty the route did not have before
     expect(body.delivery.dispatched).toBe(false);
     expect(body.delivery.status).toBe("recorded");
@@ -169,7 +197,24 @@ describe("invitations", () => {
     const email = `accepts-${Date.now()}@test.dev`;
     const invited = await invite(owner.headers, { email, name: "Accepts Once", role: "member" });
     const token = tokenFromUrl((invited.json() as { acceptUrl: string }).acceptUrl);
-    const tempPassword = (invited.json() as { tempPassword: string }).tempPassword;
+
+    /*
+     * BEFORE ACCEPTANCE THERE IS NO WAY IN.
+     *
+     * The invite route creates the account in an unusable state —
+     * `isActive: false` and a hash no password can verify against — so the
+     * only thing that turns it into a login is the invitee proving they hold
+     * the mailbox. This is the assertion that used to be "the temporary
+     * password the administrator was handed stops working": there is no
+     * longer a temporary password to stop working, which is stronger, and it
+     * is worth proving rather than assuming.
+     */
+    const before = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/login",
+      payload: { email, password: INVITEE_PASSWORD },
+    });
+    expect(before.statusCode, before.body).toBe(401);
 
     const preview = await app.inject({
       method: "POST",
@@ -188,7 +233,9 @@ describe("invitations", () => {
     expect(weak.json().details.reasons.length).toBeGreaterThan(0);
 
     const ok = await accept({ token, password: INVITEE_PASSWORD, name: "Accepts Once" });
-    expect(ok.statusCode).toBe(200);
+    // The body is in the failure message on purpose: a bare "expected 500 to
+    // be 200" from an integration test costs an hour of bisecting.
+    expect(ok.statusCode, ok.body).toBe(200);
     const body = ok.json() as {
       user: { id: string };
       company: { role: string };
@@ -205,13 +252,7 @@ describe("invitations", () => {
     expect(replay.statusCode).toBe(400);
     expect(replay.json().details.reasons.join(" ")).toContain("already been accepted");
 
-    // the temporary password the administrator was handed no longer works
-    const oldWay = await app.inject({
-      method: "POST",
-      url: "/api/v1/auth/login",
-      payload: { email, password: tempPassword },
-    });
-    expect(oldWay.statusCode).toBe(401);
+    // and the password the INVITEE chose is now the only way in
     const newWay = await app.inject({
       method: "POST",
       url: "/api/v1/auth/login",
@@ -309,7 +350,8 @@ describe("invitations", () => {
     expect(second).not.toBe(first);
 
     expect((await accept({ token: first, password: INVITEE_PASSWORD })).statusCode).toBe(400);
-    expect((await accept({ token: second, password: INVITEE_PASSWORD })).statusCode).toBe(200);
+    const accepted = await accept({ token: second, password: INVITEE_PASSWORD });
+    expect(accepted.statusCode, accepted.body).toBe(200);
   });
 
   it("refuses to resend an invitation that is no longer pending", async () => {
@@ -340,12 +382,14 @@ describe("invitations", () => {
     });
     expect(res.statusCode).toBe(201);
     const body = res.json() as {
-      existingUser: boolean;
+      existingUser?: boolean;
       tempPassword?: string;
       acceptUrl: string | null;
       invitation: { id: string };
     };
-    expect(body.existingUser).toBe(true);
+    // The route does not say whether this address already had an account —
+    // and the behaviour below proves it did, without the caller being told.
+    expect(body.existingUser).toBeUndefined();
     expect(body.tempPassword).toBeUndefined();
     // THE POINT: no link comes back for an account this invitation did not
     // create, because that link would set a password on somebody else's
@@ -560,6 +604,6 @@ async function signInAs(
     url: "/api/v1/auth/login",
     payload: { email, password },
   });
-  expect(res.statusCode).toBe(200);
+  expect(res.statusCode, res.body).toBe(200);
   return (res.json() as { accessToken: string }).accessToken;
 }

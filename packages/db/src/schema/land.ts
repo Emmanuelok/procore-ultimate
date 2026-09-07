@@ -93,6 +93,15 @@ export const affectedPersons = pgTable(
     livelihoodProgramme: text("livelihood_programme"),
     livelihoodRestoredAt: text("livelihood_restored_at"),
     status: text("status").default("registered").notNull(), // PapStatus
+    /**
+     * Where the register had this household before a grievance naming it was
+     * opened. `grievance_open` is a state the grievance module imposes, not a
+     * step in the resettlement lifecycle, so the household has to be able to
+     * come BACK to where it was when the grievance settles — otherwise a dust
+     * complaint permanently erases the fact that the household was
+     * compensated and resettled.
+     */
+    statusBeforeGrievance: text("status_before_grievance"),
     /** declared before the cut-off date; later arrivals are encroachment (#564) */
     censusDate: text("census_date"),
     createdBy: text("created_by").notNull(),
@@ -421,5 +430,56 @@ export const rapAudits = pgTable(
   (t) => [
     uniqueIndex("rap_audits_uq").on(t.projectId, t.number),
     index("rap_audits_project_idx").on(t.projectId, t.auditDate),
+  ],
+);
+
+/**
+ * Grievance triage proposals and their calibration (#571-572).
+ *
+ * An intake officer classifies a grievance in the minutes before the
+ * acknowledgement clock starts, and the severity they choose IS the service
+ * standard the project published to the community. This table records what
+ * the assistant proposed, the precedent and rule text it cited, and — the
+ * point of the exercise — what the officer actually decided, so agreement
+ * can be measured instead of assumed.
+ *
+ * A proposal is never applied on its own: `decidedAt` is set only by an
+ * officer confirming or overriding it, which is also the moment the
+ * grievance's own category/severity change and are ledgered.
+ */
+export const grievanceTriages = pgTable(
+  "grievance_triages",
+  {
+    id: text("id").primaryKey(),
+    companyId: text("company_id").notNull(),
+    projectId: text("project_id").notNull(),
+    grievanceId: text("grievance_id").notNull(),
+    /** ai_runs.id when a model produced this; null for the precedent-only baseline */
+    runId: text("run_id"),
+    /** "precedent" (deterministic tf-idf vote) | "agent" (cited model proposal) */
+    method: text("method").default("precedent").notNull(),
+    proposedCategory: text("proposed_category").notNull(),
+    proposedSeverity: text("proposed_severity").notNull(),
+    proposedAssigneeId: text("proposed_assignee_id"),
+    confidence: doublePrecision("confidence").default(0).notNull(),
+    rationale: text("rationale").notNull(),
+    /** SLA rule text quoted in support of the proposed severity */
+    ruleCitations: jsonb("rule_citations").$type<unknown[]>().default([]).notNull(),
+    /** [{ id, number, score, category, severity, sharedTerms }] */
+    precedents: jsonb("precedents").$type<unknown[]>().default([]).notNull(),
+    /** citations the model made that survived validation against the inputs */
+    citations: jsonb("citations").$type<unknown[]>().default([]).notNull(),
+    decidedCategory: text("decided_category"),
+    decidedSeverity: text("decided_severity"),
+    decidedAssigneeId: text("decided_assignee_id"),
+    decisionNote: text("decision_note"),
+    decidedAt: timestamp("decided_at", { withTimezone: true, mode: "string" }),
+    decidedBy: text("decided_by"),
+    createdBy: text("created_by").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index("grievance_triages_grievance_idx").on(t.grievanceId, t.createdAt),
+    index("grievance_triages_project_idx").on(t.companyId, t.projectId, t.decidedAt),
   ],
 );

@@ -769,9 +769,16 @@ function lineAmounts(l: LineRow) {
 
 export interface ComponentExplanation {
   component: BudgetPostingComponent;
-  stored: number;
+  /**
+   * The figure the budget line stores for this component — null when the
+   * line carries no such column (invoiced and paid to date are read from
+   * their sources, never stored), because printing 0 there would invent a
+   * drift equal to the whole figure.
+   */
+  stored: number | null;
   /** what the sources say right now; null when the sources are unknown */
   value: number | null;
+  /** null when either side is unknown — a drift needs two known figures */
   drift: number | null;
   rows: SourceRowOut[];
   reasons: string[];
@@ -811,13 +818,25 @@ export async function explainLine(db: Db, budget: BudgetRow, line: LineRow): Pro
         }));
       });
   const sum = (rows: SourceRowOut[]): number => round2(rows.filter((r) => !r.excluded).reduce((s, r) => s + r.amount, 0));
-  const from = (component: BudgetPostingComponent, stored: number, src: SourceComponent, basis: string): ComponentExplanation => {
+  const from = (component: BudgetPostingComponent, stored: number | null, src: SourceComponent, basis: string): ComponentExplanation => {
     const rows = src.rowsByLine.get(line.id) ?? [];
     const value = src.component.value === null ? null : (src.byLine.get(line.id) ?? 0);
-    return { component, stored: round2(stored), value, drift: value === null ? null : round2(value - stored), rows, reasons: src.component.value === null ? src.component.reasons : [], basis };
+    return {
+      component,
+      stored: stored === null ? null : round2(stored),
+      value,
+      drift: value === null || stored === null ? null : round2(value - stored),
+      rows,
+      reasons: src.component.value === null ? src.component.reasons : [],
+      basis,
+    };
   };
-  const invoicedC = from("invoicedToDate", 0, invoiced, "Latest approved subcontractor invoice per commitment SOV line (cumulative to date) plus approved non-SOV invoice lines.");
-  const paidC = from("paidToDate", 0, paid, "Commitment payment allocations the payments module posted to this line.");
+  // Invoiced and paid to date have no column on the budget line: they are
+  // read from their sources and folded into jobToDateCosts. Reporting a
+  // stored 0 for them would show a drift equal to the entire figure on
+  // every line that has ever been invoiced.
+  const invoicedC = from("invoicedToDate", null, invoiced, "Latest approved subcontractor invoice per commitment SOV line (cumulative to date) plus approved non-SOV invoice lines. The budget line stores no invoiced-to-date column; this figure feeds job-to-date cost below.");
+  const paidC = from("paidToDate", null, paid, "Commitment payment allocations the payments module posted to this line. The budget line stores no paid-to-date column; this figure feeds job-to-date cost below.");
   const jtd = computeJobToDate({ invoicedToDate: invoiced.component.value === null ? null : (invoiced.byLine.get(line.id) ?? 0), paidToDate: paid.byLine.get(line.id) ?? 0, directCosts: line.directCosts });
   const modificationRows = legRows("approved").filter((r) => r.detail["kind"] !== "owner_change");
   const ownerRows = legRows("approved").filter((r) => r.detail["kind"] === "owner_change");

@@ -25,6 +25,7 @@ import {
   GRIEVANCE_SLA,
 } from "./reference.js";
 import { GRIEVANCE_TIER_LABELS, MAX_GRIEVANCE_TIER } from "./grievance-engine.js";
+import { syncPapGrievanceStatus } from "./pap-grievance.js";
 import {
   daysFromDateToInstant,
   daysUntil,
@@ -109,6 +110,24 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
       .limit(1);
     if (!rows[0]) throw notFound("Grievance not found");
     return rows[0];
+  }
+
+  /**
+   * Keep the household's `grievance_open` flag in step with its grievances.
+   * `grievance_open` is a PAP status only the grievance register can produce
+   * — the PAP status route refuses it by hand — so every route here that
+   * opens or settles a grievance naming a household calls this. It is
+   * idempotent and writes nothing when nothing changed.
+   */
+  async function syncPap(
+    companyId: string,
+    projectId: string,
+    papId: string | null,
+    actorId: string,
+    grievanceId: string,
+  ): Promise<void> {
+    if (!papId) return;
+    await syncPapGrievanceStatus(app.db, { companyId, projectId, papId, actorId, grievanceId });
   }
 
   /** View-model fields the register and the detail view both need. */
@@ -242,6 +261,14 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
       },
       storePayload: true,
     });
+    /*
+     * A household named by an open grievance is flagged `grievance_open`, so
+     * the census and the RAP dashboard stop showing it as settled while a
+     * complaint about it is live. The flag is reversible: the household's
+     * pre-grievance status is stashed and restored when the last grievance
+     * naming it settles.
+     */
+    await syncPap(req.companyId!, req.projectId!, body.papId ?? null, req.user!.id, id);
     const created = await fetchGrievance(id, req.companyId!, req.projectId!);
     return reply.status(201).send(decorate(created));
   });
@@ -432,6 +459,9 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
         },
         storePayload: true,
       });
+      // `resolved` stops the clock, so it settles the household's flag too —
+      // and an unsatisfied complainant reopening the case flags it again.
+      await syncPap(req.companyId!, req.projectId!, g.papId, req.user!.id, grievanceId);
       return decorate(await fetchGrievance(grievanceId, req.companyId!, req.projectId!));
     },
   );
@@ -522,6 +552,7 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
           storePayload: true,
         });
       }
+      await syncPap(req.companyId!, req.projectId!, g.papId, req.user!.id, grievanceId);
       return decorate(await fetchGrievance(grievanceId, req.companyId!, req.projectId!));
     },
   );
@@ -584,6 +615,7 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
         },
         storePayload: true,
       });
+      await syncPap(req.companyId!, req.projectId!, g.papId, req.user!.id, grievanceId);
       return decorate(await fetchGrievance(grievanceId, req.companyId!, req.projectId!));
     },
   );
