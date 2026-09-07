@@ -863,9 +863,60 @@ describe("lookahead window", () => {
       url: `/api/v1/projects/${projectId}/schedules/${schedule.id}/lookahead?weeks=2`,
       headers: owner.headers,
     });
-    const body = res.json() as { items: { id: string; constraints: { description: string }[] }[] };
+    const body = res.json() as {
+      items: { id: string; constraints: { description: string }[] }[];
+      constraintsOpen: number;
+      constraintsInWindow: number;
+    };
     const row = body.items.find((t) => t.id === task.id)!;
     expect(row.constraints.map((c) => c.description)).toEqual(["Rebar schedule not released"]);
+    expect(body.constraintsOpen).toBe(1);
+    expect(body.constraintsInWindow).toBe(1);
+  });
+
+  it("still reports the open make-ready constraints when no activity falls in the window", async () => {
+    /* The constraint log used to be queried only when a task was selected, so a
+       window with nothing in it reported constraintsOpen 0 — precisely the
+       state a planner opens a lookahead to see. */
+    const schedule = await createSchedule("Lookahead empty window", isoDaysFromToday(0));
+    const far = await addTask(schedule.id, { name: "Next year", durationDays: 5 });
+    await patchTask(far.id, {
+      constraintType: "start_no_earlier_than",
+      constraintDate: isoDaysFromToday(400),
+    });
+    for (const [description, needByDate] of [
+      ["Permit not granted", isoDaysFromToday(-5)],
+      ["Crane not booked", isoDaysFromToday(30)],
+    ] as const) {
+      const created = await app.inject({
+        method: "POST",
+        url: `/api/v1/projects/${projectId}/schedule-constraints`,
+        headers: owner.headers,
+        payload: { scheduleId: schedule.id, description, category: "other", needByDate },
+      });
+      expect(created.statusCode).toBe(201);
+    }
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/schedules/${schedule.id}/lookahead?weeks=3`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      items: unknown[];
+      total: number;
+      constraintsOpen: number;
+      constraintsInWindow: number;
+      constraintsOverdue: number;
+      constraintsBasis: string;
+    };
+    expect(body.total).toBe(0);
+    expect(body.constraintsOpen).toBe(2);
+    // programme-level constraints belong to every window
+    expect(body.constraintsInWindow).toBe(2);
+    expect(body.constraintsOverdue).toBe(1);
+    expect(body.constraintsBasis).toMatch(/constraintsOpen counts every open/);
   });
 });
 

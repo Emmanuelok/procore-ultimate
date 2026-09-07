@@ -5469,6 +5469,63 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
   );
 
   /**
+   * The project's worker register, as much of it as a safety form needs.
+   *
+   * Every personal record this module holds — an injury, a briefing
+   * attendance, a competency card, a drug or alcohol test result — names a
+   * worker from `workforce.workers`, and a form that asks for a `wkr_` id in a
+   * text box is a form that will be filled in wrongly. This is deliberately a
+   * SAFETY route rather than a link to the workforce register: a safety
+   * co-ordinator who may record an injury must be able to name the injured
+   * person without also holding the workforce tool.
+   */
+  app.get("/projects/:projectId/safety/workers", { preHandler: readGate }, async (req) => {
+    const q = z
+      .object({
+        search: z.string().max(120).optional(),
+        vendorId: z.string().max(64).optional(),
+        includeInactive: z.coerce.boolean().optional(),
+      })
+      .parse(req.query);
+    const filters = [
+      eq(workers.companyId, req.companyId!),
+      eq(workers.projectId, req.projectId!),
+    ];
+    if (q.vendorId) filters.push(eq(workers.vendorId, q.vendorId));
+    if (!q.includeInactive) filters.push(eq(workers.status, "active"));
+    const rows = await app.db
+      .select({
+        id: workers.id,
+        reference: workers.reference,
+        fullName: workers.fullName,
+        trade: workers.trade,
+        vendorId: workers.vendorId,
+        status: workers.status,
+      })
+      .from(workers)
+      .where(and(...filters))
+      .orderBy(asc(workers.fullName))
+      .limit(500);
+    const needle = q.search?.trim().toLowerCase();
+    const items = needle
+      ? rows.filter(
+          (r) =>
+            r.fullName.toLowerCase().includes(needle) ||
+            (r.reference ?? "").toLowerCase().includes(needle),
+        )
+      : rows;
+    return {
+      items,
+      total: items.length,
+      truncated: rows.length === 500,
+      note:
+        "The project's worker register, active workers only unless `includeInactive` is set, " +
+        "capped at 500 names. It is the same register that carries induction, identity " +
+        "verification and site access — a safety record names a PERSON, not a free-text name.",
+    };
+  });
+
+  /**
    * The inverse query, and the reason attendance is a table rather than a
    * jsonb array: "has this worker been briefed on confined spaces this
    * month" is asked about a PERSON, by a supervisor at a gate, not about a
@@ -9379,6 +9436,39 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       const { incidentId } = req.params as { incidentId: string };
       const body = assistAcceptSchema.parse(req.body);
       const row = await fetchIncident(incidentId, req.companyId!, req.projectId!);
+      /* PROVENANCE HAS TO BE TRUE TO BE WORTH STORING.
+       *
+       * `runId` is written into every contributing factor and into the
+       * acceptance ledger entry as "accepted from run X". Taken on trust it is
+       * caller-asserted, so a year later the audit trail says a model proposed
+       * something no model ever saw. It must name a real assistant run, on this
+       * company and this incident. */
+      const runs = await app.db
+        .select({
+          id: aiRuns.id,
+          agentKind: aiRuns.agentKind,
+          projectId: aiRuns.projectId,
+          inputRefs: aiRuns.inputRefs,
+        })
+        .from(aiRuns)
+        .where(and(eq(aiRuns.id, body.runId), eq(aiRuns.companyId, req.companyId!)))
+        .limit(1);
+      const run = runs[0];
+      const runCoversIncident =
+        run != null &&
+        Array.isArray(run.inputRefs) &&
+        (run.inputRefs as Array<{ type?: unknown; id?: unknown }>).some(
+          (r) => r?.type === "safety_incident" && r?.id === incidentId,
+        );
+      if (!run || run.agentKind !== "incident_investigation_assistant" || !runCoversIncident) {
+        throw badRequest(
+          `\`runId\` ${body.runId} does not name an investigation-assistant run on ${row.reference} ` +
+            `in this company. It is stored against every contributing factor accepted and in the ` +
+            `ledger entry as the provenance of the suggestion, so a value nobody can resolve is ` +
+            `worse than none: it reads as a model proposal that no model made. Run the assistant ` +
+            `first and send back the run id it returned.`,
+        );
+      }
       if (row.status === "closed" || row.status === "void") {
         throw conflict(
           `Incident ${row.reference} is ${row.status}. Accepting suggestions onto it would change ` +

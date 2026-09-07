@@ -78,8 +78,6 @@ export function isOverdueHoldPoint(a: ItpActivity): boolean {
 
 /** The one-line standing of a point, for a grid cell. */
 export function ProceedCell({ activity }: { activity: ItpActivity }) {
-  /** null when no chain is configured: the single-release rule governs. */
-  const chain = activity.signOffChain;
   const overdue = isOverdueHoldPoint(activity);
   if (activity.mayProceed.allowed) {
     return (
@@ -132,6 +130,8 @@ export default function ActivityCard({
   /** bumped by every transition so the chain panel reloads with the card */
   const [chainVersion, setChainVersion] = useState(0);
 
+  /** null when no chain is configured: the single-release rule governs. */
+  const chain = activity.signOffChain;
   const overdue = isOverdueHoldPoint(activity);
   const held = !activity.mayProceed.allowed;
   const blocking = activity.interventionPoint === "hold_point";
@@ -402,8 +402,18 @@ export default function ActivityCard({
               className="text-2xs font-medium text-content-muted underline-offset-2 hover:underline"
               onClick={() => setChainOpen((open) => !open)}
             >
-              {chainOpen ? "Hide the sign-off chain" : "Sign-off chain — who signs, in what order"}
+              {chainOpen
+                ? "Hide the sign-off chain"
+                : chain
+                  ? `Sign-off chain — ${chain.releasedCount + chain.waivedCount} of ${chain.requiredCount} signed${chain.rejected ? ", one leg rejected it" : ""}`
+                  : "Sign-off chain — who signs, in what order"}
             </button>
+            {chain && !chain.complete && !chainOpen ? (
+              <p className="mt-0.5 text-2xs text-content-subtle">
+                {chain.reasons[0] ??
+                  "Required legs are outstanding; this point is released by its chain, not by a single release."}
+              </p>
+            ) : null}
             {chainOpen ? (
               <div className="mt-1.5">
                 <SignOffChain
