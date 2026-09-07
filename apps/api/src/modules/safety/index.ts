@@ -134,7 +134,7 @@ import {
   type AssistContext,
   type AssistRecordRef,
 } from "./assist.js";
-import { aiEnabled, runAgent } from "../ai/service.js";
+import { aiDisabledError, aiEnabled, runAgent } from "../ai/service.js";
 import { forEachCompany } from "../../lib/scheduler.js";
 import { isExpired } from "../../lib/time.js";
 
@@ -415,6 +415,13 @@ const notifyRegulatorSchema = z.object({
 const incidentCloseSchema = z.object({
   note: z.string().min(1).max(8000),
   lessonId: z.string().max(64).nullable().optional(),
+  /**
+   * The only way past a duty whose deadline cannot be established from the
+   * record (a row written before the rules engine, carrying a regime and no
+   * `reportDueAt`). It never opens a duty with a real, unmet clock — those are
+   * refused whatever is sent — and it is stored on the incident and ledgered.
+   */
+  statutoryOverrideReason: z.string().min(20).max(4000).optional(),
 });
 
 /* --- corrective actions --- */
@@ -2112,6 +2119,8 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
         duties: notification.duties,
         outstandingRegimes: notification.outstanding,
         missedRegimes: notification.missed,
+        /** regimes owed but with no establishable deadline — reassess them */
+        needsReviewRegimes: notification.needsReview,
         allDischarged: notification.allDischarged,
         reasons: notification.reasons,
       },
@@ -3643,6 +3652,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
        * `regulator_notified_at` column. An incident assessed under both RIDDOR
        * and OSHA whose F2508 was filed still owes the OSHA notification, and
        * closing it would take that live duty off the register. */
+      let statutoryOverride: { reason: string; regimes: string[] } | null = null;
       if (asBool(row.isReportable)) {
         const state = incidentNotificationState(row, new Date().toISOString());
         const owed = state.duties.filter(
@@ -3663,6 +3673,30 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
               `and record it, or reassess the classification if it is wrong.`,
           );
         }
+        /* A duty whose deadline cannot be established from the record is not a
+         * live clock and never becomes one, so refusing on it forever would
+         * make an old row unclosable. It is let through only on an explicit
+         * reason, which is stored and ledgered — the same standard as any
+         * other override of a statutory gate. */
+        const unknown = state.duties.filter((d) => d.state === "deadline_unknown");
+        if (unknown.length > 0) {
+          if (!body.statutoryOverrideReason) {
+            throw conflict(
+              `Incident ${row.reference} carries ${unknown.length} statutory duty/duties ` +
+                `(${unknown.map((d) => d.regime).join(", ")}) whose deadline cannot be established ` +
+                `from the record: the regime is stored but no \`reportDueAt\` is. That is what a row ` +
+                `written before the reportability engine looks like, and it is not a clock that will ` +
+                `ever expire. Reassess the incident to get the real deadline and the rule behind it — ` +
+                `or, if the duty genuinely does not apply or has been discharged outside the ` +
+                `platform, close it with \`statutoryOverrideReason\` saying which and why. The reason ` +
+                `is stored on the incident and in the ledger.`,
+            );
+          }
+          statutoryOverride = {
+            reason: body.statutoryOverrideReason,
+            regimes: unknown.map((d) => d.regime),
+          };
+        }
       }
       const liveActions = await app.db
         .select({ n: count() })
@@ -3682,7 +3716,12 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       }
       const now = new Date().toISOString();
       const detail = { ...row.detail } as Record<string, unknown>;
-      detail["closure"] = { note: body.note, closedBy: req.user!.id, closedAt: now };
+      detail["closure"] = {
+        note: body.note,
+        closedBy: req.user!.id,
+        closedAt: now,
+        statutoryOverride,
+      };
       await app.db
         .update(safetyIncidents)
         .set({
@@ -3708,6 +3747,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
           to: "closed",
           note: body.note,
           lessonId: body.lessonId ?? row.lessonId,
+          statutoryOverride,
         },
         storePayload: true,
       });
@@ -9195,40 +9235,63 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     };
   }
 
+  /**
+   * The DETERMINISTIC half of the assistant, with no model in it at all.
+   *
+   * The assembly — every observation raised on this location or against this
+   * subcontractor in the ninety days before, the inspections of that work, the
+   * briefings the crew received, the prior incidents sharing the mechanism —
+   * is the half an investigator actually needs, and it is the half that must
+   * never depend on an API key. The model's reading of the pattern is the
+   * extra, and it lives on the POST route which refuses with 503 AiDisabled
+   * when there is no key, exactly like every other AI endpoint on the
+   * platform.
+   */
+  app.get(
+    "/projects/:projectId/safety/incidents/:incidentId/assist/context",
+    { preHandler: readGate },
+    async (req) => {
+      const { incidentId } = req.params as { incidentId: string };
+      const incident = await fetchIncident(incidentId, req.companyId!, req.projectId!);
+      const ctx = await buildAssistContext(req.companyId!, req.projectId!, incident);
+      return {
+        incidentId,
+        reference: incident.reference,
+        aiAvailable: aiEnabled(app),
+        context: {
+          priorObservations: ctx.priorObservations,
+          priorIncidents: ctx.priorIncidents,
+          inspections: ctx.inspections,
+          briefings: ctx.briefings,
+          openActions: ctx.openActions,
+          programmeRecords: ctx.programmeRecords,
+          witnesses: ctx.incident.witnesses,
+          openQuestions: ctx.determination?.openQuestions ?? [],
+        },
+        note:
+          "The records around this incident, gathered by location, subcontractor and mechanism. " +
+          "Nothing here is inferred and nothing here is written to the incident. " +
+          (aiEnabled(app)
+            ? "Ask the assistant to read the pattern behind them."
+            : "The AI layer is not configured, so no reading of the pattern is available; this " +
+              "assembly is unaffected."),
+      };
+    },
+  );
+
   app.post(
     "/projects/:projectId/safety/incidents/:incidentId/assist",
     { preHandler: standardGate },
     async (req) => {
       const { incidentId } = req.params as { incidentId: string };
+      /* 503 AiDisabled, the platform convention, rather than a 200 carrying
+       * `available: false` that a client written against that convention would
+       * read as a successful AI answer. The deterministic assembly has its own
+       * route and is unaffected by the key. */
+      if (!aiEnabled(app)) throw aiDisabledError();
       const incident = await fetchIncident(incidentId, req.companyId!, req.projectId!);
       const ctx = await buildAssistContext(req.companyId!, req.projectId!, incident);
       const prompt = buildAssistPrompt(ctx);
-
-      if (!aiEnabled(app)) {
-        /* Degrading, not failing: the assembly is the useful half and it is
-         * deterministic. What the model would have added is a reading of the
-         * pattern; what the site still gets is every record that bears on this
-         * incident, in one place, with nothing invented. */
-        return {
-          available: false,
-          reason:
-            "The AI layer is not configured (ANTHROPIC_API_KEY is unset), so no reading of the " +
-            "pattern was generated. Everything below is the deterministic assembly the model would " +
-            "have been given: the records around this incident, gathered by location, subcontractor " +
-            "and mechanism. Nothing here is inferred.",
-          context: {
-            priorObservations: ctx.priorObservations,
-            priorIncidents: ctx.priorIncidents,
-            inspections: ctx.inspections,
-            briefings: ctx.briefings,
-            openActions: ctx.openActions,
-            programmeRecords: ctx.programmeRecords,
-            witnesses: ctx.incident.witnesses,
-            openQuestions: ctx.determination?.openQuestions ?? [],
-          },
-          assist: null,
-        };
-      }
 
       try {
         const result = await runAgent({

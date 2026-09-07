@@ -111,6 +111,13 @@ export interface ItpActivity {
   parsedVerifyingParties: VerifyingParty[];
   notice: NoticeStatus;
   mayProceed: Decision;
+  /**
+   * The sequential sign-off chain, when one is configured on this point.
+   * `null` means no chain exists and the single-release rule governs — the API
+   * refuses the activity-level release outright while a chain is incomplete,
+   * so the UI must not offer it.
+   */
+  signOffChain: ChainSummary | null;
 }
 
 export interface HoldPointSummary {
@@ -892,6 +899,8 @@ export interface SurveillanceRegister {
     }
   >;
   total: number;
+  page: number;
+  pageSize: number;
   awaitingAttendance: number;
   notifiedAwaitingSignature: number;
 }

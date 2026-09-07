@@ -78,6 +78,8 @@ export function isOverdueHoldPoint(a: ItpActivity): boolean {
 
 /** The one-line standing of a point, for a grid cell. */
 export function ProceedCell({ activity }: { activity: ItpActivity }) {
+  /** null when no chain is configured: the single-release rule governs. */
+  const chain = activity.signOffChain;
   const overdue = isOverdueHoldPoint(activity);
   if (activity.mayProceed.allowed) {
     return (
@@ -453,15 +455,40 @@ export default function ActivityCard({
           >
             {activity.notifiedAt ? "Serve notice again" : "Serve notice"}
           </Button>
-          <Button
-            size="sm"
-            variant="primary"
-            icon={IconUnlock}
-            disabled={terminal || activity.interventionPoint === "surveillance_point"}
-            onClick={() => setReleaseOpen(true)}
-          >
-            Release
-          </Button>
+          {/*
+            A POINT WITH A CHAIN IS RELEASED BY ITS CHAIN.
+
+            Offering the single-signature Release next to a configured
+            contractor -> engineer -> third-party chain made the bypass a
+            one-click mistake: the API now refuses it, and the button that used
+            to invite it opens the chain instead, on the leg whose turn it is.
+          */}
+          {chain && !chain.complete ? (
+            <Button
+              size="sm"
+              variant="primary"
+              icon={IconUnlock}
+              disabled={terminal}
+              onClick={() => setChainOpen(true)}
+            >
+              Sign the next leg
+              {chain.outstanding[0] ? ` — ${labelize(chain.outstanding[0].party)}` : ""}
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              variant="primary"
+              icon={IconUnlock}
+              disabled={
+                terminal ||
+                activity.interventionPoint === "surveillance_point" ||
+                chain !== null
+              }
+              onClick={() => setReleaseOpen(true)}
+            >
+              Release
+            </Button>
+          )}
           <Button
             size="sm"
             variant="ghost"

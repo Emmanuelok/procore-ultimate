@@ -1843,6 +1843,74 @@ describe("claim valuation and portfolio exposure (#312-313, #320)", () => {
     expect(body.reasons.join(" ")).toMatch(/never summed across them/);
   });
 
+  it("refuses to revalue a determined claim and never rewrites its derived artefacts", async () => {
+    const create = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims`,
+      headers: owner.headers,
+      payload: { title: "Withdrawn claim", kind: "delay", currency: "GBP", amountClaimed: 90_000 },
+    });
+    const id = create.json().id as string;
+    const valued = await app.inject({
+      method: "PUT",
+      url: `/api/v1/projects/${projectId}/claims/${id}/valuation`,
+      headers: owner.headers,
+      payload: { quantumBest: 10_000, quantumLikely: 50_000, quantumWorst: 90_000, successProbability: 0.5 },
+    });
+    expect(valued.statusCode).toBe(200);
+    const provisionAtDetermination = valued.json().provisionAmount as number;
+
+    const withdraw = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims/${id}/status`,
+      headers: owner.headers,
+      payload: { status: "withdrawn", reason: "Raised in error" },
+    });
+    expect(withdraw.statusCode).toBe(200);
+
+    // the valuation and the provision are part of the closed record
+    const revalue = await app.inject({
+      method: "PUT",
+      url: `/api/v1/projects/${projectId}/claims/${id}/valuation`,
+      headers: owner.headers,
+      payload: { quantumLikely: 500_000, successProbability: 0.9 },
+    });
+    expect(revalue.statusCode).toBe(400);
+    expect(revalue.json().message).toMatch(/determination is final/i);
+
+    // the derived artefacts may still be assembled for reading, never saved over
+    const chron = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims/${id}/chronology`,
+      headers: owner.headers,
+    });
+    expect(chron.statusCode).toBe(200);
+    expect(chron.json().persisted).toBe(false);
+    const suff = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/claims/${id}/sufficiency`,
+      headers: owner.headers,
+    });
+    expect(suff.statusCode).toBe(200);
+    expect(suff.json().persisted).toBe(false);
+
+    const after = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/claims/${id}`,
+      headers: owner.headers,
+    });
+    const body = after.json() as {
+      provisionAmount: number;
+      quantumLikely: number;
+      chronologyAt: string | null;
+      sufficiencyAt: string | null;
+    };
+    expect(body.provisionAmount).toBe(provisionAtDetermination);
+    expect(body.quantumLikely).toBe(50_000);
+    expect(body.chronologyAt).toBeNull();
+    expect(body.sufficiencyAt).toBeNull();
+  });
+
   it("narrows exposure to one project when asked, and refuses an unknown one", async () => {
     // A claim with no amount claimed must be reported apart, never as zero.
     const unpricedClaim = await app.inject({
