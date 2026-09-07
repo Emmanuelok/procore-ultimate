@@ -59,6 +59,11 @@ import {
 import { buildAccrualSchedule, quarterEnds } from "./interest.js";
 import { computeAccountPosition, reconcileAccount, type AccountEntryInput } from "./accounts.js";
 import {
+  renderWithdrawalApplicationHtml,
+  withdrawalApplicationCsv,
+  type WithdrawalApplicationDocument,
+} from "./withdrawal.js";
+import {
   computeAvailabilityPayment,
   type UnavailabilityEvent,
 } from "./availability.js";
@@ -1831,6 +1836,16 @@ export const financeModule: FastifyPluginAsync = async (app) => {
     },
   );
 
+  /**
+   * Record (or correct) a covenant reading by hand — the override path for
+   * covenants whose inputs are not on the cashflow table.
+   *
+   * ONE READING PER TEST DATE. A period is tested once: re-posting the same
+   * readingDate CORRECTS the reading rather than stacking a second one, and
+   * the breach signal is fingerprinted on `${covenantId}:${readingDate}` so
+   * a mistyped ratio posted three times leaves one signal that the compliant
+   * correction closes — not three that nothing ever closes.
+   */
   app.post(
     "/projects/:projectId/covenants/:covenantId/readings",
     { preHandler: standardGate },
@@ -1840,65 +1855,111 @@ export const financeModule: FastifyPluginAsync = async (app) => {
       const covenant = await fetchCovenant(covenantId, req.companyId!, req.projectId!);
       const compliant = covenantCompliant(covenant.operator, body.value, covenant.threshold);
       const headroom = covenantHeadroom(covenant.operator, body.value, covenant.threshold);
-      const id = newId("cvr");
+      const existing = (
+        await app.db
+          .select({ id: covenantReadings.id, value: covenantReadings.value })
+          .from(covenantReadings)
+          .where(
+            and(
+              eq(covenantReadings.covenantId, covenantId),
+              eq(covenantReadings.readingDate, body.readingDate),
+            ),
+          )
+          .limit(1)
+      )[0];
+      const id = existing?.id ?? newId("cvr");
       // Reading, breach signal and ledger entry are one act. Split across
       // three statements, a failure after the insert left a breach nobody
       // was told about — or a signal for a reading that was never stored.
       await app.db.transaction(async (tx) => {
-      await tx.insert(covenantReadings).values({
-        id,
-        covenantId,
-        companyId: req.companyId!,
-        readingDate: body.readingDate,
-        value: body.value,
-        compliant: compliant ? 1 : 0,
-        headroom,
-        note: body.note ?? null,
-        recordedBy: req.user!.id,
-      });
-      if (!compliant) {
-        // A covenant breach is a lender event of default risk — critical
-        // signal, no obligation (the covenant is continuous, not dated).
-        const opText = covenant.operator === "gte" ? "≥" : "≤";
-        await tx.insert(signals).values({
-          id: newId("sig"),
+        if (existing) {
+          await tx
+            .update(covenantReadings)
+            .set({
+              value: body.value,
+              compliant: compliant ? 1 : 0,
+              headroom,
+              note: body.note ?? null,
+              basis: "manual",
+              computedFrom: null,
+              recordedBy: req.user!.id,
+            })
+            .where(eq(covenantReadings.id, id));
+        } else {
+          await tx.insert(covenantReadings).values({
+            id,
+            covenantId,
+            companyId: req.companyId!,
+            readingDate: body.readingDate,
+            value: body.value,
+            compliant: compliant ? 1 : 0,
+            headroom,
+            note: body.note ?? null,
+            basis: "manual",
+            recordedBy: req.user!.id,
+          });
+        }
+        if (!compliant) {
+          // A covenant breach is a lender event-of-default risk — critical
+          // signal, no obligation (the covenant is continuous, not dated).
+          const opText = covenant.operator === "gte" ? "≥" : "≤";
+          await raiseSignalOnce(tx as never, {
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            detector: "covenant_breach",
+            key: `${covenantId}:${body.readingDate}`,
+            severity: "critical",
+            confidence: 1,
+            title:
+              `Covenant breach — ${covenant.name}: ${body.value} vs required ${opText} ` +
+              `${covenant.threshold}${covenant.unit ? ` ${covenant.unit}` : ""}`,
+            explanation:
+              `The ${body.readingDate} reading of covenant "${covenant.name}" is ${body.value}` +
+              `${covenant.unit ? ` ${covenant.unit}` : ""}, against a required level of ${opText} ` +
+              `${covenant.threshold}. Headroom is ${headroom} (negative = depth of breach). ` +
+              `A financial covenant breach typically constitutes a default or draw-stop event ` +
+              `under the facility agreement and suspends further disbursements until it clears ` +
+              `or a lender waiver is recorded.`,
+            subjectType: "covenant",
+            subjectId: covenantId,
+            evidenceRefs: {
+              covenantId,
+              readingDate: body.readingDate,
+              value: body.value,
+              threshold: covenant.threshold,
+            },
+          });
+        } else {
+          await closeSignalByKey(
+            tx as never,
+            req.companyId!,
+            "covenant_breach",
+            `${covenantId}:${body.readingDate}`,
+            "The reading recorded for this test date complies with the covenant.",
+          );
+        }
+        await appendLedger(tx as never, {
           companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: existing ? "update" : "create",
+          objectType: "covenant_reading",
+          objectId: id,
+          payload: {
+            covenantId,
+            readingDate: body.readingDate,
+            value: body.value,
+            compliant,
+            headroom,
+            ...(existing ? { correctedFrom: existing.value } : {}),
+          },
+          storePayload: true,
           projectId: req.projectId!,
-          detector: "covenant_breach",
-          severity: "critical",
-          confidence: 1,
-          title:
-            `Covenant breach — ${covenant.name}: ${body.value} vs required ${opText} ` +
-            `${covenant.threshold}${covenant.unit ? ` ${covenant.unit}` : ""}`,
-          explanation:
-            `The ${body.readingDate} reading of covenant "${covenant.name}" is ${body.value}` +
-            `${covenant.unit ? ` ${covenant.unit}` : ""}, against a required level of ${opText} ` +
-            `${covenant.threshold}. Headroom is ${headroom} (negative = depth of breach). ` +
-            `A financial covenant breach typically constitutes a default or draw-stop event ` +
-            `under the facility agreement and may suspend further disbursements.`,
         });
-      }
-      await appendLedger(tx as never, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "create",
-        objectType: "covenant_reading",
-        objectId: id,
-        payload: {
-          covenantId,
-          readingDate: body.readingDate,
-          value: body.value,
-          compliant,
-          headroom,
-        },
-        storePayload: true,
-        projectId: req.projectId!,
-      });
       });
       const created = (
         await app.db.select().from(covenantReadings).where(eq(covenantReadings.id, id)).limit(1)
       )[0];
-      return reply.status(201).send(created);
+      return reply.status(existing ? 200 : 201).send(created);
     },
   );
 
@@ -2555,106 +2616,157 @@ export const financeModule: FastifyPluginAsync = async (app) => {
    * Assembled from recorded fields only — every line is traceable to a row,
    * and anything missing is stated rather than filled in.
    */
+  async function buildApplication(
+    disbursementId: string,
+    companyId: string,
+    projectId: string,
+  ): Promise<WithdrawalApplicationDocument> {
+    const d = await fetchDisbursement(disbursementId, companyId, projectId);
+    const facility = await fetchFacility(d.facilityId, companyId, projectId);
+    const projectRow = (
+      await app.db.select({ name: projects.name }).from(projects).where(eq(projects.id, projectId)).limit(1)
+    )[0];
+    const evidenceRows = d.evidenceIds.length
+      ? await app.db
+          .select()
+          .from(evidence)
+          .where(
+            and(
+              inArray(evidence.id, d.evidenceIds),
+              eq(evidence.companyId, companyId),
+              eq(evidence.projectId, projectId),
+            ),
+          )
+      : [];
+    const eligibility = assessEligibility(
+      d.evidenceIds,
+      (d.evidenceEligibility ?? []) as EligibilityEntry[],
+    );
+    const category = d.categoryId
+      ? (parseCategories(facility).find((c) => c.id === d.categoryId) ?? null)
+      : null;
+    const warnings: string[] = [];
+    if (!d.certifiedAt) {
+      warnings.push(
+        CERTIFICATION_REQUIRED_INSTRUMENTS.includes(facility.instrument)
+          ? "This application has NOT been certified by the independent engineer, and this facility requires certification before payment."
+          : "This application has not been certified; certification is optional for this instrument.",
+      );
+    }
+    if (eligibility.unassessed > 0) {
+      warnings.push(`${eligibility.unassessed} attached item(s) have not been classified for eligibility.`);
+    }
+    if (evidenceRows.length !== d.evidenceIds.length) {
+      warnings.push(
+        `${d.evidenceIds.length - evidenceRows.length} attached evidence id(s) no longer resolve in this project.`,
+      );
+    }
+    return {
+      header: {
+        applicationNumber: d.number,
+        project: projectRow?.name ?? null,
+        borrowerReference: facility.name,
+        lender: facility.lender,
+        instrument: facility.instrument,
+        currency: facility.currency,
+        committedAmount: facility.committedAmount,
+        availabilityEndDate: facility.availabilityEndDate,
+        category: category ? { id: category.id, name: category.name, limit: category.limit } : null,
+      },
+      application: {
+        amount: d.amount,
+        purpose: d.purpose,
+        status: d.status,
+        submittedAt: d.submittedAt,
+        approvedAt: d.approvedAt,
+        disbursedAt: d.disbursedAt,
+      },
+      statementOfExpenditure: evidenceRows.map((e) => {
+        const entry = ((d.evidenceEligibility ?? []) as EligibilityEntry[]).find(
+          (x) => x.evidenceId === e.id,
+        );
+        return {
+          evidenceId: e.id,
+          kind: e.kind,
+          source: e.source,
+          capturedAt: e.capturedAt,
+          contentHash: e.contentHash,
+          eligibility: entry?.eligibility ?? "unassessed",
+          reason: entry?.reason ?? null,
+          amount: entry?.amount ?? null,
+        };
+      }),
+      eligibility: {
+        total: eligibility.total,
+        eligible: eligibility.eligible,
+        ineligible: eligibility.ineligible,
+        unassessed: eligibility.unassessed,
+        ineligibleAmount: eligibility.ineligibleAmount,
+        submittable: eligibility.submittable,
+        reasons: eligibility.reasons,
+      },
+      certification: {
+        certified: Boolean(d.certifiedAt),
+        certifiedAt: d.certifiedAt,
+        certifiedBy: d.certifiedBy,
+        note: d.certificationNote,
+        evidenceIds: d.certificationEvidenceIds,
+        requiredForInstrument: CERTIFICATION_REQUIRED_INSTRUMENTS.includes(facility.instrument),
+      },
+      conditionality: d.conditionality ?? null,
+      warnings,
+      basis:
+        "Assembled from the disbursement record, the facility agreement terms held on the " +
+        "platform and the evidence attached to the application. Nothing on this form is " +
+        "computed from anything the platform does not hold; anything missing is named in warnings.",
+    };
+  }
+
   app.get(
     "/projects/:projectId/disbursements/:disbursementId/application",
     { preHandler: readGate },
     async (req) => {
       const { disbursementId } = req.params as { disbursementId: string };
-      const d = await fetchDisbursement(disbursementId, req.companyId!, req.projectId!);
-      const facility = await fetchFacility(d.facilityId, req.companyId!, req.projectId!);
-      const projectRow = (
-        await app.db
-          .select({ name: projects.name })
-          .from(projects)
-          .where(eq(projects.id, req.projectId!))
-          .limit(1)
-      )[0];
-      const evidenceRows = d.evidenceIds.length
-        ? await app.db
-            .select()
-            .from(evidence)
-            .where(
-              and(
-                inArray(evidence.id, d.evidenceIds),
-                eq(evidence.companyId, req.companyId!),
-                eq(evidence.projectId, req.projectId!),
-              ),
-            )
-        : [];
-      const eligibility = assessEligibility(
-        d.evidenceIds,
-        (d.evidenceEligibility ?? []) as EligibilityEntry[],
-      );
-      const category = d.categoryId
-        ? (parseCategories(facility).find((c) => c.id === d.categoryId) ?? null)
-        : null;
-      const warnings: string[] = [];
-      if (!d.certifiedAt) {
-        warnings.push(
-          CERTIFICATION_REQUIRED_INSTRUMENTS.includes(facility.instrument)
-            ? "This application has NOT been certified by the independent engineer, and this facility requires certification before payment."
-            : "This application has not been certified; certification is optional for this instrument.",
-        );
-      }
-      if (eligibility.unassessed > 0) {
-        warnings.push(`${eligibility.unassessed} attached item(s) have not been classified for eligibility.`);
-      }
-      if (evidenceRows.length !== d.evidenceIds.length) {
-        warnings.push(
-          `${d.evidenceIds.length - evidenceRows.length} attached evidence id(s) no longer resolve in this project.`,
-        );
-      }
-      return {
-        header: {
-          applicationNumber: d.number,
-          project: projectRow?.name ?? null,
-          borrowerReference: facility.name,
-          lender: facility.lender,
-          instrument: facility.instrument,
-          currency: facility.currency,
-          committedAmount: facility.committedAmount,
-          availabilityEndDate: facility.availabilityEndDate,
-          category: category ? { id: category.id, name: category.name, limit: category.limit } : null,
-        },
-        application: {
-          amount: d.amount,
-          purpose: d.purpose,
-          status: d.status,
-          submittedAt: d.submittedAt,
-          approvedAt: d.approvedAt,
-          disbursedAt: d.disbursedAt,
-        },
-        statementOfExpenditure: evidenceRows.map((e) => {
-          const entry = ((d.evidenceEligibility ?? []) as EligibilityEntry[]).find(
-            (x) => x.evidenceId === e.id,
-          );
-          return {
-            evidenceId: e.id,
-            kind: e.kind,
-            source: e.source,
-            capturedAt: e.capturedAt,
-            contentHash: e.contentHash,
-            eligibility: entry?.eligibility ?? "unassessed",
-            reason: entry?.reason ?? null,
-            amount: entry?.amount ?? null,
-          };
-        }),
-        eligibility,
-        certification: {
-          certified: Boolean(d.certifiedAt),
-          certifiedAt: d.certifiedAt,
-          certifiedBy: d.certifiedBy,
-          note: d.certificationNote,
-          evidenceIds: d.certificationEvidenceIds,
-          requiredForInstrument: CERTIFICATION_REQUIRED_INSTRUMENTS.includes(facility.instrument),
-        },
-        conditionality: d.conditionality ?? null,
-        warnings,
-        basis:
-          "Assembled from the disbursement record, the facility agreement terms held on the " +
-          "platform and the evidence attached to the application. Nothing on this form is " +
-          "computed from anything the platform does not hold; anything missing is named in warnings.",
-      };
+      return buildApplication(disbursementId, req.companyId!, req.projectId!);
+    },
+  );
+
+  /**
+   * The same application as the printed IFI form. There is no PDF writer in
+   * this runtime, so the platform emits the print-ready document (the
+   * browser's "save as PDF" produces the file the lender receives) rather
+   * than claiming a PDF it cannot produce.
+   */
+  app.get(
+    "/projects/:projectId/disbursements/:disbursementId/application.html",
+    { preHandler: readGate },
+    async (req, reply) => {
+      const { disbursementId } = req.params as { disbursementId: string };
+      const doc = await buildApplication(disbursementId, req.companyId!, req.projectId!);
+      return reply
+        .type("text/html; charset=utf-8")
+        .header(
+          "content-disposition",
+          `inline; filename="withdrawal-application-${doc.header.applicationNumber}.html"`,
+        )
+        .send(renderWithdrawalApplicationHtml(doc));
+    },
+  );
+
+  /** The statement-of-expenditure schedule for the lender's own system. */
+  app.get(
+    "/projects/:projectId/disbursements/:disbursementId/application.csv",
+    { preHandler: readGate },
+    async (req, reply) => {
+      const { disbursementId } = req.params as { disbursementId: string };
+      const doc = await buildApplication(disbursementId, req.companyId!, req.projectId!);
+      return reply
+        .type("text/csv; charset=utf-8")
+        .header(
+          "content-disposition",
+          `attachment; filename="withdrawal-application-${doc.header.applicationNumber}.csv"`,
+        )
+        .send(withdrawalApplicationCsv(doc));
     },
   );
 
@@ -2870,6 +2982,10 @@ export const financeModule: FastifyPluginAsync = async (app) => {
         authorisedCeiling: body.authorisedCeiling,
         openingBalance: body.openingBalance ?? 0,
         openedOn: body.openedOn ?? null,
+        // Honoured, not swallowed: an account recorded as already closed
+        // must not start accepting entries or appear in the unreconciled
+        // sweep (jobs.ts sweeps status = "active" only).
+        status: body.status ?? "active",
         createdBy: req.user!.id,
       });
       await appendLedger(app.db, {
@@ -2883,6 +2999,7 @@ export const financeModule: FastifyPluginAsync = async (app) => {
           name: body.name,
           authorisedCeiling: body.authorisedCeiling,
           currency: body.currency ?? facility.currency,
+          status: body.status ?? "active",
         },
         storePayload: true,
         projectId: req.projectId!,

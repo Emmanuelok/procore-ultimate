@@ -1976,6 +1976,106 @@ describe("disruption (#290-293)", () => {
     expect(body.series.some((p) => p.window === "baseline")).toBe(true);
   });
 
+  it("bounds the measured-mile scan by the window in SQL and withholds the money when the record set is capped", async () => {
+    /* 12 timecards far outside the analysis window, same trade: with the window
+       pushed into SQL they never reach the scan at all. */
+    for (let i = 0; i < 12; i += 1) {
+      await app.db.insert(timecards).values({
+        id: newId("tc"),
+        companyId: owner.companyId,
+        projectId,
+        number: 5000 + i,
+        reference: `TC-OUT-${i}`,
+        workerId: newId("wkr"),
+        workDate: `2027-01-${String(i + 1).padStart(2, "0")}`,
+        trade: "steel_fixing",
+        totalHours: 999,
+        status: "approved",
+        createdBy: owner.userId,
+      });
+    }
+    const payload = {
+      method: "measured_mile",
+      title: "Steel fixing measured mile — capped",
+      trade: "steel_fixing",
+      unit: "t",
+      baselineFrom: "2026-04-06",
+      baselineTo: "2026-04-20",
+      impactedFrom: "2026-04-27",
+      impactedTo: "2026-05-11",
+      hourlyRate: 40,
+      currency: "GBP",
+    };
+    const prev = process.env["FORENSICS_TIMECARD_SCAN_CAP"];
+    try {
+      // cap 8 > the 6 in-window cards: the 12 out-of-window cards are excluded by SQL
+      process.env["FORENSICS_TIMECARD_SCAN_CAP"] = "8";
+      const ok = await app.inject({
+        method: "POST",
+        url: `/api/v1/projects/${projectId}/forensics/disruption`,
+        headers: owner.headers,
+        payload,
+      });
+      expect(ok.statusCode).toBe(201);
+      const okBody = ok.json() as {
+        amount: number | null;
+        output: { recordsTruncated: boolean; baselineProductivity: number };
+      };
+      expect(okBody.output.recordsTruncated).toBe(false);
+      expect(okBody.amount).toBeGreaterThan(0);
+      expect(okBody.output.baselineProductivity).toBeCloseTo(1.05, 2); // the 999-hour rows never entered
+
+      // cap below the in-window count: the series is a subset, so no money is produced
+      process.env["FORENSICS_TIMECARD_SCAN_CAP"] = "3";
+      const capped = await app.inject({
+        method: "POST",
+        url: `/api/v1/projects/${projectId}/forensics/disruption`,
+        headers: owner.headers,
+        payload,
+      });
+      expect(capped.statusCode).toBe(201);
+      const body = capped.json() as {
+        lostHours: number | null;
+        amount: number | null;
+        output: { recordsTruncated: boolean; reasons: string[] };
+      };
+      expect(body.output.recordsTruncated).toBe(true);
+      expect(body.lostHours).toBeNull();
+      expect(body.amount).toBeNull();
+      expect(body.output.reasons.join(" ")).toMatch(/only the first 3 by work date/);
+      expect(body.output.reasons.join(" ")).toMatch(/withheld/i);
+    } finally {
+      if (prev === undefined) delete process.env["FORENSICS_TIMECARD_SCAN_CAP"];
+      else process.env["FORENSICS_TIMECARD_SCAN_CAP"] = prev;
+    }
+  });
+
+  it("tells the productivity series reader that the record set was capped instead of suggesting a baseline from a subset", async () => {
+    const prev = process.env["FORENSICS_TIMECARD_SCAN_CAP"];
+    process.env["FORENSICS_TIMECARD_SCAN_CAP"] = "2";
+    try {
+      const res = await app.inject({
+        method: "GET",
+        url: `/api/v1/projects/${projectId}/forensics/productivity-series?trade=steel_fixing&unit=t&from=2026-04-01&to=2026-05-31`,
+        headers: owner.headers,
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as {
+        truncated: boolean;
+        suggestedBaseline: unknown;
+        reasons: string[];
+        window: { from: string | null; to: string | null };
+      };
+      expect(body.truncated).toBe(true);
+      expect(body.suggestedBaseline).toBeNull();
+      expect(body.window).toEqual({ from: "2026-04-01", to: "2026-05-31" });
+      expect(body.reasons.join(" ")).toMatch(/6 timecards match this window/);
+    } finally {
+      if (prev === undefined) delete process.env["FORENSICS_TIMECARD_SCAN_CAP"];
+      else process.env["FORENSICS_TIMECARD_SCAN_CAP"] = prev;
+    }
+  });
+
   it("refuses an industry-curve claim with no justification", async () => {
     const res = await app.inject({
       method: "POST",

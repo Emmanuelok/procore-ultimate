@@ -19,8 +19,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
 import {
+  commitmentPayments,
   commitmentSovLines,
   commitments,
+  invoices,
   obligations,
   paymentClaims,
   projects,
@@ -33,7 +35,7 @@ import { addDaysISO, todayISO } from "../field/dates.js";
 import { sweepLienDeadlines } from "./liens.js";
 import { computeAdjudicationTimetable, ADJUDICATION_RULES } from "./adjudication.js";
 import { reconcileAccount, signedAmount } from "./security.js";
-import { computeMetrics, type PaidInvoiceSample } from "./supplychain.js";
+import { buildSample, computeMetrics, type PaidInvoiceSample } from "./supplychain.js";
 
 let built: Awaited<ReturnType<typeof buildTestApp>>;
 let app: FastifyInstance;
@@ -792,5 +794,319 @@ describe("regression: deemed liability does not depend on someone opening a page
     expect(raised.length).toBe(1);
     expect(raised[0]!.severity).toBe("critical");
     expect(raised[0]!.explanation).toContain("indicative");
+  });
+});
+
+/* ================================================================== */
+/* Verifier regressions                                                */
+/* ================================================================== */
+
+describe("regression: an adjudication case moves once, not twice", () => {
+  let caseId: string;
+
+  beforeAll(async () => {
+    const res = await inject("POST", `/api/v1/projects/${projectId}/adjudications`, owner.headers, {
+      regime: "uk_hgcra",
+      disputedAmount: 25000,
+      currency: "GBP",
+      noticeAt: todayISO(),
+      referringParty: "claimant",
+    });
+    expect(res.statusCode).toBe(201);
+    caseId = res.json().id;
+  });
+
+  it("lets only one of two concurrent closures win", async () => {
+    const [a, b] = await Promise.all([
+      inject(`POST`, `/api/v1/projects/${projectId}/adjudications/${caseId}/settle`, owner.headers, {
+        amount: 20000,
+        note: "Settled",
+      }),
+      inject(`POST`, `/api/v1/projects/${projectId}/adjudications/${caseId}/withdraw`, owner.headers, {
+        note: "Withdrawn",
+      }),
+    ]);
+    const codes = [a.statusCode, b.statusCode].sort();
+    expect(codes[0]).toBe(200);
+    expect(codes[1]).toBeGreaterThanOrEqual(400);
+    const row = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/adjudications/${caseId}`,
+      owner.headers,
+    );
+    expect(["settled", "withdrawn"]).toContain(row.json().status);
+  });
+
+  it("refuses a second closure outright", async () => {
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/adjudications/${caseId}/settle`,
+      owner.headers,
+      { amount: 1 },
+    );
+    expect(res.statusCode).toBe(409);
+  });
+});
+
+describe("regression: statutory money moves and transitions are guarded", () => {
+  let lienId: string;
+  let accountId: string;
+
+  beforeAll(async () => {
+    const lien = await inject("POST", `/api/v1/projects/${projectId}/liens`, owner.headers, {
+      kind: "preliminary_notice",
+      claimantName: "Racing claimant",
+      amount: 1000,
+      currency: "USD",
+      deadlineAt: addDaysISO(todayISO(), 30),
+    });
+    lienId = lien.json().id;
+    const acct = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/payment-security-accounts`,
+      owner.headers,
+      { kind: "escrow", name: "Escrow — concurrency", currency: "USD" },
+    );
+    accountId = acct.json().id;
+    const funded = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/payment-security-accounts/${accountId}/movements`,
+      owner.headers,
+      { kind: "deposit", amount: 10000 },
+    );
+    expect(funded.statusCode).toBe(201);
+  });
+
+  it("serves a notice before it is filed (the transition the register claimed)", async () => {
+    const served = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/liens/${lienId}/serve`,
+      owner.headers,
+      {},
+    );
+    expect(served.statusCode).toBe(200);
+    expect(served.json().status).toBe("served");
+    expect(served.json().servedAt).toBeTruthy();
+    /* a served notice is still open exposure */
+    const summary = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/liens/summary`,
+      owner.headers,
+    );
+    expect(summary.json().open).toBeGreaterThanOrEqual(1);
+    const filed = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/liens/${lienId}/file`,
+      owner.headers,
+      {},
+    );
+    expect(filed.statusCode).toBe(200);
+    expect(filed.json().status).toBe("filed");
+  });
+
+  it("lets only ONE of two concurrent lien transitions win", async () => {
+    const [a, b] = await Promise.all([
+      inject(`POST`, `/api/v1/projects/${projectId}/liens/${lienId}/release`, owner.headers, {}),
+      inject(`POST`, `/api/v1/projects/${projectId}/liens/${lienId}/expire`, owner.headers, {
+        reason: "Statute ran",
+      }),
+    ]);
+    const codes = [a.statusCode, b.statusCode].sort();
+    expect(codes[0]).toBe(200);
+    expect(codes[1]).toBeGreaterThanOrEqual(400);
+    const row = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/liens/${lienId}`,
+      owner.headers,
+    );
+    expect(["released", "expired"]).toContain(row.json().status);
+  });
+
+  it("refuses to overdraw a trust when two full releases race each other", async () => {
+    const path = `/api/v1/projects/${projectId}/payment-security-accounts/${accountId}/movements`;
+    const [a, b] = await Promise.all([
+      inject("POST", path, owner.headers, { kind: "release", amount: 10000 }),
+      inject("POST", path, owner.headers, { kind: "release", amount: 10000 }),
+    ]);
+    const codes = [a.statusCode, b.statusCode].sort();
+    expect(codes[0]).toBe(201);
+    expect(codes[1]).toBeGreaterThanOrEqual(400);
+    const after = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/payment-security-accounts/${accountId}`,
+      owner.headers,
+    );
+    /* the balance never goes negative: a trust that lends money is not a trust */
+    expect(after.json().reconciliation.balance).toBe(0);
+  });
+
+  it("refuses a withdrawal above the balance outright", async () => {
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/payment-security-accounts/${accountId}/movements`,
+      owner.headers,
+      { kind: "withdrawal", amount: 1 },
+    );
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("exceeds");
+  });
+
+  it("closes the emptied account and then takes no further movement", async () => {
+    const closed = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/payment-security-accounts/${accountId}/close`,
+      owner.headers,
+      {},
+    );
+    expect(closed.statusCode).toBe(200);
+    expect(closed.json().status).toBe("closed");
+    const again = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/payment-security-accounts/${accountId}/close`,
+      owner.headers,
+      {},
+    );
+    expect(again.statusCode).toBe(409);
+    const move = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/payment-security-accounts/${accountId}/movements`,
+      owner.headers,
+      { kind: "deposit", amount: 5 },
+    );
+    expect(move.statusCode).toBe(409);
+  });
+
+  it("does not let another company serve or move money on these records", async () => {
+    const lien = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/liens/${lienId}/serve`,
+      outsider.headers,
+      {},
+    );
+    expect(lien.statusCode).toBeGreaterThanOrEqual(400);
+    const move = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/payment-security-accounts/${accountId}/movements`,
+      outsider.headers,
+      { kind: "deposit", amount: 1 },
+    );
+    expect(move.statusCode).toBeGreaterThanOrEqual(400);
+  });
+});
+
+/* ================================================================== */
+/* Regression: the reporting sample is bounded by the window           */
+/* ================================================================== */
+
+/**
+ * `buildSample` used to select EVERY issued payment for the company and apply
+ * the window in memory — a full read of the payment register on a route any
+ * authenticated company user can call. It now bounds the query by the period
+ * end. The invoice paid after the window must still be absent from the sample,
+ * which is what the bound has to preserve.
+ */
+describe("regression: supply-chain sampling is bounded by the reporting window", () => {
+  let inWindow: string;
+  let afterWindow: string;
+  let payCommitment: string;
+
+  beforeAll(async () => {
+    payCommitment = newId("cmt");
+    await app.db.insert(commitments).values({
+      id: payCommitment,
+      companyId: owner.companyId,
+      projectId,
+      kind: "subcontract",
+      number: 77,
+      reference: "SC-0077",
+      title: "Reporting sample package",
+      vendorId,
+      status: "approved",
+      executed: 1,
+      currency: "USD",
+      originalCommitmentSum: 50000,
+      revisedCommitmentSum: 50000,
+      createdBy: owner.userId,
+    });
+    let seq = 0;
+    const makeInvoice = async (billing: string, due: string, paid: string) => {
+      seq += 1;
+      const id = newId("inv");
+      await app.db.insert(invoices).values({
+        id,
+        companyId: owner.companyId,
+        projectId,
+        kind: "subcontractor_invoice",
+        number: 500 + seq,
+        reference: `INV-${500 + seq}`,
+        status: "paid",
+        commitmentId: payCommitment,
+        vendorId,
+        currency: "USD",
+        billingDate: billing,
+        receivedDate: billing,
+        dueDate: due,
+        paidDate: paid,
+        currentPaymentDue: 1000,
+        total: 1000,
+        amountPaid: 1000,
+        createdBy: owner.userId,
+      });
+      await app.db.insert(commitmentPayments).values({
+        id: newId("cpy"),
+        companyId: owner.companyId,
+        projectId,
+        commitmentId: payCommitment,
+        invoiceId: id,
+        vendorId,
+        number: 500 + seq,
+        reference: `SC-0077-PAY-${500 + seq}`,
+        status: "issued",
+        amount: 1000,
+        currency: "USD",
+        paymentDate: paid,
+        createdBy: owner.userId,
+      });
+      return id;
+    };
+    inWindow = await makeInvoice("2027-01-05", "2027-02-04", "2027-02-01");
+    afterWindow = await makeInvoice("2027-01-06", "2027-02-05", "2027-07-15");
+  });
+
+  it("counts only the invoice whose first payment falls inside the window", async () => {
+    const { sample } = await buildSample(
+      app.db,
+      owner.companyId,
+      "2027-01-01",
+      "2027-06-30",
+    );
+    const ids = sample.map((s) => s.invoiceId);
+    expect(ids).toContain(inWindow);
+    expect(ids).not.toContain(afterWindow);
+    const paid = sample.find((s) => s.invoiceId === inWindow)!;
+    expect(paid.daysToPay).toBe(27);
+    expect(paid.withinTerms).toBe(true);
+  });
+
+  it("counts the invoice still unpaid at the period end as outstanding", async () => {
+    const { metrics } = await buildSample(
+      app.db,
+      owner.companyId,
+      "2027-01-01",
+      "2027-06-30",
+    );
+    const usd = metrics.find((m) => m.currency === "USD")!;
+    expect(usd.invoicesPaid).toBeGreaterThanOrEqual(1);
+    expect(usd.invoicesOutstandingAtPeriodEnd).toBeGreaterThanOrEqual(1);
+  });
+
+  it("picks the later payment up once the window reaches it", async () => {
+    const { sample } = await buildSample(
+      app.db,
+      owner.companyId,
+      "2027-07-01",
+      "2027-12-31",
+    );
+    expect(sample.map((s) => s.invoiceId)).toContain(afterWindow);
   });
 });

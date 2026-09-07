@@ -17,12 +17,13 @@
  */
 
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, count, eq, inArray, isNotNull, isNull } from "drizzle-orm";
 import { z } from "zod";
 import { inspectionTestPlans, itpActivities, itpActivityReleases } from "@constructos/db";
 import { ITP_RESPONSIBLE_PARTIES } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { badRequest, forbidden, notFound } from "../../lib/errors.js";
+import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { pushNotifications } from "../notifications/service.js";
 import {
   buildGates,
@@ -599,8 +600,8 @@ export const surveillanceRoutes: FastifyPluginAsync = async (app) => {
    * are the ones that stop the programme.
    */
   app.get("/projects/:projectId/surveillance", { preHandler: readGate }, async (req) => {
-    const query = z
-      .object({
+    const query = pageQuerySchema
+      .extend({
         party: z.enum(ITP_RESPONSIBLE_PARTIES).optional(),
         openOnly: z.coerce.boolean().optional(),
       })
@@ -618,12 +619,47 @@ export const surveillanceRoutes: FastifyPluginAsync = async (app) => {
     if (query.openOnly) {
       clauses.push(inArray(itpActivityReleases.status, ["pending", "notified", "attended"]));
     }
+    /*
+     * PAGINATED, AND THE TOTAL IS THE REAL TOTAL.
+     *
+     * This used to take 500 rows with no offset and report `rows.length` as
+     * the total, so a project with 900 outstanding legs told its surveillance
+     * co-ordinator there were 500 — and the 400 it dropped were the ones
+     * nobody would then chase. The counts below are computed over the same
+     * where clause as the page, not over the page.
+     */
+    const where = and(...clauses);
+    const [totalRow] = await app.db
+      .select({ n: count() })
+      .from(itpActivityReleases)
+      .where(where);
+    const [awaitingRow] = await app.db
+      .select({ n: count() })
+      .from(itpActivityReleases)
+      .where(
+        and(
+          where,
+          inArray(itpActivityReleases.status, ["pending", "notified", "attended"]),
+          isNull(itpActivityReleases.attendedAt),
+        ),
+      );
+    const [notifiedRow] = await app.db
+      .select({ n: count() })
+      .from(itpActivityReleases)
+      .where(
+        and(
+          where,
+          inArray(itpActivityReleases.status, ["pending", "notified", "attended"]),
+          isNotNull(itpActivityReleases.notifiedAt),
+        ),
+      );
     const rows = await app.db
       .select()
       .from(itpActivityReleases)
-      .where(and(...clauses))
+      .where(where)
       .orderBy(asc(itpActivityReleases.createdAt))
-      .limit(500);
+      .limit(query.pageSize)
+      .offset(pageOffset(query));
     const activityIds = [...new Set(rows.map((r) => r.activityId))];
     const activities = activityIds.length
       ? await app.db
@@ -632,24 +668,24 @@ export const surveillanceRoutes: FastifyPluginAsync = async (app) => {
           .where(inArray(itpActivities.id, activityIds))
       : [];
     const byId = new Map(activities.map((a) => [a.id, a] as const));
+    const items = rows.map((r) => ({
+      ...r,
+      activity: byId.get(r.activityId)
+        ? {
+            id: r.activityId,
+            activity: byId.get(r.activityId)!.activity,
+            activityCode: byId.get(r.activityId)!.activityCode,
+            interventionPoint: byId.get(r.activityId)!.interventionPoint,
+            plannedDate: byId.get(r.activityId)!.plannedDate,
+            status: byId.get(r.activityId)!.status,
+            itpId: byId.get(r.activityId)!.itpId,
+          }
+        : null,
+    }));
     return {
-      items: rows.map((r) => ({
-        ...r,
-        activity: byId.get(r.activityId)
-          ? {
-              id: r.activityId,
-              activity: byId.get(r.activityId)!.activity,
-              activityCode: byId.get(r.activityId)!.activityCode,
-              interventionPoint: byId.get(r.activityId)!.interventionPoint,
-              plannedDate: byId.get(r.activityId)!.plannedDate,
-              status: byId.get(r.activityId)!.status,
-              itpId: byId.get(r.activityId)!.itpId,
-            }
-          : null,
-      })),
-      total: rows.length,
-      awaitingAttendance: rows.filter((r) => !isLegTerminal(r.status) && !r.attendedAt).length,
-      notifiedAwaitingSignature: rows.filter((r) => !isLegTerminal(r.status) && r.notifiedAt).length,
+      ...paginate(items, Number(totalRow?.n ?? 0), query),
+      awaitingAttendance: Number(awaitingRow?.n ?? 0),
+      notifiedAwaitingSignature: Number(notifiedRow?.n ?? 0),
     };
   });
 };

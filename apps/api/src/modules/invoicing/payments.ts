@@ -16,7 +16,11 @@ import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import type { Db } from "../../lib/db.js";
 import { assessCommitment } from "../commitments/compliance.js";
 import { rememberIdempotent, replayIdempotent } from "../commitments/idempotency.js";
-import { assertCompliancePermits } from "../commitments/payments.js";
+import {
+  allocateRetainageRelease,
+  assertCompliancePermits,
+  assertRetainageAvailable,
+} from "../commitments/payments.js";
 import { fetchInvoice, type InvoiceRow } from "./invoices.js";
 import {
   allocateToBudgetLines,
@@ -287,6 +291,20 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
 
     const held = waiverBlocked || complianceBlocked;
     const status = held ? "on_hold" : (body.status ?? "issued");
+    /*
+     * RETAINAGE RELEASED HERE IS RETAINAGE ACTUALLY RELEASED. The commitments
+     * register holds retainage on the schedule of values, and
+     * `commitments.retainageHeld` is derived from those lines — so recording a
+     * release on the payment row without allocating it against the lines would
+     * let the same retainage be released twice, once from each module. This
+     * route therefore runs the SAME two calls the commitments-side issue runs:
+     * the headroom check before the row exists, and the allocation when the
+     * payment is issued, stamped with `retainageAppliedAt` so a later fail or
+     * void puts it back. A scheduled or held payment only RESERVES it (the
+     * headroom check counts scheduled and on-hold rows).
+     */
+    const retainageRelease = round2(body.retainageReleasedAmount ?? 0);
+    const appliesRetainage = status === "issued" && retainageRelease > 0;
     const number = await nextRecordNumber(
       app.db,
       inv.projectId,
@@ -322,6 +340,19 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
           { payable: livePayable, requested: amount, currency: inv.currency },
         );
       }
+      /*
+       * The commitment row is locked for the rest of the transaction: the
+       * retainage headroom check, the allocation and the recompute that
+       * follows it are one act, so two concurrent releases cannot both read
+       * the same `retainageHeld` and both pass.
+       */
+      const lockedCommitment = (
+        await tx.select().from(commitments).where(eq(commitments.id, inv.commitmentId!)).for("update")
+      )[0];
+      if (!lockedCommitment) throw badRequest("The commitment behind this invoice is gone");
+      if (retainageRelease > 0) {
+        await assertRetainageAvailable(tx, lockedCommitment, retainageRelease);
+      }
       await tx.insert(commitmentPayments).values({
         id,
         companyId: req.companyId!,
@@ -334,7 +365,7 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
         method: body.method ?? "check",
         status,
         amount,
-        retainageReleasedAmount: round2(body.retainageReleasedAmount ?? 0),
+        retainageReleasedAmount: retainageRelease,
         discountTaken: round2(body.discountTaken ?? 0),
         currency: inv.currency,
         paymentDate: body.paymentDate ?? todayIso(),
@@ -362,12 +393,21 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
             warnings: compliance.warnings.map((f) => f.code),
             asOf: compliance.asOf,
           },
+          ...(appliesRetainage ? { retainageAppliedAt: now } : {}),
         },
         createdBy: req.user!.id,
         ...(status === "issued" ? { issuedBy: req.user!.id, issuedAt: now } : {}),
         ...(status === "issued" ? { approvedBy: inv.approvedBy, approvedAt: inv.approvedAt } : {}),
         updatedAt: now,
       });
+      /*
+       * Money out means the retainage really leaves the schedule of values —
+       * before the recompute below, so the header figure the next reader sees
+       * is the position after this release.
+       */
+      if (appliesRetainage) {
+        await allocateRetainageRelease(tx, lockedCommitment, retainageRelease);
+      }
       /* the register service re-derives amountPaid, status, commitment totals and direct costs */
       settled = await settleAfterTransition(tx, id);
     });
@@ -381,6 +421,8 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
       amount,
       currency: inv.currency,
       status,
+      retainageReleased: retainageRelease,
+      retainageApplied: appliesRetainage,
       method: body.method ?? "check",
       lienWaiverSatisfied: gate.satisfied,
       waiverOverridden: waiverBlocked,

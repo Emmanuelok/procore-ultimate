@@ -162,6 +162,14 @@ const accessReportQuery = z.object({
 });
 
 const PIPELINE_KINDS = ["drawing_set", "spec_book"];
+/**
+ * `metadata.kind` is written by the drawings/specifications pipelines and read
+ * back as ownership: it hides the file from the documents list, disables the
+ * delete action and refuses a move. A client that could write it could hide
+ * any file from everyone, or re-expose (and move) a set/book source. It is
+ * therefore stripped from every client patch — the stored value always wins.
+ */
+const RESERVED_METADATA_KEYS = ["kind"];
 const STALE_CHECKOUT_DAYS = 7;
 const PREVIEWABLE = /^(application\/pdf|image\/(png|jpeg|gif|webp|svg\+xml|bmp)|text\/(plain|csv|markdown|html)|application\/json)$/;
 
@@ -602,17 +610,52 @@ export const documentsModule: FastifyPluginAsync = async (app) => {
     if (Number(childFolders?.n ?? 0) > 0 || Number(childFiles?.n ?? 0) > 0) {
       throw conflict("Folder is not empty");
     }
-    await app.db.delete(folders).where(eq(folders.id, folderId));
+    /*
+     * The emptiness check above only counts LIVE files. Files in the recycle
+     * bin still carry this folderId, and there is no purge: dropping the
+     * folder row underneath them would leave restorable files pointing at a
+     * folder that no longer exists — invisible in the tree, `folderPath: null`
+     * on the detail route, unreachable except by id. So they are reparented
+     * onto the deleted folder's parent (null = project root, which the file
+     * list already renders) inside the same transaction, and the move is
+     * ledgered with the folder deletion so the recycle bin stays honest.
+     */
+    const orphans = await app.db
+      .select({ id: files.id, name: files.name })
+      .from(files)
+      .where(and(eq(files.folderId, folderId), isNotNull(files.deletedAt)));
+    await app.db.transaction(async (tx) => {
+      if (orphans.length > 0) {
+        await tx
+          .update(files)
+          .set({ folderId: folder.parentId, updatedAt: new Date().toISOString() })
+          .where(and(eq(files.folderId, folderId), isNotNull(files.deletedAt)));
+      }
+      await tx.delete(folders).where(eq(folders.id, folderId));
+    });
     await appendLedger(app.db, {
       companyId: req.companyId!,
       actorId: req.user!.id,
       action: "delete",
       objectType: "folder",
       objectId: folderId,
-      payload: { name: folder.name, path: folder.path },
+      payload: {
+        name: folder.name,
+        path: folder.path,
+        recycleBinFilesMoved: orphans.length,
+        movedToFolderId: folder.parentId,
+      },
       projectId,
     });
-    return { ok: true };
+    return {
+      ok: true,
+      recycleBinFilesMoved: orphans.length,
+      movedToFolderId: folder.parentId,
+      note:
+        orphans.length > 0
+          ? `${orphans.length} file(s) in the recycle bin were moved to ${folder.parentId ? "the parent folder" : "the project root"} so they stay restorable.`
+          : null,
+    };
   });
 
   /* ---------------------------------------------------------------- */
@@ -1387,6 +1430,14 @@ export const documentsModule: FastifyPluginAsync = async (app) => {
     if (body.folderId !== undefined && isPipelineOwned(f.metadata)) {
       throw badRequest("This file is owned by the drawings/specifications pipeline and cannot be moved");
     }
+    const ignoredMetadataKeys = Object.keys(body.metadata ?? {}).filter((k) =>
+      RESERVED_METADATA_KEYS.includes(k),
+    );
+    const patchMetadata = body.metadata
+      ? Object.fromEntries(
+          Object.entries(body.metadata).filter(([k]) => !RESERVED_METADATA_KEYS.includes(k)),
+        )
+      : undefined;
     if (body.folderId) {
       const folder = await app.db
         .select({ id: folders.id, projectId: folders.projectId })
@@ -1407,7 +1458,9 @@ export const documentsModule: FastifyPluginAsync = async (app) => {
         name: body.name ?? f.name,
         folderId: body.folderId === undefined ? f.folderId : body.folderId,
         isPrivate: body.isPrivate === undefined ? f.isPrivate : body.isPrivate ? 1 : 0,
-        metadata: body.metadata ? { ...(f.metadata as Record<string, unknown>), ...body.metadata } : (f.metadata as Record<string, unknown>),
+        metadata: patchMetadata
+          ? { ...(f.metadata as Record<string, unknown>), ...patchMetadata }
+          : (f.metadata as Record<string, unknown>),
         documentType: body.documentType === undefined ? f.documentType : body.documentType,
         tags: body.tags ?? f.tags,
         description: body.description === undefined ? f.description : body.description,
@@ -1421,11 +1474,11 @@ export const documentsModule: FastifyPluginAsync = async (app) => {
       action: "update",
       objectType: "file",
       objectId: fileId,
-      payload: body,
+      payload: { ...body, metadata: patchMetadata, ignoredMetadataKeys },
       projectId: f.projectId,
     });
     const updated = await app.db.select().from(files).where(eq(files.id, fileId)).limit(1);
-    return updated[0];
+    return { ...updated[0]!, ignoredMetadataKeys };
   });
 
   /** Copy: a new file row over the same content-addressed bytes (#294). */

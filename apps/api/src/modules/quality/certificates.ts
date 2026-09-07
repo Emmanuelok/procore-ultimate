@@ -40,6 +40,7 @@ import {
   QUALITY_DETECTORS,
   raiseSignal,
   todayISO,
+  visibleProjectIds,
 } from "./shared.js";
 import {
   verifyCertificate,
@@ -352,6 +353,14 @@ export const certificateRoutes: FastifyPluginAsync = async (app) => {
   /**
    * Heat traceability, company-wide. "Which certificates cover cast H-1234"
    * is a recall question — it crosses projects, because the cast did.
+   *
+   * It crosses projects; it does not cross the caller's own access. The route
+   * used to run on company membership alone, which admits `guest` and checks
+   * no tool permission, so anyone added to the tenant could enumerate the
+   * supplier, heat number and verification standing of every certificate on
+   * every project. It is now filtered to the projects the caller can actually
+   * see (owner/admin and company-wide assurance grants excepted), and says so
+   * when the filter is the reason the answer is empty.
    */
   app.get("/companies/current/material-certificates/trace", { preHandler: memberGate }, async (req) => {
     const q = z
@@ -363,7 +372,25 @@ export const certificateRoutes: FastifyPluginAsync = async (app) => {
     if (!q.heatNumber && !q.batchNumber) {
       throw badRequest("Give a heat number or a batch number to trace.");
     }
+    const visible = await visibleProjectIds(app, req, "read");
+    const scopeReason =
+      visible === null
+        ? "Traced across every project in the company."
+        : `Traced across the ${visible.size} project(s) you hold quality access to; certificates on other projects are not shown, and a recall question that needs the whole tenant should be asked by an administrator.`;
+    if (visible !== null && visible.size === 0) {
+      return {
+        items: [],
+        total: 0,
+        scope: { projectCount: 0, allProjects: false },
+        reasons: [
+          "You are a member of this company but of no project with quality access, so there is nothing to trace. This is an access answer, not a statement that the heat was never certified.",
+        ],
+      };
+    }
     const clauses = [eq(materialTestCertificates.companyId, req.companyId!)];
+    if (visible !== null) {
+      clauses.push(inArray(materialTestCertificates.projectId, [...visible]));
+    }
     if (q.heatNumber) clauses.push(eq(materialTestCertificates.heatNumber, q.heatNumber));
     if (q.batchNumber) clauses.push(eq(materialTestCertificates.batchNumber, q.batchNumber));
     const rows = await app.db
@@ -375,12 +402,14 @@ export const certificateRoutes: FastifyPluginAsync = async (app) => {
     return {
       items: rows.map(decorate),
       total: rows.length,
+      scope: { projectCount: visible === null ? null : visible.size, allProjects: visible === null },
       reasons:
         rows.length === 0
           ? [
-              `No certificate in this company records ${q.heatNumber ? `heat ${q.heatNumber}` : `batch ${q.batchNumber}`}. Either the material was received without a certificate, or the certificate was filed without its heat number — both are worth knowing before the material is installed.`,
+              `No certificate visible to you records ${q.heatNumber ? `heat ${q.heatNumber}` : `batch ${q.batchNumber}`}. Either the material was received without a certificate, or the certificate was filed without its heat number — both are worth knowing before the material is installed.`,
+              scopeReason,
             ]
-          : [],
+          : [scopeReason],
     };
   });
 

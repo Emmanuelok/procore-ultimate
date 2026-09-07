@@ -818,6 +818,8 @@ export const commitmentPayments = pgTable(
     index("commitment_payments_invoice_idx").on(t.invoiceId),
     index("commitment_payments_vendor_idx").on(t.vendorId),
     index("commitment_payments_commitment_idx").on(t.commitmentId, t.status),
+    /* WP-FIN2: the supply-chain payment-practice window scans company + status + payment date */
+    index("commitment_payments_company_paid_idx").on(t.companyId, t.status, t.paymentDate),
   ],
 );
 

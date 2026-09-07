@@ -26,7 +26,7 @@ import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { pushNotifications } from "../notifications/service.js";
 import { addDaysISO, isoDateSchema, todayISO } from "./dates.js";
-import { assertCompanyUsers, assertVendor, hasToolAdmin, isCompanyAdmin, requireToolLevel } from "./access.js";
+import { assertCompanyUsers, assertVendor, hasToolAdmin, hasToolStandard, isCompanyAdmin, requireToolLevel } from "./access.js";
 import { ageInDays, bucketise } from "./ageingEngine.js";
 import {
   BUILTIN_RESPONSE_CODES,
@@ -513,8 +513,18 @@ export const submittalRoutes: FastifyPluginAsync = async (app) => {
       currentPosition: pending?.position ?? null,
       permissions: {
         isAdmin: admin,
+        // Everything except responding runs through the standard gate. A
+        // consultant reviewer holds `submittals: read` and may respond to
+        // their own step but must not be offered Submit/Close/Edit/Resubmit,
+        // which would 403 at the preHandler.
+        canManage: admin || (await hasToolStandard(app, actorOf(req), req.projectId!, "submittals")),
         canRespondStepIds: row.status === "in_review" && pending ? pending.steps.filter((s) => admin || s.reviewerId === me).map((s) => s.id) : [],
-        canResubmit: row.status === "responded" && !row.supersededById && !!row.responseCode && isResubmitCode(row.responseCode, await companyCodes(req.companyId!)),
+        canResubmit:
+          row.status === "responded" &&
+          !row.supersededById &&
+          !!row.responseCode &&
+          isResubmitCode(row.responseCode, await companyCodes(req.companyId!)) &&
+          (admin || (await hasToolStandard(app, actorOf(req), req.projectId!, "submittals"))),
       },
     };
   });

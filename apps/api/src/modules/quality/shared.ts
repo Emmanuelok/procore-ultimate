@@ -13,11 +13,29 @@
  *    register rather than five.
  */
 
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
-import { assets, commissioningSystems, locations, signals, vendors } from "@constructos/db";
-import type { SignalSeverity } from "@constructos/shared";
+import {
+  assets,
+  assuranceGrants,
+  commissioningSystems,
+  locations,
+  permissionTemplates,
+  projectMemberships,
+  projects,
+  signals,
+  vendors,
+} from "@constructos/db";
+import {
+  BUILTIN_PERMISSION_TEMPLATES,
+  meetsLevel,
+  resolveLevel,
+  type PermissionLevel,
+  type SignalSeverity,
+  type ToolPermissionMap,
+} from "@constructos/shared";
+import { isExpired } from "../../lib/time.js";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
@@ -68,6 +86,79 @@ export function buildGates(app: FastifyInstance) {
     standardGate: [app.authenticate, app.requireCompany, app.requireTool("quality", "standard")],
     adminGate: [app.authenticate, app.requireCompany, app.requireTool("quality", "admin")],
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* Which projects may this caller see? (plan §6.3)                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The company-level routes in this module read PROJECT data — the heat-number
+ * trace crosses projects because the cast did. `requireCompany` alone is not
+ * an answer to "may this person read it": it admits the role `guest`, checks
+ * no tool permission and knows nothing about project membership, so a
+ * subcontractor added to the company could enumerate every material test
+ * certificate in the tenant — supplier, heat number, verification standing —
+ * on projects they have never been near.
+ *
+ * `null` means "every project in the company": the caller is an owner or an
+ * admin, or holds a company-wide assurance grant. Anything else is the set of
+ * projects they are a member of at the requested `quality` level, plus the
+ * projects a live assurance grant covers (read only — a grant widens what may
+ * be SEEN, never what may be done).
+ *
+ * Deliberately self-contained: the plan says not to depend on a helper another
+ * package may or may not land.
+ */
+export async function visibleProjectIds(
+  app: FastifyInstance,
+  req: FastifyRequest,
+  level: PermissionLevel = "read",
+): Promise<Set<string> | null> {
+  const companyId = req.companyId!;
+  const userId = req.user!.id;
+  if (req.companyRole === "owner" || req.companyRole === "admin") return null;
+
+  const nowMs = Date.now();
+  const [memberRows, grantRows, templateRows] = await Promise.all([
+    app.db
+      .select({
+        projectId: projectMemberships.projectId,
+        templateKey: projectMemberships.templateKey,
+        overrides: projectMemberships.overrides,
+      })
+      .from(projectMemberships)
+      .innerJoin(projects, eq(projects.id, projectMemberships.projectId))
+      .where(and(eq(projectMemberships.userId, userId), eq(projects.companyId, companyId))),
+    app.db
+      .select({ projectId: assuranceGrants.projectId, expiresAt: assuranceGrants.expiresAt })
+      .from(assuranceGrants)
+      .where(and(eq(assuranceGrants.companyId, companyId), eq(assuranceGrants.userId, userId))),
+    app.db
+      .select({ key: permissionTemplates.key, tools: permissionTemplates.tools })
+      .from(permissionTemplates)
+      .where(eq(permissionTemplates.companyId, companyId)),
+  ]);
+
+  const stored = new Map(templateRows.map((t) => [t.key, t.tools as ToolPermissionMap]));
+  const visible = new Set<string>();
+  for (const m of memberRows) {
+    const builtin = BUILTIN_PERMISSION_TEMPLATES.find((t) => t.key === m.templateKey)?.tools;
+    const merged: ToolPermissionMap | undefined = stored.has(m.templateKey)
+      ? { ...(builtin ?? {}), ...(stored.get(m.templateKey) ?? {}) }
+      : builtin;
+    if (meetsLevel(resolveLevel("quality", merged, m.overrides as ToolPermissionMap), level)) {
+      visible.add(m.projectId);
+    }
+  }
+  if (level === "read") {
+    for (const g of grantRows) {
+      if (isExpired(g.expiresAt, nowMs)) continue;
+      if (g.projectId === null) return null;
+      visible.add(g.projectId);
+    }
+  }
+  return visible;
 }
 
 /* ------------------------------------------------------------------ */

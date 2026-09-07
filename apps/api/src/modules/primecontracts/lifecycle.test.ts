@@ -311,6 +311,32 @@ describe("applications", () => {
     expect(aging.json<{ paymentTermsDays: number }>().paymentTermsDays).toBe(30);
   });
 
+  /*
+   * The over-payment guard reads Σ receipts, compares, then inserts. Unless
+   * that read and that insert are one transaction with the application row
+   * held, two remittances arriving together both see nothing outstanding
+   * against them and both land: paidAmount overshoots the certificate, the
+   * application flips to 'paid', and the contract's totalPaid overstates what
+   * the owner actually sent with no route to reverse it but voiding a receipt.
+   */
+  it("lands exactly one of two concurrent receipts for the whole outstanding balance", async () => {
+    const before = await call("GET", `/prime-contracts/${contractId}/billings/${app2}/receipts`);
+    expect(before.json<{ outstanding: number }>().outstanding).toBe(50_000);
+    const [a, b] = await Promise.all([
+      call("POST", `/prime-contracts/${contractId}/billings/${app2}/receipts`, { payload: { amount: 50_000, paymentReference: "WIRE-A" }, headers: certifierHeaders }),
+      call("POST", `/prime-contracts/${contractId}/billings/${app2}/receipts`, { payload: { amount: 50_000, paymentReference: "WIRE-B" }, headers: certifierHeaders }),
+    ]);
+    const codes = [a.statusCode, b.statusCode].sort();
+    expect(codes).toEqual([201, 400]);
+    const after = await call("GET", `/prime-contracts/${contractId}/billings/${app2}/receipts`);
+    const settled = after.json<{ paid: number; outstanding: number; items: Array<{ status: string }> }>();
+    expect(settled.paid).toBe(350_000);
+    expect(settled.outstanding).toBe(0);
+    expect(settled.items.filter((r) => r.status !== "void")).toHaveLength(2);
+    const contract = await call("GET", `/prime-contracts/${contractId}`);
+    expect(contract.json<{ totalPaid: number }>().totalPaid).toBe(350_000);
+  });
+
   it("exports the AIA G702/G703 as data and as CSV", async () => {
     const json = await call("GET", `/prime-contracts/${contractId}/billings/${app2}/export`);
     expect(json.statusCode).toBe(200);
@@ -424,6 +450,11 @@ describe("prime change orders fund the budget", () => {
     const voided = await call("POST", `/prime-contracts/${contractId}/changes/${id}/void`, { payload: { reason: "Withdrawn by the owner" }, headers: certifierHeaders });
     expect(voided.statusCode).toBe(200);
     expect(voided.json<{ status: string }>().status).toBe("void");
+    // The reviewer's REJECTION reason is the audit trail this register exists
+    // to keep: voiding afterwards must not overwrite it with its own reason.
+    expect(voided.json<{ rejectionReason: string }>().rejectionReason).toBe("Not proceeding");
+    expect(voided.json<{ detail: { voidReason: string; statusBeforeVoid: string } }>().detail.voidReason).toBe("Withdrawn by the owner");
+    expect(voided.json<{ detail: { statusBeforeVoid: string } }>().detail.statusBeforeVoid).toBe("rejected");
     expect((await call("POST", `/prime-contracts/${contractId}/changes/${id}/void`, { payload: { reason: "again" }, headers: certifierHeaders })).statusCode).toBe(409);
     const ledger = await built.app.db.select().from(ledgerEntries).where(eq(ledgerEntries.objectId, id));
     expect(ledger.some((e) => e.action === "state_change")).toBe(true);
@@ -457,6 +488,38 @@ describe("prime change orders fund the budget", () => {
     expect(after.approvedChanges).toBe(before.approvedChanges + 8_000);
     const funded = await built.app.db.select().from(budgetChanges).where(eq(budgetChanges.sourceId, id));
     expect(funded).toHaveLength(1);
+  });
+
+  /*
+   * Two DIFFERENT change orders landing on the SAME budget line at the same
+   * moment. The plan (which reads the line) is built before the transaction
+   * opens and the write stores an absolute figure, so without re-reading the
+   * line under a row lock inside the transaction the later commit overwrites
+   * the earlier one: the contract sum rises by both, the budget by only one.
+   */
+  it("adds both when two DIFFERENT change orders land on the same budget line concurrently", async () => {
+    const mk = async (title: string, amount: number): Promise<string> => {
+      const created = await call("POST", `/prime-contracts/${contractId}/changes`, { payload: { title, amount, lines: [{ sovLineId: idOf("01"), description: title, amount }] } });
+      expect(created.statusCode).toBe(201);
+      const id = created.json<{ id: string }>().id;
+      await call("POST", `/prime-contracts/${contractId}/changes/${id}/submit`, { payload: {} });
+      await call("POST", `/prime-contracts/${contractId}/changes/${id}/approve`, { payload: {}, headers: certifierHeaders });
+      return id;
+    };
+    const first = await mk("Parallel A", 11_000);
+    const second = await mk("Parallel B", 4_000);
+    const before = (await built.app.db.select().from(budgetLineItems).where(eq(budgetLineItems.id, budgetLineA)))[0]!;
+    const contractBefore = (await call("GET", `/prime-contracts/${contractId}`)).json<{ revisedContractSum: number }>().revisedContractSum;
+    const [a, b] = await Promise.all([
+      call("POST", `/prime-contracts/${contractId}/changes/${first}/execute`, { payload: { executedDate: today() }, headers: certifierHeaders }),
+      call("POST", `/prime-contracts/${contractId}/changes/${second}/execute`, { payload: { executedDate: today() }, headers: certifierHeaders }),
+    ]);
+    expect([a.statusCode, b.statusCode]).toEqual([200, 200]);
+    const after = (await built.app.db.select().from(budgetLineItems).where(eq(budgetLineItems.id, budgetLineA)))[0]!;
+    expect(after.approvedChanges).toBe(before.approvedChanges + 15_000);
+    const contractAfter = (await call("GET", `/prime-contracts/${contractId}`)).json<{ revisedContractSum: number; sov: { identity: { ok: boolean } } }>();
+    expect(contractAfter.revisedContractSum).toBe(contractBefore + 15_000);
+    expect(contractAfter.sov.identity.ok).toBe(true);
   });
 });
 

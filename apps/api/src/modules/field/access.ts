@@ -105,6 +105,21 @@ export async function hasToolAdmin(
 }
 
 /**
+ * "May this actor take the write actions on this tool?" — the same test the
+ * standard gates apply, exposed so a detail route can tell the UI which
+ * buttons to render. A reviewer with read-only access to the register must
+ * not be offered Submit/Close/Edit, which would 403 at the preHandler.
+ */
+export async function hasToolStandard(
+  app: FastifyInstance,
+  actor: Actor,
+  projectId: string,
+  tool: ToolKey,
+): Promise<boolean> {
+  return meetsLevel(await toolLevelFor(app, actor, projectId, tool), "standard");
+}
+
+/**
  * Every id in `ids` must be a member of the company. Returns the de-duplicated
  * list; throws 400 naming the first offending id.
  */

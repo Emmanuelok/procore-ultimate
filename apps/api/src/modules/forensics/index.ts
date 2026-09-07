@@ -251,6 +251,17 @@ const CLAIM_TRANSITIONS: Record<string, string[]> = {
   withdrawn: [],
 };
 
+/**
+ * A claim that has been determined (agreed / rejected) or withdrawn is a
+ * closed record. Nothing may rewrite it — not the claimed figures (the PATCH
+ * route already refuses those), not the three-point valuation and the carried
+ * provision, and not the derived artefacts (chronology, sufficiency, Scott
+ * Schedule) that were the state of the record at determination. Regenerating
+ * an artefact is still allowed, but the result is returned, not persisted.
+ */
+const DETERMINED_CLAIM_STATUSES: readonly string[] = ["agreed", "rejected", "withdrawn"];
+const isDeterminedClaim = (status: string): boolean => DETERMINED_CLAIM_STATUSES.includes(status);
+
 /** Fields frozen once a claim leaves draft — the case that gets assessed. */
 const FROZEN_AFTER_DRAFT = [
   "title",
@@ -2215,17 +2226,51 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
    * `quantities` section. Every point carries the ids it was built from, so an
    * expert report can be traced back to the underlying records.
    */
+  /*
+   * Row caps for the productivity scans. They are operational knobs (a very
+   * large project may want a bigger page on a bigger box) read per call, and a
+   * cap that is actually reached is always reported — never silently applied.
+   */
+  const scanCap = (envKey: string, fallback: number): number => {
+    const raw = Number(process.env[envKey]);
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
+  };
+
   async function buildProductivitySeries(
     companyId: string,
     projectId: string,
     opts: { trade?: string | null; unit?: string | null; quantityMatch?: string | null; from?: string; to?: string },
-  ): Promise<{ points: ProductivityPoint[]; reasons: string[]; hourSources: number; quantitySources: number }> {
+  ): Promise<{
+    points: ProductivityPoint[];
+    reasons: string[];
+    hourSources: number;
+    quantitySources: number;
+    /** true when the record set hit a scan cap — the series is then a subset */
+    truncated: boolean;
+    window: { from: string | null; to: string | null };
+  }> {
     const reasons: string[] = [];
-    const clauses = [eq(timecards.companyId, companyId), eq(timecards.projectId, projectId)];
+    const timecardCap = scanCap("FORENSICS_TIMECARD_SCAN_CAP", 20_000);
+    const dailyLogCap = scanCap("FORENSICS_DAILY_LOG_SCAN_CAP", 5_000);
+    /*
+     * Both scans are date-bounded by the caller's window and ordered
+     * deterministically (workDate/logDate then id), so the same analysis run
+     * twice reads the same records in the same order. They were unordered and
+     * unbounded before: a two-year project could hand back an arbitrary 20,000
+     * of its 150,000 timecards, and the derived lost hours — and the money on
+     * them — moved between two runs of the same analysis with nothing said.
+     * A cap that is actually reached is reported and disables the money.
+     */
+    const clauses = [
+      eq(timecards.companyId, companyId),
+      eq(timecards.projectId, projectId),
+      ne(timecards.status, "rejected"),
+      ne(timecards.status, "void"),
+    ];
     if (opts.trade) clauses.push(eq(timecards.trade, opts.trade));
     if (opts.from) clauses.push(gte(timecards.workDate, opts.from));
     if (opts.to) clauses.push(lte(timecards.workDate, opts.to));
-    const cards = await app.db
+    const cardRows = await app.db
       .select({
         id: timecards.id,
         workDate: timecards.workDate,
@@ -2234,16 +2279,35 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       })
       .from(timecards)
       .where(and(...clauses))
-      .limit(20000);
+      .orderBy(asc(timecards.workDate), asc(timecards.id))
+      .limit(timecardCap + 1);
+    const cardsTruncated = cardRows.length > timecardCap;
+    const cards = cardsTruncated ? cardRows.slice(0, timecardCap) : cardRows;
+    if (cardsTruncated) {
+      const [agg] = await app.db.select({ n: count() }).from(timecards).where(and(...clauses));
+      reasons.push(
+        `${Number(agg?.n ?? 0)} timecards match this window — only the first ${timecardCap} by work date were read, so hours are a subset. Narrow the window or filter by trade before relying on the figures.`,
+      );
+    }
 
     const logClauses = [eq(dailyLogs.companyId, companyId), eq(dailyLogs.projectId, projectId)];
     if (opts.from) logClauses.push(gte(dailyLogs.logDate, opts.from));
     if (opts.to) logClauses.push(lte(dailyLogs.logDate, opts.to));
-    const logs = await app.db
+    const logRows = await app.db
       .select({ id: dailyLogs.id, logDate: dailyLogs.logDate, sections: dailyLogs.sections })
       .from(dailyLogs)
       .where(and(...logClauses))
-      .limit(5000);
+      .orderBy(asc(dailyLogs.logDate), asc(dailyLogs.id))
+      .limit(dailyLogCap + 1);
+    const logsTruncated = logRows.length > dailyLogCap;
+    const logs = logsTruncated ? logRows.slice(0, dailyLogCap) : logRows;
+    if (logsTruncated) {
+      const [agg] = await app.db.select({ n: count() }).from(dailyLogs).where(and(...logClauses));
+      reasons.push(
+        `${Number(agg?.n ?? 0)} daily logs match this window — only the first ${dailyLogCap} by log date were read, so installed quantities are a subset. Narrow the window before relying on the figures.`,
+      );
+    }
+    const truncated = cardsTruncated || logsTruncated;
 
     const byWeek = new Map<string, { hours: number; quantity: number; sourceIds: string[] }>();
     const bucket = (week: string) => {
@@ -2301,7 +2365,14 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
         sourceIds: b.sourceIds,
       }))
       .sort((a, b) => a.weekStart.localeCompare(b.weekStart));
-    return { points, reasons, hourSources, quantitySources };
+    return {
+      points,
+      reasons,
+      hourSources,
+      quantitySources,
+      truncated,
+      window: { from: opts.from ?? null, to: opts.to ?? null },
+    };
   }
 
   app.get(
@@ -2313,9 +2384,11 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       return {
         trade: q.trade ?? null,
         unit: q.unit ?? null,
+        window: series.window,
         points: series.points,
         total: series.points.length,
-        suggestedBaseline: suggestBaselineWindow(series.points, 3),
+        truncated: series.truncated,
+        suggestedBaseline: series.truncated ? null : suggestBaselineWindow(series.points, 3),
         sources: { timecards: series.hourSources, dailyLogQuantities: series.quantitySources },
         reasons: series.reasons,
       };
@@ -2336,10 +2409,19 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       if (!body.baselineFrom || !body.baselineTo || !body.impactedFrom || !body.impactedTo) {
         throw badRequest("A measured mile needs baselineFrom, baselineTo, impactedFrom and impactedTo");
       }
+      /*
+       * The window goes into SQL. It used to be applied in memory AFTER an
+       * unbounded, unordered scan, so the baseline and impacted hours were
+       * drawn from whatever subset the database happened to return.
+       */
+      const windowFrom = body.baselineFrom < body.impactedFrom ? body.baselineFrom : body.impactedFrom;
+      const windowTo = body.baselineTo > body.impactedTo ? body.baselineTo : body.impactedTo;
       const built = await buildProductivitySeries(req.companyId!, req.projectId!, {
         trade: body.trade,
         unit: body.unit,
         quantityMatch: body.quantityMatch,
+        from: windowFrom,
+        to: windowTo,
       });
       const res = measuredMile({
         trade: body.trade ?? "all trades",
@@ -2352,10 +2434,26 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
         hourlyRate: body.hourlyRate ?? null,
         currency,
       });
-      output = { ...res, reasons: [...built.reasons, ...res.reasons] } as unknown as Record<string, unknown>;
       series = res.series;
-      lostHours = res.lostHours;
-      amount = res.amount;
+      /* A capped record set cannot produce a defensible money figure: the
+         series is returned so the analyst can see what was read, the lost
+         hours and the amount are withheld with the reason. */
+      lostHours = built.truncated ? null : res.lostHours;
+      amount = built.truncated ? null : res.amount;
+      output = {
+        ...res,
+        lostHours,
+        amount,
+        recordsTruncated: built.truncated,
+        window: { from: windowFrom, to: windowTo },
+        reasons: [
+          ...built.reasons,
+          ...res.reasons,
+          ...(built.truncated
+            ? ["Lost hours and the money on them are withheld because the record set was capped — this analysis is not complete"]
+            : []),
+        ],
+      } as unknown as Record<string, unknown>;
     } else if (body.method === "earned_value") {
       const schedule = await resolveSchedule(req.companyId!, req.projectId!, body.scheduleId);
       const tasks = await app.db
@@ -2367,14 +2465,30 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
         })
         .from(scheduleTasks)
         .where(eq(scheduleTasks.scheduleId, schedule.id));
-      const cards = await app.db
-        .select({ totalHours: timecards.totalHours, status: timecards.status })
+      /*
+       * Actual hours are SUMMED IN SQL, not by reading a capped page of
+       * timecards into memory: a project with more timecards than the old
+       * 20,000-row limit silently lost hours from the denominator, and which
+       * hours it lost depended on the order the database felt like returning.
+       */
+      const cardClauses = [
+        eq(timecards.companyId, req.companyId!),
+        eq(timecards.projectId, req.projectId!),
+        ne(timecards.status, "rejected"),
+        ne(timecards.status, "void"),
+      ];
+      if (body.trade) cardClauses.push(eq(timecards.trade, body.trade));
+      if (body.baselineFrom) cardClauses.push(gte(timecards.workDate, body.baselineFrom));
+      if (body.impactedTo) cardClauses.push(lte(timecards.workDate, body.impactedTo));
+      const [cardAgg] = await app.db
+        .select({
+          n: count(),
+          hours: sql<number>`coalesce(sum(${timecards.totalHours}), 0)`,
+        })
         .from(timecards)
-        .where(and(eq(timecards.companyId, req.companyId!), eq(timecards.projectId, req.projectId!)))
-        .limit(20000);
-      const actualTotal = cards
-        .filter((c) => c.status !== "rejected" && c.status !== "void")
-        .reduce((s, c) => s + c.totalHours, 0);
+        .where(and(...cardClauses));
+      const actualTotal = Number(cardAgg?.hours ?? 0);
+      const cardCount = Number(cardAgg?.n ?? 0);
       const budgetedTotal = tasks.reduce((s, t) => s + (t.budgetedHours ?? 0), 0);
       // Actual hours are booked at project level, so they are apportioned to
       // activities by budgeted share; the response says so.
@@ -2398,7 +2512,13 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
           ...res.reasons,
           "Actual hours are booked at project level and were apportioned to activities by budgeted-hours share",
         ],
-        actualHoursSource: { timecards: cards.length, totalHours: Math.round(actualTotal * 100) / 100 },
+        actualHoursSource: {
+          timecards: cardCount,
+          totalHours: Math.round(actualTotal * 100) / 100,
+          trade: body.trade ?? null,
+          window: { from: body.baselineFrom ?? null, to: body.impactedTo ?? null },
+          basis: "summed in the database over every timecard that is not rejected or void",
+        },
       } as unknown as Record<string, unknown>;
       lostHours = res.lostHours;
       amount = res.amount;
@@ -2818,6 +2938,18 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
     const { claimId } = req.params as { claimId: string };
     const body = claimValuationSchema.parse(req.body);
     const claim = await fetchClaim(claimId, req.companyId!, req.projectId!);
+    /*
+     * The valuation PUT used to accept a new three-point range and rewrite the
+     * carried provision at any status, so an agreed or withdrawn claim could be
+     * shown carrying a provision that post-dated its own determination. The
+     * same gate the PATCH route applies applies here.
+     */
+    if (isDeterminedClaim(claim.status)) {
+      throw badRequest(
+        `A ${claim.status} claim's valuation and provision cannot be changed — the determination is final, ` +
+          "and the provision the claim carried when it was determined is part of the record.",
+      );
+    }
     const best = body.quantumBest !== undefined ? body.quantumBest : claim.quantumBest;
     const likely = body.quantumLikely !== undefined ? body.quantumLikely : claim.quantumLikely;
     const worst = body.quantumWorst !== undefined ? body.quantumWorst : claim.quantumWorst;
@@ -3189,22 +3321,33 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
       }
 
       const chronologyAt = new Date().toISOString();
-      await app.db
-        .update(forensicClaims)
-        .set({ chronology: capped, chronologyAt, updatedAt: chronologyAt })
-        .where(eq(forensicClaims.id, claimId));
-      await appendLedger(app.db, {
-        companyId,
-        actorId: req.user!.id,
-        action: "update",
-        objectType: "forensic_claim",
-        objectId: claimId,
-        projectId,
-        payload: { chronologyAt, entryCount: capped.length, window: { from, to } },
-      });
+      /* A determined or withdrawn claim's artefacts are the record as it stood
+         at determination: the chronology is still assembled on request, but it
+         is handed back rather than written over the closed record. */
+      const persisted = !isDeterminedClaim(claim.status);
+      if (persisted) {
+        await app.db
+          .update(forensicClaims)
+          .set({ chronology: capped, chronologyAt, updatedAt: chronologyAt })
+          .where(eq(forensicClaims.id, claimId));
+        await appendLedger(app.db, {
+          companyId,
+          actorId: req.user!.id,
+          action: "update",
+          objectType: "forensic_claim",
+          objectId: claimId,
+          projectId,
+          payload: { chronologyAt, entryCount: capped.length, window: { from, to } },
+        });
+      } else {
+        reasons.push(
+          `This claim is ${claim.status} — the chronology was assembled for reading but not saved over the determined record`,
+        );
+      }
       return {
         claimId: claim.id,
         chronologyAt,
+        persisted,
         count: capped.length,
         window: { from, to },
         scope: {
@@ -3339,24 +3482,36 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
 
       const result = scoreClaimSufficiency({ limbs, events });
       const scoredAt = result.scoredAt;
-      await app.db
-        .update(forensicClaims)
-        .set({ sufficiency: result as unknown as Record<string, unknown>, sufficiencyAt: scoredAt, updatedAt: scoredAt })
-        .where(eq(forensicClaims.id, claimId));
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "update",
-        objectType: "forensic_claim",
-        objectId: claimId,
-        projectId: req.projectId!,
-        payload: {
-          sufficiencyScore: result.overallScore,
-          gaps: result.gaps.length,
-          missingNotices: result.missingNotices.length,
-        },
-      });
-      return { claimId, ...result };
+      const persisted = !isDeterminedClaim(claim.status);
+      if (persisted) {
+        await app.db
+          .update(forensicClaims)
+          .set({ sufficiency: result as unknown as Record<string, unknown>, sufficiencyAt: scoredAt, updatedAt: scoredAt })
+          .where(eq(forensicClaims.id, claimId));
+        await appendLedger(app.db, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "update",
+          objectType: "forensic_claim",
+          objectId: claimId,
+          projectId: req.projectId!,
+          payload: {
+            sufficiencyScore: result.overallScore,
+            gaps: result.gaps.length,
+            missingNotices: result.missingNotices.length,
+          },
+        });
+      }
+      return {
+        claimId,
+        persisted,
+        ...(persisted
+          ? {}
+          : {
+              notPersistedReason: `This claim is ${claim.status} — the score was computed for reading but not saved over the determined record`,
+            }),
+        ...result,
+      };
     },
   );
 
@@ -3424,20 +3579,32 @@ export const forensicsModule: FastifyPluginAsync = async (app) => {
         }),
       });
       const now = new Date().toISOString();
-      await app.db
-        .update(forensicClaims)
-        .set({ scottSchedule: rows, packageAt: now, updatedAt: now })
-        .where(eq(forensicClaims.id, claimId));
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "create",
-        objectType: "forensic_claim",
-        objectId: claimId,
-        projectId: req.projectId!,
-        payload: { scottSchedule: rows.length, generatedAt: now },
-      });
-      return { claimId, generatedAt: now, currency: claim.currency, rows };
+      const persisted = !isDeterminedClaim(claim.status);
+      if (persisted) {
+        await app.db
+          .update(forensicClaims)
+          .set({ scottSchedule: rows, packageAt: now, updatedAt: now })
+          .where(eq(forensicClaims.id, claimId));
+        await appendLedger(app.db, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "create",
+          objectType: "forensic_claim",
+          objectId: claimId,
+          projectId: req.projectId!,
+          payload: { scottSchedule: rows.length, generatedAt: now },
+        });
+      }
+      return {
+        claimId,
+        generatedAt: now,
+        persisted,
+        notPersistedReason: persisted
+          ? null
+          : `This claim is ${claim.status} — the Scott Schedule was generated for reading but not saved over the determined record`,
+        currency: claim.currency,
+        rows,
+      };
     },
   );
 

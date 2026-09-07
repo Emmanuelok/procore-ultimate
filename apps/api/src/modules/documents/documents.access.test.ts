@@ -355,6 +355,71 @@ describe("files: multi-upload, metadata search, copy, preview, references, recyc
     expect(download.headers["content-disposition"]).toMatch(/^attachment/);
     expect(download.headers["x-content-type-options"]).toBe("nosniff");
   });
+
+  /**
+   * `metadata.kind` is pipeline ownership: it hides a file from the documents
+   * list, disables its delete action and refuses a move. A client that could
+   * write it could hide any file from everyone, or free a set/book source.
+   */
+  it("REGRESSION: a standard user cannot write metadata.kind to hide or free a file", async () => {
+    const kindFolder = await mkFolder("Kind");
+    const ordinary = await upload(kindFolder, "ordinary.txt", "hello");
+    const pm = await addMember("project_manager"); // documents: standard
+
+    const hide = await patch(`/api/v1/files/${ordinary}`, pm.headers, {
+      metadata: { kind: "drawing_set", note: "kept" },
+    });
+    expect(hide.statusCode).toBe(200);
+    expect(hide.json().ignoredMetadataKeys).toEqual(["kind"]);
+    expect(hide.json().metadata).toEqual({ note: "kept" });
+    const listed = (await get(`/api/v1/projects/${projectId}/files?folderId=${kindFolder}`, owner.headers)).json();
+    expect(listed.items.some((f: { id: string }) => f.id === ordinary)).toBe(true);
+
+    // ...and the flag cannot be cleared off a file the pipeline does own.
+    const pipelineId = newId("fil");
+    await built.app.db.insert(files).values({
+      id: pipelineId,
+      companyId: owner.companyId,
+      projectId,
+      folderId: null,
+      name: "pipeline-set.pdf",
+      contentType: "application/pdf",
+      sizeBytes: 4,
+      sha256: "a".repeat(64),
+      storageKey: "sk-pipeline",
+      metadata: { kind: "drawing_set" },
+      uploadedBy: owner.userId,
+    });
+    const free = await patch(`/api/v1/files/${pipelineId}`, owner.headers, { metadata: { kind: null } });
+    expect(free.statusCode).toBe(200);
+    const [row] = await built.app.db.select().from(files).where(eq(files.id, pipelineId));
+    expect((row!.metadata as { kind?: string }).kind).toBe("drawing_set");
+    expect((await patch(`/api/v1/files/${pipelineId}`, owner.headers, { folderId: kindFolder })).statusCode).toBe(400);
+  });
+
+  /**
+   * The emptiness check only counts live files, and there is no purge: a
+   * folder whose remaining contents are all in the recycle bin used to be
+   * deleted out from under them, stranding restorable files under a folder id
+   * that no longer existed.
+   */
+  it("REGRESSION: deleting a folder keeps its recycle-bin files reachable", async () => {
+    const parent = await mkFolder("Archive");
+    const child = await mkFolder("Old drawings", parent);
+    const doomed = await upload(child, "old.txt", "old");
+    expect((await del(`/api/v1/files/${doomed}`, owner.headers)).statusCode).toBe(200);
+
+    const removed = await del(`/api/v1/projects/${projectId}/folders/${child}`, owner.headers);
+    expect(removed.statusCode).toBe(200);
+    expect(removed.json()).toMatchObject({ recycleBinFilesMoved: 1, movedToFolderId: parent });
+
+    const bin = (await get(`/api/v1/projects/${projectId}/files?deleted=1`, owner.headers)).json();
+    expect(bin.items.find((f: { id: string }) => f.id === doomed).folderId).toBe(parent);
+    expect((await post(`/api/v1/files/${doomed}/restore`, owner.headers)).statusCode).toBe(200);
+    expect((await get(`/api/v1/files/${doomed}`, owner.headers)).json().folderPath).toBe("/Archive");
+    const inParent = (await get(`/api/v1/projects/${projectId}/files?folderId=${parent}`, owner.headers)).json();
+    expect(inParent.items.some((f: { id: string }) => f.id === doomed)).toBe(true);
+  });
 });
 
 describe("e-mail-to-folder ingestion (#300)", () => {

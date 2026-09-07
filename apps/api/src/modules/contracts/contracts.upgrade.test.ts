@@ -1143,3 +1143,156 @@ describe("LD exposure and health inputs", () => {
     expect(stillEmpty).toHaveLength(0);
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* Verifier regressions                                                */
+/* ------------------------------------------------------------------ */
+
+describe("verifier regressions", () => {
+  it("freezes the contract currency once a bill is priced under it", async () => {
+    const contractId = await createContract({
+      name: "Currency freeze",
+      form: "fidic_red_2017",
+      currency: "GBP",
+      contractSum: 1_000_000,
+    });
+    // before anything references it, a correction is allowed
+    const early = await inject(
+      "PATCH",
+      `/api/v1/projects/${projectId}/contracts/${contractId}`,
+      owner.headers,
+      { currency: "AED" },
+    );
+    expect(early.statusCode).toBe(200);
+    expect((early.json() as { currency: string }).currency).toBe("AED");
+
+    const bill = await inject("POST", `/api/v1/projects/${projectId}/boqs`, owner.headers, {
+      name: "Bill under the frozen contract",
+      method: "nrm2",
+      currency: "AED",
+      contractId,
+    });
+    expect(bill.statusCode).toBe(201);
+
+    const late = await inject(
+      "PATCH",
+      `/api/v1/projects/${projectId}/contracts/${contractId}`,
+      owner.headers,
+      { currency: "GBP" },
+    );
+    expect(late.statusCode).toBe(409);
+    expect((late.json() as { message: string }).message).toContain("AED");
+    // everything else on the same contract still edits
+    const other = await inject(
+      "PATCH",
+      `/api/v1/projects/${projectId}/contracts/${contractId}`,
+      owner.headers,
+      { ldRatePerDay: 250 },
+    );
+    expect(other.statusCode).toBe(200);
+  });
+
+  it("bounds the time-bar sweep by a deadline window", async () => {
+    const contractId = await createContract({ name: "Far horizon", form: "fidic_red_2017" });
+    const far = await createEvent(contractId, {
+      kind: "claim_notice",
+      title: "Notice due in three years",
+      eventDate: isoDaysFromToday(0),
+      timeBarDays: 1_095,
+    });
+    expect(far.statusCode).toBe(201);
+    const farId = (far.json() as { id: string }).id;
+
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/contracts/sweep-time-bars`,
+      owner.headers,
+      {},
+    );
+    expect(res.statusCode).toBe(200);
+    const scannedIds = await built.app.db
+      .select()
+      .from(contractEvents)
+      .where(eq(contractEvents.id, farId));
+    // it is untouched, and it was never loaded: the sweep's scan count excludes it
+    expect(scannedIds[0]!.status).toBe("open");
+    expect(scannedIds[0]!.warnedAt).toBeNull();
+    const { scanned } = res.json() as { scanned: number };
+    const openInWindow = (
+      await built.app.db
+        .select()
+        .from(contractEvents)
+        .where(and(eq(contractEvents.projectId, projectId), eq(contractEvents.status, "open")))
+    ).filter(
+      (e) => e.noticeDeadline != null && e.noticeDeadline <= isoDaysFromToday(366),
+    ).length;
+    expect(scanned).toBe(openInWindow);
+  });
+
+  it("allocates quotation numbers atomically instead of counting rows", async () => {
+    const contractId = await createContract({
+      name: "Quotation numbering",
+      form: "nec4_ecc",
+      necOption: "A",
+      currency: "GBP",
+    });
+    const ev = await createEvent(contractId, {
+      kind: "compensation_event",
+      clauseRef: "61.3",
+      title: "Numbering",
+      eventDate: isoDaysFromToday(-2),
+    });
+    const eventId = (ev.json() as { id: string }).id;
+    const base = `/api/v1/projects/${projectId}/contracts/${contractId}/events/${eventId}/quotations`;
+
+    const q1 = await inject("POST", base, pmHeaders, {
+      components: [{ component: "people", description: "Gang", unit: "hr", qty: 10, rate: 50 }],
+      feePercent: 10,
+    });
+    expect(q1.statusCode).toBe(201);
+    expect((q1.json() as { number: number }).number).toBe(1);
+    await inject("POST", `/api/v1/ce-quotations/${q1.json().id}/reply`, owner.headers, {
+      decision: "rejected",
+      reason: "Rates not agreed",
+    });
+
+    const q2 = await inject("POST", base, pmHeaders, {
+      components: [{ component: "people", description: "Gang", unit: "hr", qty: 12, rate: 50 }],
+      feePercent: 10,
+    });
+    expect(q2.statusCode).toBe(201);
+    expect((q2.json() as { number: number }).number).toBe(2);
+
+    const rows = await built.app.db
+      .select()
+      .from(ceQuotations)
+      .where(eq(ceQuotations.eventId, eventId));
+    expect(new Set(rows.map((r) => r.number)).size).toBe(rows.length);
+  });
+
+  it("still names the accepted programme when it has fallen off the first page", async () => {
+    const contractId = await createContract({
+      name: "Paged programmes",
+      form: "nec4_ecc",
+      necOption: "A",
+    });
+    const base = `/api/v1/projects/${projectId}/contracts/${contractId}/programmes`;
+    const first = await inject("POST", base, pmHeaders, { submittedAt: isoDaysFromToday(-30) });
+    const firstId = first.json().id as string;
+    await inject("POST", `${base}/${firstId}/decide`, owner.headers, { decision: "accepted" });
+    await inject("POST", base, pmHeaders, { submittedAt: isoDaysFromToday(-20), revision: "B" });
+    await inject("POST", base, pmHeaders, { submittedAt: isoDaysFromToday(-10), revision: "C" });
+
+    const page = await inject("GET", `${base}?pageSize=1`, owner.headers);
+    expect(page.statusCode).toBe(200);
+    const body = page.json() as {
+      items: Array<{ id: string }>;
+      total: number;
+      currentAcceptedProgrammeId: string | null;
+    };
+    expect(body.items).toHaveLength(1);
+    expect(body.total).toBe(3);
+    expect(body.items[0]!.id).not.toBe(firstId);
+    expect(body.currentAcceptedProgrammeId).toBe(firstId);
+  });
+});

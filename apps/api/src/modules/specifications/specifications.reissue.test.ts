@@ -7,7 +7,9 @@ import { and, eq } from "drizzle-orm";
 import {
   companyMemberships,
   notifications,
+  projectMemberships,
   projects,
+  specBooks,
   specRevisionNotices,
   specSubmittalRequirements,
 } from "@constructos/db";
@@ -344,5 +346,63 @@ describe("register integrity", () => {
     expect(health.metrics.needsReconfirmation).toBeGreaterThanOrEqual(1);
     const stranger = await registerActor(built.app);
     expect((await inject("GET", `/api/v1/projects/${projectId}/spec-revision-notices`, stranger.headers)).statusCode).toBe(403);
+  });
+
+  /**
+   * Putting an issue in force is admin-only on POST .../set-current and on
+   * PATCH. `makeCurrent` on the upload was a third door into the same
+   * transition, reachable from the upload form, and it was open to any
+   * standard user.
+   */
+  it("REGRESSION: a standard user cannot put a book in force at upload", { timeout: 120_000 }, async () => {
+    const pm = await registerActor(built.app);
+    await built.app.db.insert(companyMemberships).values({ id: newId("cm"), companyId: uploader.companyId, userId: pm.userId, role: "member" });
+    await built.app.db.insert(projectMemberships).values({
+      id: newId("pm"),
+      companyId: uploader.companyId,
+      projectId,
+      userId: pm.userId,
+      templateKey: "project_manager", // specifications: standard
+      overrides: {},
+    });
+    const pmHeaders = { authorization: `Bearer ${pm.accessToken}`, "x-company-id": uploader.companyId };
+
+    // The dedicated transition refuses them...
+    expect((await inject("POST", `/api/v1/projects/${projectId}/spec-books/${bookId}/set-current`, pmHeaders, {})).statusCode).toBe(403);
+    // ...and so does the upload shortcut, before anything is stored.
+    const escalated = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/spec-books`,
+      payload: multipartBody(
+        buildPdf(["SECTION 07 21 00 - THERMAL INSULATION\nPART 1 - GENERAL\n1.3 SUBMITTALS\nA. Product Data: For each insulation product."]),
+        "standard-user-issue.pdf",
+        { name: "Standard user issue", makeCurrent: "1", extractRequirements: "0" },
+      ),
+      headers: mpHeaders(pmHeaders),
+    });
+    expect(escalated.statusCode).toBe(403);
+    const stored = await built.app.db.select().from(specBooks).where(eq(specBooks.name, "Standard user issue"));
+    expect(stored).toHaveLength(0);
+    const currentBefore = (await inject("GET", `/api/v1/projects/${projectId}/spec-books`, uploader.headers)).json();
+    expect(currentBefore.items.find((b: { isCurrent: number }) => b.isCurrent === 1).id).toBe(bookId);
+
+    // The list tells the tab which affordance it may draw.
+    expect(currentBefore.access).toMatchObject({ level: "admin", canSetCurrent: true });
+    const asPm = (await inject("GET", `/api/v1/projects/${projectId}/spec-books`, pmHeaders)).json();
+    expect(asPm.access).toMatchObject({ level: "standard", canSetCurrent: false });
+
+    // The same upload without the escalation is their job and is allowed.
+    const allowed = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/spec-books`,
+      payload: multipartBody(
+        buildPdf(["SECTION 07 21 00 - THERMAL INSULATION\nPART 1 - GENERAL\n1.3 SUBMITTALS\nA. Product Data: For each insulation product."]),
+        "standard-user-issue.pdf",
+        { name: "Standard user issue", makeCurrent: "0", extractRequirements: "0" },
+      ),
+      headers: mpHeaders(pmHeaders),
+    });
+    expect(allowed.statusCode).toBe(201);
+    expect(allowed.json()).toMatchObject({ isCurrent: 0, status: "draft" });
   });
 });

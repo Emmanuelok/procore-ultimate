@@ -8,7 +8,7 @@ import { nextRecordNumber } from "../../lib/numbering.js";
 import { AppError, badRequest, conflict, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { requestWaiverForPayment } from "../invoicing/waivers.js";
-import { assessCommitment } from "./compliance.js";
+import { assessCommitment, type ComplianceResult } from "./compliance.js";
 import { withIdempotency } from "./idempotency.js";
 import { assertCompliancePermits, performIssue, renderRemittanceHtml } from "./payments.js";
 import {
@@ -243,19 +243,56 @@ export const paymentRunRoutes: FastifyPluginAsync = async (app) => {
       : [];
     const byCommitment = new Map(commitmentRows.map((c) => [c.id, c]));
     const byVendor = new Map(vendorRows.map((v) => [v.id, v]));
+    /*
+     * The COMPLIANCE POSITION OF EVERY MEMBER, assessed once per commitment.
+     * The issue route stamps "acknowledgedWarnings" on each payment it issues,
+     * so the issuer has to be able to READ those warnings before ticking the
+     * box — a blanket acknowledgement of warnings nobody was shown is an
+     * audited assertion about a fact that never happened. The run drawer
+     * renders these verbatim.
+     */
+    const fullCommitments = commitmentIds.length
+      ? await app.db.select().from(commitments).where(inArray(commitments.id, commitmentIds))
+      : [];
+    const complianceByCommitment = new Map<string, ComplianceResult>();
+    for (const c of fullCommitments) {
+      complianceByCommitment.set(c.id, await assessCommitment(app.db, c));
+    }
+    const payloads = payments.map((p) => {
+      const c = byCommitment.get(p.commitmentId);
+      const v = c?.vendorId ? byVendor.get(c.vendorId) : undefined;
+      const compliance = complianceByCommitment.get(p.commitmentId) ?? null;
+      return {
+        ...p,
+        commitmentReference: c?.reference ?? null,
+        commitmentTitle: c?.title ?? null,
+        vendorName: v?.name ?? null,
+        vendorEmail: v?.email ?? null,
+        compliance,
+      };
+    });
     return {
       ...run,
-      payments: payments.map((p) => {
-        const c = byCommitment.get(p.commitmentId);
-        const v = c?.vendorId ? byVendor.get(c.vendorId) : undefined;
-        return {
-          ...p,
-          commitmentReference: c?.reference ?? null,
-          commitmentTitle: c?.title ?? null,
-          vendorName: v?.name ?? null,
-          vendorEmail: v?.email ?? null,
-        };
-      }),
+      payments: payloads,
+      /** every warning that would be acknowledged by issuing this run, named */
+      complianceWarnings: payloads.flatMap((p) =>
+        (p.compliance?.warnings ?? []).map((f) => ({
+          paymentId: p.id,
+          paymentReference: p.reference,
+          commitmentReference: p.commitmentReference,
+          vendorName: p.vendorName,
+          finding: f,
+        })),
+      ),
+      complianceBlocking: payloads.flatMap((p) =>
+        (p.compliance?.blocking ?? []).map((f) => ({
+          paymentId: p.id,
+          paymentReference: p.reference,
+          commitmentReference: p.commitmentReference,
+          vendorName: p.vendorName,
+          finding: f,
+        })),
+      ),
     };
   });
 

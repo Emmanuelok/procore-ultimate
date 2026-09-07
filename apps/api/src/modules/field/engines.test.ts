@@ -44,7 +44,7 @@ import {
   validateVerifierChange,
 } from "./punchEngine.js";
 import { exifDateToIso, extractExif, haversineKm, isValidPin, sniffMediaType } from "./photoEngine.js";
-import { buildZip, listZip, uniqueZipNames } from "./zip.js";
+import { buildZip, listZip, uniqueZipNames, zipStream } from "./zip.js";
 import {
   detectCoApprovalPattern,
   detectPhotoDateDrift,
@@ -413,6 +413,32 @@ describe("punch engine", () => {
     expect(stats.overdue).toBe(1);
     expect(toCsv([{ a: 'x,"y"', b: 1 }], [{ key: "a", header: "A" }, { key: "b", header: "B" }])).toBe('A,B\r\n"x,""y""",1\r\n');
   });
+
+  it("neutralises spreadsheet formulas in exported punch text", () => {
+    // A punch title is user text and the register is opened in Excel: a cell
+    // starting =, +, -, @, tab or CR must not execute. Same rule as
+    // modules/twin/shared.ts.
+    const csv = toCsv(
+      [
+        { title: "=cmd|'/c calc'!A1" },
+        { title: "+1+1" },
+        { title: "-2" },
+        { title: "@SUM(A1)" },
+        { title: "\tlead" },
+        { title: "=A1,=B1" },
+        { title: "Normal title" },
+      ],
+      [{ key: "title", header: "Title" }],
+    );
+    const lines = csv.trimEnd().split("\r\n");
+    expect(lines[1]).toBe("'=cmd|'/c calc'!A1");
+    expect(lines[2]).toBe("'+1+1");
+    expect(lines[3]).toBe("'-2");
+    expect(lines[4]).toBe("'@SUM(A1)");
+    expect(lines[5]).toBe("'\tlead");
+    expect(lines[6]).toBe("\"'=A1,=B1\""); // still quoted because it holds a comma
+    expect(lines[7]).toBe("Normal title");
+  });
 });
 
 describe("photo engine", () => {
@@ -466,6 +492,37 @@ describe("zip writer", () => {
     // local header offset points at a local header signature
     expect(zip.readUInt32LE(entries[1]!.offset)).toBe(0x04034b50);
     expect(uniqueZipNames(["x", "x", "../x"])).toEqual(["x", "x (2)", "x (3)"]);
+  });
+
+  it("streams the same archive without ever holding an entry in memory", async () => {
+    const a = Buffer.from("hello");
+    const b = Buffer.from("world!!");
+    const chunks: Buffer[] = [];
+    for await (const chunk of zipStream([
+      // Deliberately handed out in pieces: the writer must accumulate the CRC
+      // and the size across chunks and only then emit the data descriptor.
+      { name: "a.txt", mtime: new Date("2026-08-12T10:00:00Z"), open: () => (async function* () { yield a.subarray(0, 2); yield a.subarray(2); })() },
+      { name: "a.txt", mtime: new Date("2026-08-12T10:00:00Z"), open: () => (async function* () { yield b; })() },
+    ])) {
+      chunks.push(chunk);
+    }
+    const zip = Buffer.concat(chunks);
+    const entries = listZip(zip);
+    expect(entries.map((e) => e.name)).toEqual(["a.txt", "a (2).txt"]);
+    expect(entries[0]!.crc).toBe(crc32(a) >>> 0);
+    expect(entries[0]!.size).toBe(a.length);
+    expect(entries[1]!.crc).toBe(crc32(b) >>> 0);
+    expect(entries[1]!.size).toBe(b.length);
+    for (const e of entries) {
+      expect(zip.readUInt32LE(e.offset)).toBe(0x04034b50);
+      // bit 3 set, CRC/size zero in the local header, real values in a
+      // trailing descriptor — the shape that makes streaming possible.
+      expect(zip.readUInt16LE(e.offset + 6) & 0x0008).toBe(0x0008);
+      expect(zip.readUInt32LE(e.offset + 14)).toBe(0);
+      const dataStart = e.offset + 30 + zip.readUInt16LE(e.offset + 26);
+      expect(zip.readUInt32LE(dataStart + e.size)).toBe(0x08074b50);
+      expect(zip.readUInt32LE(dataStart + e.size + 4)).toBe(e.crc);
+    }
   });
 });
 

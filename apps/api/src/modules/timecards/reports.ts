@@ -877,6 +877,13 @@ export const timecardReportRoutes: FastifyPluginAsync = async (app) => {
           ),
         );
       const byLine = new Map<string, { cost: number; hours: number; currency: string }>();
+      /*
+       * A LINE THAT MIXED CURRENCIES STAYS OUT, however many rows follow it.
+       * Deleting the accumulator alone was not enough: the next allocation on
+       * that line simply started a fresh one, and the line was posted at a
+       * PARTIAL figure while `reasons` said it had not been posted at all.
+       */
+      const mixedCurrencyLines = new Set<string>();
       const reasons: string[] = [];
       let uncoded = 0;
       let uncosted = 0;
@@ -885,6 +892,7 @@ export const timecardReportRoutes: FastifyPluginAsync = async (app) => {
           uncoded = round2(uncoded + a.totalHours);
           continue;
         }
+        if (mixedCurrencyLines.has(a.budgetLineItemId)) continue;
         if (a.cost === null) {
           uncosted = round2(uncosted + a.totalHours);
           continue;
@@ -899,6 +907,7 @@ export const timecardReportRoutes: FastifyPluginAsync = async (app) => {
             `Budget line ${a.budgetLineItemId} has labour in both ${held.currency} and ` +
               `${a.currency}. Money is never summed across currencies, so this line was not posted.`,
           );
+          mixedCurrencyLines.add(a.budgetLineItemId);
           byLine.delete(a.budgetLineItemId);
           continue;
         }

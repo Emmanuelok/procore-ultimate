@@ -618,7 +618,7 @@ describe("material test certificates", () => {
 
     const missing = await get("/companies/current/material-certificates/trace?heatNumber=H-NOPE");
     expect(missing.json().total).toBe(0);
-    expect(missing.json().reasons.join(" ")).toContain("No certificate in this company records");
+    expect(missing.json().reasons.join(" ")).toContain("No certificate visible to you records");
   });
 
   it("summarises the register with the certificates nobody has read", async () => {

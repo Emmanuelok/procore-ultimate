@@ -60,12 +60,8 @@ import {
   type AppetiteRule,
   type PlanPoint,
 } from "./contingency.js";
-import { riskAdjustedCost, runQcraBatched, runQsraBatched } from "./simulation.js";
+import { riskAdjustedCost } from "./simulation.js";
 import { SimulationQueue, type SimulationJobParams } from "./runner.js";
-
-/** Releases the event loop between simulation batches (see the audit note on
- *  synchronous Monte Carlo blocking every other request). */
-const yieldToEventLoop = (): Promise<void> => new Promise<void>((r) => setImmediate(r));
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -1095,8 +1091,10 @@ export const riskModule: FastifyPluginAsync = async (app) => {
   app.post(
     "/projects/:projectId/risk/simulation-jobs/run",
     { preHandler: standardGate },
-    async () => {
-      const ran = await queue.drain();
+    async (req) => {
+      // Scoped to the caller's company: a tenant may run its own backlog,
+      // never another tenant's, and the count it reads back is its own.
+      const ran = await queue.drain({ companyId: req.companyId! });
       return { ran };
     },
   );
@@ -1161,39 +1159,44 @@ export const riskModule: FastifyPluginAsync = async (app) => {
    */
   app.post(
     "/projects/:projectId/risk-simulations/:simId/rerun",
-    { preHandler: readGate },
+    { preHandler: standardGate },
     async (req) => {
       const { simId } = req.params as { simId: string };
       const sim = await fetchSimulation(simId, req.companyId!, req.projectId!);
-      let fresh: SummaryLike;
+      // A rerun is a full Monte Carlo run: it goes through the SAME queue as
+      // the run routes so exactly one simulation executes per process at a
+      // time. Running it inline on the request path is what let ten clicks
+      // hold ten multi-million-sample arrays at once.
+      let params: SimulationJobParams;
       if (sim.kind === "qcra") {
-        const inputs = sim.inputs as { risks?: QcraRiskInput[] };
+        const inputs = sim.inputs as { risks?: QcraRiskInput[]; riskIds?: string[] };
         if (!Array.isArray(inputs.risks)) throw badRequest("Stored QCRA inputs are incomplete");
-        fresh = (
-          await runQcraBatched(inputs.risks, {
-            iterations: sim.iterations,
-            seed: sim.seed,
-            onBatch: yieldToEventLoop,
-          })
-        ).result.summary;
+        params = { kind: "qcra", risks: inputs.risks, riskIds: inputs.riskIds ?? [] };
       } else {
         const inputs = sim.inputs as {
           tasks?: QsraTaskInput[];
           deps?: CpmDependencyInput[];
           projectStart?: string;
+          scheduleId?: string;
+          distributionSources?: Record<string, string>;
         };
         if (!Array.isArray(inputs.tasks) || !Array.isArray(inputs.deps) || !inputs.projectStart) {
           throw badRequest("Stored QSRA inputs are incomplete");
         }
-        fresh = (
-          await runQsraBatched(inputs.tasks, inputs.deps, {
-            projectStart: inputs.projectStart,
-            iterations: sim.iterations,
-            seed: sim.seed,
-            onBatch: yieldToEventLoop,
-          })
-        ).result.summary;
+        params = {
+          kind: "qsra",
+          scheduleId: inputs.scheduleId ?? "",
+          projectStart: inputs.projectStart,
+          tasks: inputs.tasks,
+          deps: inputs.deps,
+          distributionSources: inputs.distributionSources ?? {},
+        };
       }
+      const outcome = await queue.verify(params, {
+        iterations: sim.iterations,
+        seed: sim.seed,
+      });
+      const fresh: SummaryLike = outcome.result.summary;
       const stored = (sim.results["summary"] ?? {}) as SummaryLike;
       const reproduced =
         JSON.stringify(stored.percentiles ?? null) === JSON.stringify(fresh.percentiles ?? null);
@@ -2232,18 +2235,23 @@ export const riskModule: FastifyPluginAsync = async (app) => {
       if (conts.length === 0) {
         reasons.push("No contingency has been set on this project, so cover cannot be measured.");
       } else {
-        const budget = conts.reduce((s, c) => s + c.amount, 0);
-        const drawn = draws.reduce((s, d) => s + d.amount, 0);
-        contingencyRemainingPercent =
-          budget > 0 ? round2(((budget - drawn) / budget) * 100) : null;
-        if (contingencyRemainingPercent === null) {
-          reasons.push("Contingency budget is zero, so a remaining percentage is undefined.");
-        }
         const currencies = new Set(conts.map((c) => c.currency));
         if (currencies.size > 1) {
+          // A single percentage over pots in different currencies is a
+          // cross-currency sum wearing a percent sign: an exhausted EUR pot
+          // hides behind an untouched GBP one. The scorer reads metrics, not
+          // reasons, so the honest metric is "not available".
           reasons.push(
-            `Contingencies span ${[...currencies].join(", ")}; the remaining percentage is computed on the raw amounts and should be read per currency.`,
+            `Contingencies span ${[...currencies].join(", ")}; a single remaining percentage would come from a cross-currency sum, so it is not available. Read cover per currency on the contingency register.`,
           );
+        } else {
+          const budget = conts.reduce((s, c) => s + c.amount, 0);
+          const drawn = draws.reduce((s, d) => s + d.amount, 0);
+          contingencyRemainingPercent =
+            budget > 0 ? round2(((budget - drawn) / budget) * 100) : null;
+          if (contingencyRemainingPercent === null) {
+            reasons.push("Contingency budget is zero, so a remaining percentage is undefined.");
+          }
         }
       }
 

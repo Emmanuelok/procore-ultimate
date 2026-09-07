@@ -17,6 +17,7 @@ import {
   type NecOption,
 } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
+import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
@@ -269,11 +270,10 @@ export const ceRoutes: FastifyPluginAsync = async (app) => {
         cal.basis,
         cal.holidays,
       );
-      const [numberRow] = await app.db
-        .select({ n: count() })
-        .from(ceQuotations)
-        .where(eq(ceQuotations.eventId, eventId));
-      const number = Number(numberRow?.n ?? 0) + 1;
+      // Atomic per-event numbering (PLAN §6.2). count()+1 handed two
+      // concurrent submissions the same number, and (event_id, number) is
+      // unique, so one of them died on a constraint violation.
+      const number = await nextRecordNumber(app.db, req.projectId!, `ce_quotation:${eventId}`);
       const id = newId("ceq");
 
       await app.db.transaction(async (tx) => {
@@ -471,7 +471,17 @@ export const ceRoutes: FastifyPluginAsync = async (app) => {
         .orderBy(desc(acceptedProgrammes.number))
         .limit(q.pageSize)
         .offset(pageOffset(q));
-      const accepted = items.find((p) => p.status === "accepted") ?? null;
+      // The accepted programme is a property of the CONTRACT, not of the page
+      // being viewed: scanning `items` reported "no accepted programme" as soon
+      // as it fell off page one.
+      const accepted = (
+        await app.db
+          .select({ id: acceptedProgrammes.id })
+          .from(acceptedProgrammes)
+          .where(and(where, eq(acceptedProgrammes.status, "accepted")))
+          .orderBy(desc(acceptedProgrammes.number))
+          .limit(1)
+      )[0];
       return {
         ...paginate(items, Number(totalRow?.n ?? 0), q),
         currentAcceptedProgrammeId: accepted?.id ?? null,
@@ -487,11 +497,11 @@ export const ceRoutes: FastifyPluginAsync = async (app) => {
       const body = programmeSchema.parse(req.body);
       const contract = await fetchContract(contractId, req.companyId!, req.projectId!);
       const cal = calendarOf(contract);
-      const [numberRow] = await app.db
-        .select({ n: count() })
-        .from(acceptedProgrammes)
-        .where(eq(acceptedProgrammes.contractId, contractId));
-      const number = Number(numberRow?.n ?? 0) + 1;
+      const number = await nextRecordNumber(
+        app.db,
+        req.projectId!,
+        `accepted_programme:${contractId}`,
+      );
       const id = newId("apr");
       // NEC 31.3: the Project Manager replies within two weeks of submission.
       const decisionDue = addDaysOnCalendar(body.submittedAt, 14, cal.basis, cal.holidays);

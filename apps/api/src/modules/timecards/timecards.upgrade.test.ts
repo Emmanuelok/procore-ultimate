@@ -373,6 +373,22 @@ describe("regressions", () => {
     // The owner raised the card, so this must be refused — which is itself the
     // segregation control working. Approve as a third party instead.
     expect(second.statusCode).toBe(403);
+
+    /*
+     * AND THE FIRST APPROVER MAY NOT TAKE THE SECOND TIER TOO. The level is
+     * derived as "one above the highest approved", so pressing Approve twice
+     * would otherwise have completed both tiers of a two-tier crew with one
+     * signature and flipped every card in the week to approved.
+     */
+    const again = await post(
+      `/projects/${projectId}/timecard-batches/${batchId}/approve`,
+      { decision: "approved" },
+      approver.headers,
+    );
+    expect(again.statusCode).toBe(409);
+    expect(again.json().message).toContain("One person is one tier");
+    const stillPartial = await get(`/projects/${projectId}/timecard-batches/${batchId}`);
+    expect(stillPartial.json().status).toBe("partially_approved");
   });
 
   it("reprices the rest of the week when a weekly-rule card is edited", async () => {

@@ -2904,6 +2904,13 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
         string,
         { cost: number; hours: number; currency: string; days: number }
       >();
+      /*
+       * A LINE THAT MIXED CURRENCIES STAYS OUT, however many days follow it.
+       * Deleting the accumulator alone was not enough: the next plant day on
+       * that line started a fresh one, and the line was posted at a PARTIAL
+       * figure while `reasons` said it had not been posted at all.
+       */
+      const mixedCurrencyLines = new Set<string>();
       const reasons: string[] = [];
       let uncoded = 0;
       let unverified = 0;
@@ -2914,6 +2921,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
           uncoded += 1;
           continue;
         }
+        if (mixedCurrencyLines.has(row.budgetLineItemId)) continue;
         if (row.verifiedBy === null && !body.includeUnverified) {
           unverified += 1;
           continue;
@@ -2955,6 +2963,7 @@ export const equipmentModule: FastifyPluginAsync = async (app) => {
               `${cost.currency}. Money is never summed across currencies, so this line was not ` +
               "posted. Split the coding by currency.",
           );
+          mixedCurrencyLines.add(row.budgetLineItemId);
           byLine.delete(row.budgetLineItemId);
           continue;
         }

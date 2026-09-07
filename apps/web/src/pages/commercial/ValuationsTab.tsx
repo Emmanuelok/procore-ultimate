@@ -36,6 +36,7 @@ import {
   todayIso,
   valuationStatusTone,
   type BoqRow,
+  type CertifyPreview,
   type ListResponse,
   type ValuationDetail,
   type ValuationRow,
@@ -63,19 +64,63 @@ function CertifyModal({
   const [materials, setMaterials] = useState(
     String(round2(valuation.materialsOnSite + valuation.materialsOffSite)),
   );
+  const [sections, setSections] = useState(String(valuation.sectionsTotal));
   const [reason, setReason] = useState("");
   const [dueDate, setDueDate] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sodBlocked, setSodBlocked] = useState(false);
 
+  // The certificate the SERVER would issue. The dialog used to do its own
+  // arithmetic, which left out the valuation's sections (variations, dayworks,
+  // claims, fluctuations, contra charges) and the retention cap — so the
+  // certifier was shown one net and issued another.
+  const [preview, setPreview] = useState<CertifyPreview | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+
   const cwd = parseNum(workDone);
   const cmat = parseNum(materials);
-  const valid = typeof cwd === "number" && typeof cmat === "number";
-  const retention = valid ? round2((valuation.retentionPercent / 100) * (cwd + cmat)) : null;
-  const netCertified =
-    valid && retention !== null ? round2(cwd + cmat - retention - valuation.previousNet) : null;
-  const variance = netCertified !== null ? round2(netCertified - valuation.netDue) : null;
+  const csec = parseNum(sections);
+  const valid = typeof cwd === "number" && typeof cmat === "number" && typeof csec === "number";
+
+  useEffect(() => {
+    if (!open || !valid) return;
+    const params = new URLSearchParams();
+    if (typeof cwd === "number") params.set("certifiedWorkDone", String(cwd));
+    if (typeof cmat === "number") params.set("certifiedMaterials", String(cmat));
+    if (typeof csec === "number") params.set("certifiedSections", String(csec));
+    let cancelled = false;
+    setPreviewing(true);
+    const timer = window.setTimeout(() => {
+      api
+        .get<CertifyPreview>(
+          `/api/v1/valuations/${valuation.id}/certify-preview?${params.toString()}`,
+        )
+        .then((p) => {
+          if (cancelled) return;
+          setPreview(p);
+          setPreviewError(null);
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          setPreview(null);
+          setPreviewError(
+            err instanceof Error ? err.message : "The certified position could not be computed.",
+          );
+        })
+        .finally(() => {
+          if (!cancelled) setPreviewing(false);
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [open, valid, cwd, cmat, csec, valuation.id]);
+
+  const cert = preview?.certificate ?? null;
+  const variance = cert?.varianceFromApplication ?? null;
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -86,6 +131,7 @@ function CertifyModal({
       const payload: Record<string, unknown> = {};
       if (typeof cwd === "number") payload["certifiedWorkDone"] = cwd;
       if (typeof cmat === "number") payload["certifiedMaterials"] = cmat;
+      if (typeof csec === "number") payload["certifiedSections"] = csec;
       if (reason.trim()) payload["varianceReason"] = reason.trim();
       if (dueDate) payload["dueDate"] = dueDate;
       await api.post(`/api/v1/valuations/${valuation.id}/certify`, payload);
@@ -110,8 +156,8 @@ function CertifyModal({
       ) : null}
       <ErrorAlert message={error} />
       <form onSubmit={submit} className="space-y-4">
-        <div className="grid grid-cols-2 gap-4">
-          <Field label="Certified work done" hint={`Applied: ${money(valuation.workDoneToDate, currency)}`}>
+        <div className="grid grid-cols-3 gap-3">
+          <Field label="Work done" hint={`Applied ${money(valuation.workDoneToDate, currency)}`}>
             <Input
               inputMode="decimal"
               value={workDone}
@@ -119,8 +165,8 @@ function CertifyModal({
             />
           </Field>
           <Field
-            label="Certified materials"
-            hint={`Applied: ${money(round2(valuation.materialsOnSite + valuation.materialsOffSite), currency)}`}
+            label="Materials"
+            hint={`Applied ${money(round2(valuation.materialsOnSite + valuation.materialsOffSite), currency)}`}
           >
             <Input
               inputMode="decimal"
@@ -128,40 +174,93 @@ function CertifyModal({
               onChange={(e) => setMaterials(e.target.value)}
             />
           </Field>
+          <Field
+            label="Sections"
+            hint={`Applied ${money(valuation.sectionsTotal, currency)}`}
+          >
+            <Input
+              inputMode="decimal"
+              value={sections}
+              onChange={(e) => setSections(e.target.value)}
+            />
+          </Field>
         </div>
+
         <div className="rounded-md bg-ink-50 p-3 text-sm">
-          <div className="flex justify-between">
-            <span className="text-ink-500">Retention ({valuation.retentionPercent}%)</span>
-            <span className="tabular-nums">{retention !== null ? money(-retention, currency) : "—"}</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-ink-500">Previous net certified</span>
-            <span className="tabular-nums">{money(-valuation.previousNet, currency)}</span>
-          </div>
-          <div className="mt-1 flex justify-between border-t border-ink-200 pt-1 font-medium">
-            <span>Net certified</span>
-            <span className="tabular-nums">
-              {netCertified !== null ? money(netCertified, currency) : "—"}
-            </span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-ink-500">Variance vs application ({money(valuation.netDue, currency)})</span>
-            <span
-              className={
-                variance === null || variance === 0
-                  ? "tabular-nums text-ink-600"
-                  : variance > 0
-                    ? "tabular-nums font-medium text-emerald-600"
-                    : "tabular-nums font-medium text-red-600"
-              }
-            >
-              {variance === null ? "—" : `${variance > 0 ? "+" : ""}${money(variance, currency)}`}
-            </span>
-          </div>
+          {previewError ? (
+            <p className="text-xs text-red-700">{previewError}</p>
+          ) : cert === null ? (
+            <p className="text-xs text-ink-500">
+              {previewing ? "Computing the certified position…" : "Enter the certified amounts."}
+            </p>
+          ) : (
+            <>
+              <div className="flex justify-between">
+                <span className="text-ink-500">Certified gross</span>
+                <span className="tabular-nums">{money(cert.certifiedGross, currency)}</span>
+              </div>
+              {cert.nonRetainableSections !== 0 ? (
+                <div className="flex justify-between text-xs">
+                  <span className="text-ink-400">
+                    of which outside the retention base
+                  </span>
+                  <span className="tabular-nums text-ink-400">
+                    {money(cert.nonRetainableSections, currency)}
+                  </span>
+                </div>
+              ) : null}
+              <div className="flex justify-between">
+                <span className="text-ink-500">
+                  Retention ({valuation.retentionPercent}%
+                  {cert.retentionCapped ? ", capped" : ""})
+                </span>
+                <span className="tabular-nums">{money(-cert.retentionHeld, currency)}</span>
+              </div>
+              {cert.retentionReleased > 0 ? (
+                <div className="flex justify-between text-xs">
+                  <span className="text-ink-400">Retention already released</span>
+                  <span className="tabular-nums text-ink-400">
+                    {money(cert.retentionReleased, currency)}
+                  </span>
+                </div>
+              ) : null}
+              <div className="flex justify-between">
+                <span className="text-ink-500">Previous net certified</span>
+                <span className="tabular-nums">{money(-cert.previousCertified, currency)}</span>
+              </div>
+              <div className="mt-1 flex justify-between border-t border-ink-200 pt-1 font-medium">
+                <span>Net certified</span>
+                <span className="tabular-nums">{money(cert.netCertified, currency)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-ink-500">
+                  Variance vs application ({money(preview?.applied.netDue ?? 0, currency)})
+                </span>
+                <span
+                  className={
+                    variance === null || variance === 0
+                      ? "tabular-nums text-ink-600"
+                      : variance > 0
+                        ? "tabular-nums font-medium text-emerald-600"
+                        : "tabular-nums font-medium text-red-600"
+                  }
+                >
+                  {variance === null ? "—" : `${variance > 0 ? "+" : ""}${money(variance, currency)}`}
+                </span>
+              </div>
+              <p className="mt-2 text-[11px] text-ink-400">
+                Computed by the server with the same engine that issues the certificate.
+              </p>
+            </>
+          )}
         </div>
         <Field
           label="Variance reason"
-          hint={variance !== null && variance !== 0 ? "Explain the difference from the application." : undefined}
+          hint={
+            variance !== null && variance !== 0
+              ? "Explain the difference from the application."
+              : undefined
+          }
         >
           <Textarea value={reason} onChange={(e) => setReason(e.target.value)} />
         </Field>

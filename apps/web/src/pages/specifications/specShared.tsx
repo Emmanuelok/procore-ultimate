@@ -915,12 +915,22 @@ export function useAction(): {
 
 const base = (projectId: string) => `/api/v1/projects/${projectId}`;
 
+/**
+ * The books list carries the caller's own level on `specifications`, because
+ * putting an issue in force is an admin act and the upload form must not
+ * offer a checkbox that will 403. `canSetCurrent` is the API's own answer,
+ * not a guess from the company role.
+ */
+export interface SpecBooksResponse extends Paginated<SpecBook> {
+  access: { level: "none" | "read" | "standard" | "admin"; canSetCurrent: boolean };
+}
+
 export function useSpecBooks(projectId: string | undefined, version: number) {
   const path = useMemo(
     () => (projectId ? `${base(projectId)}/spec-books?page=1&pageSize=200&_v=${version}` : null),
     [projectId, version],
   );
-  return useResource<Paginated<SpecBook>>(path);
+  return useResource<SpecBooksResponse>(path);
 }
 
 export function useSpecBook(projectId: string | undefined, bookId: string | null, version: number) {

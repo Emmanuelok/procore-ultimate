@@ -284,19 +284,24 @@ export const analysisRoutes: FastifyPluginAsync = async (app) => {
       );
     if (projectVariations.length === 0) return paginate([], 0, q);
     const byId = new Map(projectVariations.map((v) => [v.id, v]));
+    const where = and(
+      eq(variationBuildUpLines.companyId, req.companyId!),
+      inArray(
+        variationBuildUpLines.variationId,
+        projectVariations.map((v) => v.id),
+      ),
+      inArray(variationBuildUpLines.basis, ["star_rate", "daywork", "pro_rata"]),
+    );
+    // the register's total is how many star rates the project has, not how
+    // many fit on this page
+    const [totalRow] = await app.db
+      .select({ n: count() })
+      .from(variationBuildUpLines)
+      .where(where);
     const lines = await app.db
       .select()
       .from(variationBuildUpLines)
-      .where(
-        and(
-          eq(variationBuildUpLines.companyId, req.companyId!),
-          inArray(
-            variationBuildUpLines.variationId,
-            projectVariations.map((v) => v.id),
-          ),
-          inArray(variationBuildUpLines.basis, ["star_rate", "daywork", "pro_rata"]),
-        ),
-      )
+      .where(where)
       .orderBy(desc(variationBuildUpLines.createdAt))
       .limit(q.pageSize)
       .offset(pageOffset(q));
@@ -309,7 +314,7 @@ export const analysisRoutes: FastifyPluginAsync = async (app) => {
         currency: v?.currency ?? "USD",
       };
     });
-    return paginate(items, items.length, q);
+    return paginate(items, Number(totalRow?.n ?? 0), q);
   });
 
   /* ---------------------------------------------------------------- */
@@ -577,6 +582,14 @@ export const analysisRoutes: FastifyPluginAsync = async (app) => {
         .limit(1);
       const calc = calcRows[0];
       if (!calc) throw notFound("Fluctuation calculation not found");
+      // Attaching money to an application is editing it: a certified or paid
+      // application is closed, exactly as every other section-editing route
+      // on this valuation already requires.
+      if (val.status !== "draft") {
+        throw badRequest(
+          `Only a draft valuation can take a price adjustment; this one is ${val.status}.`,
+        );
+      }
       if (calc.currency !== val.currency) {
         throw badRequest(
           `The calculation is in ${calc.currency} and the valuation in ${val.currency}; they cannot be combined.`,
@@ -586,6 +599,21 @@ export const analysisRoutes: FastifyPluginAsync = async (app) => {
         .update(fluctuationCalculations)
         .set({ valuationId })
         .where(eq(fluctuationCalculations.id, calculationId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "valuation",
+        objectId: valuationId,
+        projectId: val.projectId,
+        payload: {
+          attachedFluctuation: calculationId,
+          formula: calc.formula,
+          adjustment: calc.adjustment,
+          currency: calc.currency,
+        },
+        storePayload: true,
+      });
       return reply.status(200).send({
         ok: true,
         calculationId,

@@ -8,7 +8,8 @@
  * manual tags + tag/date/GPS/location/360 filters (#431–#434), drawing
  * pins (#433), an un-ledgered inline content route so a gallery of 48
  * tiles is not 48 access-log rows on the company chain, bulk download as a
- * ZIP (#438), AI photo intelligence that runs after upload when AI is
+ * streamed ZIP (#438 — headers and blobs are written incrementally so neither
+ * a photo nor the archive is ever fully resident), AI photo intelligence that runs after upload when AI is
  * configured and is otherwise honestly marked `skipped` (#437, #439), and
  * record-level PATCH/DELETE that resolve the photo's project and enforce
  * the `photos` tool level (audit: photos.ts:175).
@@ -37,12 +38,13 @@ import {
   requireToolLevel,
 } from "./access.js";
 import {
+  BULK_DOWNLOAD_MAX_BYTES,
   PHOTO_MAX_BYTES,
   extractExif,
   isValidPin,
   sniffMediaType,
 } from "./photoEngine.js";
-import { buildZip } from "./zip.js";
+import { zipStream } from "./zip.js";
 import { actorOf, jsonbHas, nowIso } from "./shared.js";
 
 const photoFieldsSchema = z.object({
@@ -653,27 +655,35 @@ export const photoRoutes: FastifyPluginAsync = async (app) => {
     for (const r of rows) if (await canSeeAlbum(req, req.projectId!, r.photo.album)) allowed.push(r);
     if (allowed.length === 0) throw notFound("No downloadable photos in the selection");
     const total = allowed.reduce((s, r) => s + r.sizeBytes, 0);
-    if (total > 500 * 1024 * 1024) throw new AppError(413, "Selection exceeds the 500 MB bulk-download limit — pick fewer photos");
-    const entries = [];
-    for (const r of allowed) {
-      const data = await streamToBuffer(app.storage.readStream(r.storageKey));
-      entries.push({ name: r.fileName, data, mtime: r.photo.takenAt ? new Date(r.photo.takenAt) : new Date(r.photo.createdAt) });
+    if (total > BULK_DOWNLOAD_MAX_BYTES) {
+      throw new AppError(413, `Selection exceeds the ${Math.round(BULK_DOWNLOAD_MAX_BYTES / (1024 * 1024))} MB bulk-download limit — pick fewer photos`);
     }
-    const archive = buildZip(entries);
+    // The archive is produced incrementally: one local header, the blob piped
+    // straight off storage, then a data descriptor. Neither a photo nor the
+    // finished ZIP is ever fully resident, so a 500 MB selection costs one
+    // read buffer rather than a gigabyte of heap (verifier: photos.ts:662).
+    const entries = allowed.map((r) => ({
+      name: r.fileName,
+      mtime: r.photo.takenAt ? new Date(r.photo.takenAt) : new Date(r.photo.createdAt),
+      open: () => app.storage.readStream(r.storageKey),
+    }));
+    // Ledger the access before the first byte leaves: the evidentiary fact is
+    // "these photos were pulled", and it must not depend on the transfer
+    // finishing. `bytes` is the declared payload total, not the framed
+    // archive length, which is only known once the stream has drained.
     await appendLedger(app.db, {
       companyId: req.companyId!,
       actorId: req.user!.id,
       action: "access",
       objectType: "photo_bulk_download",
       objectId: req.projectId!,
-      payload: { photoIds: allowed.map((r) => r.photo.id), bytes: archive.length },
+      payload: { photoIds: allowed.map((r) => r.photo.id), bytes: total, entries: allowed.length },
       projectId: req.projectId!,
     });
     return reply
       .header("content-type", "application/zip")
       .header("content-disposition", `attachment; filename="photos-${req.projectId!}.zip"`)
-      .header("content-length", String(archive.length))
-      .send(archive);
+      .send(zipStream(entries));
   });
 
   /* ---------------------------------------------------------------- */

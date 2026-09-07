@@ -98,4 +98,44 @@ describe("computeEarnedValue", () => {
     expect(res.spi).toBe(0.5);
     expect(res.scheduleEacDays).toBe(20);
   });
+
+  it("never counts an unknown actual cost as zero: CPI is measured over the costed activities only", () => {
+    const res = computeEarnedValue({
+      dataDate: "2026-01-10",
+      currency: "GBP",
+      activities: [
+        act("a", { percentComplete: 100, actualCost: 900 }),
+        act("b", { percentComplete: 100, actualCost: 1000 }),
+        act("c", { percentComplete: 100, actualCost: null }), // priced, no cost source
+      ],
+    });
+    expect(res.costUnknown).toBe(1);
+    expect(res.costedBac).toBe(2000);
+    expect(res.costCoverage).toBeCloseTo(0.6667, 3);
+    expect(res.ac).toBe(1900); // c contributes nothing, not 0
+    // the naive figure would be EV 3000 / AC 1900 = 1.58; the honest one is 2000/1900
+    expect(res.cpi).toBeCloseTo(1.0526, 3);
+    expect(res.eac).toBeCloseTo(2900, 0); // 2000/1.0526 + 1000 carried at budget
+    expect(res.activities.find((a) => a.id === "c")?.ac).toBeNull();
+    expect(res.activities.find((a) => a.id === "c")?.cv).toBeNull();
+    expect(res.reasons.join(" ")).toContain("no booked cost");
+  });
+
+  it("withholds CPI and EAC when most of the priced budget has no booked cost", () => {
+    const res = computeEarnedValue({
+      dataDate: "2026-01-10",
+      currency: "GBP",
+      activities: [
+        act("a", { percentComplete: 100, actualCost: 900 }),
+        act("b", { percentComplete: 100, actualCost: null }),
+        act("c", { percentComplete: 100, actualCost: null }),
+      ],
+    });
+    expect(res.costCoverage).toBeCloseTo(0.3333, 3);
+    expect(res.cpi).toBeNull();
+    expect(res.eac).toBeNull();
+    expect(res.etc).toBeNull();
+    expect(res.vac).toBeNull();
+    expect(res.reasons.join(" ")).toContain("CPI and the cost forecast are withheld");
+  });
 });

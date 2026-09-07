@@ -15,7 +15,7 @@
  *    YYYY-MM-DD and orderings are re-checked on patch as well as on create.
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { and, eq } from "drizzle-orm";
+import { and, eq, ne, sql } from "drizzle-orm";
 import { z } from "zod";
 import { assets, sensors, signals, warranties } from "@constructos/db";
 import type { BimDetector, PermissionLevel, SignalSeverity } from "@constructos/shared";
@@ -177,6 +177,34 @@ export async function ledger(
   });
 }
 
+/**
+ * Close a signal whose condition the detector has observed clearing.
+ *
+ * `autoClosedAt` is what separates this from a human dismissal: a signal the
+ * platform closed itself may be re-opened by `raiseTwinSignal` when the
+ * condition returns, while one a reviewer dismissed stays dismissed.
+ */
+export async function closeTwinSignalById(
+  db: Db,
+  signalId: string,
+  companyId: string,
+  reason: string,
+): Promise<number> {
+  const at = nowISO();
+  const closed = await db
+    .update(signals)
+    .set({ disposition: "closed", closedAt: at, autoClosedAt: at, reviewerNotes: reason })
+    .where(
+      and(
+        eq(signals.id, signalId),
+        eq(signals.companyId, companyId),
+        ne(signals.disposition, "closed"),
+      ),
+    )
+    .returning({ id: signals.id });
+  return closed.length;
+}
+
 export interface TwinSignalDraft {
   detector: BimDetector;
   severity: SignalSeverity;
@@ -189,7 +217,16 @@ export interface TwinSignalDraft {
   subjectId?: string;
 }
 
-/** Raise a signal unless the same condition is already on the register. */
+/**
+ * Raise a signal for a condition, refresh the one already open, or re-open the
+ * one this detector auto-closed when the condition returns.
+ *
+ * The auto-close branch is why this is not a plain "insert if absent": a
+ * sensor that recovers auto-closes its stale/threshold signal, and without a
+ * re-open path the very next breach of the SAME sensor and bound would raise
+ * nothing at all — the detector would go silent forever. A signal a human
+ * dismissed stays dismissed; that is a judgement, not a cleared condition.
+ */
 export async function raiseTwinSignal(
   db: Db,
   companyId: string,
@@ -197,8 +234,13 @@ export async function raiseTwinSignal(
   actorId: string | null,
   draft: TwinSignalDraft,
 ): Promise<string | null> {
+  const at = nowISO();
   const existing = await db
-    .select({ id: signals.id })
+    .select({
+      id: signals.id,
+      disposition: signals.disposition,
+      autoClosedAt: signals.autoClosedAt,
+    })
     .from(signals)
     .where(
       and(
@@ -208,9 +250,49 @@ export async function raiseTwinSignal(
       ),
     )
     .limit(1);
-  if (existing[0]) return null;
+  const prior = existing[0];
+  if (prior) {
+    const humanDismissed = prior.disposition === "closed" && !prior.autoClosedAt;
+    if (humanDismissed) return null;
+    const reopening = prior.disposition === "closed";
+    await db
+      .update(signals)
+      .set({
+        lastSeenAt: at,
+        occurrences: sql`${signals.occurrences} + 1`,
+        severity: draft.severity,
+        title: draft.title,
+        explanation: draft.explanation,
+        evidenceRefs: { key: draft.key, ...(draft.evidence ?? {}) },
+        ...(reopening
+          ? {
+              disposition: "new" as const,
+              closedAt: null,
+              autoClosedAt: null,
+              reviewerNotes: null,
+              reviewerId: null,
+            }
+          : {}),
+      })
+      .where(eq(signals.id, prior.id));
+    if (!reopening) return null;
+    await ledger(db, {
+      companyId,
+      projectId,
+      actorId,
+      action: "state_change",
+      objectType: "signal",
+      objectId: prior.id,
+      payload: {
+        detector: draft.detector,
+        severity: draft.severity,
+        key: draft.key,
+        reopened: true,
+      },
+    });
+    return prior.id;
+  }
   const id = newId("sig");
-  const at = nowISO();
   await db.insert(signals).values({
     id,
     companyId,

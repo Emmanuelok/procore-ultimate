@@ -7808,6 +7808,7 @@ ALTER TABLE "bim_elements" ADD COLUMN "max_y" double precision;--> statement-bre
 ALTER TABLE "bim_elements" ADD COLUMN "max_z" double precision;--> statement-breakpoint
 ALTER TABLE "bim_model_versions" ADD COLUMN "processing_error" text;--> statement-breakpoint
 ALTER TABLE "bim_model_versions" ADD COLUMN "processed_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "bim_model_versions" ADD COLUMN "processing_started_at" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "bim_model_versions" ADD COLUMN "size_bytes" double precision;--> statement-breakpoint
 ALTER TABLE "bim_model_versions" ADD COLUMN "spatial_count" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE "bim_model_versions" ADD COLUMN "authorised_by" text;--> statement-breakpoint
@@ -9199,6 +9200,7 @@ CREATE INDEX "webhook_endpoints_active_idx" ON "webhook_endpoints" USING btree (
 CREATE INDEX "change_order_requests_package_idx" ON "change_order_requests" USING btree ("change_order_package_id");--> statement-breakpoint
 CREATE INDEX "commitment_changes_commitment_idx" ON "commitment_changes" USING btree ("commitment_id","status");--> statement-breakpoint
 CREATE INDEX "commitment_payments_commitment_idx" ON "commitment_payments" USING btree ("commitment_id","status");--> statement-breakpoint
+CREATE INDEX "commitment_payments_company_paid_idx" ON "commitment_payments" USING btree ("company_id","status","payment_date");--> statement-breakpoint
 CREATE INDEX "commitment_sov_lines_project_budget_idx" ON "commitment_sov_lines" USING btree ("project_id","budget_line_item_id");--> statement-breakpoint
 CREATE INDEX "invoice_line_items_project_idx" ON "invoice_line_items" USING btree ("project_id","company_id");--> statement-breakpoint
 CREATE INDEX "invoices_company_idx" ON "invoices" USING btree ("company_id","status");--> statement-breakpoint

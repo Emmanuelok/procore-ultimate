@@ -1,5 +1,5 @@
 {
-  "id": "ad9f70fb-d918-404b-9fc8-12feb250e67f",
+  "id": "b9e96ffc-3a14-4504-ba50-c040c565f900",
   "prevId": "340cf323-a4ed-4b81-8d6c-8f3e94b698e3",
   "version": "7",
   "dialect": "postgresql",
@@ -6114,6 +6114,12 @@
         },
         "processed_at": {
           "name": "processed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "processing_started_at": {
+          "name": "processing_started_at",
           "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": false
@@ -49656,6 +49662,33 @@
             },
             {
               "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "commitment_payments_company_paid_idx": {
+          "name": "commitment_payments_company_paid_idx",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "payment_date",
               "isExpression": false,
               "asc": true,
               "nulls": "last"

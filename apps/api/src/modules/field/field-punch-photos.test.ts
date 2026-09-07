@@ -70,7 +70,9 @@ beforeAll(async () => {
     { id: locA, companyId: owner.companyId, projectId, parentId: null, name: "Building A", path: locA, sortOrder: 0 },
     { id: locA3, companyId: owner.companyId, projectId, parentId: locA, name: "Level 3", path: `${locA}/${locA3}`, sortOrder: 0 },
   ]);
-});
+  // See field.test.ts: explicit hook timeout so a slow shared runner cannot
+  // turn a green package red by timing the boot out at vitest's 30s default.
+}, 180_000);
 
 afterAll(async () => {
   await built.close();
@@ -317,6 +319,27 @@ describe("Observations", () => {
     expect((await inject("GET", api(`/observations/${id}`), S)).statusCode).toBe(403);
   });
 
+  it("refuses to mint a safety incident or a change event on the punch tool alone", async () => {
+    // The subcontractor template holds punch:"standard" but safety:"none" and
+    // change_management:"none". Conversion writes straight into those modules'
+    // tables, so it must satisfy their own create gates (plan §6.3) — holding
+    // punch is not authority to open the head of the commercial change chain.
+    const o = await inject("POST", api("/observations"), H(sub), { title: "Scaffold tie missing", observationType: "safety", assigneeId: engineer.userId, verifierId: pm.userId });
+    expect(o.statusCode).toBe(201);
+    const id = o.json().id as string;
+    const incident = await inject("POST", api(`/observations/${id}/convert`), H(sub), { target: "incident", incidentType: "near_miss" });
+    expect(incident.statusCode).toBe(403);
+    const change = await inject("POST", api(`/observations/${id}/convert`), H(sub), { target: "change_event", eventType: "field_condition" });
+    expect(change.statusCode).toBe(403);
+    // Refusing at the gate must not consume the one-shot conversion claim.
+    const stillOpen = await inject("GET", api(`/observations/${id}`), H(sub));
+    expect(stillOpen.json().convertedToType).toBeNull();
+    expect(stillOpen.json().permissions.canConvert).toBe(true);
+    // The same subcontractor may still convert to punch, which they do hold.
+    const punch = await inject("POST", api(`/observations/${id}/convert`), H(sub), { target: "punch_item" });
+    expect(punch.statusCode).toBe(201);
+  });
+
   it("converts exactly once when two requests race", async () => {
     const o = await inject("POST", api("/observations"), H(engineer), { title: "Double-click hazard", observationType: "safety", assigneeId: sub.userId, verifierId: pm.userId });
     const id = o.json().id as string;
@@ -460,6 +483,19 @@ describe("Photos", () => {
     const entries = listZip(zip.rawPayload);
     expect(entries).toHaveLength(2); // the private one is not visible to the engineer
     expect(entries.map((e) => e.name).sort()).toEqual(["col-c4.bin", "u1.png"]);
+    // Streamed, not buffered: the archive is emitted with no declared length
+    // and every local header sets general-purpose bit 3 ("sizes and CRC
+    // follow the data"), which is only possible when the entry's bytes were
+    // written before its size was known. Regression guard for the ~1 GB
+    // in-memory archive this route used to build.
+    expect(zip.headers["content-length"]).toBeUndefined();
+    for (const e of entries) {
+      expect(zip.rawPayload.readUInt32LE(e.offset)).toBe(0x04034b50);
+      expect(zip.rawPayload.readUInt16LE(e.offset + 6) & 0x0008).toBe(0x0008);
+      expect(zip.rawPayload.readUInt32LE(e.offset + 14)).toBe(0); // CRC deferred to the descriptor
+      expect(e.crc).not.toBe(0); // …and recorded in the central directory
+      expect(e.size).toBeGreaterThan(0);
+    }
 
     const analyse = await inject("POST", api(`/photos/${photoId}/analyse`), H(engineer));
     expect(analyse.statusCode).toBe(200);

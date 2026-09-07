@@ -14,22 +14,25 @@
  */
 import { createHash } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { and, eq, ne } from "drizzle-orm";
+import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   bimModelVersions,
   bimModels,
   clashTests,
+  companyMemberships,
   coordinationIssues,
   federationGroups,
+  projectMemberships,
   realityCaptures,
   signals,
+  users,
 } from "@constructos/db";
 import type { BimDetector, PermissionLevel, SignalSeverity } from "@constructos/shared";
 import type { Db } from "../../lib/db.js";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { notFound } from "../../lib/errors.js";
+import { badRequest, notFound } from "../../lib/errors.js";
 
 /* ------------------------------------------------------------------ */
 /* Wire formats                                                        */
@@ -185,6 +188,88 @@ export function buildLoaders(app: FastifyInstance) {
 export type BimLoaders = ReturnType<typeof buildLoaders>;
 
 /* ------------------------------------------------------------------ */
+/* People referenced by coordination records                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Every user id written onto a coordination record must be someone who can
+ * actually act on that record: a member of the tenant AND a member of the
+ * project (company owners and admins see every project, so they pass on the
+ * company role alone).
+ *
+ * The company half closes the cross-tenant leak — an assignee id resolves to
+ * a name and an email in the register, so a foreign id would surface another
+ * tenant's user. The project half closes the intra-tenant half: assignment
+ * sends a notification carrying the issue number and title, and a colleague
+ * with no access to the project should not receive it, let alone be recorded
+ * as responsible for a record they cannot open.
+ */
+export async function assertAssignable(
+  db: Db,
+  companyId: string,
+  projectId: string,
+  ids: Array<string | null | undefined>,
+): Promise<void> {
+  const wanted = [...new Set(ids.filter((v): v is string => Boolean(v)))];
+  if (wanted.length === 0) return;
+  const company = await db
+    .select({ userId: companyMemberships.userId, role: companyMemberships.role })
+    .from(companyMemberships)
+    .where(
+      and(
+        eq(companyMemberships.companyId, companyId),
+        inArray(companyMemberships.userId, wanted),
+      ),
+    );
+  const roleByUser = new Map(company.map((r) => [r.userId, r.role]));
+  const missing = wanted.find((id) => !roleByUser.has(id));
+  if (missing) throw badRequest(`User "${missing}" is not a member of this company`);
+
+  const needProject = wanted.filter((id) => {
+    const role = roleByUser.get(id);
+    return role !== "owner" && role !== "admin";
+  });
+  if (needProject.length === 0) return;
+  const onProject = await db
+    .select({ userId: projectMemberships.userId })
+    .from(projectMemberships)
+    .where(
+      and(
+        eq(projectMemberships.projectId, projectId),
+        eq(projectMemberships.companyId, companyId),
+        inArray(projectMemberships.userId, needProject),
+      ),
+    );
+  const found = new Set(onProject.map((r) => r.userId));
+  const notOnProject = needProject.find((id) => !found.has(id));
+  if (notOnProject) {
+    throw badRequest(`User "${notOnProject}" is not a member of this project`);
+  }
+}
+
+/**
+ * Resolve display names for user ids held on records — tenant-scoped, so an
+ * id that somehow got past validation still cannot surface another company's
+ * user. Unknown ids are simply absent from the map and render as the raw id.
+ */
+export async function resolvePeople(
+  db: Db,
+  companyId: string,
+  ids: Array<string | null | undefined>,
+): Promise<Record<string, { id: string; name: string; email: string }>> {
+  const wanted = [...new Set(ids.filter((v): v is string => Boolean(v)))];
+  if (wanted.length === 0) return {};
+  const rows = await db
+    .select({ id: users.id, name: users.name, email: users.email })
+    .from(users)
+    .innerJoin(companyMemberships, eq(companyMemberships.userId, users.id))
+    .where(
+      and(eq(companyMemberships.companyId, companyId), inArray(users.id, wanted)),
+    );
+  return Object.fromEntries(rows.map((r) => [r.id, r]));
+}
+
+/* ------------------------------------------------------------------ */
 /* Ledger + signals                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -276,7 +361,25 @@ export interface SignalDraft {
   subjectId?: string;
 }
 
-/** Raise a signal unless one with the same dedupe key already exists. */
+/**
+ * Raise a signal for a condition, or refresh the one already on the register.
+ *
+ * Three cases, and the difference between them is the whole point:
+ *   - no row yet            -> insert, ledger the discovery, return the id.
+ *   - row still open        -> bump lastSeenAt/occurrences, return null (this
+ *                              is not a new discovery, so no second ledger
+ *                              entry and no second notification).
+ *   - row AUTO-closed       -> the detector previously observed the condition
+ *                              clearing and closed its own signal. The
+ *                              condition is back, so re-open the same row
+ *                              (disposition 'new', closedAt/autoClosedAt
+ *                              cleared) and ledger it. Without this the
+ *                              close/raise cycle only ever runs once and the
+ *                              detector goes permanently silent for that key.
+ *   - row closed BY A HUMAN -> leave it closed. A reviewer dismissing a
+ *                              finding must not be overruled by the next
+ *                              sweep, or the register becomes noise again.
+ */
 export async function raiseSignal(
   db: Db,
   companyId: string,
@@ -284,8 +387,13 @@ export async function raiseSignal(
   actorId: string | null,
   draft: SignalDraft,
 ): Promise<string | null> {
+  const at = nowISO();
   const existing = await db
-    .select({ id: signals.id })
+    .select({
+      id: signals.id,
+      disposition: signals.disposition,
+      autoClosedAt: signals.autoClosedAt,
+    })
     .from(signals)
     .where(
       and(
@@ -295,9 +403,49 @@ export async function raiseSignal(
       ),
     )
     .limit(1);
-  if (existing[0]) return null;
+  const prior = existing[0];
+  if (prior) {
+    const humanDismissed = prior.disposition === "closed" && !prior.autoClosedAt;
+    if (humanDismissed) return null;
+    const reopening = prior.disposition === "closed";
+    await db
+      .update(signals)
+      .set({
+        lastSeenAt: at,
+        occurrences: sql`${signals.occurrences} + 1`,
+        severity: draft.severity,
+        title: draft.title,
+        explanation: draft.explanation,
+        evidenceRefs: { key: draft.key, ...(draft.evidence ?? {}) },
+        ...(reopening
+          ? {
+              disposition: "new" as const,
+              closedAt: null,
+              autoClosedAt: null,
+              reviewerNotes: null,
+              reviewerId: null,
+            }
+          : {}),
+      })
+      .where(eq(signals.id, prior.id));
+    if (!reopening) return null;
+    await ledger(db, {
+      companyId,
+      projectId,
+      actorId,
+      action: "state_change",
+      objectType: "signal",
+      objectId: prior.id,
+      payload: {
+        detector: draft.detector,
+        severity: draft.severity,
+        key: draft.key,
+        reopened: true,
+      },
+    });
+    return prior.id;
+  }
   const id = newId("sig");
-  const at = nowISO();
   await db.insert(signals).values({
     id,
     companyId,

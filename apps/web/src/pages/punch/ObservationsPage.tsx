@@ -4,6 +4,12 @@
  * into a punch item, a safety incident or a change event with the link kept.
  * Routed at /projects/:projectId/observations; lives beside the punch pages
  * because the same people work both registers.
+ *
+ * The detail drawer is a full editor, not a read-only card: reassigning a
+ * finding, moving its due date, re-pinning it or attributing it to a vendor
+ * are the ordinary field actions, and PATCH /observations/:id backs every one
+ * of them (verifier changes obey the same segregation-of-duties rule the API
+ * enforces, surfaced as `permissions.canEditVerifier`).
  */
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
@@ -48,6 +54,11 @@ interface Observation {
   ageDays: number | null;
 }
 
+interface Vendor {
+  id: string;
+  name: string;
+}
+
 interface Detail extends Observation {
   links: Array<{ toType: string; toId: string; linkKind: string }>;
   permissions: { isAdmin: boolean; canStart: boolean; canReadyForReview: boolean; canClose: boolean; canVoid: boolean; canConvert: boolean; canEditVerifier: boolean };
@@ -90,6 +101,8 @@ export default function ObservationsPage() {
   const base = `/api/v1/projects/${projectId}/observations`;
   const { users, nameOf } = useCompanyUsers();
   const locations = useLocations(projectId);
+  const vendors = useFieldResource<ListResponse<Vendor>>("/api/v1/vendors?pageSize=200");
+  const vendorName = useCallback((id: string | null | undefined) => (id ? (vendors.data?.items.find((v) => v.id === id)?.name ?? id) : DASH), [vendors.data]);
   const [tab, setTab] = useState<TabKey>(searchParams.get("tab") === "ageing" ? "ageing" : "register");
   const [version, setVersion] = useState(0);
   const refresh = useCallback(() => setVersion((n) => n + 1), []);
@@ -239,31 +252,115 @@ export default function ObservationsPage() {
         </form>
       </Modal>
 
-      <ObservationDetail base={base} projectId={projectId ?? ""} id={detailId} onClose={() => setDetailId(null)} onChanged={refresh} nameOf={nameOf} locationLabel={locations.labelOf} />
+      <ObservationDetail
+        base={base}
+        projectId={projectId ?? ""}
+        id={detailId}
+        onClose={() => setDetailId(null)}
+        onChanged={refresh}
+        users={users}
+        nameOf={nameOf}
+        vendors={vendors.data?.items ?? []}
+        vendorName={vendorName}
+        locations={locations.items}
+        locationLabel={locations.labelOf}
+      />
     </div>
   );
 }
 
-function ObservationDetail({ base, projectId, id, onClose, onChanged, nameOf, locationLabel }: {
+interface EditForm {
+  description: string;
+  priority: string;
+  assigneeId: string;
+  verifierId: string;
+  vendorId: string;
+  locationId: string;
+  dueDate: string;
+  sheetId: string;
+  pinX: string;
+  pinY: string;
+}
+
+function ObservationDetail({ base, projectId, id, onClose, onChanged, users, nameOf, vendors, vendorName, locations, locationLabel }: {
   base: string;
   projectId: string;
   id: string | null;
   onClose: () => void;
   onChanged: () => void;
+  users: Array<{ id: string; name: string }>;
   nameOf: (id: string | null | undefined) => string;
+  vendors: Vendor[];
+  vendorName: (id: string | null | undefined) => string;
+  locations: Array<{ id: string }>;
   locationLabel: (id: string | null | undefined) => string;
 }) {
   const [version, setVersion] = useState(0);
   const detail = useFieldResource<Detail>(id ? `${base}/${id}` : null, [version]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
   const [target, setTarget] = useState("punch_item");
   const [result, setResult] = useState<{ type: string; id: string; label: string } | null>(null);
+  const [edit, setEdit] = useState<EditForm | null>(null);
   const d = detail.data;
   useEffect(() => {
     setError(null);
     setResult(null);
+    setSaved(false);
+    setEdit(null);
   }, [id]);
+  // The form mirrors the loaded record until the user touches it; `edit === null`
+  // means "unchanged", which is also what disables the save button.
+  const draft: EditForm | null = d
+    ? (edit ?? {
+        description: d.description ?? "",
+        priority: d.priority,
+        assigneeId: d.assigneeId ?? "",
+        verifierId: d.verifierId ?? "",
+        vendorId: d.vendorId ?? "",
+        locationId: d.locationId ?? "",
+        dueDate: d.dueDate ?? "",
+        sheetId: d.sheetId ?? "",
+        pinX: d.pinX === null ? "" : String(d.pinX),
+        pinY: d.pinY === null ? "" : String(d.pinY),
+      })
+    : null;
+  const setField = (key: keyof EditForm, value: string) => {
+    setSaved(false);
+    setEdit((prev) => ({ ...(prev ?? draft!), [key]: value }));
+  };
+
+  async function save() {
+    if (!d || !draft) return;
+    setBusy(true);
+    setError(null);
+    setSaved(false);
+    try {
+      const pinComplete = draft.sheetId.trim() !== "" && draft.pinX !== "" && draft.pinY !== "";
+      const payload: Record<string, unknown> = {
+        description: draft.description.trim() || null,
+        priority: draft.priority,
+        assigneeId: draft.assigneeId || null,
+        vendorId: draft.vendorId || null,
+        locationId: draft.locationId || null,
+        dueDate: draft.dueDate || null,
+        pin: pinComplete ? { sheetId: draft.sheetId.trim(), x: Number(draft.pinX), y: Number(draft.pinY) } : null,
+      };
+      // Only send the verifier when the API says this caller may change it —
+      // otherwise an untouched field would trip the segregation-of-duties check.
+      if (d.permissions.canEditVerifier) payload["verifierId"] = draft.verifierId || null;
+      await api.patch(`${base}/${d.id}`, payload);
+      setEdit(null);
+      setSaved(true);
+      setVersion((n) => n + 1);
+      onChanged();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function transition(status: string) {
     if (!d) return;
@@ -294,6 +391,9 @@ function ObservationDetail({ base, projectId, id, onClose, onChanged, nameOf, lo
       setBusy(false);
     }
   }
+  // The API refuses edits to a closed or void observation; do not offer a form
+  // that can only fail.
+  const editable = d ? d.status !== "closed" && d.status !== "void" : false;
   const hrefFor = (type: string, targetId: string) =>
     type === "punch_item" ? `/projects/${projectId}/punch?item=${targetId}` : type === "safety_incident" || type === "incident" ? `/projects/${projectId}/safety?incident=${targetId}` : `/projects/${projectId}/changes?event=${targetId}`;
 
@@ -314,11 +414,58 @@ function ObservationDetail({ base, projectId, id, onClose, onChanged, nameOf, lo
             <h3 className="text-base font-semibold text-ink-900">{d.title}</h3>
             {d.description ? <p className="mt-1 whitespace-pre-wrap text-sm text-ink-700">{d.description}</p> : null}
           </div>
+          {editable && draft ? (
+            <section className="rounded-lg border border-ink-100 p-3">
+              <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-500">Edit this observation</h4>
+              {saved ? <Alert tone="success" size="sm" className="mb-2">Saved.</Alert> : null}
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <Field label="Assignee">
+                  <Select value={draft.assigneeId} onChange={(e) => setField("assigneeId", e.target.value)}>
+                    <option value="">Unassigned</option>
+                    {users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+                  </Select>
+                </Field>
+                <Field label="Verifier" hint={d.permissions.canEditVerifier ? "Must differ from the assignee." : "Locked while the observation is ready for review."}>
+                  <Select value={draft.verifierId} disabled={!d.permissions.canEditVerifier} onChange={(e) => setField("verifierId", e.target.value)}>
+                    <option value="">None</option>
+                    {users.filter((u) => u.id !== draft.assigneeId).map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+                  </Select>
+                </Field>
+                <Field label="Priority">
+                  <Select value={draft.priority} onChange={(e) => setField("priority", e.target.value)}>
+                    <option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option>
+                  </Select>
+                </Field>
+                <Field label="Due date"><Input type="date" value={draft.dueDate} onChange={(e) => setField("dueDate", e.target.value)} /></Field>
+                <Field label="Vendor">
+                  <Select value={draft.vendorId} onChange={(e) => setField("vendorId", e.target.value)}>
+                    <option value="">No vendor</option>
+                    {vendors.map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}
+                  </Select>
+                </Field>
+                <Field label="Location">
+                  <Select value={draft.locationId} onChange={(e) => setField("locationId", e.target.value)}>
+                    <option value="">No location</option>
+                    {locations.map((l) => <option key={l.id} value={l.id}>{locationLabel(l.id)}</option>)}
+                  </Select>
+                </Field>
+                <Field label="Drawing sheet id" hint="Clear the sheet to remove the pin."><Input value={draft.sheetId} onChange={(e) => setField("sheetId", e.target.value)} placeholder="sht_…" /></Field>
+                <Field label="Pin x"><Input type="number" min="0" max="1" step="0.01" value={draft.pinX} onChange={(e) => setField("pinX", e.target.value)} /></Field>
+                <Field label="Pin y"><Input type="number" min="0" max="1" step="0.01" value={draft.pinY} onChange={(e) => setField("pinY", e.target.value)} /></Field>
+                <Field label="Description" className="sm:col-span-3"><Textarea rows={3} value={draft.description} onChange={(e) => setField("description", e.target.value)} /></Field>
+              </div>
+              <div className="mt-3 flex justify-end gap-2">
+                <Button variant="secondary" size="sm" disabled={busy || edit === null} onClick={() => { setEdit(null); setSaved(false); }}>Discard changes</Button>
+                <Button size="sm" disabled={busy || edit === null} onClick={() => void save()}>{busy ? "Saving…" : "Save changes"}</Button>
+              </div>
+            </section>
+          ) : null}
           <dl className="grid grid-cols-2 gap-2 text-sm sm:grid-cols-4">
             <div><dt className="text-ink-400">Assignee</dt><dd className="text-ink-800">{nameOf(d.assigneeId)}</dd></div>
             <div><dt className="text-ink-400">Verifier</dt><dd className="text-ink-800">{nameOf(d.verifierId)}</dd></div>
             <div><dt className="text-ink-400">Due</dt><dd className="text-ink-800">{formatDate(d.dueDate)}</dd></div>
             <div><dt className="text-ink-400">Location</dt><dd className="text-ink-800">{locationLabel(d.locationId)}</dd></div>
+            <div><dt className="text-ink-400">Vendor</dt><dd className="text-ink-800">{vendorName(d.vendorId)}</dd></div>
             <div><dt className="text-ink-400">Drawing pin</dt><dd className="text-ink-800">{d.sheetId ? `${d.sheetId} @ ${d.pinX?.toFixed(2)}, ${d.pinY?.toFixed(2)}` : DASH}</dd></div>
             <div><dt className="text-ink-400">Photos</dt><dd className="text-ink-800">{d.photoIds.length}</dd></div>
             <div><dt className="text-ink-400">Closed</dt><dd className="text-ink-800">{d.closedBy ? `${nameOf(d.closedBy)} · ${formatDateTime(d.closedAt)}` : DASH}</dd></div>

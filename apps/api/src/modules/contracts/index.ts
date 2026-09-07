@@ -2,10 +2,12 @@ import type { FastifyPluginAsync } from "fastify";
 import { and, asc, count, desc, eq, inArray, isNotNull, lte } from "drizzle-orm";
 import { z } from "zod";
 import {
+  boqs,
   contractEvents,
   contractObligationLinks,
   contracts,
   eotClaims,
+  finalAccounts,
   obligations,
   type ParticularCondition,
 } from "@constructos/db";
@@ -23,7 +25,7 @@ import {
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { badRequest, forbidden, notFound } from "../../lib/errors.js";
+import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { addDaysISO, isoDateSchema, todayISO } from "../field/dates.js";
 import { necValuationBasis } from "./ce.js";
@@ -590,6 +592,37 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
       const nextOption = body.necOption !== undefined ? body.necOption : contract.necOption;
       if (body.form !== undefined || body.necOption !== undefined) {
         necFormCheck(nextForm, nextOption);
+      }
+      // The currency is frozen once anything is priced in it. Changing it
+      // would leave bills, applications and certificates denominated in the
+      // old currency while the contract claims another — the commercial module
+      // then refuses new applications ("a valuation cannot span two
+      // currencies") while the certified position keeps reporting in the bill's.
+      if (body.currency !== undefined && body.currency !== contract.currency) {
+        const bill = (
+          await app.db
+            .select({ id: boqs.id, name: boqs.name })
+            .from(boqs)
+            .where(eq(boqs.contractId, contractId))
+            .limit(1)
+        )[0];
+        if (bill) {
+          throw conflict(
+            `The bill "${bill.name}" is priced in ${contract.currency} under this contract; the contract currency can no longer be changed.`,
+          );
+        }
+        const account = (
+          await app.db
+            .select({ id: finalAccounts.id, number: finalAccounts.number })
+            .from(finalAccounts)
+            .where(eq(finalAccounts.contractId, contractId))
+            .limit(1)
+        )[0];
+        if (account) {
+          throw conflict(
+            `Final account ${account.number} is drawn in ${contract.currency} under this contract; the contract currency can no longer be changed.`,
+          );
+        }
       }
       const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
       for (const [k, v] of Object.entries(body)) {

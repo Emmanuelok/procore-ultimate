@@ -126,7 +126,15 @@ export function EarnedValuePanel({ base, scheduleId }: { base: string; scheduleI
         <Stat label="Budget at completion" value={money(data.bac, c)} hint={`${data.pricedActivities} priced activities`} />
         <Stat label="Planned value" value={money(data.pv, c)} hint={`basis: ${data.basis}`} />
         <Stat label="Earned value" value={money(data.ev, c)} />
-        <Stat label="Actual cost" value={money(data.ac, c)} />
+        <Stat
+          label="Actual cost"
+          value={money(data.ac, c)}
+          hint={
+            data.costUnknown > 0
+              ? `${data.costUnknown} priced activit${data.costUnknown === 1 ? "y has" : "ies have"} no booked cost`
+              : undefined
+          }
+        />
       </div>
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Stat
@@ -137,9 +145,21 @@ export function EarnedValuePanel({ base, scheduleId }: { base: string; scheduleI
         <Stat
           label="CPI"
           value={data.cpi === null ? "—" : String(data.cpi)}
-          hint={data.cpi === null ? "no cost has been booked" : "earned ÷ actual"}
+          hint={
+            data.cpi === null
+              ? data.costUnknown > 0
+                ? "too little of the budget carries a booked cost"
+                : "no cost has been booked"
+              : data.costCoverage !== null && data.costCoverage < 1
+                ? `earned ÷ actual over ${Math.round(data.costCoverage * 100)}% of BAC`
+                : "earned ÷ actual"
+          }
         />
-        <Stat label="Forecast at completion" value={money(data.eac, c)} hint="BAC ÷ CPI" />
+        <Stat
+          label="Forecast at completion"
+          value={money(data.eac, c)}
+          hint={data.eac === null ? "CPI is not available" : "costed BAC ÷ CPI + uncosted BAC"}
+        />
         <Stat
           label="Schedule EAC"
           value={data.scheduleEacDays === null ? "—" : `${data.scheduleEacDays} d`}
@@ -188,7 +208,10 @@ export function EarnedValuePanel({ base, scheduleId }: { base: string; scheduleI
                     <td className={`px-3 py-1.5 text-right tabular-nums ${a.sv < 0 ? "text-red-600" : "text-ink-700"}`}>
                       {money(a.sv, c)}
                     </td>
-                    <td className={`px-3 py-1.5 text-right tabular-nums ${a.cv < 0 ? "text-red-600" : "text-ink-700"}`}>
+                    <td
+                      className={`px-3 py-1.5 text-right tabular-nums ${a.cv !== null && a.cv < 0 ? "text-red-600" : "text-ink-700"}`}
+                      title={a.ac === null ? "No cost source is mapped to this activity" : undefined}
+                    >
                       {money(a.cv, c)}
                     </td>
                   </tr>

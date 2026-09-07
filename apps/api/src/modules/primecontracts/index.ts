@@ -1159,7 +1159,7 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         }
       }
       const now = nowIso();
-      await app.db
+      const claimedStatus = await app.db
         .update(primeContracts)
         .set({
           status: body.status,
@@ -1173,7 +1173,14 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
               : {}),
           updatedAt: now,
         })
-        .where(eq(primeContracts.id, contract.id));
+        .where(and(eq(primeContracts.id, contract.id), eq(primeContracts.status, contract.status)))
+        .returning({ id: primeContracts.id });
+      if (claimedStatus.length !== 1) {
+        throw conflict(
+          `Prime contract ${contract.reference} is no longer ${contract.status} — another ` +
+            "request moved it first. Reload before acting on it again.",
+        );
+      }
       await appendLedger(app.db, {
         companyId: req.companyId!,
         projectId: contract.projectId,
@@ -2503,7 +2510,13 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         const pkg = await app.db
           .select({ id: changeOrderPackages.id, reference: changeOrderPackages.reference, primeContractChangeId: changeOrderPackages.primeContractChangeId, status: changeOrderPackages.status })
           .from(changeOrderPackages)
-          .where(eq(changeOrderPackages.id, change.changeOrderPackageId))
+          .where(
+            and(
+              eq(changeOrderPackages.id, change.changeOrderPackageId),
+              eq(changeOrderPackages.companyId, contract.companyId),
+              eq(changeOrderPackages.projectId, contract.projectId),
+            ),
+          )
           .limit(1);
         if (pkg[0]?.primeContractChangeId && pkg[0].primeContractChangeId !== change.id) {
           throw conflict(

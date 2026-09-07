@@ -725,6 +725,29 @@ export const batchRoutes: FastifyPluginAsync = async (app) => {
         throw badRequest("A rejection needs a reason — the crew has to know what to fix.");
       }
 
+      /*
+       * ONE PERSON IS ONE TIER — the same control the card route carries.
+       *
+       * The level is DERIVED as "one above the highest already approved", so
+       * without this an approver on a two-tier crew simply pressed Approve
+       * twice: the first click took tier 1, the second took tier 2,
+       * `approvedLevels.size` reached the required count and the whole week
+       * flipped to approved with a single signature. The card route refuses
+       * exactly this (cards.ts); the batch route is where approval actually
+       * happens, so it has to refuse it harder.
+       */
+      const alreadyApprovedByMe = priorApprovals.find(
+        (a) => a.approverId === actorId && a.decision === "approved" && a.isSelfApproval === 0,
+      );
+      if (alreadyApprovedByMe && body.decision === "approved") {
+        throw conflict(
+          `Batch ${batch.reference} already carries an approval from you at level ` +
+            `${alreadyApprovedByMe.level}. One person is one tier: a second signature from the ` +
+            "same hand adds no independence, and a crew configured for two tiers asks for two " +
+            "people, not two clicks.",
+        );
+      }
+
       const approvalId = newId("tap");
       await app.db.insert(timecardApprovals).values({
         id: approvalId,

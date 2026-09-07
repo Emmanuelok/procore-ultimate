@@ -785,3 +785,345 @@ describe("commissioning test records", () => {
     expect(result.json().message).toContain("void");
   });
 });
+
+/* ================================================================== */
+/* Company-wide reads are not company-wide access                      */
+/* ================================================================== */
+
+describe("company-wide heat-number trace", () => {
+  it("shows a guest of the company nothing, and says the answer is about access", async () => {
+    const created = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/material-certificates`),
+      payload: {
+        certificateNumber: "MC-70001",
+        certificateType: "en_10204_3_1",
+        materialDescription: "S355J2 plate, 30mm",
+        heatNumber: "H-TRACE-1",
+        supplierVendorId: vendorId,
+        documentFileId: newId("file"),
+      },
+      headers: owner.headers,
+    });
+    expect(created.statusCode).toBe(201);
+
+    // The owner traces it: they can see every project in the company.
+    const asOwner = await app.inject({
+      method: "GET",
+      url: api("/companies/current/material-certificates/trace?heatNumber=H-TRACE-1"),
+      headers: owner.headers,
+    });
+    expect(asOwner.statusCode).toBe(200);
+    expect(asOwner.json().total).toBe(1);
+    expect(asOwner.json().scope.allProjects).toBe(true);
+
+    /*
+     * THE DEFECT: the route ran on company membership alone, which admits the
+     * role `guest` and checks no tool permission, so a subcontractor added to
+     * the tenant could enumerate supplier, material, heat number and
+     * verification standing for every certificate on every project.
+     */
+    const asGuest = await app.inject({
+      method: "GET",
+      url: api("/companies/current/material-certificates/trace?heatNumber=H-TRACE-1"),
+      headers: guestHeaders,
+    });
+    expect(asGuest.statusCode).toBe(200);
+    expect(asGuest.json().total).toBe(0);
+    expect(asGuest.json().items).toHaveLength(0);
+    expect(asGuest.json().scope.allProjects).toBe(false);
+    expect(asGuest.json().reasons.join(" ")).toContain("no project with quality access");
+  });
+});
+
+/* ================================================================== */
+/* Sub-reference allocation is a write, not a count                    */
+/* ================================================================== */
+
+describe("defect references under a defects liability period", () => {
+  it("allocates distinct references to two concurrent reports on the same period", async () => {
+    const dlp = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/dlps`),
+      payload: { name: "Concurrent DLP", startDate: "2030-01-01", durationMonths: 12 },
+      headers: owner.headers,
+    });
+    expect(dlp.statusCode).toBe(201);
+    const dlpId = dlp.json().id as string;
+
+    const report = (title: string) =>
+      app.inject({
+        method: "POST",
+        url: api(`/projects/${projectId}/dlps/${dlpId}/defects`),
+        payload: { title },
+        headers: owner.headers,
+      });
+    // Before the fix both requests computed `existing.length + 1`, both wrote
+    // the same `-D001` reference into uniqueIndex(dlpId, reference), and the
+    // loser came back as an uncaught 500.
+    const [a, b] = await Promise.all([report("Sticking door D12"), report("Leaking valve V4")]);
+    expect(a!.statusCode).toBe(201);
+    expect(b!.statusCode).toBe(201);
+    expect(a!.json().reference).not.toBe(b!.json().reference);
+
+    const list = await app.inject({
+      method: "GET",
+      url: api(`/projects/${projectId}/dlps/${dlpId}`),
+      headers: owner.headers,
+    });
+    const refs = (list.json().defects as Array<{ reference: string }>).map((d) => d.reference);
+    expect(new Set(refs).size).toBe(refs.length);
+  });
+});
+
+/* ================================================================== */
+/* A forced closure states its reason                                  */
+/* ================================================================== */
+
+describe("forcing a closure over open items", () => {
+  it("refuses to close an audit over open findings on force alone", async () => {
+    const audit = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/quality-audits`),
+      payload: { title: "Forced-closure audit", auditType: "internal", leadAuditorId: engineer.userId },
+      headers: owner.headers,
+    });
+    const auditId = audit.json().id as string;
+    const finding = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/quality-audits/${auditId}/findings`),
+      payload: {
+        findingType: "minor_nonconformity",
+        description: "Weld records not filed for level 3.",
+        requirement: "ISO 9001:2015 cl.7.5.3 — control of documented information.",
+        evidence: "Four joints with no record in the register.",
+      },
+      headers: owner.headers,
+    });
+    expect(finding.statusCode).toBe(201);
+
+    const bare = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/quality-audits/${auditId}/close`),
+      payload: { force: true },
+      headers: owner.headers,
+    });
+    expect(bare.statusCode).toBe(400);
+    expect(bare.json().message).toContain("stated reason");
+
+    const withReason = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/quality-audits/${auditId}/close`),
+      payload: {
+        force: true,
+        note: "Findings transferred to the contract closeout register at the client's direction.",
+      },
+      headers: owner.headers,
+    });
+    expect(withReason.statusCode).toBe(200);
+    expect(withReason.json().status).toBe("closed");
+    expect((withReason.json().detail as { closureNote: string }).closureNote).toContain(
+      "closeout register",
+    );
+  });
+
+  it("refuses to release retention over open defects on force alone", async () => {
+    const dlp = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/dlps`),
+      payload: {
+        name: "Forced DLP",
+        startDate: "2030-01-01",
+        durationMonths: 12,
+        retentionAmount: 10_000,
+        currency: "GBP",
+      },
+      headers: owner.headers,
+    });
+    const dlpId = dlp.json().id as string;
+    await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/dlps/${dlpId}/defects`),
+      payload: { title: "Cracked screed to plant room" },
+      headers: owner.headers,
+    });
+
+    const bare = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/dlps/${dlpId}/close`),
+      payload: { force: true },
+      headers: owner.headers,
+    });
+    expect(bare.statusCode).toBe(400);
+    expect(bare.json().message).toContain("stated reason");
+
+    const withReason = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/dlps/${dlpId}/close`),
+      payload: {
+        force: true,
+        note: "Employer accepted the screed defect against a £4,000 deduction agreed on 2031-02-02.",
+      },
+      headers: owner.headers,
+    });
+    expect(withReason.statusCode).toBe(200);
+    expect(withReason.json().status).toBe("closed");
+  });
+});
+
+/* ================================================================== */
+/* Money that only moves one way                                       */
+/* ================================================================== */
+
+describe("negative money", () => {
+  it("refuses a negative LD rate, cap and retention", async () => {
+    const negativeRate = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/performance-guarantees`),
+      payload: {
+        title: "Chiller capacity",
+        parameter: "Cooling capacity",
+        operator: "at_least",
+        guaranteedValue: 1200,
+        unit: "kW",
+        // A minus sign here used to SUBTRACT from the project's LD exposure.
+        ldRatePerUnit: -100,
+        currency: "GBP",
+      },
+      headers: owner.headers,
+    });
+    expect(negativeRate.statusCode).toBe(400);
+
+    const negativeCap = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/performance-guarantees`),
+      payload: {
+        title: "Chiller capacity",
+        parameter: "Cooling capacity",
+        operator: "at_least",
+        guaranteedValue: 1200,
+        ldRatePerUnit: 100,
+        ldCapAmount: -5000,
+        currency: "GBP",
+      },
+      headers: owner.headers,
+    });
+    expect(negativeCap.statusCode).toBe(400);
+
+    const negativeRetention = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/dlps`),
+      payload: {
+        name: "Negative retention",
+        startDate: "2030-01-01",
+        durationMonths: 12,
+        retentionAmount: -1,
+      },
+      headers: owner.headers,
+    });
+    expect(negativeRetention.statusCode).toBe(400);
+  });
+
+  it("refuses a negative rework cost, which would understate what rework cost", async () => {
+    const negative = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/rework-items`),
+      payload: {
+        title: "Re-lay tiling to lobby",
+        causeCategory: "workmanship",
+        labourCost: -500,
+        currency: "GBP",
+      },
+      headers: owner.headers,
+    });
+    expect(negative.statusCode).toBe(400);
+  });
+});
+
+/* ================================================================== */
+/* An instrument comes back into service on evidence                   */
+/* ================================================================== */
+
+describe("an instrument that failed calibration", () => {
+  it("cannot be returned to service by a status change, only by a passing calibration", async () => {
+    const created = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/instruments`),
+      payload: {
+        name: "Torque wrench 0–300 Nm",
+        serialNumber: "TW-REG-1",
+        instrumentType: "torque_wrench",
+        calibrationIntervalMonths: 12,
+        lastCalibratedAt: "2029-01-15",
+      },
+      headers: owner.headers,
+    });
+    expect(created.statusCode).toBe(201);
+    const instrumentId = created.json().id as string;
+
+    const failed = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/instruments/${instrumentId}/calibrate`),
+      payload: {
+        calibratedAt: "2030-01-10",
+        result: "fail",
+        asFoundCondition: "Reading 12% high at 200 Nm.",
+      },
+      headers: owner.headers,
+    });
+    expect(failed.statusCode).toBe(201);
+    expect(failed.json().status).toBe("out_of_service");
+
+    /*
+     * THE DEFECT: one call to /status put it straight back into service with
+     * no new calibration record and nothing said about the failure, after
+     * which the register read it as calibrated and every test record made
+     * with it inherited a certificate that did not exist.
+     */
+    const backByStatus = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/instruments/${instrumentId}/status`),
+      payload: { status: "in_service" },
+      headers: owner.headers,
+    });
+    expect(backByStatus.statusCode).toBe(400);
+    expect(backByStatus.json().message).toContain("passing calibration");
+
+    const stillOut = await app.inject({
+      method: "GET",
+      url: api(`/projects/${projectId}/instruments/${instrumentId}`),
+      headers: owner.headers,
+    });
+    expect(stillOut.json().status).toBe("out_of_service");
+
+    const recalibrated = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/instruments/${instrumentId}/calibrate`),
+      payload: {
+        calibratedAt: "2030-02-01",
+        result: "pass",
+        certificateNumber: "CAL-REG-2",
+        asLeftCondition: "Within 1% across the range.",
+      },
+      headers: owner.headers,
+    });
+    expect(recalibrated.statusCode).toBe(201);
+    expect(recalibrated.json().status).toBe("in_service");
+
+    // And a deliberate withdrawal after a PASS is still allowed.
+    const withdrawn = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/instruments/${instrumentId}/status`),
+      payload: { status: "out_of_service", reason: "Sent to the hire company." },
+      headers: owner.headers,
+    });
+    expect(withdrawn.statusCode).toBe(200);
+    const back = await app.inject({
+      method: "POST",
+      url: api(`/projects/${projectId}/instruments/${instrumentId}/status`),
+      payload: { status: "in_service" },
+      headers: owner.headers,
+    });
+    expect(back.statusCode).toBe(200);
+  });
+});

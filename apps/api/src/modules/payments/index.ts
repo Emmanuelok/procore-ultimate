@@ -28,7 +28,7 @@ import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { addDaysISO, isoDateSchema, todayISO } from "../field/dates.js";
 import { pushNotifications } from "../notifications/service.js";
 import { computeTimeline, findRegime, REGIME_LIBRARY } from "./regimes.js";
-import { lienRoutes } from "./liens.js";
+import { OPEN_LIEN_STATUSES, lienRoutes } from "./liens.js";
 import { reconcileAccountRow, securityAccountRoutes } from "./security.js";
 import { adjudicationRoutes } from "./adjudication.js";
 import { supplyChainRoutes } from "./supplychain.js";
@@ -481,10 +481,10 @@ export const paymentsModule: FastifyPluginAsync = async (app) => {
               c.responseDeadline >= today &&
               c.responseDeadline <= addDaysISO(today, 7),
           ).length,
-        openLiens: liens.filter((l) => ["noticed", "filed", "disputed"].includes(l.status)).length,
+        openLiens: liens.filter((l) => (OPEN_LIEN_STATUSES as readonly string[]).includes(l.status)).length,
         liensPastDeadline: liens.filter(
           (l) =>
-            ["noticed", "filed", "disputed"].includes(l.status) &&
+            (OPEN_LIEN_STATUSES as readonly string[]).includes(l.status) &&
             l.deadlineAt !== null &&
             l.deadlineAt < today,
         ).length,

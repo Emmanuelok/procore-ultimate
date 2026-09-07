@@ -1579,19 +1579,22 @@ export const scheduleModule: FastifyPluginAsync = async (app) => {
         return s < to && f >= from;
       };
       const selected = tasks.filter((t) => t.percentComplete < 100 && overlaps(t));
-      const constraintRows =
-        selected.length > 0
-          ? await app.db
-              .select()
-              .from(scheduleConstraints)
-              .where(
-                and(
-                  eq(scheduleConstraints.scheduleId, scheduleId),
-                  ne(scheduleConstraints.status, "cleared"),
-                  ne(scheduleConstraints.status, "void"),
-                ),
-              )
-          : [];
+      const selectedIds = new Set(selected.map((t) => t.id));
+      /* The make-ready log is queried unconditionally: an empty window is
+         exactly when a planner needs to see that constraints are still open,
+         and a window with no activity in it used to report zero. */
+      const constraintRows = await app.db
+        .select()
+        .from(scheduleConstraints)
+        .where(
+          and(
+            eq(scheduleConstraints.companyId, req.companyId!),
+            eq(scheduleConstraints.projectId, req.projectId!),
+            eq(scheduleConstraints.scheduleId, scheduleId),
+            ne(scheduleConstraints.status, "cleared"),
+            ne(scheduleConstraints.status, "void"),
+          ),
+        );
       const constraintsByTask = new Map<string, typeof constraintRows>();
       for (const c of constraintRows) {
         if (!c.taskId) continue;
@@ -1610,13 +1613,22 @@ export const scheduleModule: FastifyPluginAsync = async (app) => {
           const sb = b.startDate ?? "9999-12-31";
           return sa < sb ? -1 : sa > sb ? 1 : a.sortOrder - b.sortOrder;
         });
+      const inWindow = constraintRows.filter((c) => !c.taskId || selectedIds.has(c.taskId));
+      const today = todayISO();
       return {
         weeks: q.weeks,
         from,
         to,
         items,
         total: items.length,
-        constraintsOpen: constraintRows.filter((c) => !c.taskId || constraintsByTask.has(c.taskId)).length,
+        /** every open constraint on this programme, whatever window is asked for */
+        constraintsOpen: constraintRows.length,
+        /** the subset attached to an activity in this window, plus programme-level ones */
+        constraintsInWindow: inWindow.length,
+        /** open constraints whose need-by date has already passed */
+        constraintsOverdue: constraintRows.filter((c) => c.needByDate !== null && c.needByDate < today).length,
+        constraintsBasis:
+          "constraintsOpen counts every open or escalated constraint on this programme; constraintsInWindow counts those on an activity selected for this window plus programme-level constraints",
       };
     },
   );

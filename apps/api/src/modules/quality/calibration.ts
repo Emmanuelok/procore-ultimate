@@ -447,6 +447,33 @@ export const calibrationRoutes: FastifyPluginAsync = async (app) => {
           "Taking an instrument out of service is a decision that affects every reading it was used for; it must carry a reason.",
         );
       }
+      /*
+       * AN INSTRUMENT THAT FAILED CALIBRATION COMES BACK ON EVIDENCE.
+       *
+       * The calibrate route moves an instrument found out of tolerance to
+       * out_of_service and computes the window of readings its failure puts in
+       * doubt. This route would then put it straight back to in_service with
+       * one call, no new calibration record and nothing said about why the
+       * failure no longer mattered — after which the register reads it as a
+       * calibrated instrument and every subsequent test record made with it
+       * inherits a certificate that does not exist. The way back is a passing
+       * calibration.
+       */
+      if (body.status === "in_service") {
+        const history = await app.db
+          .select({ calibratedAt: calibrationRecords.calibratedAt, result: calibrationRecords.result })
+          .from(calibrationRecords)
+          .where(eq(calibrationRecords.instrumentId, id))
+          .orderBy(desc(calibrationRecords.calibratedAt), desc(calibrationRecords.createdAt));
+        const latest = history[0];
+        if (latest && latest.result === "fail") {
+          throw badRequest(
+            `${row.reference} last calibrated ${latest.calibratedAt} and FAILED. It cannot be returned to service by changing its status: ` +
+              `record the passing calibration that shows it is back in tolerance (POST /projects/{projectId}/instruments/${id}/calibrate), ` +
+              `and the readings its failure put in doubt stay named on the record either way.`,
+          );
+        }
+      }
       await app.db
         .update(calibratedInstruments)
         .set({

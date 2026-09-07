@@ -1218,3 +1218,113 @@ describe("ERP export", () => {
     expect(res.statusCode).toBe(403);
   });
 });
+
+/* ================================================================== */
+/* Verifier blocker — retainage released on the invoice pay route      */
+/* ================================================================== */
+
+/**
+ * `retainageReleasedAmount` on POST /invoices/:id/payments used to be written
+ * onto the register row and nowhere else: `commitments.retainageHeld` is
+ * DERIVED from the schedule of values, so the release was invisible to the
+ * register and the same money could be released again through the commitments
+ * route — while the remittance advice, the vendor portal and the ERP export
+ * all told the outside world it had gone. It now runs the same two calls the
+ * commitments-side issue runs.
+ */
+describe("retainage released through the invoicing pay route reaches the schedule of values", () => {
+  let comm: string;
+  let invId: string;
+  let paymentId: string;
+
+  beforeAll(async () => {
+    const c = await makeCommitment({ billed: 80000 }); // 8,000 of retainage held
+    comm = c.id;
+    invId = await submittedInvoice(comm, 9000);
+    const approved = await inject("POST", `/api/v1/invoices/${invId}/approve`, owner.headers, {});
+    expect(approved.statusCode).toBe(200);
+  });
+
+  it("holds 8,000 before anything is paid", async () => {
+    const row = (
+      await built.app.db.select().from(commitments).where(eq(commitments.id, comm)).limit(1)
+    )[0]!;
+    /* 80,000 pre-billed plus the 9,000 this invoice posted on approval */
+    expect(row.retainageHeld).toBeCloseTo(8900, 2);
+  });
+
+  it("applies the release to the SOV lines when the payment is issued", async () => {
+    const res = await inject("POST", `/api/v1/invoices/${invId}/payments`, clerkH, {
+      amount: 9000,
+      method: "ach",
+      status: "issued",
+      retainageReleasedAmount: 8000,
+    });
+    expect(res.statusCode).toBe(201);
+    paymentId = res.json().payment.id as string;
+    expect(res.json().payment.status).toBe("issued");
+
+    const lines = await built.app.db
+      .select()
+      .from(commitmentSovLines)
+      .where(eq(commitmentSovLines.commitmentId, comm));
+    const released = lines.reduce((s, l) => s + l.retainageReleased, 0);
+    expect(released).toBeCloseTo(8000, 2);
+
+    const row = (
+      await built.app.db.select().from(commitments).where(eq(commitments.id, comm)).limit(1)
+    )[0]!;
+    /* the 8,000 has gone; only the 900 withheld from this period's billing remains */
+    expect(row.retainageHeld).toBeCloseTo(900, 2);
+  });
+
+  it("stamps retainageAppliedAt so a later fail or void can put it back", async () => {
+    const res = await inject("GET", `/api/v1/commitment-payments/${paymentId}`, owner.headers);
+    expect(res.statusCode).toBe(200);
+    expect(res.json().payment.detail.retainageAppliedAt).toEqual(expect.any(String));
+  });
+
+  it("REFUSES a second release of the same retainage through the commitments route", async () => {
+    const res = await inject("POST", `/api/v1/commitments/${comm}/payments`, owner.headers, {
+      amount: 0,
+      retainageReleasedAmount: 8000,
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toMatch(/retainage/i);
+  });
+
+  it("refuses a release larger than the retainage held on the invoicing route too", async () => {
+    const other = await makeCommitment({ billed: 20000 }); // 2,000 held
+    const inv = await submittedInvoice(other.id, 1000);
+    await inject("POST", `/api/v1/invoices/${inv}/approve`, owner.headers, {});
+    const res = await inject("POST", `/api/v1/invoices/${inv}/payments`, clerkH, {
+      amount: 1000,
+      method: "ach",
+      status: "issued",
+      retainageReleasedAmount: 9000,
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toMatch(/retainage/i);
+    const lines = await built.app.db
+      .select()
+      .from(commitmentSovLines)
+      .where(eq(commitmentSovLines.commitmentId, other.id));
+    expect(lines.reduce((s, l) => s + l.retainageReleased, 0)).toBe(0);
+  });
+
+  it("puts the retainage back when the payment is voided", async () => {
+    const res = await inject("POST", `/api/v1/commitment-payments/${paymentId}/void`, owner.headers, {
+      reason: "Bank rejected the file",
+    });
+    expect(res.statusCode).toBe(200);
+    const lines = await built.app.db
+      .select()
+      .from(commitmentSovLines)
+      .where(eq(commitmentSovLines.commitmentId, comm));
+    expect(lines.reduce((s, l) => s + l.retainageReleased, 0)).toBeCloseTo(0, 2);
+    const row = (
+      await built.app.db.select().from(commitments).where(eq(commitments.id, comm)).limit(1)
+    )[0]!;
+    expect(row.retainageHeld).toBeCloseTo(8900, 2);
+  });
+});

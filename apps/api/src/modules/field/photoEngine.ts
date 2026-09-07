@@ -13,6 +13,13 @@
 
 export const PHOTO_MAX_BYTES = 50 * 1024 * 1024;
 
+/**
+ * Ceiling on one bulk-download selection (#438). The archive is streamed, so
+ * this bounds transfer and storage read time rather than memory; it stays as
+ * a guard against a single request pulling the whole project's media.
+ */
+export const BULK_DOWNLOAD_MAX_BYTES = 500 * 1024 * 1024;
+
 export const PHOTO_MEDIA_TYPES = [
   "image/jpeg",
   "image/png",

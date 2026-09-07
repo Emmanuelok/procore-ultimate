@@ -22,7 +22,7 @@ import {
   valuations,
   variations,
 } from "@constructos/db";
-import { FINAL_ACCOUNT_CATEGORIES } from "@constructos/shared";
+import { FINAL_ACCOUNT_CATEGORIES, type FinalAccountCategory } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
@@ -42,8 +42,6 @@ import {
 const cvrQuery = z.object({
   periodEnd: isoDateSchema.optional(),
   currency: z.string().min(3).max(8).optional(),
-  /** persist the result as a CVR period record */
-  save: z.coerce.boolean().optional(),
 });
 
 const linkSchema = z.object({
@@ -57,8 +55,20 @@ const finalAccountCreateSchema = z.object({
   boqId: z.string().nullable().optional(),
 });
 
+/**
+ * A manual line is somebody's judgement added to the schedule. `contract_sum`
+ * is NOT one of them — the contract sum is the account's opening figure, taken
+ * from the contract, and a manual line carrying that category was persisted
+ * and displayed but deliberately excluded from the roll-up: money on screen
+ * that was not in the total.
+ */
+type ManualCategory = Exclude<FinalAccountCategory, "contract_sum">;
+const MANUAL_LINE_CATEGORIES = FINAL_ACCOUNT_CATEGORIES.filter(
+  (c): c is ManualCategory => c !== "contract_sum",
+) as [ManualCategory, ...ManualCategory[]];
+
 const manualLineSchema = z.object({
-  category: z.enum(FINAL_ACCOUNT_CATEGORIES),
+  category: z.enum(MANUAL_LINE_CATEGORIES),
   description: z.string().min(1).max(500),
   amount: z.number().finite(),
   note: z.string().max(2000).nullable().optional(),
@@ -102,10 +112,18 @@ export const reportingRoutes: FastifyPluginAsync = async (app) => {
   /* CVR (#184-187)                                                    */
   /* ---------------------------------------------------------------- */
 
-  app.get("/projects/:projectId/commercial/cvr", { preHandler: readGate }, async (req) => {
-    const q = cvrQuery.parse(req.query);
-    const companyId = req.companyId!;
-    const projectId = req.projectId!;
+  /**
+   * Compute the CVR for a period. Reads only — persistence is a POST.
+   *
+   * The save used to hang off `?save=true` on this GET, so a caller holding
+   * commercial:read could create durable CVR periods and ledger entries, and
+   * any replay of the URL silently rewrote the period.
+   */
+  async function computeProjectCvr(
+    companyId: string,
+    projectId: string,
+    q: { periodEnd?: string; currency?: string },
+  ) {
     const periodEnd = q.periodEnd ?? todayISO();
     const currencies = await projectCurrencies(companyId, projectId);
     const currency = q.currency ?? currencies[0] ?? "USD";
@@ -254,9 +272,31 @@ export const reportingRoutes: FastifyPluginAsync = async (app) => {
       packages,
     });
     result.gaps.unshift(...gaps);
+    return { result, currencies, currency, periodEnd };
+  }
 
-    let cvrPeriodId: string | null = null;
-    if (q.save) {
+  app.get("/projects/:projectId/commercial/cvr", { preHandler: readGate }, async (req) => {
+    const q = cvrQuery.parse(req.query);
+    const { result, currencies } = await computeProjectCvr(req.companyId!, req.projectId!, q);
+    return { ...result, currencies, cvrPeriodId: null };
+  });
+
+  /**
+   * Persist the period as the CVR of record (#186). A write, gated as one,
+   * ledgered with the person who took the snapshot.
+   */
+  app.post(
+    "/projects/:projectId/commercial/cvr/snapshot",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const q = cvrQuery.parse(req.body ?? {});
+      const companyId = req.companyId!;
+      const projectId = req.projectId!;
+      const { result, currencies, currency, periodEnd } = await computeProjectCvr(
+        companyId,
+        projectId,
+        q,
+      );
       let periodId = newId("cvr");
       await app.db.transaction(async (tx) => {
         const existing = await tx
@@ -322,7 +362,6 @@ export const reportingRoutes: FastifyPluginAsync = async (app) => {
           });
         }
       });
-      cvrPeriodId = periodId;
       await appendLedger(app.db, {
         companyId,
         actorId: req.user!.id,
@@ -338,10 +377,9 @@ export const reportingRoutes: FastifyPluginAsync = async (app) => {
         },
         storePayload: true,
       });
-    }
-
-    return { ...result, currencies, cvrPeriodId };
-  });
+      return reply.status(201).send({ ...result, currencies, cvrPeriodId: periodId });
+    },
+  );
 
   app.get("/projects/:projectId/commercial/cvr-history", { preHandler: readGate }, async (req) => {
     const q = pageQuerySchema.parse(req.query);
@@ -469,6 +507,42 @@ export const reportingRoutes: FastifyPluginAsync = async (app) => {
     return { ...result, currencies, totalBoq, linkedTasks: sCurveTasks.length };
   });
 
+  /**
+   * The programme activities BQ money can be spread over. Read from the
+   * schedule the project already holds, so the cash-flow tab can offer a
+   * picker instead of asking a quantity surveyor to paste task ids.
+   */
+  app.get(
+    "/projects/:projectId/commercial/schedule-tasks",
+    { preHandler: readGate },
+    async (req) => {
+      const q = z
+        .object({ search: z.string().max(200).optional(), limit: z.coerce.number().int().min(1).max(500).optional() })
+        .parse(req.query);
+      const rows = await app.db
+        .select({
+          id: scheduleTasks.id,
+          name: scheduleTasks.name,
+          wbsCode: scheduleTasks.wbsCode,
+          startDate: scheduleTasks.startDate,
+          finishDate: scheduleTasks.finishDate,
+        })
+        .from(scheduleTasks)
+        .where(eq(scheduleTasks.projectId, req.projectId!))
+        .orderBy(asc(scheduleTasks.startDate))
+        .limit(q.limit ?? 500);
+      const needle = q.search?.toLowerCase();
+      const items = needle
+        ? rows.filter(
+            (t) =>
+              t.name.toLowerCase().includes(needle) ||
+              (t.wbsCode ?? "").toLowerCase().includes(needle),
+          )
+        : rows;
+      return { items, total: items.length };
+    },
+  );
+
   app.get("/projects/:projectId/commercial/schedule-links", { preHandler: readGate }, async (req) => {
     const items = await app.db
       .select()
@@ -570,14 +644,65 @@ export const reportingRoutes: FastifyPluginAsync = async (app) => {
     const gaps: string[] = [];
     const currency = contract.currency;
 
-    // Remeasurement: the movement in BQ value from applied remeasurements
-    const remeasureRows = await app.db
-      .select({ r: remeasurements, rate: boqItems.rate })
-      .from(remeasurements)
-      .innerJoin(boqItems, eq(boqItems.id, remeasurements.boqItemId))
+    /*
+     * SCOPE. A final account settles ONE contract. Every source below is
+     * therefore filtered to that contract: a project carrying a main contract
+     * and a package contract used to put each contract's variations, dayworks
+     * and price adjustments into BOTH final accounts, so the same money was
+     * signed off twice.
+     *
+     * Records that name no contract are not absorbed into whichever account is
+     * computed first — they are reported as a gap so somebody attributes them.
+     */
+    const contractBills = await app.db
+      .select({ id: boqs.id, name: boqs.name })
+      .from(boqs)
       .where(
-        and(eq(remeasurements.companyId, companyId), eq(remeasurements.projectId, projectId)),
+        and(
+          eq(boqs.companyId, companyId),
+          eq(boqs.projectId, projectId),
+          eq(boqs.contractId, contract.id),
+        ),
       );
+    const billIds = (
+      boqId != null ? contractBills.filter((b) => b.id === boqId) : contractBills
+    ).map((b) => b.id);
+    if (boqId != null && billIds.length === 0) {
+      gaps.push(
+        "The bill named on this account does not belong to its contract; nothing measured against it is included.",
+      );
+    }
+    const billSet = new Set(billIds);
+
+    /** Does this record belong to the contract being settled? */
+    const attribution = (
+      recordContractId: string | null,
+      label: string,
+    ): "include" | "skip" | "unattributed" => {
+      if (recordContractId === contract.id) return "include";
+      if (recordContractId == null) {
+        gaps.push(`${label} is not attributed to a contract, so it is not in this account.`);
+        return "unattributed";
+      }
+      return "skip";
+    };
+
+    // Remeasurement: the movement in BQ value from applied remeasurements on
+    // THIS contract's bills
+    const remeasureRows =
+      billIds.length === 0
+        ? []
+        : await app.db
+            .select({ r: remeasurements, rate: boqItems.rate })
+            .from(remeasurements)
+            .innerJoin(boqItems, eq(boqItems.id, remeasurements.boqItemId))
+            .where(
+              and(
+                eq(remeasurements.companyId, companyId),
+                eq(remeasurements.projectId, projectId),
+                inArray(remeasurements.boqId, billIds),
+              ),
+            );
     for (const { r, rate } of remeasureRows) {
       if (r.status !== "applied") {
         gaps.push(
@@ -604,6 +729,7 @@ export const reportingRoutes: FastifyPluginAsync = async (app) => {
       .where(and(eq(variations.companyId, companyId), eq(variations.projectId, projectId)));
     for (const v of varRows) {
       if (v.status === "rejected" || v.status === "withdrawn") continue;
+      if (attribution(v.contractId, `Variation ${v.number} ("${v.title}")`) !== "include") continue;
       if (v.currency !== currency) {
         gaps.push(`Variation ${v.number} is in ${v.currency}; it is not included in a ${currency} account.`);
         continue;
@@ -627,6 +753,8 @@ export const reportingRoutes: FastifyPluginAsync = async (app) => {
       .from(provisionalSums)
       .where(and(eq(provisionalSums.companyId, companyId), eq(provisionalSums.projectId, projectId)));
     for (const ps of psRows) {
+      // a provisional sum lives in a bill; the bill names the contract
+      if (!billSet.has(ps.boqId)) continue;
       if (ps.currency !== currency) {
         gaps.push(`Provisional sum "${ps.title}" is in ${ps.currency} and is excluded.`);
         continue;
@@ -660,6 +788,7 @@ export const reportingRoutes: FastifyPluginAsync = async (app) => {
       .where(and(eq(dayworkSheets.companyId, companyId), eq(dayworkSheets.projectId, projectId)));
     for (const s of sheets) {
       if (s.status === "rejected" || s.status === "draft") continue;
+      if (attribution(s.contractId, `Daywork sheet ${s.number}`) !== "include") continue;
       if (s.currency !== currency) {
         gaps.push(`Daywork sheet ${s.number} is in ${s.currency} and is excluded.`);
         continue;
@@ -689,7 +818,14 @@ export const reportingRoutes: FastifyPluginAsync = async (app) => {
         ),
       );
     for (const f of fluctuations) {
-      if (f.currency !== currency || Math.abs(f.adjustment) < 0.005) continue;
+      if (Math.abs(f.adjustment) < 0.005) continue;
+      if (
+        attribution(f.contractId, `Price adjustment ${f.currentPeriod} (${f.formula})`) !==
+        "include"
+      ) {
+        continue;
+      }
+      if (f.currency !== currency) continue;
       lines.push({
         category: "fluctuation",
         description: `Price adjustment ${f.currentPeriod} (${f.formula})`,
@@ -735,11 +871,17 @@ export const reportingRoutes: FastifyPluginAsync = async (app) => {
           ne(paymentCertificates.status, "withdrawn"),
         ),
       );
+    // certified against THIS contract's bills only
     const certifiedToDate = round2(
       certRows
-        .filter((c) => c.currency === currency && (boqId == null || c.boqId === boqId))
+        .filter((c) => c.currency === currency && billSet.has(c.boqId))
         .reduce((s, c) => s + c.net, 0),
     );
+    if (billIds.length === 0) {
+      gaps.push(
+        "No bill of quantities is linked to this contract, so remeasurement, provisional sums and the certified position could not be drawn from one.",
+      );
+    }
 
     return { lines, gaps, certifiedToDate };
   }

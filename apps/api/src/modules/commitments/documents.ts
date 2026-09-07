@@ -719,6 +719,36 @@ export const contractDocumentRoutes: FastifyPluginAsync = async (app) => {
       signers.find((s) => !s.signedAt);
     if (!target) return reply.status(200).send({ accepted: false, reason: "no matching signer" });
     if (target.signedAt) return reply.status(200).send({ accepted: true, alreadySigned: true });
+    /*
+     * SIGNERS SIGN IN ORDER — the same rule the manual sign route enforces.
+     * A provider that posts signer #3 before #1 would otherwise execute the
+     * commitment out of sequence once the last signature landed. The refusal
+     * is a 200 so the provider records the delivery and stops retrying; the
+     * out-of-order attempt is on the ledger either way.
+     */
+    const earlier = signers.filter((s) => s.order < target.order && !s.signedAt);
+    if (earlier.length > 0) {
+      await appendLedger(app.db, {
+        companyId: doc.companyId,
+        actorId: null,
+        action: "access",
+        objectType: "commitment",
+        objectId: doc.commitmentId,
+        projectId: doc.projectId,
+        payload: {
+          contractDocumentId: doc.id,
+          event: "out_of_order_signature_refused",
+          attemptedOrder: target.order,
+          awaiting: earlier.map((s) => ({ order: s.order, name: s.name })),
+        },
+        storePayload: true,
+      });
+      return reply.status(200).send({
+        accepted: false,
+        reason: "out of order",
+        detail: `Signers sign in order; ${earlier.map((s) => `#${s.order} ${s.name}`).join(", ")} have not signed yet.`,
+      });
+    }
     const signedAt = body.signedAt && !Number.isNaN(Date.parse(body.signedAt)) ? new Date(body.signedAt).toISOString() : now;
     const next = signers.map((s) =>
       s.order === target.order ? { ...s, signedAt, method: body.method ?? "e_signature", reference: body.reference ?? null } : s,

@@ -23,7 +23,7 @@
  * separate portal view exists in this wave.
  */
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, inArray, lt } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, lt, ne } from "drizzle-orm";
 import { z } from "zod";
 import {
   commitments,
@@ -670,12 +670,22 @@ export const primeLifecycleRoutes: FastifyPluginAsync = async (app) => {
     await requireLevel(req, reply, receipt.projectId, "admin");
     if (receipt.status === "void") throw conflict(`${receipt.reference} is already void.`);
     const now = nowIso();
-    await db
-      .update(ownerPaymentReceipts)
-      .set({ status: "void", voidReason: body.reason, voidedBy: req.user!.id, voidedAt: now, updatedAt: now })
-      .where(eq(ownerPaymentReceipts.id, receiptId));
-    const settlement = await settleApplication(db, receipt.paymentApplicationId);
-    const contract = await recalcContract(db, receipt.primeContractId, receipt.companyId);
+    // Voiding a receipt un-pays money: the void, the application's settlement
+    // and the contract's paid position are one transaction, claimed on the
+    // status this route read so a concurrent void cannot subtract it twice.
+    const { settlement, contract } = await db.transaction(async (tx) => {
+      const claimed = await tx
+        .update(ownerPaymentReceipts)
+        .set({ status: "void", voidReason: body.reason, voidedBy: req.user!.id, voidedAt: now, updatedAt: now })
+        .where(and(eq(ownerPaymentReceipts.id, receiptId), ne(ownerPaymentReceipts.status, "void")))
+        .returning({ id: ownerPaymentReceipts.id });
+      if (claimed.length !== 1) {
+        throw conflict(`${receipt.reference} is already void.`);
+      }
+      const settled = await settleApplication(tx as unknown as typeof db, receipt.paymentApplicationId);
+      const recalculated = await recalcContract(tx as unknown as typeof db, receipt.primeContractId, receipt.companyId);
+      return { settlement: settled, contract: recalculated };
+    });
     await appendLedger(db, {
       companyId: receipt.companyId,
       projectId: receipt.projectId,

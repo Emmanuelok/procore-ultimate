@@ -17,7 +17,6 @@ import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import type { Db } from "../../lib/db.js";
 import { settleAfterTransition } from "../invoicing/register.js";
 import { requestWaiverForPayment } from "../invoicing/waivers.js";
-import { deriveSovLine } from "./arithmetic.js";
 import { assessCommitment, type ComplianceResult } from "./compliance.js";
 import { withIdempotency } from "./idempotency.js";
 import { commitmentPosition, recomputeCommitmentTotals } from "./rollups.js";
@@ -145,23 +144,24 @@ export async function allocateRetainageRelease(
   });
   for (const { line, share } of shares) {
     if (share === 0) continue;
+    /*
+     * ONLY the two retainage columns move. Re-deriving the whole line from
+     * `previousBilled + thisPeriodWork` would be wrong here: once an invoice
+     * has posted to the schedule of values, `previousBilled` ALREADY includes
+     * that period's work (invoices.ts `postInvoiceToSov` rolls it forward and
+     * keeps `thisPeriodWork` for the G703 column), so re-deriving would count
+     * the period twice and inflate the retainage this release is reducing.
+     * Releasing retainage is not a billing event; it moves money that has
+     * already been withheld, and subtracting the share from what the line
+     * holds is both correct and exactly reversible.
+     */
     const retainageReleased = round2(line.retainageReleased + share);
-    const derived = deriveSovLine({
-      scheduledValue: line.scheduledValue,
-      changeOrderValue: line.changeOrderValue,
-      previousBilled: line.previousBilled,
-      previousStoredMaterials: line.previousStoredMaterials,
-      thisPeriodWork: line.thisPeriodWork,
-      thisPeriodStoredMaterials: line.thisPeriodStoredMaterials,
-      materialsPresentlyStored: line.materialsPresentlyStored,
-      retainagePercent: line.retainagePercent,
-      retainageReleased,
-    });
+    const retainageHeld = round2(line.retainageHeld - share);
     await db
       .update(commitmentSovLines)
       .set({
         retainageReleased,
-        retainageHeld: derived.retainageHeld,
+        retainageHeld,
         updatedAt: new Date().toISOString(),
       })
       .where(eq(commitmentSovLines.id, line.id));
@@ -839,10 +839,15 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
       if (payment.status !== "scheduled") {
         throw conflict(`A payment in status "${payment.status}" cannot be put on hold`);
       }
-      await app.db
+      /* guarded: an issue racing this hold must not find the payment already gone */
+      const held = await app.db
         .update(commitmentPayments)
         .set({ status: "on_hold", holdReason: body.reason, updatedAt: new Date().toISOString() })
-        .where(eq(commitmentPayments.id, paymentId));
+        .where(and(eq(commitmentPayments.id, paymentId), eq(commitmentPayments.status, "scheduled")))
+        .returning({ id: commitmentPayments.id });
+      if (held.length === 0) {
+        throw conflict("This payment moved before it could be held. Reload it before acting.");
+      }
       await ledger(app.db, req, "state_change", "commitment_payment", paymentId, {
         status: "on_hold",
         reason: body.reason,
@@ -884,10 +889,14 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
           );
         }
       }
-      await app.db
+      const released = await app.db
         .update(commitmentPayments)
         .set({ status: "scheduled", holdReason: null, updatedAt: new Date().toISOString() })
-        .where(eq(commitmentPayments.id, paymentId));
+        .where(and(eq(commitmentPayments.id, paymentId), eq(commitmentPayments.status, "on_hold")))
+        .returning({ id: commitmentPayments.id });
+      if (released.length === 0) {
+        throw conflict("This payment moved before it could be released. Reload it before acting.");
+      }
       await ledger(app.db, req, "state_change", "commitment_payment", paymentId, {
         status: "scheduled",
         previousHoldReason: payment.holdReason,

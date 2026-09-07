@@ -8,8 +8,9 @@
  *   PV (planned value)  = Σ BAC × plannedFraction(dataDate)
  *   EV (earned value)   = Σ BAC × percentComplete/100
  *   AC (actual cost)    = Σ booked cost (from resources, or the budget line)
- *   SV = EV − PV,  SPI = EV / PV,  CV = EV − AC,  CPI = EV / AC
- *   EAC = BAC / CPI  (cost-performance EAC)
+ *   SV = EV − PV,  SPI = EV / PV,  CV = EV − AC
+ *   CPI = EV(costed) / AC   — over the activities that actually carry a cost
+ *   EAC = BAC(costed) / CPI + BAC(uncosted)   (cost-performance EAC)
  *   Schedule EAC (time) = plannedDuration / SPI, reported in days
  *
  * plannedFraction is the linear share of an activity's baseline (or planned)
@@ -20,6 +21,12 @@
  * HONESTY RULES enforced here:
  *  - an activity with no cost basis contributes to NOTHING (it is counted in
  *    `unpriced` and named in `reasons`), it is never treated as zero;
+ *  - a priced activity whose ACTUAL COST is unknown does not contribute a
+ *    zero to AC either: it is counted in `costUnknown`, its earned value is
+ *    kept out of the CPI numerator so CPI stays EV(costed) / AC(costed), and
+ *    once the unknown share of BAC passes `COST_COVERAGE_FLOOR` CPI/EAC are
+ *    returned as null with the reason, because a cost index measured over a
+ *    minority of the work is not a cost index;
  *  - SPI/CPI are null when their denominator is 0, never Infinity or 1;
  *  - currencies are never mixed: the caller passes one currency's worth of
  *    activities, and the result carries that currency.
@@ -53,9 +60,11 @@ export interface EvActivityResult {
   bac: number;
   pv: number;
   ev: number;
-  ac: number;
+  /** null when no cost source exists for the activity — never 0 */
+  ac: number | null;
   sv: number;
-  cv: number;
+  /** EV − AC; null when AC is unknown */
+  cv: number | null;
   plannedFraction: number;
 }
 
@@ -84,8 +93,19 @@ export interface EvResult {
   /** activities excluded for want of a cost basis */
   unpriced: number;
   pricedActivities: number;
+  /** priced activities with no booked-cost source — excluded from CPI */
+  costUnknown: number;
+  /** BAC of the priced activities that do carry a booked-cost source */
+  costedBac: number;
+  /** costedBac ÷ bac, 0..1; null when there is no priced work at all */
+  costCoverage: number | null;
+  /** earned value of the costed activities — the CPI numerator */
+  costedEv: number;
   reasons: string[];
 }
+
+/** Below this share of priced BAC carrying a cost source, CPI/EAC are withheld. */
+export const COST_COVERAGE_FLOOR = 0.5;
 
 const DAY_MS = 86_400_000;
 const round2 = (n: number) => Math.round(n * 100) / 100;
@@ -121,6 +141,9 @@ export function computeEarnedValue(input: EvInput): EvResult {
   let ac = 0;
   let unpriced = 0;
   let noDates = 0;
+  let costUnknown = 0;
+  let costedBac = 0;
+  let costedEv = 0;
 
   for (const a of input.activities) {
     if (a.bac === null || !Number.isFinite(a.bac) || a.bac <= 0) {
@@ -133,20 +156,26 @@ export function computeEarnedValue(input: EvInput): EvResult {
     const pct = Math.min(100, Math.max(0, a.percentComplete)) / 100;
     const aPv = a.bac * f;
     const aEv = a.bac * pct;
-    const aAc = a.actualCost ?? 0;
+    const aAc = a.actualCost !== null && Number.isFinite(a.actualCost) ? a.actualCost : null;
     bac += a.bac;
     pv += aPv;
     ev += aEv;
-    ac += aAc;
+    if (aAc === null) {
+      costUnknown += 1;
+    } else {
+      ac += aAc;
+      costedBac += a.bac;
+      costedEv += aEv;
+    }
     activities.push({
       id: a.id,
       name: a.name,
       bac: round2(a.bac),
       pv: round2(aPv),
       ev: round2(aEv),
-      ac: round2(aAc),
+      ac: aAc === null ? null : round2(aAc),
       sv: round2(aEv - aPv),
-      cv: round2(aEv - aAc),
+      cv: aAc === null ? null : round2(aEv - aAc),
       plannedFraction: round4(f),
     });
   }
@@ -163,9 +192,24 @@ export function computeEarnedValue(input: EvInput): EvResult {
     reasons.push("No activity carries a cost basis — earned value is not available for this schedule");
   }
 
+  const costCoverage = bac > 0 ? round4(costedBac / bac) : null;
+  const coverageTooThin = costCoverage !== null && costCoverage < COST_COVERAGE_FLOOR;
+  if (costUnknown > 0) {
+    reasons.push(
+      `${costUnknown} priced activit${costUnknown === 1 ? "y has" : "ies have"} no booked cost — ${
+        coverageTooThin
+          ? "CPI and the cost forecast are withheld"
+          : `CPI is measured over the ${activities.length - costUnknown} that do (${Math.round((costCoverage ?? 0) * 100)}% of budget at completion)`
+      }, they are never counted as zero cost`,
+    );
+  }
+
   const spi = pv > 0 ? round4(ev / pv) : null;
-  const cpi = ac > 0 ? round4(ev / ac) : null;
-  const eac = cpi !== null && cpi > 0 ? round2(bac / cpi) : null;
+  const cpi = ac > 0 && !coverageTooThin ? round4(costedEv / ac) : null;
+  /* the index measures the costed work, so it forecasts the costed BAC and the
+     rest is carried at budget — extrapolating a subset index over the whole
+     programme would overstate precision. */
+  const eac = cpi !== null && cpi > 0 ? round2(costedBac / cpi + (bac - costedBac)) : null;
 
   const starts = input.activities.map((a) => a.plannedStart).filter((d): d is string => d !== null);
   const finishes = input.activities.map((a) => a.plannedFinish).filter((d): d is string => d !== null);
@@ -193,6 +237,10 @@ export function computeEarnedValue(input: EvInput): EvResult {
     activities,
     unpriced,
     pricedActivities: activities.length,
+    costUnknown,
+    costedBac: round2(costedBac),
+    costCoverage,
+    costedEv: round2(costedEv),
     reasons,
   };
 }

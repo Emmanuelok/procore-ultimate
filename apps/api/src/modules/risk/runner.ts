@@ -218,10 +218,33 @@ export class SimulationQueue {
    * success while a job is still half-run and the caller reads back a
    * `running` row it was told had finished.
    */
-  private inFlight: Promise<number> | null = null;
+  private inFlight: Promise<unknown> | null = null;
   private closed = false;
 
   constructor(private readonly opts: SimulationQueueOptions) {}
+
+  /**
+   * Serialise a unit of simulation work behind whatever is already running.
+   * EVERY path that burns CPU on a simulation goes through here — the drain
+   * loop and the reproducibility rerun alike — so this process never holds
+   * two multi-million-sample runs in memory at once no matter how many
+   * requests arrive.
+   */
+  private chain<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = this.inFlight;
+    const cycle = (async () => {
+      if (previous) await previous.catch(() => undefined);
+      return fn();
+    })();
+    this.inFlight = cycle;
+    return (async () => {
+      try {
+        return await cycle;
+      } finally {
+        if (this.inFlight === cycle) this.inFlight = null;
+      }
+    })();
+  }
 
   /** Kick the queue. Never throws into the caller — jobs record their own failure. */
   schedule(): void {
@@ -242,30 +265,47 @@ export class SimulationQueue {
    * serialised, and a caller's promise resolves only once ITS cycle has
    * drained the queue.
    */
-  async drain(): Promise<number> {
-    const previous = this.inFlight;
-    const cycle = (async () => {
-      if (previous) await previous.catch(() => 0);
-      return this.drainOnce();
-    })();
-    this.inFlight = cycle;
-    try {
-      return await cycle;
-    } finally {
-      if (this.inFlight === cycle) this.inFlight = null;
-    }
+  async drain(options: { companyId?: string } = {}): Promise<number> {
+    return this.chain(() => this.drainOnce(options.companyId));
   }
 
-  /** One pass over the queue. Never runs concurrently — `drain` serialises. */
-  private async drainOnce(): Promise<number> {
+  /**
+   * Run one simulation payload without a job row, serialised behind the
+   * queue. This is the reproducibility rerun: it needs the arithmetic, not a
+   * persisted simulation, but it must not be allowed to run N at a time.
+   */
+  async verify(
+    params: SimulationJobParams,
+    options: { iterations: number; seed: number },
+  ): Promise<SimulationOutcome> {
+    return this.chain(() =>
+      executeSimulation(params, {
+        iterations: options.iterations,
+        seed: options.seed,
+        log: this.opts.log,
+      }),
+    );
+  }
+
+  /**
+   * One pass over the queue. Never runs concurrently — `drain` serialises.
+   * `companyId` narrows the pass to one tenant: a user pressing "run queued
+   * simulations" pays for their own company's work, not another tenant's,
+   * and does not learn how deep another tenant's queue is.
+   */
+  private async drainOnce(companyId?: string): Promise<number> {
     let ran = 0;
     for (;;) {
       if (this.closed) break;
+      const where =
+        companyId === undefined
+          ? eq(simulationJobs.status, "queued")
+          : and(eq(simulationJobs.status, "queued"), eq(simulationJobs.companyId, companyId));
       const next = (
         await this.opts.db
           .select()
           .from(simulationJobs)
-          .where(eq(simulationJobs.status, "queued"))
+          .where(where)
           .orderBy(asc(simulationJobs.createdAt), asc(simulationJobs.id))
           .limit(1)
       )[0];
@@ -323,7 +363,7 @@ export class SimulationQueue {
   async settle(): Promise<void> {
     while (this.inFlight) {
       const current = this.inFlight;
-      await current.catch(() => 0);
+      await current.catch(() => undefined);
       if (this.inFlight === current) break;
     }
   }

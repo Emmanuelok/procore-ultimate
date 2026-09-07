@@ -308,10 +308,17 @@ export const dailyLogRoutes: FastifyPluginAsync = async (app) => {
     if (date > todayISO()) throw badRequest("A daily log cannot be written for a future date");
     const body = upsertSchema.parse(req.body);
     await assertVendor(app.db, req.companyId!, body.vendorId);
-    if (body.logKind === "subcontractor" && !body.vendorId) {
+    const existing = await myLog(req, date);
+    // #396: validate the EFFECTIVE kind/vendor (existing row overlaid with the
+    // patch), not just the fields this request happens to carry. Sending
+    // {vendorId: null} alone against a subcontractor draft used to leave a
+    // self-reported log attributed to no company, which then flows into the
+    // compliance grouping and the timecard reconciliation keyed on vendor.
+    const effectiveKind = body.logKind ?? existing?.logKind ?? "internal";
+    const effectiveVendor = body.vendorId !== undefined ? body.vendorId : (existing?.vendorId ?? null);
+    if (effectiveKind === "subcontractor" && !effectiveVendor) {
       throw badRequest("A subcontractor self-reported log must name its vendor");
     }
-    const existing = await myLog(req, date);
     const now = nowIso();
     const incoming = (body.sections ?? {}) as Record<string, unknown>;
 

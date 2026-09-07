@@ -1546,9 +1546,14 @@ export default function SchedulePage() {
                       ))}
                     </div>
                     {lookahead ? (
-                      <span className="text-xs text-ink-400">
+                      <span className="text-xs text-ink-400" title={lookahead.constraintsBasis}>
                         {formatDate(lookahead.from)} → {formatDate(lookahead.to)} ·{" "}
-                        {lookahead.total} task{lookahead.total === 1 ? "" : "s"}
+                        {lookahead.total} task{lookahead.total === 1 ? "" : "s"} ·{" "}
+                        {lookahead.constraintsInWindow} of {lookahead.constraintsOpen} open constraint
+                        {lookahead.constraintsOpen === 1 ? "" : "s"} in the window
+                        {lookahead.constraintsOverdue > 0
+                          ? ` · ${lookahead.constraintsOverdue} past need-by`
+                          : ""}
                       </span>
                     ) : null}
                   </div>
@@ -1562,7 +1567,13 @@ export default function SchedulePage() {
                   ) : lookahead.items.length === 0 ? (
                     <EmptyState
                       title="Nothing in the window"
-                      hint="No incomplete task starts or finishes inside the lookahead window."
+                      hint={
+                        lookahead.constraintsOpen > 0
+                          ? `No incomplete activity overlaps the lookahead window, but ${lookahead.constraintsOpen} make-ready constraint${
+                              lookahead.constraintsOpen === 1 ? " is" : "s are"
+                            } still open on this programme.`
+                          : "No incomplete activity overlaps the lookahead window."
+                      }
                     />
                   ) : (
                     <div className="overflow-x-auto rounded-lg bg-white shadow-sm ring-1 ring-ink-100">

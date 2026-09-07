@@ -460,6 +460,59 @@ describe("state transitions are claimed atomically", () => {
     expect(after.pendingBudgetChanges).toBe(before.pendingBudgetChanges - 10_000);
   });
 
+  /*
+   * The audit's bug-8 fix serialised the CHANGE row. The lines the change
+   * moves money on are a second shared resource: two DIFFERENT movements, each
+   * with a leg on the same line, approved at the same moment. Both used to
+   * read the line's approvedChanges before the transaction opened and write an
+   * absolute figure derived from that snapshot, so the later commit
+   * overwrote — not added to — the earlier one, and a leg's worth of money
+   * vanished from the revised budget with nothing to show it had.
+   */
+  it("adds both legs when two DIFFERENT changes move the same line concurrently", async () => {
+    // On a budget of its own, so the assertion is about the two movements and
+    // nothing else that runs against the shared budget can perturb it.
+    const fresh = await inject("POST", `/api/v1/projects/${proj}/budgets`, u1.headers, { name: "Concurrency", currency: "USD" });
+    expect(fresh.statusCode).toBe(201);
+    const raceBudget = fresh.json().id as string;
+    const mkLine = async (costCodeId: string, description: string, originalBudget: number): Promise<string> => {
+      const res = await inject("POST", `/api/v1/budgets/${raceBudget}/lines`, u1.headers, { costCodeId, description, originalBudget });
+      expect(res.statusCode).toBe(201);
+      return res.json().id as string;
+    };
+    const source = await mkLine(ccRebar, "Rebar", 200_000);
+    const target = await mkLine(ccCip, "Concrete", 100_000);
+    const mk = async (title: string, amount: number): Promise<string> => {
+      const created = await inject("POST", `/api/v1/budgets/${raceBudget}/changes`, h3, {
+        title,
+        fromLineItemId: source,
+        toLineItemId: target,
+        amount,
+      });
+      expect(created.statusCode).toBe(201);
+      const id = created.json().id as string;
+      expect((await inject("POST", `/api/v1/budget-changes/${id}/submit`, h3)).statusCode).toBe(200);
+      return id;
+    };
+    const first = await mk("Race A", 7_000);
+    const second = await mk("Race B", 3_000);
+    expect((await lineById(target)).pendingBudgetChanges).toBe(10_000);
+    const [a, b] = await Promise.all([
+      inject("POST", `/api/v1/budget-changes/${first}/approve`, h2),
+      inject("POST", `/api/v1/budget-changes/${second}/approve`, u1.headers),
+    ]);
+    expect([a.statusCode, b.statusCode]).toEqual([200, 200]);
+    const after = await lineById(target);
+    // 7,000 + 3,000 — not 7,000 and not 3,000.
+    expect(after.budgetModifications).toBe(10_000);
+    expect(after.pendingBudgetChanges).toBe(0);
+    expect(after.revisedBudget).toBe(110_000);
+    const afterSource = await lineById(source);
+    expect(afterSource.budgetModifications).toBe(-10_000);
+    expect(afterSource.pendingBudgetChanges).toBe(0);
+    expect(afterSource.revisedBudget).toBe(190_000);
+  });
+
   it("refuses a second submit and a reject on a change that already moved on", async () => {
     const created = await inject("POST", `/api/v1/budgets/${budgetId}/changes`, u1.headers, { title: "Once", fromLineItemId: lineRebar, toLineItemId: lineElec, amount: 1_000 });
     const id = created.json().id as string;
@@ -741,8 +794,26 @@ describe("ERP import through the GL map (#481)", () => {
     const patched = await inject("PATCH", `/api/v1/gl-cost-code-maps/${mapId}?projectId=${proj}`, u1.headers, { glDescription: "Concrete subcontracts" });
     expect(patched.statusCode).toBe(200);
     expect(patched.json().glDescription).toBe("Concrete subcontracts");
-    const noProject = await inject("PATCH", `/api/v1/gl-cost-code-maps/${mapId}`, u1.headers, { glDescription: "x" });
-    expect(noProject.statusCode).toBe(400);
+    // A company-wide row is gated on the COMPANY, not on whichever project the
+    // caller nominates: a project manager holding budget 'standard' on one
+    // project must not be able to repoint the mapping every project imports
+    // through, and must not be able to delete it either.
+    const escalate = await inject("PATCH", `/api/v1/gl-cost-code-maps/${mapId}?projectId=${proj}`, h3, { glDescription: "hijacked" });
+    expect(escalate.statusCode).toBe(403);
+    expect(escalate.json().message).toMatch(/company-wide/i);
+    const escalateDelete = await inject("DELETE", `/api/v1/gl-cost-code-maps/${mapId}?projectId=${proj}`, h3);
+    expect(escalateDelete.statusCode).toBe(403);
+    // …and the company owner needs no ?projectId= at all, because the row is
+    // not scoped to one.
+    const noProject = await inject("PATCH", `/api/v1/gl-cost-code-maps/${mapId}`, u1.headers, { glDescription: "Concrete subcontracts" });
+    expect(noProject.statusCode).toBe(200);
+    // A PROJECT-scoped row stays on the project gate: the project manager may edit it.
+    const scopedId = projectScoped.json().id as string;
+    const scopedPatch = await inject("PATCH", `/api/v1/gl-cost-code-maps/${scopedId}`, h3, { glDescription: "Rebar (project)" });
+    expect(scopedPatch.statusCode).toBe(200);
+    // and a company-wide mapping is invisible to another tenant entirely
+    const crossTenant = await inject("PATCH", `/api/v1/gl-cost-code-maps/${mapId}`, outsider.headers, { glDescription: "theirs" });
+    expect(crossTenant.statusCode).toBe(404);
   });
 
   it("dry-runs a Sage export, names the unmapped account, then imports with provenance", async () => {
@@ -1028,5 +1099,74 @@ describe("health inputs and tenant isolation", () => {
     // a change carrying an outsider's line id never resolves
     const changes = await built.app.db.select().from(budgetChanges).where(eq(budgetChanges.budgetId, budgetId));
     expect(changes.length).toBeGreaterThan(0);
+  });
+});
+
+/* ================================================================== */
+/* Posting coordinates                                                 */
+/* ================================================================== */
+
+describe("the posting ledger keeps one coordinate per source row", () => {
+  /*
+   * Two approved invoice lines with NO commitment SOV line, on the SAME
+   * invoice and the same budget line. The per-line total was always right,
+   * but both rows used to be given the FIRST row's id as their posting
+   * coordinate, so the second posting overwrote the first: the posting ledger
+   * under-reported and the drill-down showed the first line's description
+   * twice.
+   */
+  it("gives two loose invoice lines on one invoice distinct postings", async () => {
+    const fresh = await inject("POST", `/api/v1/projects/${proj}/budgets`, u1.headers, { name: "Loose lines", currency: "USD" });
+    expect(fresh.statusCode).toBe(201);
+    const freshBudget = fresh.json().id as string;
+    const lineRes = await inject("POST", `/api/v1/budgets/${freshBudget}/lines`, u1.headers, { costCodeId: ccElec, description: "Electrical", originalBudget: 500_000 });
+    expect(lineRes.statusCode).toBe(201);
+    const line = lineRes.json().id as string;
+
+    const invId = newId("inv");
+    await built.app.db.insert(invoices).values({
+      id: invId,
+      companyId: u1.companyId,
+      projectId: proj,
+      kind: "subcontractor_invoice",
+      number: 90,
+      reference: "INV-90",
+      status: "approved",
+      currency: "USD",
+      commitmentId,
+      billingDate: daysAgo(10),
+      approvedAt: new Date(Date.now() - 10 * 86_400_000).toISOString(),
+      createdBy: u1.userId,
+    });
+    for (const [n, description, amount] of [["1", "Switchgear delivery", 30_000], ["2", "Cable pull", 20_000]] as const) {
+      await built.app.db.insert(invoiceLineItems).values({
+        id: newId("ili"),
+        companyId: u1.companyId,
+        projectId: proj,
+        invoiceId: invId,
+        lineNumber: n,
+        commitmentSovLineId: null,
+        budgetLineItemId: line,
+        description,
+        previousBilled: 0,
+        thisPeriodWork: amount,
+        totalCompletedAndStored: amount,
+        amount,
+      });
+    }
+
+    const res = await inject("POST", `/api/v1/budgets/${freshBudget}/recalculate`, u1.headers);
+    expect(res.statusCode).toBe(200);
+    const postings = (await built.app.db.select().from(budgetPostings).where(eq(budgetPostings.budgetLineItemId, line)))
+      .filter((p) => p.component === "invoicedToDate");
+    expect(postings).toHaveLength(2);
+    expect(new Set(postings.map((p) => p.sourceId)).size).toBe(2);
+    expect(postings.reduce((sum, p) => sum + p.amount, 0)).toBe(50_000);
+    expect(new Set(postings.map((p) => (p.detail as { invoiceId?: string } | null)?.invoiceId)).size).toBe(1);
+    const drill = await inject("GET", `/api/v1/budget-lines/${line}/transactions`, u1.headers);
+    expect(drill.statusCode).toBe(200);
+    const invoiced = drill.json().components.find((c: { component: string }) => c.component === "invoicedToDate");
+    expect(invoiced.value).toBe(50_000);
+    expect(invoiced.rows.map((r: { description: string }) => r.description).sort()).toEqual(["Cable pull", "Switchgear delivery"]);
   });
 });

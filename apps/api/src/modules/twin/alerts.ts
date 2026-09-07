@@ -25,7 +25,15 @@ import type { SensorAlertKind } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { forEachCompany } from "../../lib/scheduler.js";
 import { pushNotifications } from "../notifications/service.js";
-import { addDays, daysBetween, ledger, nowISO, raiseTwinSignal, todayISO } from "./shared.js";
+import {
+  addDays,
+  closeTwinSignalById,
+  daysBetween,
+  ledger,
+  nowISO,
+  raiseTwinSignal,
+  todayISO,
+} from "./shared.js";
 
 /* ------------------------------------------------------------------ */
 /* Pure evaluation                                                     */
@@ -142,7 +150,11 @@ export async function applyBreaches(
       ),
     );
 
-  // a batch with no breach on a bound clears the alert that bound holds
+  // a batch with no breach on a bound clears the alert that bound holds, and
+  // the signal it raised is auto-closed with it: leaving the signal open
+  // would keep a resolved condition permanently red on the register, and
+  // auto-closing (rather than deleting) is what lets the SAME condition
+  // re-open the same signal if it comes back.
   for (const alert of open) {
     if (alert.kind === "stale") continue;
     if (breaches.some((b) => b.kind === alert.kind)) continue;
@@ -150,6 +162,14 @@ export async function applyBreaches(
       .update(sensorAlerts)
       .set({ status: "cleared", clearedAt: now, updatedAt: now })
       .where(eq(sensorAlerts.id, alert.id));
+    if (alert.signalId) {
+      await closeTwinSignalById(
+        app.db,
+        alert.signalId,
+        sensor.companyId,
+        `Readings returned inside the ${alert.kind === "min_breach" ? "minimum" : "maximum"} bound at ${now}`,
+      );
+    }
     outcome.cleared += 1;
   }
 
@@ -294,6 +314,43 @@ export async function applyBreaches(
   return outcome;
 }
 
+/**
+ * A channel that reports again is no longer stale. Called from the ingest
+ * path so the "has stopped reporting" alert and its signal close themselves
+ * the moment data resumes, instead of waiting for a person to notice.
+ */
+export async function clearStaleAlerts(
+  app: FastifyInstance,
+  sensor: typeof sensors.$inferSelect,
+  now = nowISO(),
+): Promise<number> {
+  const open = await app.db
+    .select()
+    .from(sensorAlerts)
+    .where(
+      and(
+        eq(sensorAlerts.sensorId, sensor.id),
+        eq(sensorAlerts.kind, "stale"),
+        inArray(sensorAlerts.status, ["open", "acknowledged"]),
+      ),
+    );
+  for (const alert of open) {
+    await app.db
+      .update(sensorAlerts)
+      .set({ status: "cleared", clearedAt: now, updatedAt: now })
+      .where(eq(sensorAlerts.id, alert.id));
+    if (alert.signalId) {
+      await closeTwinSignalById(
+        app.db,
+        alert.signalId,
+        sensor.companyId,
+        `${sensor.name} resumed reporting at ${now}`,
+      );
+    }
+  }
+  return open.length;
+}
+
 /* ------------------------------------------------------------------ */
 /* Sweeps                                                              */
 /* ------------------------------------------------------------------ */
@@ -379,19 +436,27 @@ export async function sweepWarrantyExpiry(
   app: FastifyInstance,
   companyId: string,
   today = todayISO(),
+  /**
+   * Restrict the sweep to one project. The scheduler sweeps a whole company
+   * (system actor, every project); the manual `POST
+   * /projects/:projectId/warranties/sweep` route is authorised against ONE
+   * project, so it must not write obligations and notifications into projects
+   * the caller cannot see.
+   */
+  projectId?: string,
 ): Promise<{ obligationsCreated: number; notified: number; expired: number }> {
   const horizonDate = addDays(today, 90);
+  const conds = [
+    eq(warranties.companyId, companyId),
+    eq(warranties.status, "active"),
+    lte(warranties.endDate, horizonDate),
+  ];
+  if (projectId) conds.push(eq(warranties.projectId, projectId));
   const rows = await app.db
     .select({ warranty: warranties, asset: assets })
     .from(warranties)
     .innerJoin(assets, eq(assets.id, warranties.assetId))
-    .where(
-      and(
-        eq(warranties.companyId, companyId),
-        eq(warranties.status, "active"),
-        lte(warranties.endDate, horizonDate),
-      ),
-    )
+    .where(and(...conds))
     .limit(2000);
 
   let obligationsCreated = 0;

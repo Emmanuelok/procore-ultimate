@@ -26,7 +26,7 @@
  * retried job cannot double-count.
  */
 import type { FastifyInstance } from "fastify";
-import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
   bimElements,
   bimModelVersions,
@@ -40,7 +40,7 @@ import type { Db } from "../../lib/db.js";
 import { newId } from "../../lib/ids.js";
 import { forEachCompany } from "../../lib/scheduler.js";
 import { extractIfcFromStream, type ExtractedSpatialNode } from "./ifc-extract.js";
-import { ledger, nowISO, propertyHash, raiseSignal } from "./shared.js";
+import { closeSignal, ledger, nowISO, propertyHash, raiseSignal } from "./shared.js";
 
 /** Models at or below this size are parsed inline so the upload answers with counts. */
 export const INLINE_PARSE_MAX_BYTES = 8 * 1024 * 1024;
@@ -69,7 +69,8 @@ export interface QualityReport {
 
 export interface IngestOutcome {
   versionId: string;
-  processing: "ready" | "failed";
+  /** "processing" means another pass already holds this version — see processVersion */
+  processing: "ready" | "failed" | "processing";
   elementCount: number;
   spatialCount: number;
   locationsCreated: number;
@@ -309,10 +310,31 @@ export async function processVersion(
   }
   const { version, model } = row;
 
-  await app.db
+  // Compare-and-set: claim the version only if no other pass holds it. Both
+  // the scheduler worker and the manual reprocess route land here, and two
+  // concurrent passes would each delete then re-insert bim_elements for the
+  // same version, so the surviving element set would depend on interleaving.
+  // `processingStartedAt` is stamped here so the stall sweep measures how
+  // long THIS parse has been running rather than how old the upload is.
+  const startedAt = nowISO();
+  const claimed = await app.db
     .update(bimModelVersions)
-    .set({ processing: "processing", processingError: null })
-    .where(eq(bimModelVersions.id, versionId));
+    .set({ processing: "processing", processingError: null, processingStartedAt: startedAt })
+    .where(
+      and(eq(bimModelVersions.id, versionId), ne(bimModelVersions.processing, "processing")),
+    )
+    .returning({ id: bimModelVersions.id });
+  if (claimed.length === 0) {
+    return {
+      versionId,
+      processing: "processing",
+      elementCount: version.elementCount,
+      spatialCount: version.spatialCount,
+      locationsCreated: 0,
+      processingError: null,
+      quality: null,
+    };
+  }
 
   // a non-IFC container carries no extractable element table
   if (model.format !== "ifc") {
@@ -336,6 +358,16 @@ export async function processVersion(
       })
       .where(eq(bimModelVersions.id, versionId));
     await promoteCurrentVersion(app.db, model.id, versionId, version.version);
+    // a version that now parses is no longer a failed ingest: auto-close the
+    // signal so a fixed file does not leave a permanent red mark, and so a
+    // later failure of the same version raises it again
+    await closeSignal(
+      app.db,
+      model.companyId,
+      "bim_ingest_failed",
+      `bim_ingest_failed:${versionId}`,
+      "Auto-closed: a later extraction of this version succeeded.",
+    );
     return {
       versionId,
       processing: "ready",
@@ -432,6 +464,16 @@ export async function processVersion(
       .where(eq(bimModelVersions.id, versionId));
 
     await promoteCurrentVersion(app.db, model.id, versionId, version.version);
+    // a version that now parses is no longer a failed ingest: auto-close the
+    // signal so a fixed file does not leave a permanent red mark, and so a
+    // later failure of the same version raises it again
+    await closeSignal(
+      app.db,
+      model.companyId,
+      "bim_ingest_failed",
+      `bim_ingest_failed:${versionId}`,
+      "Auto-closed: a later extraction of this version succeeded.",
+    );
 
     await ledger(app.db, {
       companyId: model.companyId,
@@ -537,7 +579,8 @@ export async function runIngestQueue(
   for (const row of pending) {
     const outcome = await processVersion(app, row.id, null);
     if (outcome.processing === "ready") processed += 1;
-    else failed += 1;
+    else if (outcome.processing === "failed") failed += 1;
+    // "processing" = another pass already holds it; neither processed nor failed
   }
   return { processed, failed };
 }
@@ -561,7 +604,15 @@ export async function requeueStalled(
       and(
         eq(bimModels.companyId, companyId),
         eq(bimModelVersions.processing, "processing"),
-        sql`${bimModelVersions.createdAt} < ${cutoff}`,
+        // a parse with no start stamp predates this column; fall back to
+        // createdAt for those rather than leaving them stuck forever
+        or(
+          sql`${bimModelVersions.processingStartedAt} < ${cutoff}`,
+          and(
+            isNull(bimModelVersions.processingStartedAt),
+            sql`${bimModelVersions.createdAt} < ${cutoff}`,
+          ),
+        ),
       ),
     )
     .limit(50);

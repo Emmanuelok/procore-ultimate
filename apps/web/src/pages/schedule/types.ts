@@ -132,6 +132,11 @@ export interface LookaheadResponse {
   to: string;
   items: (TaskRow & { inProgress?: boolean; constraints?: ConstraintRow[] })[];
   total: number;
+  /** every open constraint on the programme, whether or not its task is in the window */
+  constraintsOpen: number;
+  constraintsInWindow: number;
+  constraintsOverdue: number;
+  constraintsBasis: string;
 }
 
 export interface QualityCheck {
@@ -238,6 +243,10 @@ export interface EarnedValueResponse {
   plannedDurationDays: number | null;
   pricedActivities: number;
   unpriced: number;
+  costUnknown: number;
+  costedBac: number;
+  costCoverage: number | null;
+  costedEv: number;
   reasons: string[];
   activities: {
     id: string;
@@ -245,9 +254,9 @@ export interface EarnedValueResponse {
     bac: number;
     pv: number;
     ev: number;
-    ac: number;
+    ac: number | null;
     sv: number;
-    cv: number;
+    cv: number | null;
   }[];
 }
 

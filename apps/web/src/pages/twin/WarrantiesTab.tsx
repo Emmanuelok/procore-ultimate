@@ -89,7 +89,7 @@ export default function WarrantiesTab({
         `/api/v1/projects/${projectId}/warranties/sweep`,
       );
       toast.success(
-        `${res.obligationsCreated} obligation(s) raised, ${res.notified} notice(s) sent, ${res.expired} marked expired.`,
+        `This project: ${res.obligationsCreated} obligation(s) raised, ${res.notified} notice(s) sent, ${res.expired} marked expired.`,
       );
       await load();
       onChanged();

@@ -99,6 +99,7 @@ import {
   sheetGrantsStandard,
   sheetVisible,
   type HiddenScopes,
+  type SheetLike,
   type SheetRule,
 } from "./permissions.js";
 import {
@@ -330,7 +331,7 @@ export const drawingsModule: FastifyPluginAsync = async (app) => {
     return { access: a, hidden, bypass };
   }
 
-  const canSee = (ctx: SheetCtx, sheet: SheetRow) => ctx.bypass || sheetVisible(sheet, ctx.hidden);
+  const canSee = (ctx: SheetCtx, sheet: SheetLike) => ctx.bypass || sheetVisible(sheet, ctx.hidden);
   const canEdit = (ctx: SheetCtx, sheet: SheetRow) =>
     ctx.bypass || meetsLevel(ctx.access.level, "standard") || sheetGrantsStandard(sheet, ctx.hidden);
 
@@ -1281,6 +1282,14 @@ export const drawingsModule: FastifyPluginAsync = async (app) => {
       if (dup[0]) throw conflict("A sheet with this number already exists in the project");
     }
     const clearsReview = body.confirmReview === true;
+    // Clearing the review flag puts the page into the register under the
+    // number it currently carries. A pipeline placeholder is not a number, and
+    // the review endpoint refuses one; this second door has to refuse it too,
+    // or a standard user can confirm `UNNAMED-7-<set>` and then need an admin
+    // to renumber it (a confirmed sheet is admin-only to renumber).
+    if (clearsReview && (/^UNNAMED-/.test(number) || /-DUP\d+-/.test(number))) {
+      throw badRequest("Give the sheet its real number before confirming it");
+    }
     await app.db
       .update(drawingSheets)
       .set({
@@ -1869,36 +1878,53 @@ export const drawingsModule: FastifyPluginAsync = async (app) => {
     return row;
   }
 
-  /** Turn the caller's set / sheet / revision selection into the exact revisions issued. */
+  /**
+   * Turn the caller's set / sheet / revision selection into the exact
+   * revisions issued. Segregation applies here too: a whole-set selection
+   * silently skips the sheets the caller may not see (it is a bulk selector,
+   * not an assertion about a particular sheet), while a sheet or revision
+   * named explicitly that the caller may not see is treated as not being on
+   * the project — the same answer every other id-scoped drawings route gives.
+   */
   async function resolveIssueRevisions(
+    req: FastifyRequest,
     projectId: string,
     body: { setId?: string | undefined; sheetIds?: string[] | undefined; revisionIds?: string[] | undefined },
   ): Promise<string[]> {
+    const ctx = await sheetContext(req, projectId);
     const ids = new Set<string>();
     if (body.setId) {
       const [set] = await app.db.select({ id: drawingSets.id }).from(drawingSets).where(and(eq(drawingSets.id, body.setId), eq(drawingSets.projectId, projectId))).limit(1);
       if (!set) throw notFound("Drawing set not found on this project");
-      const revs = await app.db.select({ id: drawingRevisions.id }).from(drawingRevisions).where(eq(drawingRevisions.setId, body.setId));
-      for (const r of revs) ids.add(r.id);
+      const revs = await app.db
+        .select({ id: drawingRevisions.id, sheetId: drawingSheets.id, discipline: drawingSheets.discipline, area: drawingSheets.area })
+        .from(drawingRevisions)
+        .innerJoin(drawingSheets, eq(drawingSheets.id, drawingRevisions.sheetId))
+        .where(eq(drawingRevisions.setId, body.setId));
+      for (const r of revs) {
+        if (canSee(ctx, { id: r.sheetId, discipline: r.discipline, area: r.area })) ids.add(r.id);
+      }
     }
     if (body.sheetIds?.length) {
       const sheets = await app.db
-        .select({ id: drawingSheets.id, currentRevisionId: drawingSheets.currentRevisionId })
+        .select({ id: drawingSheets.id, currentRevisionId: drawingSheets.currentRevisionId, discipline: drawingSheets.discipline, area: drawingSheets.area })
         .from(drawingSheets)
         .where(and(eq(drawingSheets.projectId, projectId), inArray(drawingSheets.id, body.sheetIds)));
-      if (sheets.length !== new Set(body.sheetIds).size) throw badRequest("One or more sheets do not belong to this project");
-      for (const s of sheets) if (s.currentRevisionId) ids.add(s.currentRevisionId);
+      const visible = sheets.filter((s) => canSee(ctx, s));
+      if (visible.length !== new Set(body.sheetIds).size) throw badRequest("One or more sheets do not belong to this project");
+      for (const s of visible) if (s.currentRevisionId) ids.add(s.currentRevisionId);
     }
     if (body.revisionIds?.length) {
       const revs = await app.db
-        .select({ id: drawingRevisions.id, projectId: drawingSheets.projectId })
+        .select({ id: drawingRevisions.id, projectId: drawingSheets.projectId, sheetId: drawingSheets.id, discipline: drawingSheets.discipline, area: drawingSheets.area })
         .from(drawingRevisions)
         .innerJoin(drawingSheets, eq(drawingSheets.id, drawingRevisions.sheetId))
         .where(inArray(drawingRevisions.id, body.revisionIds));
-      if (revs.length !== new Set(body.revisionIds).size || revs.some((r) => r.projectId !== projectId)) {
+      const visible = revs.filter((r) => canSee(ctx, { id: r.sheetId, discipline: r.discipline, area: r.area }));
+      if (visible.length !== new Set(body.revisionIds).size || visible.some((r) => r.projectId !== projectId)) {
         throw badRequest("One or more revisions do not belong to this project");
       }
-      for (const r of revs) ids.add(r.id);
+      for (const r of visible) ids.add(r.id);
     }
     return [...ids];
   }
@@ -1924,6 +1950,7 @@ export const drawingsModule: FastifyPluginAsync = async (app) => {
         number: drawingSheets.number,
         title: drawingSheets.title,
         discipline: drawingSheets.discipline,
+        area: drawingSheets.area,
       })
       .from(drawingRevisions)
       .innerJoin(drawingSheets, eq(drawingSheets.id, drawingRevisions.sheetId))
@@ -1935,9 +1962,21 @@ export const drawingsModule: FastifyPluginAsync = async (app) => {
   async function issueDetail(req: FastifyRequest, issue: typeof drawingIssues.$inferSelect) {
     const recipients = await app.db.select().from(drawingIssueRecipients).where(eq(drawingIssueRecipients.issueId, issue.id));
     const people = await peopleMap([...recipients.map((r) => r.userId), issue.createdBy, issue.issuedBy]);
+    /*
+     * A distribution names sheets, and a sheet's number and title are register
+     * metadata the segregation rules (#265, #282) restrict everywhere else —
+     * lists, log, review queue, summary, pins and the PDF. Reading them off an
+     * issue would be a way round those rules, so the same filter runs here.
+     * The count of what was withheld is still reported: the acknowledgement
+     * record has to stay honest about how many sheets went out.
+     */
+    const ctx = await sheetContext(req, issue.projectId);
+    const all = await issueSheets(issue.revisionIds);
+    const visible = all.filter((s) => canSee(ctx, { id: s.sheetId, discipline: s.discipline, area: s.area }));
     return {
       ...issue,
-      sheets: await issueSheets(issue.revisionIds),
+      sheets: visible,
+      hiddenSheets: all.length - visible.length,
       recipients: recipients.map((r) => ({ ...r, name: people[r.userId]?.name ?? null, email: people[r.userId]?.email ?? null })),
       acknowledged: recipients.filter((r) => r.acknowledgedAt).length,
       createdByName: people[issue.createdBy]?.name ?? null,
@@ -1983,7 +2022,7 @@ export const drawingsModule: FastifyPluginAsync = async (app) => {
   app.post("/projects/:projectId/drawing-issues", { preHandler: standardGate }, async (req, reply) => {
     const body = issueCreateSchema.parse(req.body);
     const projectId = req.projectId!;
-    const revisionIds = await resolveIssueRevisions(projectId, body);
+    const revisionIds = await resolveIssueRevisions(req, projectId, body);
     if (revisionIds.length === 0) throw badRequest("Select at least one sheet, revision or set to issue");
     const recipients = await assertRecipients(req, body.recipientUserIds);
     const number = await nextRecordNumber(app.db, projectId, "drawing_issue");
@@ -2024,7 +2063,7 @@ export const drawingsModule: FastifyPluginAsync = async (app) => {
     if (body.notes !== undefined) set["notes"] = body.notes;
     if (body.transmittalId !== undefined) set["transmittalId"] = body.transmittalId;
     if (body.setId !== undefined || body.sheetIds !== undefined || body.revisionIds !== undefined) {
-      const revisionIds = await resolveIssueRevisions(issue.projectId, body);
+      const revisionIds = await resolveIssueRevisions(req, issue.projectId, body);
       if (revisionIds.length === 0) throw badRequest("Select at least one sheet, revision or set to issue");
       set["revisionIds"] = revisionIds;
       if (body.setId !== undefined) set["setId"] = body.setId;
@@ -2108,6 +2147,8 @@ export const drawingsModule: FastifyPluginAsync = async (app) => {
       notes: detail.notes,
       transmittalId: detail.transmittalId,
       items: detail.sheets.map((s) => ({ number: s.number, title: s.title, revision: s.revision, discipline: s.discipline, superseded: s.isSuperseded === 1 })),
+      /* Sheets on this distribution that segregation hides from the reader. */
+      hiddenItems: detail.hiddenSheets,
       recipients: detail.recipients.map((r) => ({ name: r.name, email: r.email, notifiedAt: r.notifiedAt, acknowledgedAt: r.acknowledgedAt })),
     };
   });

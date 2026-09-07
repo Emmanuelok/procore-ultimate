@@ -66,7 +66,7 @@ interface Submittal {
   revisions: Revision[];
   stranded: boolean;
   currentPosition: number | null;
-  permissions: { isAdmin: boolean; canRespondStepIds: string[]; canResubmit: boolean };
+  permissions: { isAdmin: boolean; canManage: boolean; canRespondStepIds: string[]; canResubmit: boolean };
 }
 
 interface ResponseCode {
@@ -229,7 +229,11 @@ export default function SubmittalDetailPage() {
 
   const pendingSteps = sub.reviewSteps.filter((s) => !s.responseCode);
   const codeList = codes.data?.items ?? [];
-  const editable = sub.status !== "closed" && sub.status !== "void" && sub.status !== "superseded";
+  // `canManage` is the API's own answer to "does this caller pass the
+  // submittals standard gate" — a read-level reviewer may respond to their
+  // own step and nothing else, so no write button is offered to them.
+  const canManage = sub.permissions.canManage;
+  const editable = canManage && sub.status !== "closed" && sub.status !== "void" && sub.status !== "superseded";
 
   return (
     <div>
@@ -252,17 +256,18 @@ export default function SubmittalDetailPage() {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          {sub.status === "draft" || sub.status === "open" ? <Button disabled={busy} onClick={() => void doAction("submit")}>Submit for review</Button> : null}
+          {canManage && (sub.status === "draft" || sub.status === "open") ? <Button disabled={busy} onClick={() => void doAction("submit")}>Submit for review</Button> : null}
           {sub.permissions.canResubmit ? <Button disabled={busy} onClick={() => setResubmitOpen(true)}>Resubmit (new revision)</Button> : null}
           {editable ? <Button variant="secondary" disabled={busy} onClick={openEdit}>Edit</Button> : null}
-          {sub.status === "open" || sub.status === "responded" ? <Button variant="secondary" disabled={busy} onClick={() => void doAction("close")}>Close</Button> : null}
+          {canManage && (sub.status === "open" || sub.status === "responded") ? <Button variant="secondary" disabled={busy} onClick={() => void doAction("close")}>Close</Button> : null}
         </div>
       </div>
 
       <ErrorAlert message={error} />
       {sub.stranded ? (
-        <Alert tone="danger" title="This review chain is stranded" className="mb-4" actions={<Button size="sm" disabled={busy} onClick={() => void doAction("recompute")}>Recompute</Button>}>
-          Every step has responded but the record is still in review. Recompute finalises it from the recorded codes.
+        <Alert tone="danger" title="This review chain is stranded" className="mb-4" actions={canManage ? <Button size="sm" disabled={busy} onClick={() => void doAction("recompute")}>Recompute</Button> : undefined}>
+          Every step has responded but the record is still in review.{" "}
+          {canManage ? "Recompute finalises it from the recorded codes." : "Ask someone with standard access to the submittals tool to recompute it."}
         </Alert>
       ) : null}
       {sub.supersededById ? (
