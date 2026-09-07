@@ -1,11 +1,11 @@
 import {
-  ALL_INGESTION_DATASETS,
   ASSERTION_KINDS,
   COST_TYPES,
   EVIDENCE_KINDS,
   FX_RATE_SOURCES,
+  INGESTION_DATASETS,
   RFI_STATUSES,
-  type AnyIngestionDataset,
+  type IngestionDataset,
 } from "@constructos/shared";
 
 /**
@@ -37,7 +37,7 @@ export interface DatasetField {
 }
 
 export interface DatasetDef {
-  dataset: AnyIngestionDataset;
+  dataset: IngestionDataset;
   label: string;
   /** where committed rows land — shown verbatim in the mapping UI */
   target: string;
@@ -83,7 +83,7 @@ const IMPACT_VALUES = ["yes", "no", "tbd"] as const;
 /* The registry — one entry per INGESTION_DATASETS member              */
 /* ------------------------------------------------------------------ */
 
-export const DATASET_REGISTRY: Record<AnyIngestionDataset, DatasetDef> = {
+export const DATASET_REGISTRY: Record<IngestionDataset, DatasetDef> = {
   vendors: {
     dataset: "vendors",
     label: "Vendors / subcontractor directory",
@@ -505,20 +505,25 @@ export const DATASET_REGISTRY: Record<AnyIngestionDataset, DatasetDef> = {
 
 /** Look up a dataset definition; null for names outside the vocabulary. */
 export function datasetDef(name: string): DatasetDef | null {
-  return (ALL_INGESTION_DATASETS as readonly string[]).includes(name)
-    ? DATASET_REGISTRY[name as AnyIngestionDataset]
+  return (INGESTION_DATASETS as readonly string[]).includes(name)
+    ? DATASET_REGISTRY[name as IngestionDataset]
     : null;
 }
 
-/** Public shape for GET /ingestion/datasets — drives the web mapping UI. */
+/**
+ * Public shape for GET /ingestion/datasets — drives the web mapping UI.
+ * `committedElsewhere` is part of the contract: the wizard must not offer a
+ * dataset this module cannot commit, and it can only know that from here.
+ */
 export function datasetCatalog() {
-  return ALL_INGESTION_DATASETS.map((name) => {
+  return INGESTION_DATASETS.map((name) => {
     const def = DATASET_REGISTRY[name];
     return {
       dataset: def.dataset,
       label: def.label,
       target: def.target,
       requiresProject: def.requiresProject,
+      committedElsewhere: def.committedElsewhere === true,
       fields: def.fields.map((f) => ({
         key: f.key,
         label: f.label,

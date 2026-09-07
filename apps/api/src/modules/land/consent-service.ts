@@ -8,8 +8,10 @@
  * unified consent view (`GET /projects/:id/land/consent`) and the land
  * schedule-risk view answer for both registers at once. The jurisdiction
  * module keeps its own permit-only schedule-risk read for the permits
- * workspace; both are now pure, and the FINDINGS come from here alone, so
- * the two views can never disagree about what has been raised.
+ * workspace. The FINDINGS come from `sweepConsent` alone, so the views can
+ * never disagree about what has been raised; it has two triggers running the
+ * same locked, fingerprinted function — the scheduled `land.detectors` job
+ * and the land schedule-risk read, scoped to the project being read.
  *
  * Detectors raised here:
  *

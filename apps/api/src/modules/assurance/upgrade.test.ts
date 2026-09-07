@@ -176,8 +176,16 @@ describe("REGRESSION: claimant attribution cannot be forged", () => {
     expect(assertion.createdBy).toBe(surveyor.userId);
     expect(assertion.claimantId).toBe(member.userId);
 
-    // The auditor who authored the assertion now submits all the evidence.
-    const ev = await mkEvidence(projectA, surveyorHeaders);
+    // The auditor who authored the assertion now writes up all the evidence
+    // themselves. A `document`, not the helper's default `survey`: the
+    // separation rule holds a row against its uploader only when the row is
+    // the uploader's own attestation. A survey, log or bank record the author
+    // merely conveyed is a record produced upstream of them, and this test
+    // used to pass only because the rule treated uploader as source.
+    const ev = await mkEvidence(projectA, surveyorHeaders, {
+      kind: "document",
+      source: "the auditor's own measurement note",
+    });
     const rec = await post(`/projects/${projectA}/reconciliations`, owner.headers, {
       assertionId: assertion.id,
       evidenceIds: [ev.id],
@@ -185,6 +193,22 @@ describe("REGRESSION: claimant attribution cannot be forged", () => {
     });
     expect(rec.statusCode).toBe(403);
     expect(rec.json().message).toMatch(/author of the assertion/);
+    expect(rec.json().message).toMatch(/own attestation/);
+
+    // The same author conveying an independent QS survey is not on both
+    // sides of the claim: the survey is the surveyor's, whoever uploaded it.
+    const survey = await mkEvidence(projectA, surveyorHeaders, {
+      kind: "survey",
+      source: "independent quantity surveyor site measure",
+    });
+    const conveyed = await post(`/projects/${projectA}/reconciliations`, owner.headers, {
+      assertionId: assertion.id,
+      evidenceIds: [survey.id],
+      method: "quantity_check",
+    });
+    expect(conveyed.statusCode).toBe(201);
+    expect(conveyed.json().selfCertified).toBe(false);
+    expect(conveyed.json().confidence).toBeCloseTo(0.9, 5);
   });
 
   it("refuses an entity claim whose entity does not exist, and defaults the claimant to the caller", async () => {
@@ -1185,12 +1209,22 @@ describe("REGRESSION: /reconciliations/auto cannot verify a claim against its au
     // presses the bulk button, which used to skip separationCheck entirely.
     // Both rows sit inside the ±5% band, so the engine would have said
     // "supported" — and the dashboard would have printed it as verified.
+    //
+    // Photographs, not reality capture. The separation rule counts a row
+    // against its uploader only when the row is the uploader's own attestation
+    // (a photograph they framed, a document they wrote); a scanner's output
+    // is a record produced upstream of whoever uploads it. This test used to
+    // use `reality_capture` and passed only because the rule treated uploader
+    // as source — the same conflation that called every honest worker-day
+    // self-certified once one administrator ingested both claim and log.
     await mkEvidence(projectC, owner.headers, {
-      kind: "reality_capture",
+      kind: "photograph",
+      source: "the claimant's own site photographs",
       metadata: { observedPercent: 89 },
     });
     await mkEvidence(projectC, owner.headers, {
-      kind: "reality_capture",
+      kind: "photograph",
+      source: "the claimant's own site photographs",
       metadata: { observedPercent: 91 },
     });
 
@@ -1228,7 +1262,12 @@ describe("REGRESSION: /reconciliations/auto cannot verify a claim against its au
       `/projects/${projectC}/signals?detector=self_certified_claim`,
       owner.headers,
     );
-    expect((sig.json().items as unknown[]).length).toBe(1);
+    const items = sig.json().items as Array<{ explanation: string }>;
+    expect(items.length).toBe(1);
+    // The signal states the rule and the per-row verdict, so a reviewer can
+    // see why these rows counted.
+    expect(items[0]!.explanation).toMatch(/own attestation/);
+    expect(items[0]!.explanation).toMatch(/photograph is composed by whoever submits it/);
 
     // The owner-side tile must not quote it as a verified variance.
     const summary = await get(`/projects/${projectC}/assurance/summary`, owner.headers);
@@ -1268,6 +1307,76 @@ describe("REGRESSION: /reconciliations/auto cannot verify a claim against its au
     expect(independent).toBeTruthy();
     expect(independent!.selfCertified).toBe(false);
     expect(independent!.result).toBe("supported");
+  });
+
+  it("does not call an administrator who ingests both the payroll claim and the biometric log self-certified", async () => {
+    // The deployment shape that flooded the retrospective-detection harness:
+    // one site administrator records the vendor's headcount/payroll claim AND
+    // pushes the turnstile log it is tested against, so submittedBy on every
+    // evidence row equals createdBy on the assertion. Uploader is not source:
+    // the biometric reader produced the log, and the claim must get a real,
+    // confident verdict with no self_certified_claim raised.
+    const projectD = newId("prj");
+    await app.db
+      .insert(projects)
+      .values({ id: projectD, companyId: owner.companyId, name: "Project D" });
+    const vendor = await post("/entities", owner.headers, {
+      kind: "company",
+      name: "Riverside Labour Services Ltd",
+      jurisdiction: "GB",
+    });
+    expect(vendor.statusCode).toBe(201);
+    const vendorId = vendor.json().id as string;
+
+    const as = await mkAssertion(projectD, owner.headers, {
+      kind: "headcount",
+      value: 42,
+      unit: "people",
+      basis: "vendor payroll return, week 31",
+      claimantId: vendorId,
+      claimantKind: "entity",
+    });
+    expect(as.statusCode).toBe(201);
+    expect(as.json().createdBy).toBe(owner.userId);
+    for (const distinctWorkers of [42, 41]) {
+      await mkEvidence(projectD, owner.headers, {
+        kind: "biometric_log",
+        source: "site turnstile export, biometric reader B2",
+        independenceScore: 0.9,
+        metadata: { distinctWorkers },
+      });
+    }
+
+    const res = await post(`/projects/${projectD}/reconciliations/auto`, owner.headers, {});
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      created: number;
+      selfCertified: number;
+      results: Record<string, number>;
+    };
+    expect(body.created).toBe(1);
+    expect(body.selfCertified).toBe(0);
+    expect(body.results["supported"]).toBe(1);
+
+    const list = await get(`/projects/${projectD}/reconciliations?pageSize=10`, owner.headers);
+    const row = (
+      list.json().items as Array<{
+        selfCertified: boolean;
+        result: string;
+        confidence: number | null;
+        notes: string;
+      }>
+    )[0]!;
+    expect(row.selfCertified).toBe(false);
+    expect(row.result).toBe("supported");
+    expect(row.confidence).toBeCloseTo(0.9, 5);
+    expect(row.notes).not.toMatch(/NOT INDEPENDENTLY TESTED/);
+
+    const sig = await get(
+      `/projects/${projectD}/signals?detector=self_certified_claim`,
+      owner.headers,
+    );
+    expect((sig.json().items as unknown[]).length).toBe(0);
   });
 });
 

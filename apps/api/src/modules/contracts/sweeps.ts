@@ -19,6 +19,17 @@
  * The breach transition uses `UPDATE … WHERE id = ? AND status = 'open'
  * RETURNING id`, and the signal and ledger entry are written ONLY when a row
  * comes back — so a losing racer writes nothing.
+ *
+ * TRIGGER CONTRACT
+ * That atomicity is what lets `sweepTimeBars` have TWO triggers running the
+ * same function: the scheduled job above, and the events register's read
+ * paths (GET .../events and GET .../events/:eventId in index.ts), scoped to
+ * the contract being read. The scheduler is disabled under NODE_ENV=test and
+ * by SCHEDULER_ENABLED=false, so there the read is the only trigger — every
+ * test and the retrodetect harness boot that way, and taking the sweep off
+ * the read path silently blanked the harness's time-bar scheme once already.
+ * Two triggers, one claim: whichever runs first flips the row and emits; the
+ * other finds nothing open.
  */
 import type { FastifyInstance } from "fastify";
 import { and, eq, inArray, isNotNull, lte, sql } from "drizzle-orm";

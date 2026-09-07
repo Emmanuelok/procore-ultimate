@@ -590,9 +590,17 @@ async function plantColludingVendors(): Promise<void> {
 
 async function plantMissedTimeBar(): Promise<void> {
   // FIDIC 20.2 carries a 28-day notice time bar. An event dated 90 days ago
-  // with no notice served is 62 days past its deadline; the lazy time-bar
-  // sweep (triggered by the events list read in the run phase) raises the
-  // signal. The API accepts past event dates, so no DB work is needed.
+  // with no notice served is 62 days past its deadline; the time-bar sweep
+  // raises the signal. The API accepts past event dates, so no DB work is
+  // needed.
+  //
+  // TRIGGER CONTRACT: the sweep has two triggers — the hourly scheduler job
+  // (contracts.time-bars) and the register's ordinary read paths, which run
+  // the same atomic sweep for the contract being read. This harness, like
+  // every test, boots with NODE_ENV=test, where the scheduler is disabled, so
+  // the events list read in the run phase is the trigger this scheme relies
+  // on. Taking the sweep off the read path blanks this scheme (it did: 23/24)
+  // without failing any unit test that calls scheduler.runNow() directly.
   await post(
     ctx.ownerA,
     `/projects/${ctx.plantedProjectId}/contracts/${ctx.plantedContractId}/events`,
@@ -1142,7 +1150,9 @@ async function seedCleanControl(): Promise<void> {
 
   // A critical grievance (same 7-day SLA as the planted one) received three
   // days ago, acknowledged, resolved and closed WITH the complainant — the
-  // full #572-573 ladder, well inside its deadline.
+  // full #572-573 ladder, well inside its deadline. The assignee resolves and
+  // a different officer verifies closure: #573 refuses a verifier who wrote
+  // the resolution, so the honest ladder needs two people, like the real one.
   const settled = (await post(ctx.ownerA, `/projects/${projectId}/grievances`, {
     channel: "in_person",
     complainantName: "Mr K. Whitlock",
@@ -1158,7 +1168,7 @@ async function seedCleanControl(): Promise<void> {
   await post(ctx.ownerA, `/projects/${projectId}/grievances/${settled.id}/assign`, {
     assigneeId: ctx.memberB.userId,
   });
-  await post(ctx.ownerA, `/projects/${projectId}/grievances/${settled.id}/resolve`, {
+  await post(ctx.memberB, `/projects/${projectId}/grievances/${settled.id}/resolve`, {
     resolution: "Signed pedestrian diversion installed via Harbour Street; route reopened.",
   });
   await post(ctx.ownerA, `/projects/${projectId}/grievances/${settled.id}/verify-closure`, {
@@ -1210,8 +1220,18 @@ async function seedCleanControl(): Promise<void> {
     evidenceIds: [payment.id],
     note: "Compensation at valuation, paid to the registered proprietor.",
   });
-  await post(ctx.ownerA, `/projects/${projectId}/parcels/${parcel.id}/status`, {
-    status: "acquired",
+  // Acquisition goes through the evidenced route: title passes on a recorded
+  // basis with the transfer deed attached, never by flipping a status.
+  const deed = (await post(ctx.ownerA, `/projects/${projectId}/evidence`, {
+    kind: "document",
+    source: "HM Land Registry TR1 transfer, Harbour Quay Estates Ltd to the employer",
+    independenceScore: 0.9,
+    metadata: { title: "Registered transfer HQ-LP-007", reference: "TR1/HQ/0442" },
+  })) as unknown as { id: string };
+  await post(ctx.ownerA, `/projects/${projectId}/parcels/${parcel.id}/acquire`, {
+    acquisitionBasis: "purchase",
+    acquiredAt: addDaysISO(today, -14),
+    evidenceIds: [deed.id],
     note: "Transfer registered; possession taken.",
   });
 
@@ -1237,21 +1257,39 @@ async function seedCleanControl(): Promise<void> {
 /* Setup: personas + projects, all via the API                         */
 /* ------------------------------------------------------------------ */
 
-/** Invite a user into owner A's company via the API and log them in. */
+/** A policy-compliant password for harness personas; never contains an email local-part. */
+const HARNESS_INVITEE_PASSWORD = "retrodetect-gantry-lintel-2026";
+
+/**
+ * Invite a user into owner A's company via the API and sign them in.
+ *
+ * An invitation hands the inviter no credential: the invitee sets their own
+ * password through the single-use link. The harness runs with no email
+ * transport, so the API returns that link for hand delivery — and the
+ * harness, standing in for the invitee, follows it. Nothing here is a
+ * shortcut around the real flow.
+ */
 async function inviteAndLogin(name: string, email: string): Promise<Actor> {
   const invited = (await post(ctx.ownerA, "/company/users/invite", {
     email,
     name,
     role: "member",
-  })) as unknown as { user: { id: string }; tempPassword: string };
-  const login = (await api({ userId: "", headers: {} }, "POST", "/auth/login", {
-    email,
-    password: invited.tempPassword,
-  })) as unknown as { accessToken: string };
+  })) as unknown as { acceptUrl: string | null };
+  if (!invited.acceptUrl) {
+    throw new Error(
+      `invite for ${email} returned no acceptUrl; the harness needs the link to accept as the invitee`,
+    );
+  }
+  const token = new URL(invited.acceptUrl).searchParams.get("token") ?? "";
+  const accepted = (await api({ userId: "", headers: {} }, "POST", "/auth/invitations/accept", {
+    token,
+    password: HARNESS_INVITEE_PASSWORD,
+    name,
+  })) as unknown as { user: { id: string }; accessToken: string };
   return {
-    userId: invited.user.id,
+    userId: accepted.user.id,
     headers: {
-      authorization: `Bearer ${login.accessToken}`,
+      authorization: `Bearer ${accepted.accessToken}`,
       "x-company-id": ctx.companyId,
     },
   };
@@ -1414,6 +1452,13 @@ async function runDetectorsAndSweeps(): Promise<void> {
   // claims (deemed liability), grievances (GRM SLA breach), land schedule
   // risk (un-acquired land blocking works) and permits (lapsed consents,
   // overdue determinations). Every one is hit on BOTH projects.
+  //
+  // TRIGGER CONTRACT (see plantMissedTimeBar): each of these reads runs the
+  // SAME atomic sweep function the module's hourly scheduler job runs, scoped
+  // to the project/contract being read. The scheduler is disabled under
+  // NODE_ENV=test, so these reads are the only trigger here; a module that
+  // moves its sweep onto the scheduler alone blanks its scheme in this report
+  // without failing any unit test that calls scheduler.runNow() directly.
   for (const [projectId, contractId] of [
     [ctx.plantedProjectId, ctx.plantedContractId],
     [ctx.cleanProjectId, ctx.cleanContractId],

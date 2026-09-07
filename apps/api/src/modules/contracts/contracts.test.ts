@@ -368,7 +368,7 @@ describe("contract events + time-bar engine", () => {
     expect(rows[0]!.explanation).toContain("after the notice deadline");
   });
 
-  it("the scheduled sweep breaches past-deadline events exactly once", async () => {
+  it("breaches a past-deadline event exactly once — on the first register read; the scheduled sweep then adds nothing", async () => {
     const created = await createEvent(contractId, {
       kind: "compensation_event",
       clauseRef: "20.2",
@@ -376,33 +376,10 @@ describe("contract events + time-bar engine", () => {
       eventDate: isoDaysFromToday(-40), // deadline passed ~12 days ago
     });
     const ev = created.json() as { id: string; obligationId: string; status: string };
-    // Reading the register no longer performs the transition: the sweep is a
-    // scheduled job, so an unread contract is still policed.
+    // Creation records the event as stated; nothing sweeps on a write.
     expect(ev.status).toBe("open");
-    const listUrl = `/api/v1/projects/${projectId}/contracts/${contractId}/events`;
-    const beforeSweep = await app.inject({ method: "GET", url: listUrl, headers: owner.headers });
-    expect(
-      (beforeSweep.json() as { items: { id: string; status: string }[] }).items.find(
-        (i) => i.id === ev.id,
-      )!.status,
-    ).toBe("open");
 
-    await app.scheduler.runNow("contracts.time-bars");
-
-    const after = await app.inject({ method: "GET", url: listUrl, headers: owner.headers });
-    expect(after.statusCode).toBe(200);
-    const swept = (after.json() as { items: { id: string; status: string }[] }).items.find(
-      (i) => i.id === ev.id,
-    );
-    expect(swept!.status).toBe("time_barred");
-
-    const [obl] = await app.db
-      .select()
-      .from(obligations)
-      .where(eq(obligations.id, ev.obligationId));
-    expect(obl!.status).toBe("breached");
-
-    const signalCount = async () =>
+    const missedSignals = async () =>
       (
         await app.db
           .select()
@@ -410,13 +387,44 @@ describe("contract events + time-bar engine", () => {
           .where(
             and(eq(signals.companyId, owner.companyId), eq(signals.detector, "time_bar_missed")),
           )
-      ).length;
-    const afterFirst = await signalCount();
-    expect(afterFirst).toBe(1);
+      ).filter((s) => (s.evidenceRefs as Record<string, unknown>)["eventId"] === ev.id);
+    expect(await missedSignals()).toHaveLength(0);
 
-    // a second sweep must not duplicate the signal or re-transition
-    await app.scheduler.runNow("contracts.time-bars");
-    expect(await signalCount()).toBe(afterFirst);
+    // TRIGGER CONTRACT: the sweep has two triggers running the same atomic
+    // function — the hourly scheduler job and the register's read paths,
+    // scoped to the contract being read. The scheduler is disabled under
+    // NODE_ENV=test (and by SCHEDULER_ENABLED=false in production), so the
+    // first read is what performs the transition here.
+    const listUrl = `/api/v1/projects/${projectId}/contracts/${contractId}/events`;
+    const firstRead = await app.inject({ method: "GET", url: listUrl, headers: owner.headers });
+    expect(firstRead.statusCode).toBe(200);
+    const swept = (firstRead.json() as { items: { id: string; status: string }[] }).items.find(
+      (i) => i.id === ev.id,
+    );
+    expect(swept!.status).toBe("time_barred");
+    const [obl] = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, ev.obligationId));
+    expect(obl!.status).toBe("breached");
+    const raised = await missedSignals();
+    expect(raised).toHaveLength(1);
+    expect(raised[0]!.severity).toBe("critical");
+
+    // the scheduled job runs the same function afterwards and finds nothing
+    // left to claim: no second signal, no re-transition
+    const job = await app.scheduler.runNow("contracts.time-bars");
+    expect(job.state).toBe("succeeded");
+    expect(await missedSignals()).toHaveLength(1);
+
+    // and a second read is idempotent too
+    const secondRead = await app.inject({ method: "GET", url: listUrl, headers: owner.headers });
+    expect(
+      (secondRead.json() as { items: { id: string; status: string }[] }).items.find(
+        (i) => i.id === ev.id,
+      )!.status,
+    ).toBe("time_barred");
+    expect(await missedSignals()).toHaveLength(1);
   });
 
   it("time-bar radar orders open deadlines ascending with negative days for overdue", async () => {

@@ -51,6 +51,7 @@ on:
     types: [completed]
     branches:
       - main
+      - claude/ai-saas-construction-platform-9bkv1v
 
 concurrency:
   # One deploy at a time per target. A superseded deploy is cancelled rather

@@ -157,14 +157,15 @@ async function createEvidence(
   headers: Record<string, string>,
   metadata: Record<string, unknown>,
   independenceScore = 0.8,
+  kind = "survey",
 ) {
   const res = await app.inject({
     method: "POST",
     url: `/api/v1/projects/${projectId}/evidence`,
     headers,
     payload: {
-      kind: "survey",
-      source: "independent surveyor",
+      kind,
+      source: kind === "survey" ? "independent surveyor" : "the claimant's own measurement note",
       independenceScore,
       metadata,
     },
@@ -176,7 +177,13 @@ async function createEvidence(
 describe("reconciliations", () => {
   it("blocks a reconciliation where all evidence comes from the claimant (separation rule)", async () => {
     const assertion = await createAssertion(100);
-    const selfEvidence = await createEvidence(owner.headers, { value: 100 });
+    // A `document` the claimant wrote, not a `survey`: the separation rule
+    // counts a row against its uploader only when the row is the uploader's
+    // own attestation. A survey, log or bank record the claimant merely
+    // uploaded is a record produced upstream of them (uploader is not
+    // source), and this test used to pass only because the rule conflated
+    // the two.
+    const selfEvidence = await createEvidence(owner.headers, { value: 100 }, 0.8, "document");
     const res = await app.inject({
       method: "POST",
       url: `/api/v1/projects/${projectId}/reconciliations`,

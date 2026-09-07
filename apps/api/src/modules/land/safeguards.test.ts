@@ -610,14 +610,18 @@ describe("grievance rejection (#571-573)", () => {
 /* AUDIT BUG: read-time sweeps duplicated signals                      */
 /* ================================================================== */
 
-describe("detectors run once, from the scheduler — not from reads", () => {
-  it("does not raise or duplicate a signal when the register is read in parallel", async () => {
+describe("detectors raise once — from the scheduler and from the register reads alike", () => {
+  it("raises exactly one signal, as the system, when the register is read in parallel", async () => {
     const pid = await makeProject("Parallel reads");
     const task = await makeTask(pid, "Earthworks", addDaysISO(todayISO(), 10));
-    await makeParcel(pid, "P-RACE-1", { blockingTaskIds: [task] });
+    const parcel = await makeParcel(pid, "P-RACE-1", { blockingTaskIds: [task] });
 
-    // The workspace fires these together; before the fix each inserted a signal.
-    await Promise.all([
+    // TRIGGER CONTRACT: the schedule-risk read runs the same consent sweep
+    // the scheduled job runs (the grievance read runs the grievance sweep;
+    // the parcel list is a plain read). The workspace fires these together,
+    // and before the lock and the fingerprint each read inserted its own copy
+    // of the finding — so the same read is fired twice here, on purpose.
+    const responses = await Promise.all([
       app.inject({
         method: "GET",
         url: `/api/v1/projects/${pid}/land/schedule-risk`,
@@ -633,12 +637,42 @@ describe("detectors run once, from the scheduler — not from reads", () => {
         url: `/api/v1/projects/${pid}/grievances`,
         headers: owner.headers,
       }),
+      app.inject({
+        method: "GET",
+        url: `/api/v1/projects/${pid}/land/schedule-risk`,
+        headers: owner.headers,
+      }),
     ]);
+    for (const res of responses) expect(res.statusCode).toBe(200);
     const afterReads = await app.db
       .select()
       .from(signals)
       .where(eq(signals.projectId, pid));
-    expect(afterReads).toHaveLength(0);
+    expect(afterReads).toHaveLength(1);
+    expect(afterReads[0]!.detector).toBe("land_blocks_programme");
+    expect(afterReads[0]!.subjectId).toBe(parcel.id);
+    // the SYSTEM raised it, not whoever opened the page
+    const created = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(
+        and(
+          eq(ledgerEntries.objectType, "signal"),
+          eq(ledgerEntries.objectId, afterReads[0]!.id),
+        ),
+      );
+    expect(created).toHaveLength(1);
+    expect(created[0]!.actorId).toBeNull();
+
+    // the scheduled job afterwards has nothing left to claim
+    const job = await app.scheduler.runNow("land.detectors");
+    expect(job.state).toBe("succeeded");
+    const afterJob = await app.db
+      .select()
+      .from(signals)
+      .where(eq(signals.projectId, pid));
+    expect(afterJob).toHaveLength(1);
+    expect(afterJob[0]!.id).toBe(afterReads[0]!.id);
   });
 
   it("raises exactly one signal per finding however many times the job runs", async () => {
@@ -670,7 +704,9 @@ describe("detectors run once, from the scheduler — not from reads", () => {
       );
     expect(rows).toHaveLength(1);
     expect(rows[0]!.occurrences).toBeGreaterThan(1);
-    // the SYSTEM raised it, not whoever ran the job
+    // the SYSTEM raised it, not whoever ran the job. The trail is checked for
+    // THIS finding: the register is shared across this file's projects, and
+    // the read-side trigger raises the same detector for other projects.
     const entries = await app.db
       .select()
       .from(ledgerEntries)
@@ -678,6 +714,7 @@ describe("detectors run once, from the scheduler — not from reads", () => {
         and(
           eq(ledgerEntries.companyId, owner.companyId),
           eq(ledgerEntries.objectType, "signal"),
+          eq(ledgerEntries.objectId, rows[0]!.id),
         ),
       );
     const created = entries.filter(
@@ -1393,10 +1430,10 @@ describe("unified consent-to-programme view", () => {
     expect(body.tasks[0]!.dependencies.map((d) => d.kind).sort()).toEqual(["parcel", "permit"]);
   });
 
-  it("keeps the legacy schedule-risk shape working and writes nothing", async () => {
+  it("keeps the legacy schedule-risk shape working and raises the finding once, as the system", async () => {
     const pid = await makeProject("Legacy schedule risk");
     const task = await makeTask(pid, "Earthworks", addDaysISO(todayISO(), 10));
-    await makeParcel(pid, "P-LEGACY-1", { blockingTaskIds: [task] });
+    const parcel = await makeParcel(pid, "P-LEGACY-1", { blockingTaskIds: [task] });
     const res = await app.inject({
       method: "GET",
       url: `/api/v1/projects/${pid}/land/schedule-risk`,
@@ -1411,8 +1448,21 @@ describe("unified consent-to-programme view", () => {
     expect(body.blockedTasks).toBe(1);
     expect(body.blockedParcels).toBe(1);
     expect(body.items[0]!.reference).toBe("P-LEGACY-1");
+    // the read is the second trigger of the consent sweep: the finding is on
+    // the register once, keyed to the parcel, raised by the system
     const raised = await app.db.select().from(signals).where(eq(signals.projectId, pid));
-    expect(raised).toHaveLength(0);
+    expect(raised).toHaveLength(1);
+    expect(raised[0]!.detector).toBe("land_blocks_programme");
+    expect(raised[0]!.subjectId).toBe(parcel.id);
+    // a second read repeats the observation without a second row
+    await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/land/schedule-risk`,
+      headers: owner.headers,
+    });
+    const again = await app.db.select().from(signals).where(eq(signals.projectId, pid));
+    expect(again).toHaveLength(1);
+    expect(again[0]!.occurrences).toBeGreaterThan(1);
   });
 });
 

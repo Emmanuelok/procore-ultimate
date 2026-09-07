@@ -590,20 +590,27 @@ describe("distributions", () => {
     const body = res.json() as {
       accessLevel: string;
       seedIncluded: boolean;
+      contributors: number;
+      ownSamples: number;
       distribution: { n: number; suppressed?: boolean; median?: number };
       disclosures: string[];
     };
     expect(body.accessLevel).toBe("contributed");
     expect(body.distribution.suppressed).toBe(true);
-    // The caller's OWN sample is excluded from the figures it is compared
-    // against, so the only sample in the cell leaves nothing to describe. That
-    // is the anonymity repair: a company must never be shown a distribution it
-    // is itself most of.
-    expect(body.distribution.n).toBe(0);
+    // The cell holds ONE live sample — the caller's own — and n says so: a
+    // sample size is the cell's count, never a count that omits samples the
+    // cell holds (this once reported n=0). The sample is disclosed as the
+    // caller's own and does not count toward the contributor floor, so the
+    // cell is refused for want of OTHER contributors.
+    expect(body.distribution.n).toBe(1);
+    expect(body.contributors).toBe(1);
+    expect(body.ownSamples).toBe(1);
     expect(body.distribution.median).toBeUndefined();
     expect(body.seedIncluded).toBe(false);
-    expect(body.disclosures.join(" ")).toContain("n=0");
-    expect(body.disclosures.join(" ")).toContain("you contributed are excluded");
+    const disclosed = body.disclosures.join(" ");
+    expect(disclosed).toContain("n=1");
+    expect(disclosed).toContain("1 sample(s) in this cell are your own");
+    expect(disclosed).toContain("Only 0 distinct contributing companies other than yours");
   });
 
   it("computes contributed stats over contributed rows only, with no contributor ids anywhere", async () => {
@@ -642,15 +649,21 @@ describe("distributions", () => {
       accessLevel: string;
       seedIncluded: boolean;
       healthWarning?: string;
-      distribution: { n: number; min: number; max: number };
+      contributors: number;
+      ownSamples: number;
+      distribution: { n: number; min: number; max: number; p90: number };
     };
     expect(body.accessLevel).toBe("contributed");
-    // Six contributed samples exist in the cell; the caller sees FIVE, because
-    // its own is excluded from the population it is compared with. Seed rows
-    // for the same cell exist and are excluded too.
-    expect(body.distribution.n).toBe(5);
+    // Six contributed samples exist in the cell and the caller sees all six:
+    // its own 100% stays in n and in the figures, disclosed as its own. Seed
+    // rows for the same cell exist and are excluded. p90 is 65 — of the whole
+    // cell, not the 28 of the five others.
+    expect(body.distribution.n).toBe(6);
     expect(body.distribution.min).toBe(10);
-    expect(body.distribution.max).toBe(30);
+    expect(body.distribution.max).toBe(100);
+    expect(body.distribution.p90).toBe(65);
+    expect(body.contributors).toBe(6);
+    expect(body.ownSamples).toBe(1);
     expect(body.seedIncluded).toBe(false);
     expect(body.healthWarning).toBeUndefined();
     expect(res.body).not.toContain("co_fake");
@@ -711,7 +724,8 @@ describe("compare", () => {
     expect(body.assetClass).toBe("commercial");
     expect(body.region).toBe("GB");
     expect(body.value).toBe(100);
-    expect(body.distribution.n).toBe(5);
+    // the whole cell, this project's own contributed sample included
+    expect(body.distribution.n).toBe(6);
     expect(body.value).toBeGreaterThan(body.distribution.p90);
     // A GET NEVER WRITES. Compare reports that a signal WOULD be raised; the
     // raising happens on the explicit evaluate route, where a conditional
@@ -805,6 +819,49 @@ describe("compare", () => {
     });
     expect(evaluated.statusCode).toBe(200);
     expect((evaluated.json() as { signalRaised: boolean }).signalRaised).toBe(false);
+    expect((await outlierSignals(owner.companyId)).length).toBe(1); // unchanged
+  });
+
+  it("REGRESSION: keeps a value inside the cell quiet when the caller's own sample tops it", async () => {
+    // projMid sits at 50%: above the five others (10–30) and below the
+    // caller's own contributed 100%. With the caller's sample dropped from the
+    // figures, p90 of [10..30] is 28 and 50% read as an adverse outlier — a
+    // false positive manufactured by the arithmetic. The cell is the cell:
+    // n=6, p90=65, and 50% is inside it (five of six below → the 83rd
+    // percentile), so nothing is due and evaluate raises nothing.
+    const created = await createSnapshot(owner, projMid, "punch_open_rate");
+    expect(created.statusCode).toBe(201);
+    expect((created.json() as { value: number }).value).toBe(50);
+    const snapshotId = (created.json() as { id: string }).id;
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projMid}/benchmarks/compare?metric=punch_open_rate&assetClass=commercial&region=GB`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      percentile: number;
+      ownSamples: number;
+      distribution: { n: number; p90: number };
+      outlier: { adverse: boolean; signalRaised: boolean; wouldRaise: boolean };
+    };
+    expect(body.distribution.n).toBe(6);
+    expect(body.distribution.p90).toBe(65);
+    expect(body.ownSamples).toBe(1);
+    expect(body.percentile).toBeCloseTo(83.33, 2);
+    expect(body.outlier).toMatchObject({ adverse: false, signalRaised: false, wouldRaise: false });
+
+    const evaluated = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projMid}/benchmarks/snapshots/${snapshotId}/evaluate`,
+      headers: owner.headers,
+      payload: { assetClass: "commercial", region: "GB" },
+    });
+    expect(evaluated.statusCode).toBe(200);
+    const outcome = evaluated.json() as { signalRaised: boolean; reason: string };
+    expect(outcome.signalRaised).toBe(false);
+    expect(outcome.reason).toContain("not in the adverse tail");
     expect((await outlierSignals(owner.companyId)).length).toBe(1); // unchanged
   });
 

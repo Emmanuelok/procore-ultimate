@@ -1,10 +1,14 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import {
+  budgetLineItems,
+  budgets,
   companyMemberships,
   contracts,
+  costCodes,
   fxRates,
+  ingestedRecords,
   ingestionRuns,
   ledgerEntries,
   paymentCertificates,
@@ -19,6 +23,7 @@ import {
   vendors,
   workers,
 } from "@constructos/db";
+import { INGESTION_DATASETS } from "@constructos/shared";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
 import { newId } from "../../lib/ids.js";
 import { coerceRow, DATASET_REGISTRY, parseCsv } from "./datasets.js";
@@ -345,7 +350,7 @@ describe("connector mappings", () => {
 /* ------------------------------------------------------------------ */
 
 describe("sources & dataset registry", () => {
-  it("GET /ingestion/datasets describes every dataset with typed fields", async () => {
+  it("GET /ingestion/datasets describes all 11 datasets with typed fields and says which one is committed elsewhere", async () => {
     const res = await app.inject({
       method: "GET",
       url: url("/ingestion/datasets"),
@@ -353,9 +358,15 @@ describe("sources & dataset registry", () => {
     });
     expect(res.statusCode).toBe(200);
     const body = res.json() as {
-      datasets: { dataset: string; fields: { key: string; required: boolean }[] }[];
+      datasets: {
+        dataset: string;
+        requiresProject: boolean;
+        committedElsewhere: boolean;
+        fields: { key: string; required: boolean; type: string }[];
+      }[];
     };
-    expect(body.datasets.map((d) => d.dataset).sort()).toEqual([
+    const names = body.datasets.map((d) => d.dataset).sort();
+    expect(names).toEqual([
       // The upgrade wave added the two datasets a new company's first day needs
       // beyond the directory: the cost breakdown and the budget it hangs on.
       "budget_lines",
@@ -369,6 +380,25 @@ describe("sources & dataset registry", () => {
       "site_access",
       "telematics",
       "vendors",
+    ]);
+    // the catalog IS the enum: one vocabulary for the registry, the writers,
+    // token scopes and the run filters — nothing described here is unknown there
+    expect(names).toEqual([...INGESTION_DATASETS].sort());
+    const FIELD_TYPES = ["string", "number", "integer", "date", "time", "enum"];
+    for (const d of body.datasets) {
+      expect(d.fields.length).toBeGreaterThan(0);
+      expect(typeof d.requiresProject).toBe("boolean");
+      for (const f of d.fields) {
+        expect(f.key).toBeTruthy();
+        expect(typeof f.required).toBe("boolean");
+        expect(FIELD_TYPES).toContain(f.type);
+      }
+    }
+    // every dataset is committed by this module's own writers except the one the
+    // registry explicitly delegates (telematics → the equipment module's inlet);
+    // the wizard reads this flag to know what it may offer
+    expect(body.datasets.filter((d) => d.committedElsewhere).map((d) => d.dataset)).toEqual([
+      "telematics",
     ]);
     const vendorsDef = body.datasets.find((d) => d.dataset === "vendors")!;
     expect(vendorsDef.fields.find((f) => f.key === "name")!.required).toBe(true);
@@ -608,12 +638,15 @@ describe("CSV migration wizard", () => {
     const refused = await commitRun(run.id);
     expect(refused.statusCode).toBe(400);
     expect((refused.json() as { message: string }).message).toContain("no active schedule");
-    // a refused commit leaves the run exactly as it was
+    // a refused commit hands the run back — `validated`, never stranded in
+    // `committing` — with the reason recorded where the operator can see it
     const [after] = await app.db
       .select()
       .from(ingestionRuns)
       .where(eq(ingestionRuns.id, run.id));
     expect(after!.status).toBe("validated");
+    expect(after!.error).toContain("no active schedule");
+    expect(after!.committedCount).toBe(0);
 
     const scheduleId = newId("sch");
     await app.db.insert(schedules).values({
@@ -625,8 +658,17 @@ describe("CSV migration wizard", () => {
       isActive: 1,
       createdBy: owner.userId,
     });
-    const res = (await commitRun(run.id)).json() as { committed: number };
+    // the released run is claimable again — not "a commit is already running"
+    const retry = await commitRun(run.id);
+    expect(retry.statusCode).toBe(200);
+    const res = retry.json() as { committed: number; run: RunView };
     expect(res.committed).toBe(2);
+    expect(res.run.status).toBe("committed");
+    const [done] = await app.db
+      .select()
+      .from(ingestionRuns)
+      .where(eq(ingestionRuns.id, run.id));
+    expect(done!.error).toBeNull();
     const tasks = await app.db
       .select()
       .from(scheduleTasks)
@@ -716,9 +758,11 @@ describe("CSV migration wizard", () => {
       url: url("/ingestion/runs?dataset=vendors&status=discarded"),
       headers: owner.headers,
     });
+    expect(list.statusCode).toBe(200);
     const body = list.json() as { items: RunView[] };
     expect(body.items.length).toBeGreaterThanOrEqual(1);
     expect(body.items.every((r) => r.status === "discarded")).toBe(true);
+    expect(body.items.some((r) => r.id === run.id)).toBe(true);
 
     // REGRESSION: the same list for a plain member excludes company-level runs
     // entirely — a directory import is not readable by every membership.
@@ -729,6 +773,189 @@ describe("CSV migration wizard", () => {
     });
     expect(memberList.statusCode).toBe(200);
     expect((memberList.json() as { items: RunView[] }).items).toHaveLength(0);
+  });
+
+  it("a commit that fails inside its transaction ends `failed` with the reason — never `committing` — and half-writes nothing", async () => {
+    const projectId = await makeProject("RFI collision");
+    // An RFI written around the record counter already holds the number the
+    // import will be allocated, so the insert violates rfis_number_uq INSIDE
+    // the commit transaction — after the claim, after every precondition.
+    await app.db.insert(rfis).values({
+      id: newId("rfi"),
+      companyId: owner.companyId,
+      projectId,
+      number: 1,
+      subject: "Already here",
+      question: "Written outside the counter",
+      createdBy: owner.userId,
+    });
+    const csv = "subject,question\nClash A,Which governs?\nClash B,Confirm level\n";
+    const { run } = await uploadRun(csv, { sourceId: csvSourceId, dataset: "rfis", projectId });
+    await mapRun(run.id, { subject: "subject", question: "question" });
+    await validateRun(run.id);
+
+    const failed = await commitRun(run.id);
+    expect(failed.statusCode).toBe(500);
+    const [after] = await app.db
+      .select()
+      .from(ingestionRuns)
+      .where(eq(ingestionRuns.id, run.id));
+    expect(after!.status).toBe("failed");
+    expect(after!.error).toBeTruthy();
+    // the transaction rolled back as a whole: no RFI beyond the pre-existing
+    // one, and every staged row is still staged with no forward-link
+    const created = await app.db.select().from(rfis).where(eq(rfis.projectId, projectId));
+    expect(created).toHaveLength(1);
+    const staged = await app.db
+      .select()
+      .from(ingestedRecords)
+      .where(eq(ingestedRecords.runId, run.id));
+    expect(staged).toHaveLength(2);
+    expect(staged.every((r) => r.status === "staged" && r.committedRecordId === null)).toBe(true);
+
+    // `failed` is re-tryable, not a dead end: the counter has moved past the
+    // collision, so the same run now commits cleanly and clears its error
+    const retry = await commitRun(run.id);
+    expect(retry.statusCode).toBe(200);
+    expect((retry.json() as { run: RunView }).run.status).toBe("committed");
+    const [done] = await app.db
+      .select()
+      .from(ingestionRuns)
+      .where(eq(ingestionRuns.id, run.id));
+    expect(done!.error).toBeNull();
+  });
+
+  it("treats `committing` as exclusive: no discard, map, validate or second commit while a commit runs", async () => {
+    const { run } = await uploadRun("name\nBusy Co\n", { sourceId: csvSourceId, dataset: "vendors" });
+    await mapRun(run.id, { name: "name" });
+    await validateRun(run.id);
+    await app.db
+      .update(ingestionRuns)
+      .set({ status: "committing" })
+      .where(eq(ingestionRuns.id, run.id));
+
+    const discard = await app.inject({
+      method: "POST",
+      url: url(`/ingestion/runs/${run.id}/discard`),
+      headers: owner.headers,
+    });
+    expect(discard.statusCode).toBe(409);
+    expect((await mapRun(run.id, { name: "name" })).statusCode).toBe(409);
+    expect((await validateRun(run.id)).statusCode).toBe(409);
+    const second = await commitRun(run.id);
+    expect(second.statusCode).toBe(409);
+    expect((second.json() as { message: string }).message).toContain("already running");
+    const [still] = await app.db
+      .select()
+      .from(ingestionRuns)
+      .where(eq(ingestionRuns.id, run.id));
+    expect(still!.status).toBe("committing");
+  });
+
+  it("commits the upgrade wave's cost_codes and budget_lines through the same staged pipeline", async () => {
+    // cost_codes — the company standard list (no project). A code repeated in
+    // the run is skipped, and a parent named LATER in the file still resolves.
+    const csv =
+      "code,title,parent\n" +
+      "99-910,Site administration,99-900\n" +
+      "99-900,General requirements,\n" +
+      "99-910,Repeated,\n";
+    const { run } = await uploadRun(csv, { sourceId: csvSourceId, dataset: "cost_codes" });
+    await mapRun(run.id, { code: "code", title: "title", parentCode: "parent" });
+    const validated = (await validateRun(run.id)).json() as { run: RunView };
+    expect(validated.run.stagedCount).toBe(3);
+    const res = (await commitRun(run.id)).json() as {
+      committed: number;
+      skipped: number;
+      run: RunView;
+    };
+    expect(res.run.status).toBe("committed");
+    expect(res.committed).toBe(2);
+    expect(res.skipped).toBe(1);
+    const codes = await app.db
+      .select()
+      .from(costCodes)
+      .where(
+        and(
+          eq(costCodes.companyId, owner.companyId),
+          isNull(costCodes.projectId),
+          inArray(costCodes.code, ["99-900", "99-910"]),
+        ),
+      );
+    const byCode = new Map(codes.map((c) => [c.code, c]));
+    expect([...byCode.keys()].sort()).toEqual(["99-900", "99-910"]);
+    expect(byCode.get("99-910")!.parentId).toBe(byCode.get("99-900")!.id);
+
+    // budget_lines — refuses without an active budget (and hands the run back),
+    // then lands on the budget, links the cost code, and recomputes the header
+    const projectId = await makeProject("Budget import");
+    const csv2 =
+      "cc,desc,amount,qty,rate\n" +
+      "99-900,Preliminaries,12000,,\n" +
+      "99-910,Site staff,5000,10,500\n";
+    const { run: run2 } = await uploadRun(csv2, {
+      sourceId: csvSourceId,
+      dataset: "budget_lines",
+      projectId,
+    });
+    await mapRun(run2.id, {
+      costCode: "cc",
+      description: "desc",
+      originalBudget: "amount",
+      quantity: "qty",
+      unitRate: "rate",
+    });
+    await validateRun(run2.id);
+    const refused = await commitRun(run2.id);
+    expect(refused.statusCode).toBe(400);
+    expect((refused.json() as { message: string }).message).toContain("no active budget");
+    const [afterRefusal] = await app.db
+      .select()
+      .from(ingestionRuns)
+      .where(eq(ingestionRuns.id, run2.id));
+    expect(afterRefusal!.status).toBe("validated");
+    expect(afterRefusal!.error).toContain("no active budget");
+
+    const budgetId = newId("bud");
+    await app.db.insert(budgets).values({
+      id: budgetId,
+      companyId: owner.companyId,
+      projectId,
+      number: 1,
+      reference: "BUD-1",
+      name: "Original budget",
+      isActive: 1,
+      createdBy: owner.userId,
+    });
+    const ok = (await commitRun(run2.id)).json() as { committed: number; run: RunView };
+    expect(ok.run.status).toBe("committed");
+    expect(ok.committed).toBe(2);
+    const lines = await app.db
+      .select()
+      .from(budgetLineItems)
+      .where(eq(budgetLineItems.budgetId, budgetId));
+    expect(lines.map((l) => [l.costCode, l.originalBudget]).sort()).toEqual([
+      ["99-900", 12000],
+      ["99-910", 5000],
+    ]);
+    expect(lines.find((l) => l.costCode === "99-910")!.costCodeId).toBe(byCode.get("99-910")!.id);
+    const [budget] = await app.db.select().from(budgets).where(eq(budgets.id, budgetId));
+    expect(budget!.originalBudgetTotal).toBe(17000);
+  });
+
+  it("refuses a CSV run for a dataset another module commits, naming its push inlet", async () => {
+    const { payload, headers } = csvUpload("deviceId,recordedAt\nD-1,2026-01-01\n", {
+      sourceId: csvSourceId,
+      dataset: "telematics",
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: url("/ingestion/runs"),
+      headers: { ...owner.headers, ...headers },
+      payload,
+    });
+    expect(res.statusCode).toBe(400);
+    expect((res.json() as { message: string }).message).toContain("/ingestion/push/telematics");
   });
 });
 

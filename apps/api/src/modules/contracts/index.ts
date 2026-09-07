@@ -273,6 +273,23 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
     return rows[0];
   }
 
+  /**
+   * Route-side trigger of the time-bar sweep (#229-231). The scheduled job
+   * (contracts.time-bars) runs the same function hourly for every tenant; the
+   * events register's read paths run it for the contract being read, so a
+   * past-deadline event is never shown as still open and a deployment whose
+   * scheduler is off (SCHEDULER_ENABLED=false, NODE_ENV=test, the retrodetect
+   * harness) still records the breach. The row claim is a guarded UPDATE, the
+   * signal is keyed and the actor is the system — two triggers, one claim.
+   */
+  async function sweepContractTimeBars(
+    companyId: string,
+    projectId: string,
+    contractId: string,
+  ): Promise<void> {
+    await sweepTimeBars(app.db, companyId, new Date(), { projectId, contractIds: [contractId] });
+  }
+
   async function fetchEotClaim(
     claimId: string,
     contractId: string,
@@ -825,6 +842,7 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
       const { contractId } = req.params as { contractId: string };
       const q = eventListQuery.parse(req.query);
       await fetchContract(contractId, req.companyId!, req.projectId!);
+      await sweepContractTimeBars(req.companyId!, req.projectId!, contractId);
       const clauses = [
         eq(contractEvents.companyId, req.companyId!),
         eq(contractEvents.projectId, req.projectId!),
@@ -850,10 +868,11 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
   );
 
   /**
-   * Run the time-bar sweep on demand. The sweep is a SCHEDULED job
-   * (contracts.time-bars); this endpoint exists so an operator or a test can
-   * force a cycle without waiting an hour, and it is admin-gated because it
-   * writes state changes.
+   * Run the time-bar sweep on demand for a whole project. The sweep's two
+   * ordinary triggers are the scheduled job (contracts.time-bars) and the
+   * events register reads (per contract); this endpoint exists so an operator
+   * or a test can force a project-wide cycle without waiting an hour, and it
+   * is admin-gated because it writes state changes.
    */
   app.post(
     "/projects/:projectId/contracts/sweep-time-bars",
@@ -872,6 +891,7 @@ export const contractsModule: FastifyPluginAsync = async (app) => {
     async (req) => {
       const { contractId, eventId } = req.params as { contractId: string; eventId: string };
       const contract = await fetchContract(contractId, req.companyId!, req.projectId!);
+      await sweepContractTimeBars(req.companyId!, req.projectId!, contractId);
       const ev = await fetchEvent(eventId, contractId, req.companyId!, req.projectId!);
       const clause = ev.clauseRef
         ? resolveClause(contract.form as ContractForm, ev.clauseRef, contract.particularConditions, {

@@ -3,10 +3,20 @@
  * content.
  *
  * These replace three lazy sweeps that ran inside `GET /permits` and
- * `GET /permits/schedule-risk`. The permit tab loads both in parallel, so
- * both requests used to read "no signal yet" and both inserted one; the
- * expiry flip was guarded by a conditional UPDATE but the signal insert and
- * the ledger append ran regardless of whether that UPDATE matched a row.
+ * `GET /permits/schedule-risk` with no lock and no unique key. The permit tab
+ * loads both in parallel, so both requests used to read "no signal yet" and
+ * both inserted one; the expiry flip was guarded by a conditional UPDATE but
+ * the signal insert and the ledger append ran regardless of whether that
+ * UPDATE matched a row.
+ *
+ * TRIGGER CONTRACT. `sweepPermits` has two triggers that run the same
+ * function: the scheduled `jurisdiction.detectors` job (hourly, every tenant,
+ * so a project nobody opens is still policed) and `GET /permits`, scoped to
+ * the project being read. The scheduler is disabled under NODE_ENV=test and
+ * by SCHEDULER_ENABLED=false, so there the read is the only trigger (every
+ * test, the retrodetect harness); the advisory lock, the guarded flip and the
+ * fingerprint are what make a second trigger — or two parallel reads — a
+ * no-op, not the absence of a read-side call.
  *
  * Families here:
  *

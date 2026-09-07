@@ -32,14 +32,14 @@ import {
   workers,
 } from "@constructos/db";
 import {
-  ALL_INGESTION_DATASETS,
+  INGESTION_DATASETS,
   INGESTION_MODES,
   INGESTION_RESOLUTIONS,
-  meetsLevel,
   INGESTION_RUN_STATUSES,
   INGESTION_SOURCE_KINDS,
+  meetsLevel,
   STAGED_RECORD_STATUSES,
-  type AnyIngestionDataset,
+  type IngestionDataset,
   type ToolKey,
 } from "@constructos/shared";
 import { hashPayload, sha256Hex } from "@constructos/ledger";
@@ -97,20 +97,20 @@ const sourcesListQuery = pageQuerySchema.extend({
 
 const runFieldsSchema = z.object({
   sourceId: z.string().min(1).max(64),
-  dataset: z.enum(ALL_INGESTION_DATASETS),
+  dataset: z.enum(INGESTION_DATASETS),
   projectId: z.string().min(1).max(64).optional(),
   /** insert (default) rejects a re-presented externalId; reconcile diffs it */
   mode: z.enum(INGESTION_MODES).optional(),
 });
 
 const runsListQuery = pageQuerySchema.extend({
-  dataset: z.enum(ALL_INGESTION_DATASETS).optional(),
+  dataset: z.enum(INGESTION_DATASETS).optional(),
   status: z.enum(INGESTION_RUN_STATUSES).optional(),
 });
 
 const templateCreateSchema = z.object({
   name: z.string().min(1).max(200),
-  dataset: z.enum(ALL_INGESTION_DATASETS),
+  dataset: z.enum(INGESTION_DATASETS),
   sourceId: z.string().min(1).max(64).nullable().optional(),
   columnMap: z.record(z.string().min(1).max(100), z.string().min(1).max(200)),
 });
@@ -168,7 +168,7 @@ const PROGRAMME_REMEDY =
 const MAX_PROGRAMME_BYTES = 32 * 1024 * 1024;
 
 const templateListQuery = pageQuerySchema.extend({
-  dataset: z.enum(ALL_INGESTION_DATASETS).optional(),
+  dataset: z.enum(INGESTION_DATASETS).optional(),
   sourceId: z.string().min(1).max(64).optional(),
 });
 
@@ -196,7 +196,7 @@ const PROGRAMME_FIELDS = [
 
 const tokenCreateSchema = z.object({
   name: z.string().min(1).max(200),
-  scopes: z.array(z.enum(ALL_INGESTION_DATASETS)).min(1).max(ALL_INGESTION_DATASETS.length),
+  scopes: z.array(z.enum(INGESTION_DATASETS)).min(1).max(INGESTION_DATASETS.length),
   expiresAt: isoTimestamp.nullable().optional(),
 });
 
@@ -290,7 +290,7 @@ const CHUNK = 500;
  * /ingestion/runs/:runId/records. It is the same data, so it takes the same
  * gate — resolved per run against the run's own project.
  */
-const DATASET_TOOL: Record<AnyIngestionDataset, ToolKey> = {
+const DATASET_TOOL: Record<IngestionDataset, ToolKey> = {
   vendors: "directory",
   cost_assertions: "assurance",
   site_access: "workforce",
@@ -386,7 +386,7 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
    */
   async function assertRunReadable(req: FastifyRequest, run: RunRow): Promise<void> {
     if (req.companyRole === "owner" || req.companyRole === "admin") return;
-    const tool = DATASET_TOOL[run.dataset as AnyIngestionDataset] ?? "admin";
+    const tool = DATASET_TOOL[run.dataset as IngestionDataset] ?? "admin";
     if (!run.projectId) {
       throw forbidden(
         `This run is company-level ${run.dataset} data; only an owner or admin may read its ` +
@@ -759,7 +759,7 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
    */
   async function applyReconcileUpdate(
     db: Db,
-    dataset: AnyIngestionDataset,
+    dataset: IngestionDataset,
     ctx: CommitCtx,
     row: StagedRow,
   ): Promise<RowOutcome> {
@@ -812,7 +812,7 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
 
   async function commitRows(
     db: Db,
-    dataset: AnyIngestionDataset,
+    dataset: IngestionDataset,
     ctx: CommitCtx,
     rows: StagedRow[],
     prep: CommitPrep,
@@ -1450,13 +1450,46 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
   }
 
   /**
+   * Release a run whose commit was REFUSED before its transaction began.
+   *
+   * The commit route claims the run into `committing` in the same statement
+   * that checks it was committable (claimRun) — so by the time the
+   * preconditions run, the run has already left `validated`. A refusal that
+   * simply threw left it in `committing` for good: every later commit, map
+   * and validate was told "a commit is already running", and discarding the
+   * run was the only exit. Nothing was written, so the honest state is the
+   * one the claim took it from — `validated` — with the reason on `error`, so
+   * the operator can see why, fix the precondition and retry. The conditional
+   * WHERE lets the push path (which never claims; its run is still
+   * `validated`) record the same reason without inventing a transition.
+   */
+  async function releaseRefusedCommit(runId: string, err: unknown): Promise<void> {
+    const message = err instanceof Error ? err.message : String(err);
+    await app.db
+      .update(ingestionRuns)
+      .set({ status: "validated", error: message, updatedAt: new Date().toISOString() })
+      .where(
+        and(
+          eq(ingestionRuns.id, runId),
+          inArray(ingestionRuns.status, ["committing", "validated"]),
+        ),
+      );
+  }
+
+  /**
    * Commit a validated run: the real records, the per-row provenance updates
    * and the run's final state are written in ONE transaction, so a failure
-   * leaves nothing half-committed (the run is marked `failed` and can be
-   * retried). RFI numbers are allocated through the shared record-counter
-   * BEFORE the transaction — a failed commit burns numbers rather than
-   * nesting transactions, which is the same trade every module makes.
-   * The single ledger entry carries the file hash and the counts.
+   * leaves nothing half-committed (the run is marked `failed` with the reason
+   * and can be retried, re-mapped or discarded). A commit REFUSED before the
+   * transaction — no active schedule, no active budget, no staged rows —
+   * returns the run to `validated` with the reason on `error`. Either way a
+   * run never stays `committing` (ADR 0015), and both callers — the commit
+   * route, which claimed the run, and the push inlet, which did not — rely on
+   * that here rather than guessing afterwards. RFI numbers are allocated
+   * through the shared record-counter BEFORE the transaction — a failed
+   * commit burns numbers rather than nesting transactions, which is the same
+   * trade every module makes. The single ledger entry carries the file hash
+   * and the counts.
    */
   async function runCommit(
     run: RunRow,
@@ -1464,20 +1497,14 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
     ledgerActorId: string | null,
   ): Promise<{ committed: number; skipped: number; updated: number }> {
     const def = datasetDef(run.dataset)!;
-    const rows = await app.db
-      .select()
-      .from(ingestedRecords)
-      .where(and(eq(ingestedRecords.runId, run.id), eq(ingestedRecords.status, "staged")))
-      .orderBy(asc(ingestedRecords.rowNumber));
-    if (rows.length === 0) {
-      throw badRequest("Run has no valid staged rows to commit — validate first, or fix and re-map");
-    }
-    if (def.requiresProject && !run.projectId) {
-      throw badRequest(`dataset ${def.dataset} requires the run to carry a projectId`);
-    }
 
-    // Preconditions & pre-allocation (all BEFORE the run leaves `validated`,
-    // so a refused commit leaves the run exactly as it was).
+    // PRECONDITIONS & PRE-ALLOCATION. Everything up to the transaction is a
+    // check that may refuse: staged rows exist, the dataset's project is
+    // present, the project has an active schedule / budget, RFI numbers can
+    // be allocated. The commit route has ALREADY claimed the run into
+    // `committing` — the claim is what makes a double commit impossible — so
+    // a refusal here must hand the run back (releaseRefusedCommit) or it
+    // stays `committing` forever with nothing written and no way to retry.
     const prep: CommitPrep = {
       rfiNumbers: [],
       activeScheduleId: null,
@@ -1485,61 +1512,78 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
       activeBudgetId: null,
       activeBudgetCurrency: null,
     };
-    if (run.dataset === "rfis") {
-      for (let i = 0; i < rows.length; i += 1) {
-        prep.rfiNumbers.push(await nextRecordNumber(app.db, run.projectId!, "rfi"));
-      }
-    }
-    if (run.dataset === "budget_lines") {
-      const [budget] = await app.db
-        .select({ id: budgets.id, currency: budgets.currency, lockedAt: budgets.lockedAt })
-        .from(budgets)
-        .where(
-          and(
-            eq(budgets.companyId, run.companyId),
-            eq(budgets.projectId, run.projectId!),
-            eq(budgets.isActive, 1),
-          ),
-        )
-        .limit(1);
-      if (!budget) {
-        throw badRequest(
-          "Project has no active budget — create one in the budget tool before committing " +
-            "budget_lines",
-        );
-      }
-      if (budget.lockedAt) {
-        throw conflict(
-          "The active budget is locked, so lines may only move through an approved budget " +
-            "change. Unlock it, or raise the change, before importing lines.",
-        );
-      }
-      prep.activeBudgetId = budget.id;
-      prep.activeBudgetCurrency = budget.currency;
-    }
-    if (run.dataset === "schedule_tasks") {
-      const sch = await app.db
+    let rows: StagedRow[];
+    try {
+      rows = await app.db
         .select()
-        .from(schedules)
-        .where(
-          and(
-            eq(schedules.companyId, run.companyId),
-            eq(schedules.projectId, run.projectId!),
-            eq(schedules.isActive, 1),
-          ),
-        )
-        .limit(1);
-      if (!sch[0]) {
-        throw badRequest(
-          "Project has no active schedule — create one in the schedule tool before committing schedule_tasks",
-        );
+        .from(ingestedRecords)
+        .where(and(eq(ingestedRecords.runId, run.id), eq(ingestedRecords.status, "staged")))
+        .orderBy(asc(ingestedRecords.rowNumber));
+      if (rows.length === 0) {
+        throw badRequest("Run has no valid staged rows to commit — validate first, or fix and re-map");
       }
-      prep.activeScheduleId = sch[0].id;
-      const maxRow = await app.db
-        .select({ m: sql<number>`coalesce(max(${scheduleTasks.sortOrder}), -1)` })
-        .from(scheduleTasks)
-        .where(eq(scheduleTasks.scheduleId, sch[0].id));
-      prep.taskSortBase = Number(maxRow[0]?.m ?? -1) + 1;
+      if (def.requiresProject && !run.projectId) {
+        throw badRequest(`dataset ${def.dataset} requires the run to carry a projectId`);
+      }
+      if (run.dataset === "rfis") {
+        for (let i = 0; i < rows.length; i += 1) {
+          prep.rfiNumbers.push(await nextRecordNumber(app.db, run.projectId!, "rfi"));
+        }
+      }
+      if (run.dataset === "budget_lines") {
+        const [budget] = await app.db
+          .select({ id: budgets.id, currency: budgets.currency, lockedAt: budgets.lockedAt })
+          .from(budgets)
+          .where(
+            and(
+              eq(budgets.companyId, run.companyId),
+              eq(budgets.projectId, run.projectId!),
+              eq(budgets.isActive, 1),
+            ),
+          )
+          .limit(1);
+        if (!budget) {
+          throw badRequest(
+            "Project has no active budget — create one in the budget tool before committing " +
+              "budget_lines",
+          );
+        }
+        if (budget.lockedAt) {
+          throw conflict(
+            "The active budget is locked, so lines may only move through an approved budget " +
+              "change. Unlock it, or raise the change, before importing lines.",
+          );
+        }
+        prep.activeBudgetId = budget.id;
+        prep.activeBudgetCurrency = budget.currency;
+      }
+      if (run.dataset === "schedule_tasks") {
+        const sch = await app.db
+          .select()
+          .from(schedules)
+          .where(
+            and(
+              eq(schedules.companyId, run.companyId),
+              eq(schedules.projectId, run.projectId!),
+              eq(schedules.isActive, 1),
+            ),
+          )
+          .limit(1);
+        if (!sch[0]) {
+          throw badRequest(
+            "Project has no active schedule — create one in the schedule tool before committing schedule_tasks",
+          );
+        }
+        prep.activeScheduleId = sch[0].id;
+        const maxRow = await app.db
+          .select({ m: sql<number>`coalesce(max(${scheduleTasks.sortOrder}), -1)` })
+          .from(scheduleTasks)
+          .where(eq(scheduleTasks.scheduleId, sch[0].id));
+        prep.taskSortBase = Number(maxRow[0]?.m ?? -1) + 1;
+      }
+    } catch (err) {
+      await releaseRefusedCommit(run.id, err);
+      throw err;
     }
 
     const ctx: CommitCtx = {
@@ -1829,6 +1873,17 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
       );
     }
     const def = datasetDef(fields.dataset)!;
+    // The registry can name a dataset this module does not commit (telematics
+    // lands through the equipment module's inlet). Refusing here is what makes
+    // the wizard honest: without it the file staged, mapped and validated, and
+    // only the commit transaction told the operator to start over.
+    if (def.committedElsewhere) {
+      throw badRequest(
+        `dataset ${def.dataset} is committed by another module through ` +
+          `POST /api/v1/ingestion/push/${def.dataset}, not by a CSV run — push it with a ` +
+          `machine token scoped to \`${def.dataset}\``,
+      );
+    }
     const projectId = fields.projectId ?? source.projectId ?? null;
     if (def.requiresProject && !projectId) {
       throw badRequest(`dataset ${def.dataset} requires a projectId on the run`);
@@ -2067,36 +2122,13 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
     // The claim IS the check: the run moves to `committing` in the same
     // statement that verifies it was committable, so a second request finds
     // nothing to claim and is told so instead of committing the rows again.
+    // The way back out is runCommit's, not this route's: a refusal before its
+    // transaction returns the run to `validated` and a failure inside it marks
+    // the run `failed`, each with the reason on `error` — so an error thrown
+    // through here never leaves a run behind in `committing`.
     const run = await claimRun(runId, req.companyId!, ["validated", "failed"], "committing");
-    try {
-      const result = await runCommit(run, req.user!.id, req.user!.id);
-      return { run: await fetchRun(run.id, req.companyId!), ...result };
-    } catch (err) {
-      /*
-       * A REFUSED COMMIT MUST NOT STRAND THE RUN.
-       *
-       * runCommit's preconditions (no active schedule, locked budget, nothing
-       * staged) throw before anything is written, and its own catch marks the
-       * run `failed` when the transaction itself fails. So a run still sitting
-       * in `committing` here was refused before it started: the staged rows are
-       * exactly as validation left them, and the run goes back to `validated`
-       * so the operator can fix the precondition and try again. Without this
-       * the claim — which is what makes concurrent commits safe — would leave
-       * the run in a state no transition accepts.
-       */
-      const [current] = await app.db
-        .select({ status: ingestionRuns.status })
-        .from(ingestionRuns)
-        .where(eq(ingestionRuns.id, run.id))
-        .limit(1);
-      if (current?.status === "committing") {
-        await app.db
-          .update(ingestionRuns)
-          .set({ status: "validated", updatedAt: new Date().toISOString() })
-          .where(eq(ingestionRuns.id, run.id));
-      }
-      throw err;
-    }
+    const result = await runCommit(run, req.user!.id, req.user!.id);
+    return { run: await fetchRun(run.id, req.companyId!), ...result };
   });
 
   app.post("/ingestion/runs/:runId/discard", { preHandler: adminGate }, async (req) => {
@@ -2106,10 +2138,14 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
       throw conflict("A committed run cannot be discarded — its records are already real");
     }
     if (run.status === "discarded") throw conflict("Run is already discarded");
-    await app.db
-      .update(ingestionRuns)
-      .set({ status: "discarded", updatedAt: new Date().toISOString() })
-      .where(eq(ingestionRuns.id, run.id));
+    if (run.status === "committing") {
+      throw conflict("A commit is running for this run — wait for it to finish before discarding");
+    }
+    // The transition is a claim like every other: a discard that raced a
+    // commit used to win the status write and lose the records — the commit's
+    // transaction then stamped `committed` over `discarded` and left real rows
+    // behind a run the operator had been told was gone.
+    await claimRun(runId, req.companyId!, ["staging", "validated", "failed"], "discarded");
     await appendLedger(app.db, {
       companyId: req.companyId!,
       actorId: req.user!.id,
@@ -2679,7 +2715,7 @@ export const ingestionModule: FastifyPluginAsync = async (app) => {
     const def = datasetDef(dataset);
     if (!def) {
       throw badRequest(
-        `Unknown dataset "${dataset}" — one of: ${ALL_INGESTION_DATASETS.join(", ")}`,
+        `Unknown dataset "${dataset}" — one of: ${INGESTION_DATASETS.join(", ")}`,
       );
     }
     const header = req.headers.authorization;

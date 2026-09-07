@@ -44,7 +44,7 @@ import { PERMIT_REAPPLY_FROM, PERMIT_TRANSITIONS } from "./reference.js";
 // blocked by both an unacquired parcel and an ungranted permit is ONE
 // problem, so both workspaces quantify it with the same arithmetic.
 import { loadConsentView } from "../land/consent-service.js";
-import { registerJurisdictionJobs, runJurisdictionDetectors } from "./detectors.js";
+import { registerJurisdictionJobs, runJurisdictionDetectors, sweepPermits } from "./detectors.js";
 import { registerGroupRoutes } from "./group.js";
 import { registerSearchSource, tableSource } from "../search/registry.js";
 
@@ -500,8 +500,12 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
    * ledger actor for a finding they did not make.
    *
    * They now run as a scheduled job (system actor, advisory-locked,
-   * fingerprinted, self-reconciling) and reads are pure. `POST
-   * .../jurisdiction/detectors/run` triggers a cycle for operators and tests.
+   * fingerprinted, self-reconciling) — and the permit register read runs the
+   * same `sweepPermits` for the project it is reading, so the two triggers
+   * claim each finding once and a deployment with the scheduler off
+   * (SCHEDULER_ENABLED=false, NODE_ENV=test) is still policed. `POST
+   * .../jurisdiction/detectors/run` triggers a full cycle for operators and
+   * tests.
    */
   registerJurisdictionJobs(app);
 
@@ -1125,6 +1129,18 @@ export const jurisdictionModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/permits", { preHandler: readGate }, async (req) => {
     const q = permitListQuery.parse(req.query);
+    /*
+     * Route-side trigger of the permit sweep (#585-590 and expiry). The
+     * scheduled job (jurisdiction.detectors) runs the same function hourly
+     * for every tenant; the register read runs it for THIS project first, so
+     * a lapsed grant is shown as expired and an overdue determination is on
+     * the signal register by the time the list answers — and a deployment
+     * whose scheduler is off (SCHEDULER_ENABLED=false, NODE_ENV=test, the
+     * retrodetect harness) is still policed. Advisory-locked, guarded flip,
+     * fingerprinted, system actor: two triggers, one claim, and the parallel
+     * loads of the permit tab cannot duplicate a finding.
+     */
+    await sweepPermits(app.db, req.companyId!, req.projectId!);
     const filters = [eq(permits.companyId, req.companyId!), eq(permits.projectId, req.projectId!)];
     if (q.kind) filters.push(eq(permits.kind, q.kind));
     if (q.status) filters.push(eq(permits.status, q.status));

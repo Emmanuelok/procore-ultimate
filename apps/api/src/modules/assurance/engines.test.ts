@@ -28,13 +28,17 @@ import {
   type InvoiceLike,
 } from "./ghostvendor.js";
 import {
+  ATTESTATION_INDEPENDENCE_CEILING,
   DEFAULT_TOLERANCE,
+  INDEPENDENCE_BY_KIND,
   RECONCILERS,
   autoReconcile,
   effectiveIndependence,
+  ownAttestation,
   proximityFactor,
   reconcilersFor,
   runReconciler,
+  selfCertification,
   type AssertionLike,
   type EvidenceLike,
 } from "./reconcilers.js";
@@ -441,20 +445,33 @@ describe("typed reconcilers", () => {
     expect(outcome.rejected[0]!.reason).toMatch(/not accepted by the headcount_vs_access/);
   });
 
-  it("scores evidence submitted by the claimant at zero independence", () => {
+  it("scores the claimant's own attestation at zero, but not a record they merely uploaded", () => {
     const a = assertion();
-    const own = effectiveIndependence(ev({ id: "e", submittedBy: "usr_claimant" }), a);
+    // A photograph the claimant took is the claim restated.
+    const own = effectiveIndependence(
+      ev({ id: "e", kind: "photograph", submittedBy: "usr_claimant" }),
+      a,
+    );
     expect(own.score).toBe(0);
     expect(own.reason).toMatch(/claimant/);
+    expect(own.reason).toMatch(/own attestation/);
+    // Reality capture the claimant uploaded was produced by the scanner, not
+    // by the claimant: uploader is not source, and the base score stands.
+    const conveyed = effectiveIndependence(ev({ id: "e", submittedBy: "usr_claimant" }), a);
+    expect(conveyed.score).toBeCloseTo(0.9, 5);
+    expect(conveyed.reason).toMatch(/uploaded by the claimant/);
+    expect(conveyed.reason).toMatch(/record produced upstream/);
     const other = effectiveIndependence(ev({ id: "e", submittedBy: "usr_surveyor" }), a);
     expect(other.score).toBeCloseTo(0.9, 5);
   });
 
   it("also scores zero for the AUTHOR of the assertion, not just the named claimant", () => {
-    // The attack: file the claim in a colleague's name, then produce all the
+    // The attack: file the claim in a colleague's name, then write up all the
     // evidence yourself. `createdBy` closes it.
     const a = assertion({ claimantId: "usr_colleague", createdBy: "usr_author" });
-    expect(effectiveIndependence(ev({ id: "e", submittedBy: "usr_author" }), a).score).toBe(0);
+    expect(
+      effectiveIndependence(ev({ id: "e", kind: "document", submittedBy: "usr_author" }), a).score,
+    ).toBe(0);
   });
 
   it("discounts evidence captured outside the claim window", () => {
@@ -540,6 +557,113 @@ describe("typed reconcilers", () => {
 /* ------------------------------------------------------------------ */
 /* Scoring                                                             */
 /* ------------------------------------------------------------------ */
+
+describe("separation rule (selfCertification)", () => {
+  const ATTESTATION_KINDS = ["photograph", "video", "document", "other"];
+
+  it("reads the attestation ceiling off a real gap in the independence table", () => {
+    // The threshold is not a hand-picked list: every kind sits clearly on one
+    // side of it (delivery_note 0.6 above, video 0.45 below), and the kinds
+    // below are exactly the ones a person composes.
+    for (const v of Object.values(INDEPENDENCE_BY_KIND)) {
+      expect(v >= 0.6 || v <= 0.45).toBe(true);
+    }
+    const below = Object.entries(INDEPENDENCE_BY_KIND)
+      .filter(([, v]) => v < ATTESTATION_INDEPENDENCE_CEILING)
+      .map(([k]) => k)
+      .sort();
+    expect(below).toEqual([...ATTESTATION_KINDS].sort());
+    expect(ownAttestation({ kind: "photograph", independenceScore: 0 }).own).toBe(true);
+    expect(ownAttestation({ kind: "biometric_log", independenceScore: 0 }).own).toBe(false);
+    // An unknown kind is treated as an attestation, never as a record.
+    expect(ownAttestation({ kind: "carrier_pigeon", independenceScore: 0 }).own).toBe(true);
+  });
+
+  it("flags a claim evidenced only by the claimant's own photographs and documents", () => {
+    const a = assertion();
+    const self = selfCertification(a, [
+      ev({ id: "evd_1", kind: "photograph", submittedBy: "usr_claimant" }),
+      ev({ id: "evd_2", kind: "document", submittedBy: "usr_claimant" }),
+    ]);
+    expect(self.selfCertified).toBe(true);
+    expect(self.reason).toMatch(/submitted by the claimant/);
+    expect(self.reason).toMatch(/evd_1, evd_2/);
+    expect(self.rows.every((r) => r.role === "claimant" && r.counted)).toBe(true);
+  });
+
+  it("does not flag a record the same person merely conveyed (admin ingests claim and turnstile log)", () => {
+    // The deployment reality: one administrator records the vendor's payroll
+    // claim AND pushes the biometric log it is tested against. Their name is
+    // on both rows; the turnstile produced the log.
+    const a = assertion({ claimantId: "ent_vendor", claimantKind: "entity", createdBy: "usr_admin" });
+    const self = selfCertification(a, [
+      ev({ id: "evd_bio", kind: "biometric_log", independenceScore: 0.9, submittedBy: "usr_admin" }),
+    ]);
+    expect(self.selfCertified).toBe(false);
+    expect(self.reason).toBeNull();
+    expect(self.rows[0]).toMatchObject({ role: "author", counted: false });
+    expect(self.rows[0]!.reason).toMatch(/record produced upstream/);
+    expect(self.rows[0]!.reason).toMatch(/not counted/);
+    // Same for a bank record the claimant uploaded about their own cost claim.
+    expect(
+      selfCertification(assertion(), [
+        ev({ id: "evd_bank", kind: "bank_transaction", independenceScore: 0.9, submittedBy: "usr_claimant" }),
+      ]).selfCertified,
+    ).toBe(false);
+  });
+
+  it("does not bite when one independent record sits among the claimant's own attestations", () => {
+    const self = selfCertification(assertion(), [
+      ev({ id: "evd_photo", kind: "photograph", submittedBy: "usr_claimant" }),
+      ev({ id: "evd_scan", kind: "reality_capture", submittedBy: "usr_claimant" }),
+    ]);
+    expect(self.selfCertified).toBe(false);
+    expect(self.rows.map((r) => r.counted)).toEqual([true, false]);
+  });
+
+  it("believes an inlet that scored the row itself as not independent, but not a claimant vouching for a photo", () => {
+    // (b) a survey the site-progress assessment scored 0.2 because observer
+    // and claimant share an employer — the row says it is not independent.
+    const scored = selfCertification(assertion(), [
+      ev({ id: "evd_s", kind: "survey", independenceScore: 0.2, submittedBy: "usr_claimant" }),
+    ]);
+    expect(scored.selfCertified).toBe(true);
+    expect(scored.rows[0]!.reason).toMatch(/scored 0.20/);
+    // A declared 0.95 on the claimant's own photograph lifts nothing: a
+    // declaration of independence about one's own upload is self-certification.
+    const vouched = selfCertification(assertion(), [
+      ev({ id: "evd_p", kind: "photograph", independenceScore: 0.95, submittedBy: "usr_claimant" }),
+    ]);
+    expect(vouched.selfCertified).toBe(true);
+  });
+
+  it("names the author when the claim was filed for someone else, and stays quiet for third parties", () => {
+    const a = assertion({ claimantId: "usr_colleague", createdBy: "usr_author" });
+    const byAuthor = selfCertification(a, [
+      ev({ id: "evd_d", kind: "document", submittedBy: "usr_author" }),
+    ]);
+    expect(byAuthor.selfCertified).toBe(true);
+    expect(byAuthor.reason).toMatch(/author of the assertion/);
+    const third = selfCertification(a, [
+      ev({ id: "evd_d", kind: "document", submittedBy: "usr_surveyor" }),
+    ]);
+    expect(third.selfCertified).toBe(false);
+    expect(third.rows[0]).toMatchObject({ role: null, counted: false });
+    expect(selfCertification(a, []).selfCertified).toBe(false);
+  });
+
+  it("carries the inlet's provenance into the row's reason for the reviewer", () => {
+    const self = selfCertification(assertion(), [
+      ev({
+        id: "evd_p",
+        kind: "photograph",
+        submittedBy: "usr_claimant",
+        provenance: { via: "multipart_upload", filename: "IMG_0412.jpg" },
+      }),
+    ]);
+    expect(self.rows[0]!.reason).toMatch(/via multipart_upload/);
+  });
+});
 
 describe("detector precision", () => {
   it("refuses to publish a figure below the minimum reviewed count", () => {

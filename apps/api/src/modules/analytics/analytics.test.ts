@@ -802,10 +802,11 @@ describe("schedules (#736)", () => {
       nextRunAt: string;
       delivery: { enabled: boolean; dispatches: boolean; provider: string; job: string; note: string };
     };
-    // Delivery is REAL now: a scheduler job executes due schedules. Whether
-    // anything leaves depends on EMAIL_PROVIDER, and the notice states which of
-    // the two is true rather than asserting either.
-    expect(body.delivery.enabled).toBe(true);
+    // A scheduler job executes due schedules either way and is named here, but
+    // `enabled` is whether a report will LEAVE this deployment — the flag the
+    // web caveat (DeliveryNote) and API clients branch on. No EMAIL_PROVIDER in
+    // tests, so the response must say nothing leaves: in the flag, and in words.
+    expect(body.delivery.enabled).toBe(false);
     expect(body.delivery.job).toBe("analytics.report-delivery");
     expect(body.delivery.dispatches).toBe(false);
     expect(body.delivery.provider).toBe("none");
@@ -843,8 +844,9 @@ describe("schedules (#736)", () => {
       headers: owner.headers,
     });
     expect(list.json().items).toHaveLength(1);
-    // the job runs; whether anything is SENT depends on the transport
-    expect(list.json().delivery.enabled).toBe(true);
+    // the job runs, but nothing is SENT without a transport — and `enabled`
+    // reports the latter
+    expect(list.json().delivery.enabled).toBe(false);
     expect(list.json().delivery.dispatches).toBe(false);
 
     const removed = await app.inject({

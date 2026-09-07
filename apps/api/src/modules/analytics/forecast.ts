@@ -152,7 +152,7 @@ export function buildForecast(input: {
       ...input.growthInputs,
       growthToDatePct: input.growthToDate,
       poolTotalSamples: input.pool.totalSamples,
-      ownSamplesExcluded: input.pool.ownSamples,
+      ownSamples: input.pool.ownSamples,
       seedOnly: input.seedOnly,
     },
     reasons,

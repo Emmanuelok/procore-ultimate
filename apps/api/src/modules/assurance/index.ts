@@ -154,8 +154,10 @@ import { shellCompanyIndicators, undeclaredConflicts, type GraphEdge } from "./g
 import {
   DEFAULT_TOLERANCE,
   RECONCILERS,
+  ATTESTATION_INDEPENDENCE_CEILING,
   autoReconcile,
   effectiveIndependence,
+  selfCertification,
   type AssertionLike,
   type EvidenceLike,
   type TolerancePolicy,
@@ -1468,95 +1470,64 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
       independenceScore: row.independenceScore,
       metadata: row.metadata,
       submittedBy: row.submittedBy,
+      provenance: row.provenance,
     };
   }
 
   /**
    * The separation rule, at the moment it actually bites.
    *
-   * Every path by which one actor can stand on both sides of a claim is
-   * closed here, and each is a real attack rather than a hypothetical:
-   *   • the claimant submitting their own evidence (the original check);
-   *   • the AUTHOR of the assertion submitting it, when the claim was filed
+   * ONE definition — `selfCertification` in reconcilers.ts — serves both the
+   * manual route (which may refuse) and the bulk auto route (which cannot
+   * refuse a whole project and downgrades instead). The rule it applies:
+   *
+   *   a reconciliation is self-certified when EVERY evidence row it used was
+   *   submitted by the claimant (user claims) or by the author of the
+   *   assertion AND is that person's own attestation — a photograph, video,
+   *   document or "other" (kinds whose prior independence is below
+   *   ATTESTATION_INDEPENDENCE_CEILING), or a row the inlet itself scored
+   *   below that ceiling. A record from an instrument or a third party
+   *   (biometric or access-control log, telematics, sensor reading, reality
+   *   capture, bank transaction, registry extract, delivery note, survey,
+   *   inspection) does not count against independence whoever uploaded it:
+   *   the site administrator who ingests both the payroll claim and the
+   *   turnstile log is a conduit for the log, not its source.
+   *
+   * Every path by which one actor can stand on both sides of a claim is still
+   * closed, and each is a real attack rather than a hypothetical:
+   *   • the claimant submitting their own photographs and documents as the
+   *     only evidence (the original check);
+   *   • the AUTHOR of the assertion doing the same when the claim was filed
    *     in someone else's name (bug: claimantId used to be free text);
    *   • an `entity` claim, which used to skip the check entirely, letting the
    *     entity's own representative author both sides.
-   * Only an integrity reviewer may knowingly proceed, and the override is
-   * recorded on the reconciliation's ledger entry.
-   */
-  /**
-   * The same rule, expressed as a FACT about a finished reconciliation rather
-   * than as a veto on a request.
+   * Only an integrity reviewer may knowingly proceed on the manual route, and
+   * the override is recorded on the reconciliation's ledger entry.
    *
-   * `separationCheck` can refuse, because a manual reconciliation is one
-   * caller asking for one row. The bulk auto route cannot: it sweeps a whole
-   * project, and refusing the batch because one assertion is self-evidenced
-   * would leave the other forty untested. So the auto route asks THIS instead,
-   * about the rows the reconciler actually used, and downgrades the result.
-   *
-   * The engine does not close this on its own: `effectiveIndependence` scores
-   * claimant-submitted evidence 0, but the rejection test is
+   * The engine does not close this on its own: `effectiveIndependence`
+   * scores a self-submitted own attestation 0, but the rejection test is
    * `score < policy.minIndependence` and the default minimum is 0, so `0 < 0`
    * is false and the row is still weighted (floor 0.05). Without this check a
-   * user could file a claim, upload every piece of evidence for it themselves,
-   * POST /reconciliations/auto and have the owner dashboard report the result
-   * as a verified variance.
+   * user could file a claim, upload every photograph for it themselves, POST
+   * /reconciliations/auto and have the owner dashboard report the result as a
+   * verified variance.
    */
-  function selfCertification(
-    assertion: Pick<
-      typeof assertions.$inferSelect,
-      "claimantId" | "claimantKind" | "createdBy"
-    >,
-    used: Array<{ id: string; submittedBy: string }>,
-  ): { selfCertified: boolean; reason: string | null } {
-    if (used.length === 0) return { selfCertified: false, reason: null };
-    const byClaimant =
-      assertion.claimantKind === "user" &&
-      used.every((e) => e.submittedBy === assertion.claimantId);
-    const byAuthor =
-      assertion.createdBy !== null &&
-      assertion.createdBy !== undefined &&
-      used.every((e) => e.submittedBy === assertion.createdBy);
-    if (!byClaimant && !byAuthor) return { selfCertified: false, reason: null };
-    return {
-      selfCertified: true,
-      reason:
-        `every evidence row used (${used.map((e) => e.id).join(", ")}) was submitted by ` +
-        (byClaimant ? "the claimant" : "the author of the assertion") +
-        ". A claim tested only against evidence produced by the person making it has not been " +
-        "tested (Vol III §4).",
-    };
-  }
-
   async function separationCheck(
     req: FastifyRequest,
     assertion: typeof assertions.$inferSelect,
     evidenceRows: Array<typeof evidence.$inferSelect>,
   ): Promise<{ override: boolean; reason: string | null }> {
-    if (evidenceRows.length === 0) return { override: false, reason: null };
-    const submitters = new Set(evidenceRows.map((e) => e.submittedBy));
-    const problems: string[] = [];
-    if (assertion.claimantKind === "user" && evidenceRows.every((e) => e.submittedBy === assertion.claimantId)) {
-      problems.push("every evidence row was submitted by the claimant");
-    }
-    if (assertion.createdBy && evidenceRows.every((e) => e.submittedBy === assertion.createdBy)) {
-      problems.push("every evidence row was submitted by the author of the assertion");
-    }
-    if (submitters.size === 1 && submitters.has(req.user!.id) && (
-      assertion.claimantId === req.user!.id || assertion.createdBy === req.user!.id
-    )) {
-      problems.push("the caller authored or claimed the assertion and submitted all of its evidence");
-    }
-    if (problems.length === 0) return { override: false, reason: null };
+    const self = selfCertification(assertion, evidenceRows.map(toEvidenceLike));
+    if (!self.selfCertified) return { override: false, reason: null };
     const allowed = await holdsAssuranceRole(req, ["integrity_reviewer"], req.projectId);
     if (!allowed) {
       throw forbidden(
-        `evidence not independent of claimant: ${problems.join("; ")}. An assertion and the ` +
-          "evidence that tests it must not come from the same actor (Vol III §4). An integrity " +
-          "reviewer may record such a reconciliation knowingly; nobody else may.",
+        `evidence not independent of claimant: ${self.reason} An assertion and the evidence ` +
+          "that tests it must not come from the same actor (Vol III §4). An integrity reviewer " +
+          "may record such a reconciliation knowingly; nobody else may.",
       );
     }
-    return { override: true, reason: problems.join("; ") };
+    return { override: true, reason: self.reason };
   }
 
   app.post(
@@ -1820,6 +1791,10 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
             auto: true,
             selfCertified: self.selfCertified,
             selfCertifiedReason: self.reason,
+            // Every used row's verdict under the separation rule, counted or
+            // not, so the ledger shows why an uploader was or was not held to
+            // be the source.
+            separation: self.rows,
             suppressedResult: self.selfCertified ? outcome.result : null,
             rejected: outcome.rejected.slice(0, 20),
           },
@@ -1840,8 +1815,16 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
               `Assertion ${assertion.id} (${assertion.kind}) claims ${assertion.value ?? "—"}` +
               `${assertion.unit ? ` ${assertion.unit}` : ""}. Every evidence row the ` +
               `${outcome.reconciler} reconciler could use was submitted by ` +
-              `${assertion.claimantKind === "user" ? assertion.claimantId : (assertion.createdBy ?? "the author")}` +
-              `, who is the ${assertion.claimantKind === "user" ? "claimant" : "author of the claim"}. ` +
+              `${[...new Set(self.rows.map((r) => r.submittedBy))].join(", ")} — ` +
+              `${[...new Set(self.rows.map((r) => r.role === "claimant" ? "the claimant" : "the author of the claim"))].join(" and ")} — ` +
+              "and each is that person's own attestation rather than a record from an instrument " +
+              `or a third party: ${self.rows.map((r) => `${r.id} (${r.kind}: ${r.reason})`).join("; ")}. ` +
+              "Rule applied: a row counts against independence only when its submitter stands on " +
+              "the claim side AND the row is something they composed (photograph, video, document, " +
+              `other, or a row its inlet scored below ${ATTESTATION_INDEPENDENCE_CEILING} for independence); ` +
+              "biometric, access-control, " +
+              "telematics, sensor, reality-capture, bank, registry, delivery-note, survey and inspection " +
+              "records are independent of whoever uploaded them. " +
               "No reconciliation result is recorded: the claim has not been tested, and the " +
               "arithmetic that would have been reported is the claimant checking their own work. " +
               "Obtain evidence from an independent source before certifying.",
@@ -1853,6 +1836,7 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
               wouldHaveObserved: outcome.observed,
               suppressedResult: outcome.result,
               evidenceIds: outcome.usedEvidenceIds,
+              separation: self.rows,
             },
             fingerprint: fingerprintOf("self", assertion.id),
             subjectType: assertion.claimantKind === "entity" ? "entity" : "user",

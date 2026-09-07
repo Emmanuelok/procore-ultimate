@@ -18,7 +18,7 @@ import {
   PARCEL_COMPENSABLE_FROM,
   PARCEL_TRANSITIONS,
 } from "./reference.js";
-import { loadConsentView, SIGNAL_HORIZON_DAYS } from "./consent-service.js";
+import { loadConsentView, SIGNAL_HORIZON_DAYS, sweepConsent } from "./consent-service.js";
 import {
   resolveTasks,
   round2,
@@ -738,17 +738,23 @@ export async function registerParcelRoutes(app: FastifyInstance): Promise<void> 
    * one dependency set, because a task blocked by both is not two separate
    * risks to a programme director.
    *
-   * This read is PURE. It used to raise signals and append ledger rows as a
-   * side effect of being looked at, with no lock and no unique key, so the
+   * TRIGGER CONTRACT. The consent detectors (`sweepConsent`) have two
+   * triggers that run the same function: the scheduled `land.detectors` job
+   * (hourly, every tenant, so a project nobody opens is still policed) and
+   * this read, scoped to the project being looked at, so the finding exists
+   * by the time the view answers and a deployment whose scheduler is off
+   * (SCHEDULER_ENABLED=false, NODE_ENV=test, the retrodetect harness) still
+   * records it. The read used to raise with no lock and no unique key, so the
    * two requests the land workspace fires in parallel both inserted the same
-   * finding. Raising is now the scheduled detector's job (system actor,
-   * advisory-locked, fingerprinted, auto-closing when the dependency
-   * clears); the view reports what is true, and quantifies it: days-at-risk
-   * per dependency from the project's own median resolution times, and the
-   * slip that survives the task's float.
+   * finding; what fixed that is the advisory lock and the fingerprint inside
+   * the sweep — not taking the sweep off the read. System actor, auto-closing
+   * when the dependency clears. The view then reports what is true, and
+   * quantifies it: days-at-risk per dependency from the project's own median
+   * resolution times, and the slip that survives the task's float.
    */
   app.get("/projects/:projectId/land/schedule-risk", { preHandler: readGate }, async (req) => {
     const q = scheduleRiskQuery.parse(req.query);
+    await sweepConsent(app.db, req.companyId!, req.projectId!);
     const { view } = await loadConsentView(app.db, req.companyId!, req.projectId!, {
       horizonDays: q.days,
       withObservations: true,

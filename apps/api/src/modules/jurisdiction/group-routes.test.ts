@@ -610,11 +610,13 @@ describe("permit creation is atomic", () => {
 /* AUDIT BUG: read-time sweeps duplicated signals                      */
 /* ================================================================== */
 
-describe("jurisdiction detectors run from the scheduler", () => {
-  it("writes nothing on parallel workspace reads", async () => {
+describe("jurisdiction detectors raise once — from the scheduler and from the permit register read alike", () => {
+  it("raises each permit finding exactly once, as the system, on parallel workspace reads", async () => {
     const pid = await makeProject("Jurisdiction parallel reads");
     const task = await makeTask(pid, "Discharge works", addDaysISO(todayISO(), 5));
-    await app.inject({
+    // an application the authority has sat on past its statutory period, and
+    // a grant that has lapsed — the two findings the permit sweep owns
+    const overdue = await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/permits`,
       headers: owner.headers,
@@ -622,10 +624,43 @@ describe("jurisdiction detectors run from the scheduler", () => {
         kind: "environmental_consent",
         title: "Consent",
         authority: "EA",
+        appliedAt: addDaysISO(todayISO(), -100),
+        expectedDays: 56,
         blockingTaskIds: [task],
       },
     });
-    await Promise.all([
+    expect(overdue.statusCode).toBe(201);
+    const lapsed = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/permits`,
+      headers: owner.headers,
+      payload: {
+        kind: "road_closure",
+        title: "Lane closure",
+        authority: "Highways",
+        appliedAt: addDaysISO(todayISO(), -220),
+      },
+    });
+    expect(lapsed.statusCode).toBe(201);
+    const lapsedId = (lapsed.json() as { id: string }).id;
+    const granted = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/permits/${lapsedId}/status`,
+      headers: owner.headers,
+      payload: {
+        status: "granted",
+        grantedAt: addDaysISO(todayISO(), -200),
+        expiresAt: addDaysISO(todayISO(), -1),
+      },
+    });
+    expect(granted.statusCode).toBe(200);
+
+    // TRIGGER CONTRACT: the permit list read runs the same permit sweep the
+    // scheduled job runs, scoped to this project; the permit-only
+    // schedule-risk view is a plain read. The workspace fires these together,
+    // and before the lock and the fingerprint each read inserted its own copy
+    // of a finding — so the list read is fired twice here, on purpose.
+    const responses = await Promise.all([
       app.inject({
         method: "GET",
         url: `/api/v1/projects/${pid}/permits`,
@@ -636,9 +671,36 @@ describe("jurisdiction detectors run from the scheduler", () => {
         url: `/api/v1/projects/${pid}/permits/schedule-risk`,
         headers: owner.headers,
       }),
+      app.inject({
+        method: "GET",
+        url: `/api/v1/projects/${pid}/permits`,
+        headers: owner.headers,
+      }),
     ]);
+    for (const res of responses) expect(res.statusCode).toBe(200);
     const rows = await app.db.select().from(signals).where(eq(signals.projectId, pid));
-    expect(rows).toHaveLength(0);
+    expect(rows.map((r) => r.detector).sort()).toEqual([
+      "permit_determination_overdue",
+      "permit_expired",
+    ]);
+    // the lapsed grant was flipped by the read — once, by a guarded UPDATE
+    const [flipped] = await app.db.select().from(permits).where(eq(permits.id, lapsedId));
+    expect(flipped!.status).toBe("expired");
+    // the SYSTEM raised them, not whoever opened the page
+    for (const row of rows) {
+      const created = await app.db
+        .select()
+        .from(ledgerEntries)
+        .where(and(eq(ledgerEntries.objectType, "signal"), eq(ledgerEntries.objectId, row.id)));
+      expect(created).toHaveLength(1);
+      expect(created[0]!.actorId).toBeNull();
+    }
+
+    // the scheduled job afterwards has nothing left to claim
+    const job = await app.scheduler.runNow("jurisdiction.detectors");
+    expect(job.state).toBe("succeeded");
+    const afterJob = await app.db.select().from(signals).where(eq(signals.projectId, pid));
+    expect(afterJob.map((r) => r.id).sort()).toEqual(rows.map((r) => r.id).sort());
   });
 
   it("raises the determination-overdue finding exactly once, as the system", async () => {
@@ -683,6 +745,9 @@ describe("jurisdiction detectors run from the scheduler", () => {
       .where(eq(obligations.id, permit.obligationId));
     expect(obl!.status).toBe("breached");
 
+    // the trail is checked for THIS finding: the register is shared across
+    // this file's projects, and the read-side trigger raises the same
+    // detector for other projects
     const entries = await app.db
       .select()
       .from(ledgerEntries)
@@ -690,6 +755,7 @@ describe("jurisdiction detectors run from the scheduler", () => {
         and(
           eq(ledgerEntries.companyId, owner.companyId),
           eq(ledgerEntries.objectType, "signal"),
+          eq(ledgerEntries.objectId, rows[0]!.id),
         ),
       );
     const systemRaised = entries.filter(

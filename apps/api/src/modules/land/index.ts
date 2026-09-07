@@ -74,13 +74,19 @@ import {
  * store their full payload, because those are the records an auditor comes
  * back for.
  *
- * WHAT THIS MODULE DELIBERATELY DOES NOT DO: raise findings on a read. Every
- * signal in this area — grievance SLA breach and automatic escalation,
- * grievance hotspots, IFC PS5 conformance, replacement-cost shortfall,
- * unnotified chance finds and the consent-to-programme dependency — comes
- * from the scheduled `land.detectors` job as the SYSTEM actor,
- * advisory-locked and fingerprinted so a finding is raised once and
- * auto-closes when its condition clears. Reads report; they do not write.
+ * HOW FINDINGS ARE RAISED. Every signal in this area — grievance SLA breach
+ * and automatic escalation, grievance hotspots, IFC PS5 conformance,
+ * replacement-cost shortfall, unnotified chance finds and the
+ * consent-to-programme dependency — is raised by ONE set of sweep functions
+ * (`detectors.ts`, `consent-service.ts`) as the SYSTEM actor, advisory-locked
+ * and fingerprinted so a finding is raised once and auto-closes when its
+ * condition clears. Each sweep has two triggers running the same function:
+ * the scheduled `land.detectors` job (hourly, every tenant, so a project
+ * nobody opens is still policed) and the register read the finding is about
+ * — `GET /grievances` and `GET /land/schedule-risk` — scoped to the project
+ * being read, so the register never shows a breach it has not recorded and a
+ * deployment whose scheduler is off (SCHEDULER_ENABLED=false, NODE_ENV=test)
+ * is still policed. Whoever opened the page is never the ledger actor.
  */
 export const landModule: FastifyPluginAsync = async (app) => {
   /** Reference data (code-resident, not tenant data) — the published GRM
@@ -155,13 +161,15 @@ export const landModule: FastifyPluginAsync = async (app) => {
   await registerSafeguardRoutes(app);
 
   /*
-   * Every land finding — grievance SLA breach and automatic escalation,
-   * grievance hotspots, IFC PS5 conformance, replacement-cost shortfall,
-   * unnotified chance finds and the consent-to-programme dependency — is
-   * raised by this scheduled job as the SYSTEM actor. It replaced a set of
-   * lazy sweeps that ran on page reads with no lock and no unique key, so
-   * the workspace's own parallel loads duplicated findings and made whoever
-   * opened the page the ledger actor for them.
+   * The scheduled trigger. Every land finding — grievance SLA breach and
+   * automatic escalation, grievance hotspots, IFC PS5 conformance,
+   * replacement-cost shortfall, unnotified chance finds and the
+   * consent-to-programme dependency — is raised by this job as the SYSTEM
+   * actor, hourly, for every tenant. The grievance and schedule-risk reads
+   * run the same functions for the project they are reading (see
+   * grievances.ts and parcels.ts); the lock and the fingerprint inside the
+   * sweeps are what stopped the old read-time duplicates, so the two
+   * triggers claim each finding exactly once.
    */
   registerLandJobs(app);
 };

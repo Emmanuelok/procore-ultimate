@@ -23,10 +23,14 @@
  *  3. NO DOMINANT CONTRIBUTOR — no single contributor may hold half or more of
  *     the samples; a cell one company mostly wrote is that company's number
  *     wearing a distribution's clothes.
- *  4. SELF-EXCLUSION — the caller's OWN samples are removed from the figures it
- *     is shown against. Comparing yourself with a pool that contains you is
- *     circular, and with a small n it is also the disclosure: n − (mine) must
- *     still satisfy rule 1.
+ *  4. SELF-KNOWLEDGE — the caller's OWN samples do not count toward rule 1. A
+ *     contributor already knows its own figures, so the anonymity set it faces
+ *     is the OTHER contributors: n − (mine) must still satisfy rule 1. Its
+ *     samples stay IN the described set, though: ADR 0016 defines n as the
+ *     cell's contributed sample count and the percentile as the project's rank
+ *     "in its cell", and #831's unconditional disclosure is not met by an n
+ *     that omits samples the cell holds (a one-sample cell once reported n=0
+ *     here). How many of the samples are the caller's own is disclosed instead.
  *
  * WHAT IS DELIBERATELY NOT DONE: differential privacy noise. Adding calibrated
  * Laplace noise to a percentile would make the platform state a number that is
@@ -68,14 +72,14 @@ export interface CellKey {
 }
 
 export interface PoolVerdict {
-  /** samples that may be described (self-excluded, live only) */
+  /** live samples in the cell — the described set, the caller's own included */
   rows: PoolRow[];
   values: number[];
-  /** total live samples in the cell before self-exclusion */
+  /** total live samples in the cell (equals rows.length; kept for consumers) */
   totalSamples: number;
-  /** distinct contributor companies after self-exclusion */
+  /** distinct contributor companies in the cell, the caller included */
   contributors: number;
-  /** samples contributed by the caller, excluded from `rows` */
+  /** samples contributed by the caller: in `rows`, disclosed, not counted toward the k floor */
   ownSamples: number;
   suppressed: boolean;
   /** why it is suppressed; empty when it is not */
@@ -101,24 +105,63 @@ export function dominantShare(rows: readonly PoolRow[]): number {
 }
 
 /**
+ * The suppression reasons the anonymity rules produce, in one place: the
+ * row-based verdict (`assessPool`) and the count-based one (`assessCounts`)
+ * both draw from it, so the class register and the described cell can never
+ * disagree about why a cell is refused. `otherContributors` is the anonymity
+ * set the caller faces — distinct contributors excluding the caller — and
+ * `share` the largest share any one contributor holds of the WHOLE cell, the
+ * caller's own samples included.
+ */
+function suppressionReasons(input: {
+  otherContributors: number;
+  share: number;
+  sampleSize: number;
+  viewerKnown: boolean;
+}): string[] {
+  const reasons: string[] = [];
+  if (input.otherContributors < MIN_SAMPLE_N) {
+    const n = input.otherContributors;
+    const qualifier = input.viewerKnown ? " other than yours" : "";
+    reasons.push(
+      `Only ${n} distinct contributing compan${n === 1 ? "y" : "ies"}${qualifier} in this cell; ` +
+        `${MIN_SAMPLE_N} are required before a distribution can be described.`,
+    );
+  }
+  if (input.sampleSize > 0 && input.share >= MAX_CONTRIBUTOR_SHARE) {
+    reasons.push(
+      `One contributor holds ${Math.round(input.share * 100)}% of the samples in this cell, ` +
+        "so its percentiles would largely describe that contributor.",
+    );
+  }
+  return reasons;
+}
+
+/**
  * Apply the anonymity rules to a set of live samples. Pure — the database read
  * is the caller's job, so every branch is unit-testable without one.
  *
- * `viewerCompanyId` is the caller: their samples are excluded from the figures
- * they are shown, and counted separately so the disclosure can say so.
+ * `viewerCompanyId` is the caller. Its own samples stay in the described set —
+ * the cell is the cell (ADR 0016: n is the cell's sample count and the
+ * percentile is the project's rank "in its cell") — but they do not count
+ * toward the k-anonymity floor, because a contributor already knows its own
+ * figures: the anonymity set it faces is everyone else. How many of the
+ * samples are its own is disclosed so the comparison is read correctly.
  */
 export function assessPool(
   all: readonly PoolRow[],
   viewerCompanyId: string | null,
   options: { seed: boolean } = { seed: false },
 ): PoolVerdict {
+  const rows = [...all];
   const own = viewerCompanyId
-    ? all.filter((r) => r.contributorCompanyId === viewerCompanyId)
+    ? rows.filter((r) => r.contributorCompanyId === viewerCompanyId)
     : [];
-  const rows = viewerCompanyId
-    ? all.filter((r) => r.contributorCompanyId !== viewerCompanyId)
-    : [...all];
+  const others = viewerCompanyId
+    ? rows.filter((r) => r.contributorCompanyId !== viewerCompanyId)
+    : rows;
   const contributors = distinctContributors(rows);
+  const otherContributors = distinctContributors(others);
   const share = dominantShare(rows);
   const reasons: string[] = [];
   const disclosures: string[] = [
@@ -141,28 +184,25 @@ export function assessPool(
   }
 
   disclosures.push(
-    `Anonymity rules: at least ${MIN_SAMPLE_N} distinct contributing companies, no contributor ` +
-      `holding ${Math.round(MAX_CONTRIBUTOR_SHARE * 100)}% or more of the cell, one live sample ` +
-      "per project per cell, and your own samples excluded from the figures you are compared with.",
+    `Anonymity rules: at least ${MIN_SAMPLE_N} distinct contributing companies other than you, ` +
+      `no contributor holding ${Math.round(MAX_CONTRIBUTOR_SHARE * 100)}% or more of the cell, ` +
+      "and one live sample per project per cell. Your own samples are part of the cell — counted " +
+      "in n and in the figures — but do not count toward the contributors the rules require.",
   );
   if (own.length > 0) {
     disclosures.push(
-      `${own.length} sample(s) you contributed are excluded from this distribution, so the ` +
-        "comparison is against other contributors only.",
+      `${own.length} sample(s) in this cell are your own; they are included in n and in the ` +
+        "figures, and are excluded from the count of distinct contributing companies.",
     );
   }
-  if (contributors < MIN_SAMPLE_N) {
-    reasons.push(
-      `Only ${contributors} distinct contributing compan${contributors === 1 ? "y" : "ies"} in ` +
-        `this cell; ${MIN_SAMPLE_N} are required before a distribution can be described.`,
-    );
-  }
-  if (rows.length > 0 && share >= MAX_CONTRIBUTOR_SHARE) {
-    reasons.push(
-      `One contributor holds ${Math.round(share * 100)}% of the samples in this cell, so its ` +
-        "percentiles would largely describe that contributor.",
-    );
-  }
+  reasons.push(
+    ...suppressionReasons({
+      otherContributors,
+      share,
+      sampleSize: rows.length,
+      viewerKnown: viewerCompanyId !== null,
+    }),
+  );
   const suppressed = reasons.length > 0;
   if (suppressed) disclosures.push(...reasons);
 
@@ -186,7 +226,11 @@ export function assessPool(
  * into memory to answer it is an unbounded cross-tenant scan (plan §6.4) — and
  * it silently truncated past its row cap, so contributor counts and the
  * "describable" verdict went quietly wrong. The counts come from a GROUP BY
- * now, and this applies exactly the rules `assessPool` applies to rows.
+ * now, and this applies exactly the rules `assessPool` applies to rows — the
+ * same SELF-KNOWLEDGE included: the caller's own samples are in `sampleSize`
+ * and `contributors`, disclosed as `ownSamples`, and do not count toward the
+ * k floor. The register and the described cell therefore never disagree about
+ * a cell's n, or about why it is refused.
  */
 export function assessCounts(
   counts: readonly { contributorCompanyId: string | null; samples: number }[],
@@ -198,30 +242,25 @@ export function assessCounts(
   describable: boolean;
   reasons: string[];
 } {
-  const own = counts
-    .filter((c) => viewerCompanyId !== null && c.contributorCompanyId === viewerCompanyId)
-    .reduce((sum, c) => sum + c.samples, 0);
-  const others = counts.filter(
-    (c) => viewerCompanyId === null || c.contributorCompanyId !== viewerCompanyId,
-  );
-  const sampleSize = others.reduce((sum, c) => sum + c.samples, 0);
-  const contributors = new Set(others.map((c) => c.contributorCompanyId ?? "__seed__")).size;
-  const share = sampleSize === 0 ? 0 : Math.max(...others.map((c) => c.samples)) / sampleSize;
-  const reasons: string[] = [];
-  if (contributors < MIN_SAMPLE_N) {
-    reasons.push(
-      `Only ${contributors} distinct contributing compan${contributors === 1 ? "y" : "ies"} in ` +
-        `this cell; ${MIN_SAMPLE_N} are required before a distribution can be described.`,
-    );
+  const perContributor = new Map<string, number>();
+  for (const c of counts) {
+    const key = c.contributorCompanyId ?? "__seed__";
+    perContributor.set(key, (perContributor.get(key) ?? 0) + c.samples);
   }
-  if (sampleSize > 0 && share >= MAX_CONTRIBUTOR_SHARE) {
-    reasons.push(
-      `One contributor holds ${Math.round(share * 100)}% of the samples in this cell, so its ` +
-        "percentiles would largely describe that contributor.",
-    );
-  }
+  const sampleSize = [...perContributor.values()].reduce((sum, n) => sum + n, 0);
+  const own = viewerCompanyId === null ? 0 : (perContributor.get(viewerCompanyId) ?? 0);
+  const otherContributors = [...perContributor.keys()].filter(
+    (key) => viewerCompanyId === null || key !== viewerCompanyId,
+  ).length;
+  const share = sampleSize === 0 ? 0 : Math.max(...perContributor.values()) / sampleSize;
+  const reasons = suppressionReasons({
+    otherContributors,
+    share,
+    sampleSize,
+    viewerKnown: viewerCompanyId !== null,
+  });
   return {
-    contributors,
+    contributors: perContributor.size,
     sampleSize,
     ownSamples: own,
     describable: reasons.length === 0 && sampleSize > 0,
@@ -235,8 +274,8 @@ export function assessCounts(
  * is kept as the record of what was contributed and never described again.
  *
  * `contributor_company_id` IS selected here, and this is the only place it is:
- * it is used to count contributors and to exclude the caller's own rows, and it
- * never leaves this module (see viewSample in index.ts).
+ * it is used to count contributors and to tell the caller's own rows apart for
+ * disclosure, and it never leaves this module (see viewSample in index.ts).
  */
 export async function readCell(
   db: Db,

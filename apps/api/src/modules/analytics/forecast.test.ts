@@ -277,12 +277,14 @@ describe("analytics forecast honours contribute-to-access", () => {
     const f = await forecastFor(subject, subjectProject);
     expect(f.contributedAccess).toBe(true);
     expect(f.seedOnly).toBe(false);
-    // Five other contributors, the tenant's own sample self-excluded.
-    expect(f.sampleSize).toBe(5);
-    expect(f.p50Uplift).toBe(92);
-    // 12% growth against a pool of 90-94: every comparable project finished
-    // above it.
-    expect(f.probability).toBe(1);
+    // Five other contributors plus the tenant's own contributed sample (12%):
+    // own samples stay in the described set and are disclosed, not dropped, so
+    // n is the cell's six and the tenant's own figure is one of them.
+    expect(f.sampleSize).toBe(6);
+    expect(f.p50Uplift).toBe(91.5);
+    // 12% growth against 90-94 and its own 12%: five of the six comparable
+    // projects finished above it.
+    expect(f.probability).toBe(0.83);
   });
 
   it("keeps a tenant out of another tenant's forecast entirely", async () => {
