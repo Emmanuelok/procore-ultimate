@@ -715,6 +715,17 @@ export const documentsModule: FastifyPluginAsync = async (app) => {
     if (f.checkedOutBy && f.checkedOutBy !== req.user!.id) {
       throw conflict("File is checked out by another user");
     }
+    // A new version REPLACES storageKey/sha256 for everyone who resolves this
+    // file id. Drawing revisions and spec section revisions point at the file
+    // plus a page index, so swapping the bytes silently changes what every
+    // sheet and clause serves. Refuse exactly where DELETE refuses; a corrected
+    // set or book is uploaded as a new set/book, which supersedes properly.
+    const versionRefs = await fileReferences(fileId);
+    if (versionRefs.length > 0) {
+      throw conflict(
+        `This file is referenced by ${versionRefs.join(", ")}; upload a new set or issue instead of replacing its bytes`,
+      );
+    }
     const mp = await req.file();
     if (!mp) throw badRequest("Expected a multipart file upload");
     const filename = safeFilename(mp.filename, f.name);
@@ -1159,7 +1170,9 @@ export const documentsModule: FastifyPluginAsync = async (app) => {
       await storeFile(d.filename, d.contentType, d.buf, null, { fromEmail: emlName });
     }
 
-    const status = rejected.length === 0 ? "stored" : decoded.length === 0 ? "partial" : "partial";
+    // The message itself is always stored, so a refused attachment makes the
+    // delivery partial, never wholly rejected (`rejectWhole` owns that case).
+    const status = rejected.length === 0 ? "stored" : "partial";
     const id = newId("inb");
     await app.db.insert(documentInboundEmails).values({
       id,

@@ -434,6 +434,30 @@ describe("prime change orders fund the budget", () => {
     const outsiderVoid = await call("POST", `/prime-contracts/${contractId}/changes/${id}/void`, { payload: { reason: "x" }, headers: outsider.headers });
     expect(outsiderVoid.statusCode).toBe(404);
   });
+
+  it("executes once when two admins execute the same change concurrently", async () => {
+    const created = await call("POST", `/prime-contracts/${contractId}/changes`, { payload: { title: "Race to execute", amount: 8_000, lines: [{ sovLineId: idOf("01"), description: "Extra slab", amount: 8_000 }] } });
+    expect(created.statusCode).toBe(201);
+    const id = created.json<{ id: string }>().id;
+    await call("POST", `/prime-contracts/${contractId}/changes/${id}/submit`, { payload: {} });
+    await call("POST", `/prime-contracts/${contractId}/changes/${id}/approve`, { payload: {}, headers: certifierHeaders });
+    const before = (await built.app.db.select().from(budgetLineItems).where(eq(budgetLineItems.id, budgetLineA)))[0]!;
+    const sovBefore = (await call("GET", `/prime-contracts/${contractId}/sov`)).json<{ lines: unknown[] }>().lines.length;
+    const [a, b] = await Promise.all([
+      call("POST", `/prime-contracts/${contractId}/changes/${id}/execute`, { payload: { executedDate: today() }, headers: certifierHeaders }),
+      call("POST", `/prime-contracts/${contractId}/changes/${id}/execute`, { payload: { executedDate: today() }, headers: certifierHeaders }),
+    ]);
+    expect([a.statusCode, b.statusCode].sort()).toEqual([200, 409]);
+    // The SOV gained exactly one appended line and the budget moved once.
+    const sov = await call("GET", `/prime-contracts/${contractId}/sov`);
+    const sovBody = sov.json<{ identity: { ok: boolean }; lines: unknown[] }>();
+    expect(sovBody.lines.length).toBe(sovBefore + 1);
+    expect(sovBody.identity.ok).toBe(true);
+    const after = (await built.app.db.select().from(budgetLineItems).where(eq(budgetLineItems.id, budgetLineA)))[0]!;
+    expect(after.approvedChanges).toBe(before.approvedChanges + 8_000);
+    const funded = await built.app.db.select().from(budgetChanges).where(eq(budgetChanges.sourceId, id));
+    expect(funded).toHaveLength(1);
+  });
 });
 
 /* ================================================================== */

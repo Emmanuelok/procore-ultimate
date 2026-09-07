@@ -221,6 +221,95 @@ describe("account lifecycle", () => {
       expect(expired.json().message).toContain("expired");
     });
 
+    /**
+     * CHANGING THE ADDRESS (§0.1) — the half the trail said existed.
+     *
+     * `email_change` was an advertised purpose that consumed to nothing while
+     * VerifyEmailPage told the user the change was in force. These tests hold
+     * the real behaviour: the address moves only when the link is opened, and
+     * losing the race for a newly-taken address is a 400 with an explanation,
+     * never a database constraint surfacing as a 500.
+     */
+    it("moves the address only when the proof link is opened", async () => {
+      const actor = await signUp(app);
+      const next = `moved-${counter}-${Date.now()}@test.dev`;
+      const started = await app.inject({
+        method: "POST",
+        url: "/api/v1/account/email",
+        headers: actor.headers,
+        payload: { email: next, password: PASSWORD },
+      });
+      expect(started.statusCode).toBe(202);
+      const body = started.json() as { verifyUrl: string | null; pendingEmail: string };
+      expect(body.pendingEmail).toBe(next);
+
+      // Nothing has moved yet.
+      const [before] = await app.db.select().from(users).where(eq(users.id, actor.userId));
+      expect(before!.email).toBe(actor.email);
+
+      const pending = await app.inject({
+        method: "GET",
+        url: "/api/v1/account/email/pending",
+        headers: actor.headers,
+      });
+      expect(pending.statusCode).toBe(200);
+      expect((pending.json() as { pending: { email: string } | null }).pending?.email).toBe(next);
+
+      const applied = await app.inject({
+        method: "POST",
+        url: "/api/v1/auth/verify-email",
+        payload: { token: tokenFromUrl(body.verifyUrl!) },
+      });
+      expect(applied.statusCode).toBe(200);
+      const [after] = await app.db.select().from(users).where(eq(users.id, actor.userId));
+      expect(after!.email).toBe(next);
+
+      const trail = await app.db
+        .select()
+        .from(authSecurityEvents)
+        .where(
+          and(
+            eq(authSecurityEvents.userId, actor.userId),
+            eq(authSecurityEvents.kind, "email_changed"),
+          ),
+        );
+      expect(trail).toHaveLength(1);
+      expect(trail[0]!.reason).toContain(actor.email);
+    });
+
+    it("refuses an address claimed while the link was waiting, and does not 500", async () => {
+      const actor = await signUp(app);
+      const next = `contested-${counter}-${Date.now()}@test.dev`;
+      const started = await app.inject({
+        method: "POST",
+        url: "/api/v1/account/email",
+        headers: actor.headers,
+        payload: { email: next, password: PASSWORD },
+      });
+      expect(started.statusCode).toBe(202);
+      const url = (started.json() as { verifyUrl: string | null }).verifyUrl!;
+
+      // Somebody else takes it before the link is opened. The check and the
+      // write are now one transaction and the unique violation is caught, so
+      // the loser gets the branch's own explanation rather than a 500.
+      const rival = await app.inject({
+        method: "POST",
+        url: "/api/v1/auth/register",
+        payload: { email: next, password: PASSWORD, name: "Rival", companyName: "Rival Co" },
+      });
+      expect(rival.statusCode).toBe(201);
+
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/v1/auth/verify-email",
+        payload: { token: tokenFromUrl(url) },
+      });
+      expect(res.statusCode).toBe(400);
+      expect((res.json() as { message: string }).message).toContain("claimed that address");
+      const [row] = await app.db.select().from(users).where(eq(users.id, actor.userId));
+      expect(row!.email).toBe(actor.email);
+    });
+
     it("rate-limits resends per account (registration counts as the first)", async () => {
       const actor = await signUp(app);
       const resend = async () =>

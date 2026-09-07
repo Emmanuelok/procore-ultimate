@@ -640,15 +640,28 @@ export const mfaModule: FastifyPluginAsync = async (app) => {
         : !ok
           ? "Password did not match"
           : "Account is deactivated";
-      await recordSecurityEvent(app.db, {
-        kind: user && ok ? "login_blocked_inactive" : "login_failure",
-        outcome: user && ok ? "blocked" : "failure",
-        userId: user?.id ?? null,
-        email: body.email,
-        ip: context.ip,
-        userAgent: context.userAgent,
-        reason,
-      });
+      // ONLY the refusal that `noteLoginFailure` does not itself record.
+      //
+      // The rich `login_failure` row belongs to `noteLoginFailure` (login.ts),
+      // and writing a second one here counted EVERY ATTEMPT TWICE in the
+      // lockout engine — which derives the count from this very table — so the
+      // account locked at three wrong passwords instead of the five the policy
+      // states, an unknown address locked a caller out sooner than a known
+      // one, and the tenant's own threshold meant half what it said. The audit
+      // also showed two rows for one attempt. A deactivated account is
+      // different: `login_blocked_inactive` is a distinct fact nothing else
+      // records, and it is the reason the refusal is not a guess.
+      if (user && ok) {
+        await recordSecurityEvent(app.db, {
+          kind: "login_blocked_inactive",
+          outcome: "blocked",
+          userId: user.id,
+          email: body.email,
+          ip: context.ip,
+          userAgent: context.userAgent,
+          reason,
+        });
+      }
       await recordLegacyAuthEvent(app.db, {
         userId: user?.id ?? null,
         email: body.email,

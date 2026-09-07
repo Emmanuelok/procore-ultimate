@@ -56,8 +56,29 @@ async function signUp(app: FastifyInstance): Promise<{ email: string; userId: st
   return { email, userId: (res.json() as { user: { id: string } }).user.id };
 }
 
-const attempt = (app: FastifyInstance, email: string, password: string) =>
-  app.inject({ method: "POST", url: "/api/v1/auth/mfa/login", payload: { email, password } });
+/**
+ * One sign-in attempt, FROM A NAMED ADDRESS.
+ *
+ * The address matters: the per-IP scope of the lockout engine is deliberately
+ * NOT reset by a success (a sprayer usually holds a valid account of their
+ * own), so several tests hammering the same default 127.0.0.1 arm the IP lock
+ * and the next test is refused before its own assertion is reached — a red
+ * suite that says nothing about the code. Each test that drives failures to
+ * the threshold therefore uses its own address, which is also closer to what
+ * the rule is for.
+ */
+const attempt = (
+  app: FastifyInstance,
+  email: string,
+  password: string,
+  remoteAddress = "127.0.0.1",
+) =>
+  app.inject({
+    method: "POST",
+    url: "/api/v1/auth/mfa/login",
+    payload: { email, password },
+    remoteAddress,
+  });
 
 describe("POST /auth/mfa/login obeys the lockout engine", () => {
   let built: BuiltApp;
@@ -73,10 +94,13 @@ describe("POST /auth/mfa/login obeys the lockout engine", () => {
 
   it("locks the account at the fifth failure and then refuses the CORRECT password", async () => {
     const { email } = await signUp(app);
+    const from = "198.51.100.11";
     for (let i = 0; i < 5; i += 1) {
-      expect((await attempt(app, email, `wrong-${i}`)).statusCode, `attempt ${i + 1}`).toBe(401);
+      expect((await attempt(app, email, `wrong-${i}`, from)).statusCode, `attempt ${i + 1}`).toBe(
+        401,
+      );
     }
-    const locked = await attempt(app, email, PASSWORD);
+    const locked = await attempt(app, email, PASSWORD, from);
     expect(locked.statusCode).toBe(429);
     const body = locked.json() as {
       message: string;
@@ -91,8 +115,9 @@ describe("POST /auth/mfa/login obeys the lockout engine", () => {
 
   it("writes account_locked, and keeps a policy refusal apart from a guess", async () => {
     const { email } = await signUp(app);
-    for (let i = 0; i < 5; i += 1) await attempt(app, email, `wrong-${i}`);
-    await attempt(app, email, PASSWORD);
+    const from = "198.51.100.12";
+    for (let i = 0; i < 5; i += 1) await attempt(app, email, `wrong-${i}`, from);
+    await attempt(app, email, PASSWORD, from);
 
     const locked = await app.db
       .select()
@@ -119,25 +144,26 @@ describe("POST /auth/mfa/login obeys the lockout engine", () => {
 
   it("an unknown address is locked out exactly like a known one", async () => {
     const unknown = `nobody-${Date.now()}@test.dev`;
+    const from = "198.51.100.13";
     for (let i = 0; i < 5; i += 1) {
-      expect((await attempt(app, unknown, `wrong-${i}`)).statusCode).toBe(401);
+      expect((await attempt(app, unknown, `wrong-${i}`, from)).statusCode).toBe(401);
     }
-    const locked = await attempt(app, unknown, "anything-at-all");
+    const locked = await attempt(app, unknown, "anything-at-all", from);
     expect(locked.statusCode).toBe(429);
   });
 
   it("honours the tenant's own lockout threshold", async () => {
     const { email } = await signUp(app);
+    const from = "198.51.100.14";
     // Sign in to read the company id, then tighten the policy to three.
-    const login = await attempt(app, email, PASSWORD);
+    const login = await attempt(app, email, PASSWORD, from);
     expect(login.statusCode).toBe(200);
     const me = await app.inject({
       method: "GET",
       url: "/api/v1/me",
       headers: { authorization: `Bearer ${(login.json() as { accessToken: string }).accessToken}` },
     });
-    const companyId = (me.json() as { companies: Array<{ companyId: string }> }).companies[0]!
-      .companyId;
+    const companyId = (me.json() as { companies: Array<{ id: string }> }).companies[0]!.id;
     const put = await app.inject({
       method: "PUT",
       url: "/api/v1/company/security-policy",
@@ -150,10 +176,10 @@ describe("POST /auth/mfa/login obeys the lockout engine", () => {
     expect(put.statusCode).toBe(200);
 
     for (let i = 0; i < 3; i += 1) {
-      expect((await attempt(app, email, `bad-${i}`)).statusCode).toBe(401);
+      expect((await attempt(app, email, `bad-${i}`, from)).statusCode).toBe(401);
     }
     // Three, not five: the tenant said so.
-    expect((await attempt(app, email, PASSWORD)).statusCode).toBe(429);
+    expect((await attempt(app, email, PASSWORD, from)).statusCode).toBe(429);
   });
 });
 

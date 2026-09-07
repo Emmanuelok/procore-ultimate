@@ -303,17 +303,33 @@ describe("options appraisal depth", () => {
         npv: number;
         bcr: number | null;
         eirr: number | null;
-        sensitivity?: { tornado: Array<{ variable: string; swing: number }>; basis: string };
-        switchingValues?: Array<{ variable: string; percentChange: number | null }>;
+        sensitivity?: {
+          grid: Array<{ variable: string; changePercent: number; npv: number }>;
+          tornado: Array<{ variable: string; swing: number }>;
+          switching: Array<{
+            variable: string;
+            changePercent: number | null;
+            switchesAt: number | null;
+            note: string;
+          }>;
+          basis: string;
+        };
       };
     }>;
     const invest = options.find((o) => o.name === "Invest")!;
     expect(invest.computed.eirr).not.toBeNull();
     expect(invest.computed.eirr!).toBeGreaterThan(0.1);
-    expect(invest.computed.sensitivity!.tornado.length).toBeGreaterThan(0);
-    const capexSwitch = invest.computed.switchingValues!.find((s) => s.variable === "capex");
+    const sens = invest.computed.sensitivity!;
+    expect(sens.tornado.length).toBeGreaterThan(0);
+    // ±10/20/30 on each of capex, benefits, costs, discount rate
+    expect(sens.grid.length).toBeGreaterThan(0);
+    const capexSwitch = sens.switching.find((s) => s.variable === "capex");
     expect(capexSwitch).toBeDefined();
-    expect(capexSwitch!.percentChange).not.toBeNull();
+    // this option is viable, so there IS a capex increase that kills it
+    expect(capexSwitch!.changePercent).not.toBeNull();
+    expect(capexSwitch!.changePercent!).toBeGreaterThan(0);
+    expect(capexSwitch!.switchesAt).not.toBeNull();
+    expect(capexSwitch!.note.length).toBeGreaterThan(0);
   });
 });
 
@@ -455,17 +471,26 @@ describe("gate evidence packs", () => {
       })),
     });
     expect(res.statusCode).toBe(201);
-    const pack = (res.json() as Json).evidencePack as {
-      merkleRoot: string;
-      items: Array<{ id: string; sha256: string; kind: string }>;
+    const body = res.json() as Json;
+    const pack = body.evidencePack as {
+      root: string;
+      builtAt: string;
+      itemCount: number;
+      items: Array<{ id: string; sha256: string; kind: string; proof: unknown }>;
       unevidencedCriteria: Json[];
-      frozenAt: string;
+      statement: string;
     };
-    expect(pack.merkleRoot).toMatch(/^[0-9a-f]{64}$/);
+    expect(pack.root).toMatch(/^[0-9a-f]{64}$/);
     expect(pack.items).toHaveLength(1);
+    expect(pack.itemCount).toBe(1);
     expect(pack.items[0]!.id).toBe(ev1);
+    expect(pack.items[0]!.proof).toBeDefined();
     expect(pack.unevidencedCriteria).toEqual([]);
-    expect(pack.frozenAt).toBeTruthy();
+    expect(pack.builtAt).toBeTruthy();
+    expect(pack.statement).toContain(pack.root);
+    // the root is also denormalised onto the review so a reader never has to
+    // open the pack to cite it
+    expect(body.evidencePackRoot).toBe(pack.root);
   });
 
   it("rejects evidence belonging to another project", async () => {
@@ -634,13 +659,13 @@ describe("gate evidence packs", () => {
     const pid = await makeProject("Gate race");
     const results = await Promise.all([
       post(`/projects/${pid}/stage-gates`, {
-        gateNumber: 7,
-        name: "Gate 7 A",
+        gateNumber: 3,
+        name: "Gate 3 A",
         criteria: [{ text: "x" }],
       }),
       post(`/projects/${pid}/stage-gates`, {
-        gateNumber: 7,
-        name: "Gate 7 B",
+        gateNumber: 3,
+        name: "Gate 3 B",
         criteria: [{ text: "y" }],
       }),
     ]);
@@ -741,7 +766,11 @@ describe("benefits network and realisation", () => {
     const up = net.nodes.find((n) => n.id === upstream.id)!;
     const down = net.nodes.find((n) => n.id === downstream.id)!;
     expect(up.ownStatus).toBe("at_risk");
-    expect(down.ownStatus).toBe("tracking");
+    // The downstream benefit has no reading of its own, so on its own
+    // evidence it is `planned` — the engine will not call a benefit
+    // "tracking" on the strength of nothing. What propagation changes is its
+    // EFFECTIVE status, and the node says the downgrade was inherited.
+    expect(down.ownStatus).toBe("planned");
     expect(down.effectiveStatus).toBe("at_risk");
     expect(down.inherited).toBe(true);
     expect(net.edges).toHaveLength(1);

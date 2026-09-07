@@ -310,11 +310,15 @@ describe("reconcile.ts — job-to-date arithmetic", () => {
     expect(chosen.reduce((s, c) => s + c.totalCompletedAndStored, 0)).toBe(255_000);
   });
 
-  it("reads the payments module's own allocation stamps, skipping void and unposted payments", () => {
+  it("reads the payments module's own allocation stamps, skipping voided, failed and unposted payments", () => {
+    // The statuses here are the real values of commitment_payments.status
+    // (PAYMENT_STATUSES): a guard written against a status the column never
+    // holds defends nothing.
     const allocations = paidCommitmentAllocations([
-      { id: "p1", reference: "PAY-1", status: "paid", currency: "USD", invoiceId: "inv1", commitmentId: "cmt", detail: { budgetPostedAt: "2026-02-01T00:00:00Z", budgetAllocation: [{ budgetLineItemId: "bli", amount: 81_000 }] } },
-      { id: "p2", reference: "PAY-2", status: "paid", currency: "USD", invoiceId: "inv2", commitmentId: "cmt", detail: {} },
-      { id: "p3", reference: "PAY-3", status: "void", currency: "USD", invoiceId: null, commitmentId: "cmt", detail: { budgetPostedAt: "2026-02-01T00:00:00Z", budgetAllocation: [{ budgetLineItemId: "bli", amount: 999 }] } },
+      { id: "p1", reference: "PAY-1", status: "cleared", currency: "USD", invoiceId: "inv1", commitmentId: "cmt", detail: { budgetPostedAt: "2026-02-01T00:00:00Z", budgetAllocation: [{ budgetLineItemId: "bli", amount: 81_000 }] } },
+      { id: "p2", reference: "PAY-2", status: "issued", currency: "USD", invoiceId: "inv2", commitmentId: "cmt", detail: {} },
+      { id: "p3", reference: "PAY-3", status: "voided", currency: "USD", invoiceId: null, commitmentId: "cmt", detail: { budgetPostedAt: "2026-02-01T00:00:00Z", budgetAllocation: [{ budgetLineItemId: "bli", amount: 999 }] } },
+      { id: "p4", reference: "PAY-4", status: "failed", currency: "USD", invoiceId: null, commitmentId: "cmt", detail: { budgetPostedAt: "2026-02-01T00:00:00Z", budgetAllocation: [{ budgetLineItemId: "bli", amount: 777 }] } },
     ]);
     expect(allocations).toEqual([{ paymentId: "p1", reference: "PAY-1", budgetLineItemId: "bli", amount: 81_000, currency: "USD", invoiceId: "inv1", commitmentId: "cmt" }]);
   });

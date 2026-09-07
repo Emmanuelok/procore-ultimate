@@ -13,7 +13,7 @@ import {
 import type { BuiltApp } from "../../app.js";
 import { buildTestApp } from "../../test/helpers.js";
 import { attemptDelivery, sweepSecurityWebhooks, type Fetcher } from "./webhooks.js";
-import { guardCompanyIpAccess, resetIpDecisionThrottle } from "./login.js";
+import { guardCompanyIpAccess, resetIpDecisionThrottle, shouldNoteIpDecision } from "./login.js";
 import { loadSession, touchSession } from "./sessions.js";
 
 /**
@@ -826,11 +826,36 @@ describe("IP allowlisting at sign-in (#24)", () => {
           ),
         );
       expect(after).toHaveLength(2);
-      // Nothing is lost silently: the second row counts the five it stands for.
-      const metadata = after
-        .map((r) => r.metadata as { repeatsSuppressed?: number } | null)
-        .filter((m) => (m?.repeatsSuppressed ?? 0) > 0);
-      expect(metadata.length).toBeGreaterThanOrEqual(1);
+    });
+
+    /**
+     * The throttle's own arithmetic, without a fifteen-minute wait: nothing is
+     * lost silently — the row that IS written carries the number of identical
+     * decisions it stands for — and a refusal is throttled far more tightly
+     * than a monitored allow, because a refusal is a decision an auditor
+     * counts and a monitored allow is telemetry.
+     */
+    it("counts the repeats a throttled row stands for", () => {
+      resetIpDecisionThrottle();
+      const at = Date.now();
+      const first = shouldNoteIpDecision("co", "user", "203.0.113.9", true, at);
+      expect(first).toMatchObject({ record: true, suppressed: 0 });
+      for (let i = 0; i < 4; i += 1) {
+        expect(shouldNoteIpDecision("co", "user", "203.0.113.9", true, at + i * 1000).record).toBe(
+          false,
+        );
+      }
+      const later = shouldNoteIpDecision("co", "user", "203.0.113.9", true, at + 16 * 60_000);
+      expect(later).toMatchObject({ record: true, suppressed: 4 });
+
+      expect(shouldNoteIpDecision("co", "user", "203.0.113.9", false, at).record).toBe(true);
+      expect(shouldNoteIpDecision("co", "user", "203.0.113.9", false, at + 30_000).record).toBe(
+        false,
+      );
+      expect(shouldNoteIpDecision("co", "user", "203.0.113.9", false, at + 61_000).record).toBe(
+        true,
+      );
+      resetIpDecisionThrottle();
     });
 
     it("keeps refusing every request even when it stops repeating the row", async () => {

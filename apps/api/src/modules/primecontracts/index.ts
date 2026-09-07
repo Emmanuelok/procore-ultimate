@@ -2506,8 +2506,12 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
       const now = nowIso();
       let budgetLinesMoved = 0;
       await app.db.transaction(async (tx) => {
-        for (const row of appended) await tx.insert(primeContractSovLines).values(row);
-        await tx
+        // Claim the transition first: UPDATE ... WHERE status = 'approved'.
+        // Two concurrent executions would otherwise both pass the status read
+        // above and each append its own SOV lines and its own owner_change —
+        // the contract sum funded once but the schedule of values and the
+        // budget moved twice, which no later write can reconcile.
+        const claimed = await tx
           .update(primeContractChanges)
           .set({
             status: "executed",
@@ -2523,7 +2527,20 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
             },
             updatedAt: now,
           })
-          .where(eq(primeContractChanges.id, change.id));
+          .where(
+            and(
+              eq(primeContractChanges.id, change.id),
+              eq(primeContractChanges.status, "approved"),
+            ),
+          )
+          .returning({ id: primeContractChanges.id });
+        if (claimed.length !== 1) {
+          throw conflict(
+            `${change.reference} is no longer approved — another request executed it first. ` +
+              "Reload the change register before acting on it again.",
+          );
+        }
+        for (const row of appended) await tx.insert(primeContractSovLines).values(row);
         if (plan && budgetChangeId && budgetChangeNumber !== null) {
           const requestedBy = change.submittedBy ?? change.createdBy;
           const approvedBy = change.approvedBy ?? req.user!.id;

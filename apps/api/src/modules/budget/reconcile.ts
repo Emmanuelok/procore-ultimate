@@ -67,7 +67,13 @@ export const PENDING_COMMITMENT_STATUSES = ["draft", "out_for_bid", "out_for_sig
 /** Subcontractor invoice statuses that represent cost actually incurred. */
 export const INCURRED_INVOICE_STATUSES = ["approved", "approved_as_noted", "paid"] as const;
 /** Payment statuses under which money has actually left. */
-export const SETTLED_PAYMENT_STATUSES = ["issued", "cleared", "paid"] as const;
+export const SETTLED_PAYMENT_STATUSES = ["issued", "cleared"] as const;
+/**
+ * Payment statuses whose allocation must never count as paid, whatever stamp
+ * the payments module left behind. These are the real values of
+ * `commitment_payments.status` (PAYMENT_STATUSES in @constructos/shared).
+ */
+export const UNSETTLED_PAYMENT_STATUSES: readonly string[] = ["voided", "failed"];
 
 /* ------------------------------------------------------------------ */
 /* Pure arithmetic                                                     */
@@ -141,7 +147,10 @@ export interface PaidAllocation {
 export function paidCommitmentAllocations(payments: readonly PaymentRead[]): PaidAllocation[] {
   const out: PaidAllocation[] = [];
   for (const p of payments) {
-    if (p.status === "void" || p.status === "cancelled") continue;
+    // PAYMENT_STATUSES: scheduled | on_hold | issued | cleared | failed | voided.
+    // "void"/"cancelled" are not values this column ever holds, so the guard
+    // has to name the real ones or it defends nothing.
+    if (UNSETTLED_PAYMENT_STATUSES.includes(p.status)) continue;
     const detail = (p.detail && typeof p.detail === "object" ? p.detail : {}) as Record<string, unknown>;
     if (typeof detail["budgetPostedAt"] !== "string") continue;
     const allocations = detail["budgetAllocation"];

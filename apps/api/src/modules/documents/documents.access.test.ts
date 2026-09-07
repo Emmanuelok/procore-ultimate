@@ -286,6 +286,19 @@ describe("files: multi-upload, metadata search, copy, preview, references, recyc
     expect(refused.statusCode).toBe(409);
     expect(refused.json().message).toMatch(/drawing set/);
     expect((await patch(`/api/v1/files/${sourceFileId}`, owner.headers, { folderId })).statusCode).toBe(400);
+    // REGRESSION: a new version would swap the bytes every drawing revision
+    // resolves through this file id — refused exactly where DELETE is.
+    const swapped = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/files/${sourceFileId}/versions`,
+      payload: multipart([{ buffer: Buffer.from("%PDF-1.4 other\n%%EOF"), filename: "other.pdf", contentType: "application/pdf" }]),
+      headers: mp(owner.headers),
+    });
+    expect(swapped.statusCode).toBe(409);
+    expect(swapped.json().message).toMatch(/drawing set|drawing revision/);
+    const untouched = (await get(`/api/v1/files/${sourceFileId}`, owner.headers)).json();
+    expect(untouched.version).toBe(1);
+    expect(untouched.name).toBe("set.pdf");
   });
 
   it("soft-deletes into a recycle bin admins can read and restore from", async () => {

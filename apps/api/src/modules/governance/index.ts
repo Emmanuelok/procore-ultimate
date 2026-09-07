@@ -1766,7 +1766,26 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
             })
             .where(eq(upliftChallenges.id, challengeId));
           if (verb === "approve") {
-            const bc = await fetchBc(challenge.businessCaseId, req.companyId!, req.projectId!);
+            // Read the case through `tx`, never through `app.db`. The
+            // platform's test database (and any single-connection
+            // deployment) serves one statement at a time: a query issued on
+            // the outer handle while this transaction is open waits for the
+            // transaction, which is waiting for the query — the request
+            // hangs forever rather than failing. Everything inside a
+            // transaction reads and writes through its own handle.
+            const bcRows = await tx
+              .select()
+              .from(businessCases)
+              .where(
+                and(
+                  eq(businessCases.id, challenge.businessCaseId),
+                  eq(businessCases.companyId, req.companyId!),
+                  eq(businessCases.projectId, req.projectId!),
+                ),
+              )
+              .limit(1);
+            const bc = bcRows[0];
+            if (!bc) throw notFound("Business case not found");
             const config = {
               ...asAppraisalConfig(bc.appraisal),
               optimismBiasPercent: challenge.proposedPercent,
@@ -2243,6 +2262,23 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
       q,
     );
   });
+
+  /**
+   * One action, with its overdue state refreshed on the read. The list route
+   * sweeps; a caller looking at a single action deserves the same currency —
+   * an action that went overdue an hour ago should not read as "open" just
+   * because nobody has opened the register since.
+   */
+  app.get(
+    "/projects/:projectId/assurance-actions/:actionId",
+    { preHandler: readGate },
+    async (req) => {
+      const { actionId } = req.params as { actionId: string };
+      await sweepAssuranceActions(app.db, req.companyId!, todayISO());
+      const action = await fetchAction(actionId, req.companyId!, req.projectId!);
+      return { ...action, daysToDue: action.dueDate ? daysUntil(action.dueDate) : null };
+    },
+  );
 
   app.patch(
     "/projects/:projectId/assurance-actions/:actionId",

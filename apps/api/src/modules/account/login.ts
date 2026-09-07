@@ -406,7 +406,7 @@ export function resetIpDecisionThrottle(): void {
   ipNoteState.clear();
 }
 
-function shouldNoteIpDecision(
+export function shouldNoteIpDecision(
   companyId: string,
   userId: string,
   ip: string | null,
