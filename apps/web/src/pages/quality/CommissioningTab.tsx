@@ -36,13 +36,16 @@ import {
   LoadError,
   NothingHere,
   RefusalNotice,
+  TEST_RESULT_TONE,
+  TEST_STATUS_TONE,
   isoDate,
   labelize,
   plural,
   useAction,
+  useResource,
   type Resource,
 } from "./qualityShared";
-import type { CxSystem, Paged } from "./types";
+import type { CxSystem, CxTest, Paged } from "./types";
 
 const CX_STATUSES = [...CX_LADDER, "on_hold"];
 const CX_LEVELS = ["system", "subsystem", "equipment"];
@@ -427,6 +430,10 @@ export default function CommissioningTab({
         />
       )}
 
+      {rows.length > 0 ? (
+        <TestRegister projectId={projectId} version={systems.data?.total ?? 0} onOpen={onOpen} />
+      ) : null}
+
       <Modal
         open={createOpen}
         onClose={() => setCreateOpen(false)}
@@ -496,5 +503,145 @@ export default function CommissioningTab({
         </div>
       </Modal>
     </div>
+  );
+}
+
+/**
+ * EVERY TEST ON THE PROJECT, ACROSS THE SYSTEMS.
+ *
+ * The system drawer answers "is this system proven?". This answers the other
+ * question a commissioning manager asks every morning: "what is outstanding
+ * anywhere?" — the pre-functional records nobody has performed, the functional
+ * tests that failed, the passes waiting for an owner's acceptance. Without it
+ * the list endpoint existed and the only way to see a project's tests was to
+ * open the systems one at a time.
+ *
+ * A failed test is drawn as a failure and an unperformed one as unperformed;
+ * neither is rolled into a percentage, because the useful unit here is the
+ * named record somebody has to go and do.
+ */
+function TestRegister({
+  projectId,
+  version,
+  onOpen,
+}: {
+  projectId: string;
+  version: number;
+  onOpen: (systemId: string) => void;
+}) {
+  const [phase, setPhase] = useState("");
+  const [status, setStatus] = useState("");
+  const [result, setResult] = useState("");
+  const query = [
+    "page=1",
+    "pageSize=200",
+    phase === "" ? "" : `phase=${phase}`,
+    status === "" ? "" : `status=${status}`,
+    result === "" ? "" : `result=${result}`,
+  ]
+    .filter((p) => p !== "")
+    .join("&");
+  const url = `/api/v1/projects/${projectId}/commissioning/test-records?${query}`;
+  const tests = useResource<Paged<CxTest>>(
+    (signal) => api.get<Paged<CxTest>>(url, { signal }),
+    [url, version],
+  );
+  const rows = tests.data?.items ?? [];
+
+  return (
+    <section className="space-y-2 rounded-md border border-border-subtle p-3">
+      <div className="flex flex-wrap items-end justify-between gap-2">
+        <div>
+          <h3 className="text-label uppercase tracking-wide text-content-subtle">
+            Tests across every system
+          </h3>
+          <p className="text-2xs text-content-subtle">
+            {tests.data
+              ? `${tests.data.total} ${plural(tests.data.total, "record")}${tests.data.total > rows.length ? ` · showing the first ${rows.length}` : ""}`
+              : "Loading the test register…"}
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Field label="Phase">
+            <Select value={phase} onChange={(e) => setPhase(e.target.value)}>
+              <option value="">Both phases</option>
+              <option value="prefunctional">Pre-functional</option>
+              <option value="functional">Functional</option>
+              <option value="unclassified">Unclassified</option>
+            </Select>
+          </Field>
+          <Field label="Status">
+            <Select value={status} onChange={(e) => setStatus(e.target.value)}>
+              <option value="">Every status</option>
+              {["scheduled", "in_progress", "complete", "retest_required", "accepted", "void"].map(
+                (s) => (
+                  <option key={s} value={s}>
+                    {labelize(s)}
+                  </option>
+                ),
+              )}
+            </Select>
+          </Field>
+          <Field label="Result">
+            <Select value={result} onChange={(e) => setResult(e.target.value)}>
+              <option value="">Any result</option>
+              {["pass", "pass_with_deficiencies", "fail", "aborted"].map((r) => (
+                <option key={r} value={r}>
+                  {labelize(r)}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        </div>
+      </div>
+
+      {tests.error ? (
+        <LoadError
+          message={tests.error}
+          onRetry={tests.reload}
+          title="The test register could not be loaded"
+        />
+      ) : rows.length === 0 ? (
+        <p className="text-meta text-content-muted">
+          {phase || status || result
+            ? "No test matches these filters. That is a statement about the filters, not about the systems."
+            : "No test record exists on any system yet, so nothing on this project has been proved to work — only registered as something that will have to be."}
+        </p>
+      ) : (
+        <ul className="space-y-1">
+          {rows.map((t) => (
+            <li
+              key={t.id}
+              className="flex flex-wrap items-center gap-1.5 rounded border border-border-subtle px-2 py-1 text-meta"
+            >
+              <span className="font-mono text-2xs">{t.reference}</span>
+              <Badge tone="neutral" size="xs" variant="outline">
+                {labelize(t.testKind)}
+              </Badge>
+              <span className="min-w-0 flex-1 truncate">{t.title}</span>
+              <Badge tone={TEST_STATUS_TONE[t.status] ?? "neutral"} size="xs" dot>
+                {labelize(t.status)}
+              </Badge>
+              {t.result ? (
+                <Badge tone={TEST_RESULT_TONE[t.result] ?? "neutral"} size="xs" variant="solid">
+                  {labelize(t.result)}
+                </Badge>
+              ) : (
+                <span className="text-2xs italic text-content-subtle">not performed</span>
+              )}
+              {t.witnessedAt === null && t.result !== null ? (
+                <span className="text-2xs text-warning-fg">no witness</span>
+              ) : null}
+              <span className="text-2xs text-content-subtle">
+                {t.scheduledFor ? isoDate(t.scheduledFor) : "no date"}
+              </span>
+              <Button size="xs" variant="ghost" onClick={() => onOpen(t.systemId)}>
+                Open the system
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   );
 }

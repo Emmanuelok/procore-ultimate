@@ -11,6 +11,7 @@
  * unreleased hold points past their date, dispositions waiting for an
  * independent approval, overdue NCRs and turnover artefact gaps.
  */
+import { useState } from "react";
 import {
   Alert,
   BarChart,
@@ -64,14 +65,45 @@ export default function OverviewTab({
 }) {
   const { busy, refusal, clear, run } = useAction();
 
+  /*
+   * RUN EVERY DETECTOR, NOT JUST THE CORE FOUR.
+   *
+   * The registers each carry their own sweep — concessions past their expiry,
+   * instruments out of calibration, certificates nobody has verified, audit
+   * findings past their close-out date — and each is also a scheduler job. The
+   * button used to run only the core sweep, so the four register sweeps could
+   * be triggered from nowhere in the product and a user who had just fixed a
+   * date had to wait for the next scheduled run to see the signal clear. They
+   * are idempotent on their signal key, so running them by hand costs nothing
+   * and duplicates nothing.
+   */
+  const [swept, setSwept] = useState<string | null>(null);
+
   async function sweep() {
-    const done = await run("sweep", () =>
-      api.post<{ raised: number; byDetector: Record<string, number> }>(
-        `/api/v1/projects/${projectId}/quality/sweep`,
+    const base = `/api/v1/projects/${projectId}`;
+    const done = await run("sweep", async () => {
+      const core = await api.post<{ raised: number; byDetector: Record<string, number> }>(
+        `${base}/quality/sweep`,
         {},
-      ),
-    );
-    if (done) summary.reload();
+      );
+      const rest = await Promise.all([
+        api.post<{ raised?: number; expired?: number }>(`${base}/concessions/sweep`, {}),
+        api.post<{ raised?: number }>(`${base}/instruments/sweep`, {}),
+        api.post<{ raised?: number }>(`${base}/material-certificates/sweep`, {}),
+        api.post<{ raised?: number }>(`${base}/audit-findings/sweep`, {}),
+      ]);
+      const raised =
+        core.raised + rest.reduce((total, r) => total + (r.raised ?? 0), 0);
+      return { raised };
+    });
+    if (done) {
+      setSwept(
+        done.raised === 0
+          ? "Every detector ran and raised nothing new — the registers agree with the signals already open."
+          : `Every detector ran; ${done.raised} new ${plural(done.raised, "signal")} raised.`,
+      );
+      summary.reload();
+    }
   }
 
   if (summary.error) {
@@ -164,10 +196,15 @@ export default function OverviewTab({
           }
         />
         <p className="text-2xs text-content-subtle">
-          The detectors run lazily on every list read and are idempotent — reading this page has
-          already run them, and running them again over an unchanged project raises nothing. There
-          is no scheduled job behind them, so nothing here is waiting on a cron to notice it.
+          The detectors also run on a schedule — hold points, concessions, calibration, welding,
+          certificates, audit findings, defects liability and seasonal commissioning each have their
+          own job — and they are idempotent on the condition they describe, so running them here
+          raises nothing over a project that has not changed. This button runs the core four and the
+          four register sweeps immediately rather than waiting for the next scheduled pass.
         </p>
+        {swept ? (
+          <p className="text-2xs font-medium text-content-muted">{swept}</p>
+        ) : null}
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           <CountTile
             label="Hold points past their date"

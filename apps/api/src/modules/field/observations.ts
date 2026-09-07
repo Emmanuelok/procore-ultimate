@@ -45,6 +45,7 @@ import {
   assertProjectLocation,
   assertVendor,
   hasToolAdmin,
+  hasToolStandard,
   isCompanyAdmin,
   requireToolLevel,
 } from "./access.js";
@@ -337,6 +338,13 @@ export const observationRoutes: FastifyPluginAsync = async (app) => {
     };
     const can = (to: string) =>
       authorisePunchTransition({ item, actorId: me, isAdmin: admin, to, settings: { requireVerifier: settings.punch.requireVerifier } }).ok;
+    const convertTargets: string[] = [];
+    if (!row.convertedToType && row.status !== "void") {
+      const actor = actorOf(req);
+      if (await hasToolStandard(app, actor, req.projectId!, "punch")) convertTargets.push("punch_item");
+      if (await hasToolStandard(app, actor, req.projectId!, "safety")) convertTargets.push("incident");
+      if (await hasToolStandard(app, actor, req.projectId!, "change_management")) convertTargets.push("change_event");
+    }
     return {
       ...decorate(row, todayISO()),
       links,
@@ -346,7 +354,12 @@ export const observationRoutes: FastifyPluginAsync = async (app) => {
         canReadyForReview: can("ready_for_review"),
         canClose: can("closed"),
         canVoid: can("void"),
-        canConvert: !row.convertedToType && row.status !== "void",
+        canConvert: convertTargets.length > 0,
+        // Per-target, not one boolean: minting a safety incident or a change
+        // event satisfies the owning module's own create gate, so offering
+        // those choices to a caller who only holds `punch` would be a button
+        // that 403s. The UI renders exactly this list.
+        canConvertTo: convertTargets,
         canEditVerifier: admin || row.status !== "ready_for_review",
       },
     };

@@ -1,3 +1,33 @@
+/**
+ * Quantified risk management (spec Vol I §3.7 #443-462, Vol II Domain H
+ * #402-406, #463-476).
+ *
+ * WHAT IT IS
+ * The project risk register with real depth — cause → event → effect,
+ * response strategy, proximity, early-warning triggers and secondary-risk
+ * links — sitting on top of four engines: the Green Book optimism-bias
+ * table and a company-wide reference-class outturn database (optimism.ts),
+ * Monte Carlo QCRA/QSRA run OFF the request path through simulation_jobs
+ * and a worker pool (simulation.ts, runner.ts), contingency plan-vs-actual
+ * drift with a request→approve release machine (contingency.ts), and a
+ * server-side status transition machine (transitions.ts).
+ *
+ * THE TWO RULES THIS MODULE EXISTS TO ENFORCE
+ *  1. A simulation is reproducible: inputs and seed are frozen on the
+ *     record, and /rerun replays them through the same queue to prove the
+ *     stored percentiles.
+ *  2. Contingency is money: every draw and release runs inside one
+ *     transaction with the contingency row locked FOR UPDATE, the requester
+ *     may not be the approver, and cover is never expressed as a percentage
+ *     of a cross-currency sum.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO
+ * It does not convert currencies (cover spanning currencies reports "not
+ * available" with the reason), it does not run a simulation inline on the
+ * request path at any privilege level, and it does not own the schedule or
+ * the budget — QSRA reads the schedule baseline and QCRA the deterministic
+ * EAC, and writes back only risk-adjusted views of them.
+ */
 import type { FastifyPluginAsync } from "fastify";
 import { and, asc, count, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -218,6 +248,11 @@ const EXHAUSTION_FRACTION = 0.2;
  * directly (#471-472). A risk:admin may still draw directly — they are the
  * approving authority — but a standard user cannot self-serve six figures
  * out of the risk pot.
+ *
+ * The figure is read in the CONTINGENCY'S OWN currency and is never
+ * converted: this platform holds no exchange rate, so a threshold that
+ * claimed to be currency-neutral would be a converted number invented on
+ * the spot. Read it as "50,000 of whatever this pot is denominated in".
  */
 const DIRECT_DRAWDOWN_THRESHOLD = 50_000;
 

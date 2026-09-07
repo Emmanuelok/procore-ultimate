@@ -8034,11 +8034,13 @@ ALTER TABLE "disputes" ADD COLUMN "compliance_deadline" text;--> statement-break
 ALTER TABLE "disputes" ADD COLUMN "nod_deadline" text;--> statement-breakpoint
 ALTER TABLE "affected_persons" ADD COLUMN "currency" text DEFAULT 'USD' NOT NULL;--> statement-breakpoint
 ALTER TABLE "affected_persons" ADD COLUMN "status_before_grievance" text;--> statement-breakpoint
+ALTER TABLE "grievances" ADD COLUMN "resolved_by" text;--> statement-breakpoint
 ALTER TABLE "grievances" ADD COLUMN "escalation_tier" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE "grievances" ADD COLUMN "escalated_at" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "grievances" ADD COLUMN "escalation_history" jsonb DEFAULT '[]'::jsonb NOT NULL;--> statement-breakpoint
 ALTER TABLE "land_parcels" ADD COLUMN "acquisition_basis" text;--> statement-breakpoint
 ALTER TABLE "land_parcels" ADD COLUMN "acquired_at" text;--> statement-breakpoint
+ALTER TABLE "land_parcels" ADD COLUMN "compensation_payments" jsonb DEFAULT '[]'::jsonb NOT NULL;--> statement-breakpoint
 ALTER TABLE "payroll_entries" ADD COLUMN "source_ref" text DEFAULT '' NOT NULL;--> statement-breakpoint
 ALTER TABLE "payroll_entries" ADD COLUMN "external_ref" text;--> statement-breakpoint
 ALTER TABLE "payroll_entries" ADD COLUMN "updated_at" timestamp with time zone DEFAULT now() NOT NULL;--> statement-breakpoint

@@ -248,6 +248,61 @@ export async function assertAssignable(
 }
 
 /**
+ * The people a coordination record may name: members of the tenant who can
+ * actually open the project. This is the READ side of `assertAssignable`, and
+ * the two must agree — an assignee picker that offers someone the writer will
+ * reject is a lie the user only discovers after typing the issue.
+ *
+ * Company owners and admins are included with basis "company_admin" because
+ * `requireTool` lets them into every project; everyone else has to hold a
+ * project membership.
+ */
+export async function listAssignable(
+  db: Db,
+  companyId: string,
+  projectId: string,
+): Promise<
+  Array<{ id: string; name: string; email: string; basis: "project_member" | "company_admin" }>
+> {
+  const companyRows = await db
+    .select({
+      userId: companyMemberships.userId,
+      role: companyMemberships.role,
+      name: users.name,
+      email: users.email,
+    })
+    .from(companyMemberships)
+    .innerJoin(users, eq(users.id, companyMemberships.userId))
+    .where(eq(companyMemberships.companyId, companyId))
+    .limit(1000);
+  const onProject = new Set(
+    (
+      await db
+        .select({ userId: projectMemberships.userId })
+        .from(projectMemberships)
+        .where(
+          and(
+            eq(projectMemberships.projectId, projectId),
+            eq(projectMemberships.companyId, companyId),
+          ),
+        )
+        .limit(1000)
+    ).map((r) => r.userId),
+  );
+  return companyRows
+    .filter((r) => onProject.has(r.userId) || r.role === "owner" || r.role === "admin")
+    .map((r) => ({
+      id: r.userId,
+      name: r.name,
+      email: r.email,
+      basis: onProject.has(r.userId)
+        ? ("project_member" as const)
+        : ("company_admin" as const),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
  * Resolve display names for user ids held on records — tenant-scoped, so an
  * id that somehow got past validation still cannot surface another company's
  * user. Unknown ids are simply absent from the map and render as the raw id.

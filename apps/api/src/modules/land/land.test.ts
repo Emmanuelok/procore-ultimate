@@ -3,8 +3,11 @@ import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
 import {
   affectedPersons,
+  companyMemberships,
   evidence,
+  grievances,
   landParcels,
+  ledgerEntries,
   obligations,
   projects,
   scheduleTasks,
@@ -18,12 +21,34 @@ let built: Awaited<ReturnType<typeof buildTestApp>>;
 let app: FastifyInstance;
 let owner: TestActor;
 let stranger: TestActor; // separate tenant — isolation counterparty
+/**
+ * A SECOND officer inside the owner's company. Closure verification is
+ * segregated from resolution — the officer who wrote a resolution cannot also
+ * certify that the complainant accepted it (#573) — so the tests need someone
+ * else to close a grievance the owner resolved.
+ */
+let verifier: TestActor;
 
 beforeAll(async () => {
   built = await buildTestApp();
   app = built.app;
   owner = await registerActor(app);
   stranger = await registerActor(app);
+  const second = await registerActor(app);
+  await app.db.insert(companyMemberships).values({
+    id: newId("cmb"),
+    companyId: owner.companyId,
+    userId: second.userId,
+    role: "admin",
+  });
+  verifier = {
+    ...second,
+    companyId: owner.companyId,
+    headers: {
+      authorization: second.headers["authorization"]!,
+      "x-company-id": owner.companyId,
+    },
+  };
 });
 
 afterAll(async () => {
@@ -285,6 +310,177 @@ describe("land parcel register", () => {
 
     // and only then can title pass — on a stated basis, with its own evidence
     expect(await acquire(pid, parcel.id, "purchase")).toBe(200);
+  });
+
+  /**
+   * Supplementary and corrected payments are ordinary RAP practice — a
+   * valuation revised on appeal, a crop missed at the survey, a court-awarded
+   * top-up. Before this, /compensate refused an already-compensated parcel
+   * and PATCH refused the edit, so the register was frozen on the first
+   * figure and rap-progress understated what the programme had paid; the only
+   * reachable path was compensated → disputed → under_negotiation, three
+   * fabricated state changes including a fictitious dispute.
+   */
+  it("accumulates supplementary payments and restates a corrected figure", async () => {
+    const pid = await makeProject("Supplementary compensation");
+    const parcel = (await createParcel(pid, { reference: "P-SUPP" })).json();
+    await setStatus(pid, parcel.id, "surveyed");
+    await setStatus(pid, parcel.id, "under_negotiation");
+    await setStatus(pid, parcel.id, "agreed");
+    const url = `/api/v1/projects/${pid}/parcels/${parcel.id}/compensate`;
+
+    const first = await app.inject({
+      method: "POST",
+      url,
+      headers: owner.headers,
+      payload: {
+        amount: 10000,
+        paidAt: "2026-03-01",
+        evidenceIds: [await insertEvidence(pid)],
+      },
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().compensationAmount).toBe(10000);
+    expect(first.json().compensationPayments).toHaveLength(1);
+    expect(first.json().compensationPayments[0].kind).toBe("initial");
+
+    // the frozen-after-payment PATCH names a route that actually accepts it
+    const patched = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${pid}/parcels/${parcel.id}`,
+      headers: owner.headers,
+      payload: { compensationAmount: 14000 },
+    });
+    expect(patched.statusCode).toBe(409);
+    expect(patched.json().message).toContain("compensation-correction");
+
+    // a supplement ADDS; it does not restate, and it does not need a
+    // fictitious dispute to be recorded
+    const supplement = await app.inject({
+      method: "POST",
+      url,
+      headers: owner.headers,
+      payload: {
+        amount: 2500.004,
+        paidAt: "2026-06-15",
+        evidenceIds: [await insertEvidence(pid)],
+        note: "Mango trees missed at the asset survey",
+      },
+    });
+    expect(supplement.statusCode).toBe(200);
+    const topped = supplement.json();
+    expect(topped.status).toBe("compensated");
+    expect(topped.compensationAmount).toBe(12500);
+    // the FIRST payment date is what the possession rule reads
+    expect(topped.compensationPaidAt).toBe("2026-03-01");
+    expect(topped.compensationLastPaidAt).toBe("2026-06-15");
+    expect(topped.compensationPayments).toHaveLength(2);
+    expect(topped.compensationPayments[1].kind).toBe("supplementary");
+    expect(topped.compensationPayments[1].delta).toBe(2500);
+    expect(topped.evidenceIds).toHaveLength(2);
+    expect(topped.compensable).toBe(true);
+    expect(topped.correctable).toBe(true);
+
+    // title passes, and a further payment afterwards does not undo it
+    expect(await acquire(pid, parcel.id, "purchase")).toBe(200);
+    const afterTitle = await app.inject({
+      method: "POST",
+      url,
+      headers: owner.headers,
+      payload: {
+        amount: 500,
+        paidAt: "2026-08-01",
+        evidenceIds: [await insertEvidence(pid)],
+      },
+    });
+    expect(afterTitle.statusCode).toBe(200);
+    expect(afterTitle.json().status).toBe("acquired");
+    expect(afterTitle.json().compensationAmount).toBe(13000);
+
+    // a correction RESTATES the total, with a reason and its own evidence
+    const correctionUrl = `/api/v1/projects/${pid}/parcels/${parcel.id}/compensation-correction`;
+    const noReason = await app.inject({
+      method: "POST",
+      url: correctionUrl,
+      headers: owner.headers,
+      payload: { correctedAmount: 12800, reason: "typo", evidenceIds: [] },
+    });
+    expect(noReason.statusCode).toBe(400);
+
+    const corrected = await app.inject({
+      method: "POST",
+      url: correctionUrl,
+      headers: owner.headers,
+      payload: {
+        correctedAmount: 12800,
+        reason: "Second instalment keyed twice; bank statement shows one transfer of 200 less",
+        evidenceIds: [await insertEvidence(pid)],
+      },
+    });
+    expect(corrected.statusCode).toBe(200);
+    expect(corrected.json().compensationAmount).toBe(12800);
+    const entries = corrected.json().compensationPayments;
+    expect(entries).toHaveLength(4);
+    expect(entries[3].kind).toBe("correction");
+    expect(entries[3].delta).toBe(-200);
+
+    // a no-op correction is refused rather than ledgered as a change
+    const noop = await app.inject({
+      method: "POST",
+      url: correctionUrl,
+      headers: owner.headers,
+      payload: {
+        correctedAmount: 12800,
+        reason: "Re-keying the same figure to see what happens",
+        evidenceIds: [await insertEvidence(pid)],
+      },
+    });
+    expect(noop.statusCode).toBe(400);
+
+    // the movement is readable from the ledger without the record beside it
+    const ledger = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(and(eq(ledgerEntries.companyId, owner.companyId), eq(ledgerEntries.objectId, parcel.id)))
+      .orderBy(ledgerEntries.seq);
+    const correction = ledger.find(
+      (e) => (e.payload as { event?: string } | null)?.event === "compensation_corrected",
+    );
+    expect(correction).toBeTruthy();
+    expect(correction!.payload).toMatchObject({
+      before: { compensationAmount: 13000 },
+      after: { compensationAmount: 12800 },
+      delta: -200,
+    });
+    const supplementEntry = ledger.find(
+      (e) => (e.payload as { paymentKind?: string } | null)?.paymentKind === "supplementary",
+    );
+    expect(supplementEntry!.payload).toMatchObject({ previousTotal: 10000, totalPaid: 12500 });
+
+    // and the RAP dashboard reports the combined figure, not the first one
+    const rap = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/land/rap-progress`,
+      headers: owner.headers,
+    });
+    expect(rap.json().compensation.parcels.paid).toBe(12800);
+  });
+
+  it("refuses a correction on a parcel that has never been paid", async () => {
+    const pid = await makeProject("Correction without payment");
+    const parcel = (await createParcel(pid, { reference: "P-NOPAY" })).json();
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/parcels/${parcel.id}/compensation-correction`,
+      headers: owner.headers,
+      payload: {
+        correctedAmount: 100,
+        reason: "There is nothing on the register to correct",
+        evidenceIds: [await insertEvidence(pid)],
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("nothing to correct");
   });
 
   it("lists parcels with linked PAP counts and filters", async () => {
@@ -898,6 +1094,52 @@ describe("grievance redress mechanism", () => {
     expect(stored.every((o) => !o.trigger.includes("Jane Okoro"))).toBe(true);
   });
 
+  /**
+   * A household id is identifying data on a scheme with one household per
+   * parcel: the census row, the PAP drawer, the RAP indicator
+   * `householdsUnderOpenGrievance` and the land health metric all name the
+   * household a live complaint is about. The web form clears the field, but
+   * the API is what machine tokens and MCP callers use, so the refusal has to
+   * live on the server.
+   */
+  it("refuses to attach a household to an anonymous grievance", async () => {
+    const pid = await makeProject("Anonymous household link");
+    const pap = (await createPap(pid, { reference: "PAP-ANON" })).json();
+
+    for (const payload of [
+      { isAnonymous: true, papId: pap.id },
+      { channel: "anonymous", papId: pap.id },
+    ]) {
+      const res = await createGrievance(pid, payload);
+      expect(res.statusCode).toBe(400);
+      expect(res.json().message).toContain("anonymous");
+    }
+
+    // nothing was written: no grievance, and the household is untouched
+    const list = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/grievances`,
+      headers: owner.headers,
+    });
+    expect(list.json().total).toBe(0);
+    const [household] = await app.db
+      .select()
+      .from(affectedPersons)
+      .where(eq(affectedPersons.id, pap.id));
+    expect(household!.status).toBe("registered");
+    expect(household!.statusBeforeGrievance).toBeNull();
+
+    // the same grievance, named, DOES flag the household
+    const named = await createGrievance(pid, { papId: pap.id });
+    expect(named.statusCode).toBe(201);
+    expect(named.json().papId).toBe(pap.id);
+    const [flaggedHousehold] = await app.db
+      .select()
+      .from(affectedPersons)
+      .where(eq(affectedPersons.id, pap.id));
+    expect(flaggedHousehold!.status).toBe("grievance_open");
+  });
+
   it("closes a grievance only when the complainant says it worked", async () => {
     const pid = await makeProject("Closure verification");
     const g = (await createGrievance(pid, { severity: "high" })).json();
@@ -906,7 +1148,7 @@ describe("grievance redress mechanism", () => {
     const premature = await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/grievances/${g.id}/verify-closure`,
-      headers: owner.headers,
+      headers: verifier.headers,
       payload: { complainantSatisfied: true },
     });
     expect(premature.statusCode).toBe(400);
@@ -956,7 +1198,7 @@ describe("grievance redress mechanism", () => {
     const rejected = await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/grievances/${g.id}/verify-closure`,
-      headers: owner.headers,
+      headers: verifier.headers,
       payload: { complainantSatisfied: false, note: "Dust unchanged after one week" },
     });
     expect(rejected.statusCode).toBe(200);
@@ -978,7 +1220,7 @@ describe("grievance redress mechanism", () => {
     const closed = await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/grievances/${g.id}/verify-closure`,
-      headers: owner.headers,
+      headers: verifier.headers,
       payload: { complainantSatisfied: true },
     });
     expect(closed.json().status).toBe("closed_verified");
@@ -1076,7 +1318,7 @@ describe("grievance redress mechanism", () => {
     await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/grievances/${overdueCritical.id}/verify-closure`,
-      headers: owner.headers,
+      headers: verifier.headers,
       payload: { complainantSatisfied: true },
     });
     const [afterClosure] = await app.db
@@ -1094,6 +1336,99 @@ describe("grievance redress mechanism", () => {
     // the medium one is still open — escalated by the detector, but escalation
     // is not settlement, so it is still an overdue case
     expect(overdueOnly.json().total).toBe(1);
+  });
+
+  /**
+   * SEGREGATION OF DUTIES (PLAN §6.3, #573). A satisfied closure asserts what
+   * the complainant said; letting the officer who wrote the resolution make
+   * that assertion turns the SLA compliance and satisfaction rates the lender
+   * reads into self-certification.
+   */
+  it("refuses a satisfied closure from the officer who wrote the resolution", async () => {
+    const pid = await makeProject("Closure segregation");
+    const g = (await createGrievance(pid, { severity: "high" })).json();
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/grievances/${g.id}/resolve`,
+      headers: owner.headers,
+      payload: { resolution: "Compound wall repaired" },
+    });
+    const [resolved] = await app.db.select().from(grievances).where(eq(grievances.id, g.id));
+    expect(resolved!.resolvedBy).toBe(owner.userId);
+
+    const self = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/grievances/${g.id}/verify-closure`,
+      headers: owner.headers,
+      payload: { complainantSatisfied: true },
+    });
+    expect(self.statusCode).toBe(403);
+    expect(self.json().message).toContain("cannot also certify");
+    const [stillResolved] = await app.db.select().from(grievances).where(eq(grievances.id, g.id));
+    expect(stillResolved!.status).toBe("resolved");
+
+    // recording that the complainant REJECTED the resolution is adverse to the
+    // resolver, reopens rather than closes, and stays open to them: blocking
+    // it would only encourage leaving a rejection unrecorded
+    const reopened = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/grievances/${g.id}/verify-closure`,
+      headers: owner.headers,
+      payload: { complainantSatisfied: false, note: "Wall repaired, dust unchanged" },
+    });
+    expect(reopened.statusCode).toBe(200);
+    expect(reopened.json().status).toBe("investigating");
+
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/grievances/${g.id}/resolve`,
+      headers: owner.headers,
+      payload: { resolution: "Dust suppression doubled" },
+    });
+    const byOther = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/grievances/${g.id}/verify-closure`,
+      headers: verifier.headers,
+      payload: { complainantSatisfied: true },
+    });
+    expect(byOther.statusCode).toBe(200);
+    expect(byOther.json().status).toBe("closed_verified");
+    const [closed] = await app.db.select().from(grievances).where(eq(grievances.id, g.id));
+    expect(closed!.verifiedBy).toBe(verifier.userId);
+    expect(closed!.resolvedBy).toBe(owner.userId);
+  });
+
+  /**
+   * With no resolution author on file (a grievance resolved before the column
+   * existed, or one closed by a route that does not set it) the assignee is
+   * the next-best proxy and is refused on the same grounds.
+   */
+  it("refuses a satisfied closure from the assignee when no resolver is recorded", async () => {
+    const pid = await makeProject("Closure segregation fallback");
+    const g = (await createGrievance(pid, { severity: "high" })).json();
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/grievances/${g.id}/assign`,
+      headers: owner.headers,
+      payload: { assigneeId: owner.userId },
+    });
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/grievances/${g.id}/resolve`,
+      headers: verifier.headers,
+      payload: { resolution: "Access track reinstated" },
+    });
+    // strip the resolver, leaving only the assignee to segregate against
+    await app.db.update(grievances).set({ resolvedBy: null }).where(eq(grievances.id, g.id));
+
+    const self = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/grievances/${g.id}/verify-closure`,
+      headers: owner.headers,
+      payload: { complainantSatisfied: true },
+    });
+    expect(self.statusCode).toBe(403);
+    expect(self.json().message).toContain("assignee");
   });
 
   it("reports GRM analytics including medians, anonymous share and satisfaction", async () => {
@@ -1131,13 +1466,13 @@ describe("grievance redress mechanism", () => {
     await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/grievances/${ten.id}/verify-closure`,
-      headers: owner.headers,
+      headers: verifier.headers,
       payload: { complainantSatisfied: true },
     });
     await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/grievances/${twenty.id}/verify-closure`,
-      headers: owner.headers,
+      headers: verifier.headers,
       payload: { complainantSatisfied: false },
     });
 
@@ -1304,6 +1639,93 @@ describe("stakeholders and engagement", () => {
       headers: owner.headers,
     });
     expect(del.statusCode).toBe(409);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Ledger fidelity on the remaining PATCH routes                        */
+/* ------------------------------------------------------------------ */
+
+describe("patch ledger payloads", () => {
+  /**
+   * Influence and interest drive the Mendelow quadrant and therefore the
+   * engagement plan a community gets. A silent re-score from high/high to
+   * low/low used to be auditable only as the words "influence, interest",
+   * with storePayload unset so nothing was stored at all.
+   */
+  it("stores the before and after values of a stakeholder re-score", async () => {
+    const pid = await makeProject("Stakeholder ledger");
+    const s0 = (
+      await app.inject({
+        method: "POST",
+        url: `/api/v1/projects/${pid}/stakeholders`,
+        headers: owner.headers,
+        payload: { name: "Riverside Committee", influence: 5, interest: 5, category: "community" },
+      })
+    ).json();
+    expect(s0.quadrant).toBe("manage_closely");
+
+    const patched = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${pid}/stakeholders/${s0.id}`,
+      headers: owner.headers,
+      payload: { influence: 1, interest: 1 },
+    });
+    expect(patched.statusCode).toBe(200);
+    expect(patched.json().quadrant).toBe("monitor");
+
+    const [entry] = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(
+        and(
+          eq(ledgerEntries.objectType, "stakeholder"),
+          eq(ledgerEntries.objectId, s0.id),
+          eq(ledgerEntries.action, "update"),
+        ),
+      )
+      .orderBy(ledgerEntries.seq);
+    expect(entry!.payload).toMatchObject({
+      before: { influence: 5, interest: 5 },
+      after: { influence: 1, interest: 1 },
+    });
+  });
+
+  it("stores the before and after values of an engagement edit", async () => {
+    const pid = await makeProject("Engagement ledger");
+    const e0 = (
+      await app.inject({
+        method: "POST",
+        url: `/api/v1/projects/${pid}/engagements`,
+        headers: owner.headers,
+        payload: {
+          title: "FPIC assembly",
+          kind: "consultation",
+          engagementDate: todayISO(),
+          consentStatus: "pending",
+          summary: "Consent not reached; reconvene",
+        },
+      })
+    ).json();
+
+    const patched = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${pid}/engagements/${e0.id}`,
+      headers: owner.headers,
+      payload: { consentStatus: "granted", summary: "Consent recorded by show of hands" },
+    });
+    expect(patched.statusCode).toBe(200);
+
+    const entries = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(and(eq(ledgerEntries.objectType, "engagement"), eq(ledgerEntries.objectId, e0.id)))
+      .orderBy(ledgerEntries.seq);
+    const update = entries.find((e) => e.action === "update");
+    expect(update!.payload).toMatchObject({
+      before: { consentStatus: "pending", summary: "Consent not reached; reconvene" },
+      after: { consentStatus: "granted", summary: "Consent recorded by show of hands" },
+    });
   });
 });
 

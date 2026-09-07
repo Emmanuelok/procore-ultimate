@@ -23,7 +23,6 @@ import { and, asc, count, desc, eq, gte, ilike, inArray, isNull, lt, lte, or, sq
 import { z } from "zod";
 import {
   assets,
-  companyMemberships,
   locations,
   sensorAlerts,
   sensorReadings,
@@ -35,6 +34,7 @@ import { badRequest, conflict, forbidden, notFound } from "../../../lib/errors.j
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
 import { applyBreaches, clearStaleAlerts, evaluateBreaches } from "../alerts.js";
 import {
+  assertAssignable,
   buildTwinGates,
   buildTwinLoaders,
   isoTimestampSchema,
@@ -120,18 +120,10 @@ export const sensorRoutes: FastifyPluginAsync = async (app) => {
         .limit(1);
       if (!rows[0]) throw badRequest("Location not found in this project");
     }
+    // the owner is paged when this channel breaches or goes silent, and the
+    // alert names the project — so they have to be able to open it
     if (body.ownerId) {
-      const rows = await app.db
-        .select({ userId: companyMemberships.userId })
-        .from(companyMemberships)
-        .where(
-          and(
-            eq(companyMemberships.companyId, companyId),
-            eq(companyMemberships.userId, body.ownerId),
-          ),
-        )
-        .limit(1);
-      if (!rows[0]) throw badRequest("Owner must be a member of this company");
+      await assertAssignable(app.db, companyId, projectId, [body.ownerId]);
     }
   }
 

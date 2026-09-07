@@ -16,7 +16,7 @@ import {
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { badRequest, notFound } from "../../lib/errors.js";
+import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { addDaysISO, isoDateSchema, todayISO } from "../field/dates.js";
 import {
@@ -167,6 +167,24 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
     const anonymous = body.isAnonymous === true || body.channel === "anonymous";
     const complainantName = anonymous ? null : (body.complainantName ?? null);
     const complainantContact = anonymous ? null : (body.complainantContact ?? null);
+    /*
+     * A household id IS identifying data. Everything downstream treats it as
+     * such: the census row, the PAP detail, the RAP indicator
+     * `householdsUnderOpenGrievance` and the land health metric all name the
+     * household a live complaint is about, and on a scheme with one household
+     * per parcel that names the complainant. Silently dropping a link the
+     * caller asked for would be its own dishonesty, so an anonymous intake
+     * carrying a papId is refused with the reason: the web form clears the
+     * field, but the API is the surface machine tokens and MCP callers use,
+     * and a guarantee only the client enforces is not a guarantee.
+     */
+    if (anonymous && body.papId) {
+      throw badRequest(
+        "An anonymous grievance cannot name a household: a papId identifies the complainant " +
+          "through the census, the RAP dashboard and the household's own record. Submit it " +
+          "without papId, or record it as a named grievance with the complainant's consent.",
+      );
+    }
     if (body.papId) {
       const rows = await app.db
         .select({ id: affectedPersons.id })
@@ -438,7 +456,15 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
       const now = new Date().toISOString();
       await app.db
         .update(grievances)
-        .set({ status: "resolved", resolution: body.resolution, resolvedAt: now, updatedAt: now })
+        .set({
+          status: "resolved",
+          resolution: body.resolution,
+          resolvedAt: now,
+          // who authored the resolution, so the person who wrote it cannot
+          // also be the one who certifies the complainant accepted it
+          resolvedBy: req.user!.id,
+          updatedAt: now,
+        })
         .where(eq(grievances.id, grievanceId));
       // The obligation is deliberately NOT satisfied here: a resolution the
       // complainant has not accepted is not a closed grievance (#573).
@@ -454,6 +480,7 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
           number: g.number,
           resolution: body.resolution,
           resolvedAt: now,
+          resolvedBy: req.user!.id,
           resolveDueAt: g.resolveDueAt,
           onTime: g.resolveDueAt ? now.slice(0, 10) <= g.resolveDueAt : null,
         },
@@ -472,6 +499,21 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
    * grievance and satisfies its obligation; an unsatisfied complainant
    * reopens it into investigation, and the reopen is ledgered so the
    * "closed" statistics can never be laundered.
+   *
+   * SEGREGATION OF DUTIES. A satisfied closure is an ASSERTION about what
+   * the complainant said, and the platform rule is that an assertion and the
+   * evidence that tests it are not authored by the same actor through the
+   * same pathway. Without this the officer who wrote the resolution could
+   * post `complainantSatisfied: true` seconds later, close the grievance,
+   * satisfy its GRM obligation and lift the household's flag unaided — the
+   * SLA compliance and satisfaction rates the lender reads would then be
+   * self-certified. So the resolver (and, where no resolution author is on
+   * file, the assignee) cannot record a SATISFIED verification.
+   *
+   * The unsatisfied branch is deliberately NOT restricted: recording that
+   * the complainant rejected the resolution is adverse to the person who
+   * wrote it, it reopens rather than closes, and blocking it would give an
+   * officer a reason to leave a rejection unrecorded.
    */
   app.post(
     "/projects/:projectId/grievances/:grievanceId/verify-closure",
@@ -483,6 +525,16 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
       if (g.status !== "resolved") {
         throw badRequest(
           `Closure can only be verified on a resolved grievance (this one is ${g.status})`,
+        );
+      }
+      const selfVerifier = g.resolvedBy ?? g.assigneeId;
+      if (body.complainantSatisfied && selfVerifier === req.user!.id) {
+        throw forbidden(
+          g.resolvedBy === req.user!.id
+            ? "You wrote this resolution, so you cannot also certify that the complainant " +
+                "accepted it. Another officer must verify closure with the complainant (#573)."
+            : "You are the assignee on this grievance, so you cannot also certify that the " +
+                "complainant accepted its resolution. Another officer must verify closure (#573).",
         );
       }
       const now = new Date().toISOString();
@@ -517,6 +569,8 @@ export async function registerGrievanceRoutes(app: FastifyInstance): Promise<voi
             number: g.number,
             complainantSatisfied: true,
             verifiedAt: now,
+            verifiedBy: req.user!.id,
+            resolvedBy: g.resolvedBy,
             note: body.note ?? null,
           },
           storePayload: true,

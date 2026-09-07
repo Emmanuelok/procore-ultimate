@@ -39,6 +39,7 @@ import {
   CX_LADDER,
   CX_STATUS_TONE,
   EM_DASH,
+  EditModal,
   Facts,
   LoadError,
   NothingHere,
@@ -56,9 +57,45 @@ import {
   plural,
   todayIso,
   useAction,
+  useReason,
   useResource,
+  type EditFieldSpec,
 } from "./qualityShared";
 import type { CxReading, CxSystemDetail, CxTest } from "./types";
+
+/*
+ * The system as it is PLANNED and DESCRIBED, and the test as it is SCHEDULED.
+ * Neither list carries a result, a witness or an acceptance: those are earned,
+ * and the API keeps them behind their own routes. `seasonalTestDueDate` is
+ * here deliberately — it is the date the seasonal sweep reads, and a heating
+ * season that moves has to be able to move it.
+ */
+const SYSTEM_EDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "name", label: "Name", kind: "text", nullable: false, wide: true },
+  { key: "discipline", label: "Discipline", kind: "text" },
+  { key: "plannedStaticCompletion", label: "Planned static completion", kind: "date" },
+  { key: "plannedEnergisation", label: "Planned energisation", kind: "date" },
+  { key: "plannedFunctionalTest", label: "Planned functional test", kind: "date" },
+  { key: "plannedCompletionDate", label: "Planned completion", kind: "date" },
+  {
+    key: "seasonalTestDueDate",
+    label: "Seasonal test due",
+    kind: "date",
+    hint: "The sweep raises the deferred seasonal test on this date and creates the scheduled record.",
+  },
+  { key: "beneficialUseDate", label: "Beneficial use", kind: "date" },
+  { key: "warrantyStartDate", label: "Warranty starts", kind: "date" },
+  { key: "percentComplete", label: "Percent complete", kind: "number" },
+  { key: "description", label: "Description", kind: "textarea" },
+];
+
+const TEST_EDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "title", label: "Title", kind: "text", nullable: false, wide: true },
+  { key: "testProcedureRef", label: "Procedure reference", kind: "text" },
+  { key: "scheduledFor", label: "Scheduled for", kind: "date" },
+  { key: "contractorRepName", label: "Contractor representative", kind: "text" },
+  { key: "description", label: "Description", kind: "textarea" },
+];
 
 const TEST_KINDS = [
   "prefunctional_checklist",
@@ -162,6 +199,7 @@ function SystemBody({
 }) {
   const { busy, refusal, clear, run } = useAction();
   const [addOpen, setAddOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
 
   const readiness = system.functionalReadiness;
   const pre = system.testRecords.filter((t) => t.phase === "prefunctional");
@@ -268,11 +306,25 @@ function SystemBody({
           >
             Accept the system
           </Button>
+          <Button size="sm" variant="ghost" onClick={() => setEditOpen(true)}>
+            Correct the record
+          </Button>
           <span className="text-2xs text-content-subtle">
             Owner acceptance — never the Cx agent who tested it, and only once functional testing is
             complete. Accepting earlier accepts a system nobody has finished proving.
           </span>
         </div>
+
+        <EditModal
+          open={editOpen}
+          onClose={() => setEditOpen(false)}
+          title={`Correct ${system.systemCode}`}
+          description="The system as it is described and planned. The commissioning status is climbed by doing the work — energisation, testing, acceptance — and is not editable here."
+          url={`/api/v1/projects/${projectId}/commissioning/systems/${system.id}`}
+          fields={SYSTEM_EDIT_FIELDS}
+          record={system as unknown as Record<string, unknown>}
+          onSaved={onMutated}
+        />
       </section>
 
       {/* -------- children -------- */}
@@ -450,6 +502,7 @@ function TestCard({
 }) {
   const { busy, refusal, clear, run } = useAction();
   const { ask, dialog } = useReason();
+  const [editOpen, setEditOpen] = useState(false);
   const [resultOpen, setResultOpen] = useState(false);
   const [witnessOpen, setWitnessOpen] = useState(false);
   const [result, setResult] = useState("pass");
@@ -658,7 +711,26 @@ function TestCard({
         >
           Raise a retest
         </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={test.status === "accepted"}
+          onClick={() => setEditOpen(true)}
+        >
+          Edit
+        </Button>
       </div>
+
+      <EditModal
+        open={editOpen}
+        onClose={() => setEditOpen(false)}
+        title={`Edit ${test.reference}`}
+        description="How the test is scheduled and which procedure it runs. The readings, the result, the witness and the acceptance are not editable — a test whose result could be typed over is not a test."
+        url={base}
+        fields={TEST_EDIT_FIELDS}
+        record={test as unknown as Record<string, unknown>}
+        onSaved={onMutated}
+      />
 
       <Modal
         open={resultOpen}
@@ -718,6 +790,7 @@ function TestCard({
           </Field>
         </div>
       </Modal>
+      {dialog}
     </div>
   );
 }

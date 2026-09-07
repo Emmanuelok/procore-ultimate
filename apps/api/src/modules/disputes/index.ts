@@ -1,3 +1,34 @@
+/**
+ * Dispute resolution: adjudication, DAAB, bundles and settlement
+ * (spec Vol II Domain E #322-333, #340-343, #351-357).
+ *
+ * WHAT IT IS
+ * A dispute register that knows the statute. Jurisdiction rule sets for UK
+ * HGCRA/Scheme, Singapore SOPA, NSW SOPA, QLD BOIF, Malaysia CIPAA, NZ CCA
+ * and FIDIC DAAB are held as DATA (regimes.ts) and materialise every dated
+ * step as an obligation on a business-day calendar. On top of that: DAAB
+ * boards with independence disclosures and site visits, hearing bundles
+ * whose items are content-snapshotted at generation so verification can
+ * tell tampering from an ordinary later change (bundle.ts), a Redfern
+ * schedule for document production, decision-tree settlement modelling with
+ * Part 36/Calderbank consequences (settlement.ts), and a company-wide
+ * outcome database whose root causes feed contract drafting
+ * recommendations (analytics.ts).
+ *
+ * THE RULES THIS MODULE EXISTS TO ENFORCE
+ * A statutory deadline is an obligation, not a note. An expired offer is
+ * not on the table. A dispute's currency denominates its money, so it
+ * cannot be relabelled once money exists. A bundle's manifest is checked
+ * against an INDEPENDENT snapshot record, so rewriting the index and its
+ * Merkle root together is still caught.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO
+ * It does not render a PDF (no PDF writer here): the produced bundle is
+ * served as a print-ready document with a hyperlinked index addressed by
+ * tab, because a page number this platform cannot know would be a lie on
+ * a document served in evidence. It does not give legal advice — every
+ * timetable step cites the rule it comes from.
+ */
 import type { FastifyPluginAsync } from "fastify";
 import { and, asc, count, desc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";

@@ -1,3 +1,35 @@
+/**
+ * Project finance and lender discipline (spec Vol II Domains N/O #732-751,
+ * #769).
+ *
+ * WHAT IT IS
+ * The DFI/PPP financing side of a project: facilities with conditions
+ * precedent, disbursements running draft → submitted → approved →
+ * certified → disbursed, expenditure eligibility and ineligible-expenditure
+ * recoveries, designated-account ledgers and reconciliation (accounts.ts),
+ * covenants computed from period cashflows rather than typed in
+ * (covenants.ts), interest-during-construction and commitment-fee accrual
+ * (interest.ts), PPP availability payments with deduction mechanics
+ * (availability.ts), and the IFI withdrawal application (withdrawal.ts).
+ *
+ * THE THREE RULES THIS MODULE EXISTS TO ENFORCE
+ *  1. Money never crosses a currency boundary: every total is bucketed by
+ *     currency and a mixed-currency headline returns an Unknowable with
+ *     reasons (money.ts).
+ *  2. Headroom is checked inside the transaction that consumes it, with the
+ *     facility row locked FOR UPDATE, at submit AND again at approve — and
+ *     the pipeline, not just cash paid, consumes it.
+ *  3. Separation of duties across the whole chain: requester/submitter ≠
+ *     approver ≠ certifier ≠ payer, and certification is performed by an
+ *     independent engineer, not the delivery team.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO
+ * It does not write a PDF — this runtime has no PDF writer, so the
+ * withdrawal application is served as the print-ready form plus a
+ * statement-of-expenditure CSV rather than a file that claims to be the
+ * lender's. It does not move cash; it records the decisions that authorise
+ * someone else to.
+ */
 import type { FastifyPluginAsync } from "fastify";
 import { and, asc, count, desc, eq, inArray, isNotNull, lt } from "drizzle-orm";
 import { z } from "zod";

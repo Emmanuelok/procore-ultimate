@@ -582,7 +582,7 @@ export const esgModule: FastifyPluginAsync = async (app) => {
   app.patch("/carbon-factors/:factorId", { preHandler: companyWrite }, async (req) => {
     const { factorId } = req.params as { factorId: string };
     const body = factorPatchSchema.parse(req.body);
-    await fetchFactor(factorId, req.companyId!);
+    const current = await fetchFactor(factorId, req.companyId!);
     // Editing a factor already used would silently restate published tCO2e
     // figures. Supersede it with a new factor instead.
     const used = await factorUsage(factorId);
@@ -607,13 +607,23 @@ export const esgModule: FastifyPluginAsync = async (app) => {
     if (Object.keys(set).length > 0) {
       await app.db.update(carbonFactors).set(set).where(eq(carbonFactors.id, factorId));
     }
+    // the values, not the key names: an emission factor is the multiplier
+    // every tCO2e figure in the project is built on, so a change to it has to
+    // be readable from the ledger without the record beside it
+    const before: Record<string, unknown> = {};
+    const after: Record<string, unknown> = {};
+    for (const key of Object.keys(set)) {
+      before[key] = (current as unknown as Record<string, unknown>)[key];
+      after[key] = set[key];
+    }
     await appendLedger(app.db, {
       companyId: req.companyId!,
       actorId: req.user!.id,
       action: "update",
       objectType: "carbon_factor",
       objectId: factorId,
-      payload: { changed: Object.keys(body) },
+      payload: { before, after },
+      storePayload: true,
     });
     return fetchFactor(factorId, req.companyId!);
   });

@@ -1253,6 +1253,18 @@ export interface CertificateCheck {
   independentlyWitnessed: boolean;
 }
 
+/**
+ * The company-wide heat trace. `scope` is part of the answer, not decoration:
+ * an empty result on a filtered scope means "not on the projects you can see",
+ * which is a different statement from "this cast was never certified".
+ */
+export interface HeatTraceResult {
+  items: MaterialCertificate[];
+  total: number;
+  scope: { projectCount: number | null; allProjects: boolean };
+  reasons: string[];
+}
+
 export interface MaterialCertificate {
   id: string;
   reference: string;

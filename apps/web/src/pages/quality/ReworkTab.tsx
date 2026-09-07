@@ -29,6 +29,7 @@ import { IconPlus } from "../../ui/icons";
 import { api } from "../../lib/api";
 import {
   CountTile,
+  EditModal,
   LoadError,
   NothingHere,
   ReasonList,
@@ -40,6 +41,7 @@ import {
   plural,
   useAction,
   useReason,
+  type EditFieldSpec,
   type Resource,
 } from "./qualityShared";
 import type { CostOfQuality, FirstTimeRight, Paged, ReworkItem, ReworkSummary } from "./types";
@@ -66,6 +68,51 @@ const PHASES = [
   "post_handover",
 ];
 
+/*
+ * What may be corrected on a rework item. Every cost here feeds the project's
+ * cost-of-quality buckets and the first-time-right figure, so a mistyped
+ * labour cost is a mistyped statement about what failure cost — worth
+ * correcting in place rather than by raising a second item. The lifecycle
+ * (approve, start, complete, verify, cancel) is not here: it has its own
+ * routes and its own segregation.
+ */
+const asOptions = (values: readonly string[]) =>
+  values.map((value) => ({ value, label: labelize(value) }));
+
+const REWORK_EDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "title", label: "What had to be done again", kind: "text", nullable: false, wide: true },
+  { key: "description", label: "Description", kind: "textarea" },
+  {
+    key: "causeCategory",
+    label: "Cause",
+    kind: "select",
+    options: asOptions(CAUSES),
+    nullable: false,
+    hint: "The cause drives the trade and phase analysis; a wrong one moves the blame quietly.",
+  },
+  { key: "causeDescription", label: "Cause, in words", kind: "textarea" },
+  {
+    key: "discoveryPhase",
+    label: "Discovered in",
+    kind: "select",
+    options: asOptions(PHASES),
+    nullable: false,
+  },
+  { key: "discoveredAt", label: "Discovered on", kind: "date" },
+  { key: "trade", label: "Trade", kind: "text" },
+  { key: "locationText", label: "Location", kind: "text" },
+  { key: "quantityAffected", label: "Quantity affected", kind: "number" },
+  { key: "unit", label: "Unit", kind: "text" },
+  { key: "scheduleImpactDays", label: "Schedule impact (days)", kind: "number" },
+  { key: "labourHours", label: "Labour hours", kind: "number" },
+  { key: "labourCost", label: "Labour cost", kind: "number" },
+  { key: "materialCost", label: "Material cost", kind: "number" },
+  { key: "plantCost", label: "Plant cost", kind: "number" },
+  { key: "subcontractorCost", label: "Subcontractor cost", kind: "number" },
+  { key: "otherCost", label: "Other cost", kind: "number" },
+];
+
+
 export default function ReworkTab({
   rework,
   summary,
@@ -82,9 +129,11 @@ export default function ReworkTab({
   onMutated: () => void;
 }) {
   const [createOpen, setCreateOpen] = useState(false);
+  const [editId, setEditId] = useState<string | null>(null);
   const { busy, refusal, clear, run } = useAction();
   const { ask, dialog } = useReason();
   const rows = rework.data?.items ?? [];
+  const editing = rows.find((r) => r.id === editId) ?? null;
   const s = summary.data;
   const coq = costOfQuality.data;
   const ftr = firstTimeRight.data;
@@ -283,6 +332,9 @@ export default function ReworkTab({
                 verified {isoDate(row.verifiedAt)}
               </span>
             ) : null}
+            <Button size="xs" variant="ghost" onClick={() => setEditId(row.id)}>
+              Edit
+            </Button>
           </div>
         ),
       },
@@ -490,6 +542,17 @@ export default function ReworkTab({
           <GroupPanel title="By trade" groups={s.byTrade} />
         </div>
       ) : null}
+
+      <EditModal
+        open={editing !== null}
+        onClose={() => setEditId(null)}
+        title={editing ? `Correct ${editing.reference}` : "Correct the rework item"}
+        description="What the rework was and what it cost. These figures are the project's record of what failure cost, so they are worth correcting; the lifecycle and the verification are not editable here."
+        url={`${base}/${editId ?? ""}`}
+        fields={REWORK_EDIT_FIELDS}
+        record={editing as unknown as Record<string, unknown> | null}
+        onSaved={onMutated}
+      />
 
       <CreateRework
         open={createOpen}

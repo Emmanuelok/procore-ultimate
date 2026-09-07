@@ -15,14 +15,22 @@
  *    YYYY-MM-DD and orderings are re-checked on patch as well as on create.
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { and, eq, ne, sql } from "drizzle-orm";
+import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import { z } from "zod";
-import { assets, sensors, signals, warranties } from "@constructos/db";
+import {
+  assets,
+  companyMemberships,
+  projectMemberships,
+  sensors,
+  signals,
+  users,
+  warranties,
+} from "@constructos/db";
 import type { BimDetector, PermissionLevel, SignalSeverity } from "@constructos/shared";
 import type { Db } from "../../lib/db.js";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { notFound } from "../../lib/errors.js";
+import { badRequest, notFound } from "../../lib/errors.js";
 
 /* ------------------------------------------------------------------ */
 /* Wire formats                                                        */
@@ -134,6 +142,114 @@ export function buildTwinLoaders(app: FastifyInstance) {
 }
 
 export type TwinLoaders = ReturnType<typeof buildTwinLoaders>;
+
+/* ------------------------------------------------------------------ */
+/* People named on twin records                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * An asset or sensor owner is not a label: threshold breaches, staleness and
+ * warranty expiry all notify that person, and the alert names the project.
+ * So the owner must be a member of the tenant AND able to open the project —
+ * company membership alone let a colleague with no access to the project be
+ * recorded as responsible for equipment they cannot see, and then paged about
+ * it at 3am.
+ *
+ * Company owners and admins pass on their company role, exactly as
+ * `requireTool` lets them into every project.
+ */
+export async function assertAssignable(
+  db: Db,
+  companyId: string,
+  projectId: string,
+  ids: Array<string | null | undefined>,
+  label = "Owner",
+): Promise<void> {
+  const wanted = [...new Set(ids.filter((v): v is string => Boolean(v)))];
+  if (wanted.length === 0) return;
+  const company = await db
+    .select({ userId: companyMemberships.userId, role: companyMemberships.role })
+    .from(companyMemberships)
+    .where(
+      and(
+        eq(companyMemberships.companyId, companyId),
+        inArray(companyMemberships.userId, wanted),
+      ),
+    );
+  const roleByUser = new Map(company.map((r) => [r.userId, r.role]));
+  const missing = wanted.find((id) => !roleByUser.has(id));
+  if (missing) throw badRequest(`${label} must be a member of this company`);
+
+  const needProject = wanted.filter((id) => {
+    const role = roleByUser.get(id);
+    return role !== "owner" && role !== "admin";
+  });
+  if (needProject.length === 0) return;
+  const onProject = await db
+    .select({ userId: projectMemberships.userId })
+    .from(projectMemberships)
+    .where(
+      and(
+        eq(projectMemberships.projectId, projectId),
+        eq(projectMemberships.companyId, companyId),
+        inArray(projectMemberships.userId, needProject),
+      ),
+    );
+  const found = new Set(onProject.map((r) => r.userId));
+  const notOnProject = needProject.find((id) => !found.has(id));
+  if (notOnProject) {
+    throw badRequest(`${label} must be a member of this project`);
+  }
+}
+
+/**
+ * The read side of `assertAssignable` — the owner picker reads this so it can
+ * only offer people the writer will accept.
+ */
+export async function listAssignable(
+  db: Db,
+  companyId: string,
+  projectId: string,
+): Promise<
+  Array<{ id: string; name: string; email: string; basis: "project_member" | "company_admin" }>
+> {
+  const companyRows = await db
+    .select({
+      userId: companyMemberships.userId,
+      role: companyMemberships.role,
+      name: users.name,
+      email: users.email,
+    })
+    .from(companyMemberships)
+    .innerJoin(users, eq(users.id, companyMemberships.userId))
+    .where(eq(companyMemberships.companyId, companyId))
+    .limit(1000);
+  const onProject = new Set(
+    (
+      await db
+        .select({ userId: projectMemberships.userId })
+        .from(projectMemberships)
+        .where(
+          and(
+            eq(projectMemberships.projectId, projectId),
+            eq(projectMemberships.companyId, companyId),
+          ),
+        )
+        .limit(1000)
+    ).map((r) => r.userId),
+  );
+  return companyRows
+    .filter((r) => onProject.has(r.userId) || r.role === "owner" || r.role === "admin")
+    .map((r) => ({
+      id: r.userId,
+      name: r.name,
+      email: r.email,
+      basis: onProject.has(r.userId)
+        ? ("project_member" as const)
+        : ("company_admin" as const),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
 
 /* ------------------------------------------------------------------ */
 /* Ledger + signals                                                    */

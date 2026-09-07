@@ -52,7 +52,10 @@ import {
   Facts,
   INTERVENTION_LABEL,
   INTERVENTION_MEANING,
+  INTERVENTION_POINTS,
   INTERVENTION_TONE,
+  RESPONSIBLE_PARTIES,
+  EditModal,
   ReasonList,
   RefusalNotice,
   TONE_RAIL,
@@ -64,8 +67,49 @@ import {
   plural,
   useAction,
   useReason,
+  type EditFieldSpec,
 } from "./qualityShared";
 import type { ItpActivity } from "./types";
+
+/*
+ * What may be corrected on an intervention point. The API allows the plan
+ * columns only while the ITP itself is a draft or was rejected — once it is
+ * agreed, the sequence is changed by revising the plan — and it refuses to
+ * leave a hold point with no verifying party. Nothing here can move the
+ * point's status: notice, release, waiver, failure and closure are acts, each
+ * with its own route, its own segregation and its own ledger entry.
+ */
+const ACTIVITY_EDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "activity", label: "Activity", kind: "text", nullable: false, wide: true },
+  { key: "activityCode", label: "Code", kind: "text" },
+  { key: "plannedDate", label: "Planned date", kind: "date" },
+  {
+    key: "interventionPoint",
+    label: "Intervention point",
+    kind: "select",
+    nullable: false,
+    options: INTERVENTION_POINTS.map((value) => ({
+      value,
+      label: INTERVENTION_LABEL[value] ?? labelize(value),
+    })),
+    hint: "Making it a hold point with no nominated party is refused — nominate one first.",
+  },
+  {
+    key: "responsibleParty",
+    label: "Responsible party",
+    kind: "select",
+    nullable: false,
+    options: RESPONSIBLE_PARTIES.map((value) => ({ value, label: labelize(value) })),
+  },
+  { key: "noticePeriodHours", label: "Notice period (hours)", kind: "integer" },
+  { key: "specReference", label: "Specification reference", kind: "text" },
+  { key: "drawingReference", label: "Drawing reference", kind: "text" },
+  { key: "frequency", label: "Frequency", kind: "text", placeholder: "Every pour" },
+  { key: "recordRequired", label: "Record required", kind: "text" },
+  { key: "testMethod", label: "Test method", kind: "text" },
+  { key: "acceptanceCriteria", label: "Acceptance criteria", kind: "textarea" },
+  { key: "description", label: "Description", kind: "textarea" },
+];
 
 const TERMINAL = ["released", "waived", "closed", "not_applicable"];
 
@@ -127,6 +171,7 @@ export default function ActivityCard({
   const [releaseOpen, setReleaseOpen] = useState(false);
   const [releaseNote, setReleaseNote] = useState("");
   const [chainOpen, setChainOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
   /** bumped by every transition so the chain panel reloads with the card */
   const [chainVersion, setChainVersion] = useState(0);
 
@@ -549,7 +594,21 @@ export default function ActivityCard({
               release, because a signature belongs to the work it was given against.
             </span>
           ) : null}
+          <Button size="sm" variant="ghost" onClick={() => setEditOpen(true)}>
+            Edit the point
+          </Button>
         </div>
+
+        <EditModal
+          open={editOpen}
+          onClose={() => setEditOpen(false)}
+          title={`Edit ${activity.activityCode ?? activity.activity}`}
+          description="The point as it is planned. While the plan is a draft these are freely editable; once it has been agreed the API refuses and says so, because a released point belongs to the wording people signed against."
+          url={base}
+          fields={ACTIVITY_EDIT_FIELDS}
+          record={activity as unknown as Record<string, unknown>}
+          onSaved={onMutated}
+        />
       </CardBody>
 
       {/* ---------------- notice dialog ---------------- */}

@@ -135,6 +135,61 @@ describe("twin — asset register", () => {
     expect(badOwner.statusCode).toBe(400);
   });
 
+  it("refuses an owner who cannot open the project, and keeps them out of the picker", async () => {
+    // an owner is paged when this asset's warranty expires or its sensors
+    // breach, and the alert names the project — company membership alone put
+    // a colleague with no access on the hook for equipment they cannot see
+    const offProject = await registerActor(built.app);
+    await built.app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: offProject.userId,
+      role: "member",
+    });
+
+    const refused = await inject("POST", `/api/v1/projects/${projectId}/assets`, owner.headers, {
+      tagCode: "OWN-01",
+      name: "Owned by an outsider",
+      ownerId: offProject.userId,
+    });
+    expect(refused.statusCode).toBe(400);
+    expect(refused.json().message).toMatch(/member of this project/i);
+
+    const sensorRefused = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/sensors`,
+      owner.headers,
+      { name: "Outsider channel", kind: "temperature", unit: "C", ownerId: offProject.userId },
+    );
+    expect(sensorRefused.statusCode).toBe(400);
+
+    // ... and the picker never offers them in the first place
+    const picker = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/twin/assignable-people`,
+      owner.headers,
+    );
+    expect(picker.statusCode).toBe(200);
+    const ids = (picker.json().items as Array<{ id: string; basis: string }>).map((p) => p.id);
+    expect(ids).not.toContain(offProject.userId);
+    expect(ids).toContain(manager.userId);
+    // the company owner is offered even without a project membership row,
+    // because requireTool lets them into every project
+    expect(ids).toContain(owner.userId);
+    const ownerRow = (
+      picker.json().items as Array<{ id: string; basis: string }>
+    ).find((p) => p.id === owner.userId);
+    expect(ownerRow?.basis).toBe("company_admin");
+
+    // a project member remains a valid owner
+    const accepted = await inject("POST", `/api/v1/projects/${projectId}/assets`, owner.headers, {
+      tagCode: "OWN-02",
+      name: "Owned by the PM",
+      ownerId: manager.userId,
+    });
+    expect(accepted.statusCode).toBe(201);
+  });
+
   it("enforces the forward-only lifecycle and stamps the dates", async () => {
     const commissioned = await inject("PATCH", `/api/v1/assets/${assetId}`, owner.headers, {
       status: "commissioned",

@@ -1395,6 +1395,68 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
               },
               storePayload: true,
             });
+          } else {
+            /* Neither open nor waived: the duty was recorded SATISFIED when
+             * every regime then known had been notified, and the reassessment
+             * has just added one that has not been. A GB incident reported to
+             * the HSE and later reassessed under RIDDOR *and* OSHA owes an
+             * eight-hour notification nobody has made, while the obligations
+             * register still says the duty was answered — the same
+             * contradiction as a withdrawn duty that applies again, from the
+             * other end. It is reopened on the new deadline, and only when a
+             * duty really is undischarged.
+             *
+             * A `breached` obligation is left alone deliberately: a deadline
+             * that was missed stays missed, and reopening it would erase the
+             * breach. The safety register keeps naming the undischarged duty
+             * and the close gate keeps refusing on it. */
+            const state = notificationState({
+              determination,
+              storedRegimes: determination.regimes,
+              reportDueAt: due,
+              notifications: ((row.notifications ?? []) as unknown[]).filter(
+                (n): n is NotificationEntry => !!n && typeof n === "object",
+              ),
+              isReportable: determination.isReportable,
+              asOfISO: new Date().toISOString(),
+            });
+            if (!state.allDischarged) {
+              const reopened = await app.db
+                .update(obligations)
+                .set({
+                  status: "open",
+                  deadline: due,
+                  trigger,
+                  sourceClause,
+                  warnDaysBefore: warnDays,
+                })
+                .where(and(eq(obligations.id, obligationId), eq(obligations.status, "satisfied")))
+                .returning({ id: obligations.id });
+              if (reopened.length > 0) {
+                await appendLedger(app.db, {
+                  companyId: row.companyId,
+                  projectId: row.projectId,
+                  actorId,
+                  action: "state_change",
+                  objectType: "obligation",
+                  objectId: obligationId,
+                  payload: {
+                    act: "reopen",
+                    from: "satisfied",
+                    to: "open",
+                    source: "safety_incident",
+                    incidentId: row.id,
+                    reference: row.reference,
+                    reason: "reportability_reassessed_new_duty_undischarged",
+                    deadline: due,
+                    undischargedRegimes: [...state.outstanding, ...state.missed],
+                    ruleId: determination.governingRuleId,
+                    regimes: determination.regimes,
+                  },
+                  storePayload: true,
+                });
+              }
+            }
           }
         }
       } else {
@@ -6775,47 +6837,114 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       const accepted: unknown[] = [];
       const duplicates: Array<{ externalId: string; id: string }> = [];
 
-      for (const body of incoming) {
+      /* PASS ONE — CHECK THE WHOLE BATCH BEFORE WRITING ANY OF IT.
+       *
+       * A gateway posts what it buffered while it was offline: fifty alarms in
+       * one request. Validating and inserting in the same loop meant a bad
+       * fourteenth event left thirteen alarms written and returned an error,
+       * so the gateway's retry either duplicated them (no `externalId`) or the
+       * operator had to work out which half of a rejected batch had landed.
+       * Every reference, clock and idempotency key is resolved first; only
+       * then is anything written. */
+      type Incoming = (typeof incoming)[number];
+      /** what an externalId already resolved to inside this batch */
+      const seen = new Map<string, { existing: SensorRow | null; body: Incoming }>();
+      const plan: Array<{
+        body: Incoming;
+        /** a row already in the register carrying this event's id */
+        existing: SensorRow | null;
+        /** the id of an earlier NEW event in this batch that this repeats */
+        repeatOf: string | null;
+      }> = [];
+      /* Two entries carrying one device event id are the same alarm only if
+       * they say the same thing. A gateway that resends what it already sent
+       * in the same request is a retry and is collapsed; two DIFFERENT alarms
+       * sharing an id would mean one of them silently disappearing, so that is
+       * refused instead. */
+      const sameEvent = (a: Incoming, b: Incoming): boolean =>
+        a.kind === b.kind &&
+        a.occurredAt === b.occurredAt &&
+        (a.deviceId ?? null) === (b.deviceId ?? null) &&
+        (a.workerId ?? null) === (b.workerId ?? null);
+      for (const [index, body] of incoming.entries()) {
+        const where = incoming.length > 1 ? ` (event ${index + 1} of ${incoming.length})` : "";
         if (body.workerId) await assertWorker(body.workerId, req.companyId!, req.projectId!);
         if (body.vendorId) await assertVendor(body.vendorId, req.companyId!);
         if (Date.parse(body.occurredAt) > Date.parse(nowISO) + 60_000) {
           throw badRequest(
-            `Alarm occurredAt ${body.occurredAt} is in the future. A device clock ahead of the ` +
-              `platform's makes every response time it produces meaningless, and the response time ` +
-              `is the only thing this register can prove.`,
+            `Alarm occurredAt ${body.occurredAt} is in the future${where}. A device clock ahead of ` +
+              `the platform's makes every response time it produces meaningless, and the response ` +
+              `time is the only thing this register can prove. Nothing in this batch was written.`,
           );
         }
         /* A device that loses its uplink retries. The device's own event id is
          * the idempotency key: the same alarm arriving twice is one alarm, and
          * a duplicate row would double-count the fleet's alarm load and reset
-         * a response clock somebody has already answered. */
+         * a response clock somebody has already answered. A batch that repeats
+         * an id inside itself is the same retry, so it is resolved once. */
+        let existing: SensorRow | null = null;
+        let repeatOf: string | null = null;
         if (body.externalId) {
-          const existing = await app.db
-            .select()
-            .from(safetySensorEvents)
-            .where(
-              and(
-                eq(safetySensorEvents.companyId, req.companyId!),
-                eq(safetySensorEvents.externalId, body.externalId),
-              ),
-            )
-            .limit(1);
-          if (existing[0]) {
+          const already = seen.get(body.externalId);
+          if (already) {
+            if (!sameEvent(already.body, body)) {
+              throw badRequest(
+                `externalId \`${body.externalId}\` appears twice in this batch${where} against two ` +
+                  `different alarms. A device event id identifies ONE event: keeping both would ` +
+                  `leave the register unable to say which alarm was answered, and keeping one ` +
+                  `would drop an alarm nobody ever sees. Nothing was written — give each event its ` +
+                  `own id.`,
+              );
+            }
+            existing = already.existing;
+            if (!existing) repeatOf = body.externalId;
+          } else {
+            const rows = await app.db
+              .select()
+              .from(safetySensorEvents)
+              .where(
+                and(
+                  eq(safetySensorEvents.companyId, req.companyId!),
+                  eq(safetySensorEvents.externalId, body.externalId),
+                ),
+              )
+              .limit(1);
+            existing = rows[0] ?? null;
             /* The idempotency key is unique per COMPANY (a device fleet moves
              * between sites), so the row already holding it may belong to a
              * project this caller has no access to. Returning it would hand a
              * member of one project another project's alarm — location,
              * worker and raw device payload — for the price of guessing an
              * external id. The collision is reported without the row. */
-            if (existing[0].projectId !== req.projectId!) {
+            if (existing && existing.projectId !== req.projectId!) {
               throw conflict(
                 `externalId \`${body.externalId}\` is already held by a device alarm on another ` +
-                  `project in this company. Device event ids are unique per company — send the ` +
-                  `device's own event id, which no other device shares.`,
+                  `project in this company${where}. Device event ids are unique per company — send ` +
+                  `the device's own event id, which no other device shares. Nothing in this batch ` +
+                  `was written.`,
               );
             }
-            duplicates.push({ externalId: body.externalId, id: existing[0].id });
-            accepted.push(decorateSensorEvent(existing[0], nowISO));
+            seen.set(body.externalId, { existing, body });
+          }
+        }
+        plan.push({ body, existing, repeatOf });
+      }
+
+      /* PASS TWO — write it. Nothing here can fail on the data: everything the
+       * batch asserts about workers, vendors, clocks and event ids was
+       * resolved above. */
+      const writtenInBatch = new Map<string, { id: string; decorated: unknown }>();
+      for (const { body, existing, repeatOf } of plan) {
+        if (existing) {
+          duplicates.push({ externalId: existing.externalId!, id: existing.id });
+          accepted.push(decorateSensorEvent(existing, nowISO));
+          continue;
+        }
+        if (repeatOf) {
+          const prior = writtenInBatch.get(repeatOf);
+          if (prior) {
+            duplicates.push({ externalId: repeatOf, id: prior.id });
+            accepted.push(prior.decorated);
             continue;
           }
         }
@@ -6872,9 +7001,12 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
           },
           storePayload: true,
         });
-        accepted.push(
-          decorateSensorEvent(await fetchSensorEvent(id, req.companyId!, req.projectId!), nowISO),
+        const decorated = decorateSensorEvent(
+          await fetchSensorEvent(id, req.companyId!, req.projectId!),
+          nowISO,
         );
+        accepted.push(decorated);
+        if (body.externalId) writtenInBatch.set(body.externalId, { id, decorated });
       }
 
       reply.code(201);
@@ -8390,6 +8522,42 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
    * record, clearly separated from the assessed answers, never overwriting a
    * score somebody assigned.
    */
+  /**
+   * The observed record as it is written onto a submission: the figures, the
+   * coverage that produced them, and a note saying what it is NOT. It never
+   * carries a bare number — a metric the registers could not compute is null
+   * with its reason beside it, because a blank on a prequalification screen is
+   * read as a zero.
+   */
+  function buildObservedRecord(
+    card: VendorScorecard,
+    from: string,
+    to: string,
+  ): Record<string, unknown> {
+    return {
+      source: "safety_vendor_scorecard",
+      from,
+      to,
+      score: card.score,
+      grade: card.grade,
+      coverage: card.coverage,
+      recordCount: card.recordCount,
+      flags: card.flags,
+      reasons: card.reasons,
+      metrics: card.metrics.map((m) => ({
+        key: m.key,
+        name: m.name,
+        value: m.value,
+        unit: m.unit,
+        reasons: m.reasons,
+      })),
+      computedAt: card.computedAt,
+      note:
+        "Observed from this company's own registers. It does not replace the assessed " +
+        "questionnaire score and no assessor's figure has been altered.",
+    };
+  }
+
   app.post(
     "/companies/current/safety/vendor-scorecard/publish",
     { preHandler: companyAdmin },
@@ -8414,24 +8582,51 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       const skipped: Array<{ vendorId: string; reason: string }> = [];
       const now = new Date().toISOString();
       for (const card of scorecards) {
-        const submissions = await app.db
-          .select({
-            id: prequalificationSubmissions.id,
-            reference: prequalificationSubmissions.reference,
-            detail: prequalificationSubmissions.detail,
-            projectId: prequalificationSubmissions.projectId,
-          })
-          .from(prequalificationSubmissions)
-          .where(
-            and(
-              eq(prequalificationSubmissions.companyId, req.companyId!),
-              eq(prequalificationSubmissions.vendorId, card.vendorId),
-              inArray(prequalificationSubmissions.status, ["assessed", "under_review", "submitted"]),
-            ),
-          )
-          .orderBy(desc(prequalificationSubmissions.createdAt))
-          .limit(1);
-        const submission = submissions[0];
+        /* READ-MODIFY-WRITE OF ANOTHER MODULE'S JSONB, UNDER A ROW LOCK.
+         *
+         * `detail` carries the assessor's answers. Publishing merges one key
+         * into it, so an unlocked read-then-write would silently drop whatever
+         * an assessor saved between the two — on the record a bid evaluation
+         * reads. The row is locked, re-read and written in one transaction,
+         * and the lock is taken on the submission rather than the vendor
+         * because that is the row being changed. */
+        const submission = await app.db.transaction(async (tx) => {
+          const rows = await tx
+            .select({
+              id: prequalificationSubmissions.id,
+              reference: prequalificationSubmissions.reference,
+              detail: prequalificationSubmissions.detail,
+              projectId: prequalificationSubmissions.projectId,
+            })
+            .from(prequalificationSubmissions)
+            .where(
+              and(
+                eq(prequalificationSubmissions.companyId, req.companyId!),
+                eq(prequalificationSubmissions.vendorId, card.vendorId),
+                inArray(prequalificationSubmissions.status, [
+                  "assessed",
+                  "under_review",
+                  "submitted",
+                ]),
+              ),
+            )
+            .orderBy(desc(prequalificationSubmissions.createdAt))
+            .limit(1)
+            .for("update");
+          const found = rows[0];
+          if (!found) return null;
+          await tx
+            .update(prequalificationSubmissions)
+            .set({
+              detail: {
+                ...(found.detail as Record<string, unknown>),
+                observedSafetyRecord: buildObservedRecord(card, from, to),
+              },
+              updatedAt: now,
+            })
+            .where(eq(prequalificationSubmissions.id, found.id));
+          return found;
+        });
         if (!submission) {
           skipped.push({
             vendorId: card.vendorId,
@@ -8441,37 +8636,6 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
           });
           continue;
         }
-        await app.db
-          .update(prequalificationSubmissions)
-          .set({
-            detail: {
-              ...(submission.detail as Record<string, unknown>),
-              observedSafetyRecord: {
-                source: "safety_vendor_scorecard",
-                from,
-                to,
-                score: card.score,
-                grade: card.grade,
-                coverage: card.coverage,
-                recordCount: card.recordCount,
-                flags: card.flags,
-                reasons: card.reasons,
-                metrics: card.metrics.map((m) => ({
-                  key: m.key,
-                  name: m.name,
-                  value: m.value,
-                  unit: m.unit,
-                  reasons: m.reasons,
-                })),
-                computedAt: card.computedAt,
-                note:
-                  "Observed from this company's own registers. It does not replace the assessed " +
-                  "questionnaire score and no assessor's figure has been altered.",
-              },
-            },
-            updatedAt: now,
-          })
-          .where(eq(prequalificationSubmissions.id, submission.id));
         await appendLedger(app.db, {
           companyId: req.companyId!,
           projectId: submission.projectId,

@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { GRIEVANCE_CHANNELS, GRIEVANCE_SEVERITIES, GRIEVANCE_STATUSES } from "@constructos/shared";
 import { api, ApiClientError } from "../../lib/api";
+import { useAuth } from "../../lib/auth";
 import {
   Badge,
   Button,
@@ -379,6 +380,18 @@ export default function GrievancesTab({
       setBusy(false);
     }
   }
+
+  /*
+   * Segregation of duties (#573): the resolver — or, with no resolution
+   * author on file, the assignee — cannot certify that the complainant
+   * accepted their own resolution. The server enforces it; the drawer says
+   * so rather than offering a button that 403s.
+   */
+  const currentUserId = useAuth().user?.id ?? null;
+  const selfResolved =
+    selected !== null &&
+    currentUserId !== null &&
+    (selected.resolvedBy ?? selected.assigneeId) === currentUserId;
 
   async function onVerify(e: FormEvent) {
     e.preventDefault();
@@ -1045,16 +1058,32 @@ export default function GrievancesTab({
                     <span className="font-medium">with the complainant</span>. A resolution nobody
                     has accepted is not a closed grievance.
                   </p>
+                  {/*
+                   * Segregation of duties (#573): the officer who wrote the
+                   * resolution cannot certify that the complainant accepted
+                   * it. The server refuses it; saying so here means the
+                   * button does not lead to a 403 the user cannot act on.
+                   * Recording a REJECTED resolution stays open to them —
+                   * that reopens the grievance rather than closing it.
+                   */}
+                  {selfResolved ? (
+                    <p className="mb-2 text-xs text-amber-700">
+                      You {selected.resolvedBy === currentUserId ? "wrote this resolution" : "are the assignee"}
+                      , so another officer has to verify closure with the complainant. You can still
+                      record that the complainant was <span className="font-medium">not</span>{" "}
+                      satisfied, which reopens the case.
+                    </p>
+                  ) : null}
                   <Button
                     size="sm"
                     disabled={busy}
                     onClick={() => {
-                      setSatisfied("");
+                      setSatisfied(selfResolved ? "no" : "");
                       setVerifyNote("");
                       setVerifyOpen(true);
                     }}
                   >
-                    Verify closure
+                    {selfResolved ? "Record the complainant's response" : "Verify closure"}
                   </Button>
                 </div>
               ) : null}
@@ -1097,10 +1126,12 @@ export default function GrievancesTab({
             </legend>
             <div className="space-y-2">
               <label
-                className={`flex cursor-pointer items-start gap-2.5 rounded-md px-3 py-2 text-sm ring-1 ${
-                  satisfied === "yes"
-                    ? "bg-emerald-50 text-emerald-900 ring-emerald-200"
-                    : "ring-ink-200 hover:bg-ink-50"
+                className={`flex items-start gap-2.5 rounded-md px-3 py-2 text-sm ring-1 ${
+                  selfResolved
+                    ? "cursor-not-allowed opacity-60 ring-ink-200"
+                    : satisfied === "yes"
+                      ? "cursor-pointer bg-emerald-50 text-emerald-900 ring-emerald-200"
+                      : "cursor-pointer ring-ink-200 hover:bg-ink-50"
                 }`}
               >
                 <input
@@ -1108,12 +1139,15 @@ export default function GrievancesTab({
                   name="satisfied"
                   className="mt-0.5 h-4 w-4 border-ink-300 text-brand-600 focus:ring-brand-500"
                   checked={satisfied === "yes"}
+                  disabled={selfResolved}
                   onChange={() => setSatisfied("yes")}
                 />
                 <span>
                   <span className="font-medium">Yes — the resolution worked.</span>
                   <span className="mt-0.5 block text-xs opacity-80">
-                    The grievance closes as verified and its SLA obligation is satisfied.
+                    {selfResolved
+                      ? "Not available to you: you wrote or own this resolution, and a satisfied closure has to be certified by someone else (#573)."
+                      : "The grievance closes as verified and its SLA obligation is satisfied."}
                   </span>
                 </span>
               </label>

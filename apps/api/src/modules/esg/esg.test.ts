@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
-import { boqItems, boqs, projects, signals } from "@constructos/db";
+import { boqItems, boqs, ledgerEntries, projects, signals } from "@constructos/db";
 import { CARBON_MODULES, SOCIAL_VALUE_THEMES } from "@constructos/shared";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
 import { newId } from "../../lib/ids.js";
@@ -214,6 +214,23 @@ describe("carbon factor library", () => {
     });
     expect(okPatch.statusCode).toBe(200);
     expect((okPatch.json() as { factorKgCo2ePerUnit: number }).factorKgCo2ePerUnit).toBe(5);
+
+    // the ledger carries the MULTIPLIER that moved, not the word "factor":
+    // every tCO2e figure in a project is built on it
+    const [entryRow] = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(
+        and(
+          eq(ledgerEntries.objectType, "carbon_factor"),
+          eq(ledgerEntries.objectId, unused.id),
+          eq(ledgerEntries.action, "update"),
+        ),
+      );
+    expect(entryRow!.payload).toMatchObject({
+      before: { factorKgCo2ePerUnit: 1, isProductSpecific: 0 },
+      after: { factorKgCo2ePerUnit: 5, isProductSpecific: 1 },
+    });
 
     const okDelete = await app.inject({
       method: "DELETE",

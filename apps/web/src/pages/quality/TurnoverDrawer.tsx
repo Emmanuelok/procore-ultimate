@@ -37,6 +37,7 @@ import {
   LoadError,
   NCR_STATUS_TONE,
   ReasonList,
+  EditModal,
   RefusalNotice,
   STRICTNESS_MEANING,
   SectionTitle,
@@ -52,8 +53,28 @@ import {
   useAction,
   useReason,
   useResource,
+  type EditFieldSpec,
 } from "./qualityShared";
 import type { ArtefactEntry, TurnoverDetail } from "./types";
+
+/*
+ * The package as it is described and the dates the warranty runs between.
+ * Its contents are declared through the artefact routes — each mark records
+ * who said the certificate is present — and its status is earned through
+ * submission, review and acceptance, so neither is here.
+ */
+const PACKAGE_EDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "name", label: "Name", kind: "text", nullable: false, wide: true },
+  { key: "description", label: "Description", kind: "textarea" },
+  { key: "beneficialUseDate", label: "Beneficial use", kind: "date" },
+  {
+    key: "warrantyStartDate",
+    label: "Warranty starts",
+    kind: "date",
+    hint: "The defects liability period and the warranty obligations are dated from here.",
+  },
+  { key: "warrantyEndDate", label: "Warranty ends", kind: "date" },
+];
 
 export default function TurnoverDrawer({
   packageId,
@@ -138,6 +159,12 @@ function PackageBody({
   const { ask, dialog } = useReason();
   const [acceptOpen, setAcceptOpen] = useState(false);
   const [addKind, setAddKind] = useState("");
+  const [editOpen, setEditOpen] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewOutcome, setReviewOutcome] = useState<"comments_issued" | "cleared">(
+    "comments_issued",
+  );
+  const [reviewComments, setReviewComments] = useState("");
 
   const base = `/api/v1/projects/${projectId}/turnover-packages/${pkg.id}`;
   const readiness = pkg.readiness;
@@ -478,7 +505,99 @@ function PackageBody({
           >
             Reject
           </Button>
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={!["submitted", "resubmitted", "under_review"].includes(pkg.status)}
+            onClick={() => setReviewOpen(true)}
+          >
+            Record a review
+          </Button>
+          <Button size="sm" variant="ghost" disabled={!editable} onClick={() => setEditOpen(true)}>
+            Correct the record
+          </Button>
         </div>
+
+        {/*
+          REVIEW IS THE STEP BETWEEN SUBMISSION AND ACCEPTANCE, and it was
+          missing from this screen: a package could only be accepted or
+          rejected outright, so the ordinary outcome — "we have read it, here
+          is what is missing" — had nowhere to be recorded and reviewers
+          rejected packages that only needed two certificates. Comments issued
+          sends it back with the list; cleared keeps it under review with the
+          reviewer named.
+        */}
+        <Modal
+          open={reviewOpen}
+          onClose={() => setReviewOpen(false)}
+          title={`Record a review of ${pkg.reference}`}
+          description="A review is not an acceptance. The API refuses a review by the person who submitted the package — the same separation as everywhere else in this workspace."
+          footer={
+            <div className="flex justify-end gap-2">
+              <Button variant="ghost" onClick={() => setReviewOpen(false)}>
+                Cancel
+              </Button>
+              <Button
+                variant="primary"
+                loading={busy === "review"}
+                disabled={reviewOutcome === "comments_issued" && reviewComments.trim() === ""}
+                onClick={async () => {
+                  const done = await run("review", () =>
+                    api.post(`${base}/review`, {
+                      outcome: reviewOutcome,
+                      comments: reviewComments.trim() === "" ? null : reviewComments.trim(),
+                    }),
+                  );
+                  if (done) {
+                    setReviewOpen(false);
+                    setReviewComments("");
+                    onMutated();
+                  }
+                }}
+              >
+                Record the review
+              </Button>
+            </div>
+          }
+        >
+          <div className="space-y-3">
+            <Field label="Outcome" required>
+              <Select
+                value={reviewOutcome}
+                onChange={(e) =>
+                  setReviewOutcome(e.target.value === "cleared" ? "cleared" : "comments_issued")
+                }
+              >
+                <option value="comments_issued">
+                  Comments issued — it goes back with a list
+                </option>
+                <option value="cleared">Cleared — nothing outstanding from this review</option>
+              </Select>
+            </Field>
+            <Field
+              label="Comments"
+              required={reviewOutcome === "comments_issued"}
+              hint="What is missing, named record by record. This is what the assembling party works from."
+            >
+              <Textarea
+                rows={4}
+                value={reviewComments}
+                onChange={(e) => setReviewComments(e.target.value)}
+              />
+            </Field>
+          </div>
+        </Modal>
+
+        <EditModal
+          open={editOpen}
+          onClose={() => setEditOpen(false)}
+          title={`Correct ${pkg.reference}`}
+          description="The package as it is described, and the dates the warranty runs between. What it contains is declared artefact by artefact, and its acceptance is a signature — neither is editable here."
+          url={base}
+          fields={PACKAGE_EDIT_FIELDS}
+          record={pkg as unknown as Record<string, unknown>}
+          onSaved={onMutated}
+        />
         {readiness.wouldBlock ? (
           <p className="text-2xs text-danger-fg">
             Strictness is <strong>block</strong>, so the API will refuse both submission and

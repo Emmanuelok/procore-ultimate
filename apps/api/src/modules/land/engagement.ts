@@ -311,8 +311,17 @@ export async function registerEngagementRoutes(app: FastifyInstance): Promise<vo
     async (req) => {
       const { stakeholderId } = req.params as { stakeholderId: string };
       const body = stakeholderPatchSchema.parse(req.body);
-      await fetchStakeholder(stakeholderId, req.companyId!, req.projectId!);
+      const current = await fetchStakeholder(stakeholderId, req.companyId!, req.projectId!);
       const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+      /*
+       * The VALUES, not the key names. Influence and interest drive the
+       * Mendelow quadrant and therefore the engagement plan a stakeholder
+       * gets, so a quiet re-score from high/high to low/low moves a community
+       * out of "manage closely" — and the ledger used to record that as the
+       * single word "influence", with nothing stored at all.
+       */
+      const before: Record<string, unknown> = {};
+      const after: Record<string, unknown> = {};
       for (const key of [
         "name",
         "organisation",
@@ -322,7 +331,11 @@ export async function registerEngagementRoutes(app: FastifyInstance): Promise<vo
         "contact",
         "notes",
       ] as const) {
-        if (body[key] !== undefined) set[key] = body[key];
+        if (body[key] !== undefined) {
+          set[key] = body[key];
+          before[key] = current[key];
+          after[key] = body[key];
+        }
       }
       await app.db.update(stakeholders).set(set).where(eq(stakeholders.id, stakeholderId));
       await appendLedger(app.db, {
@@ -331,7 +344,8 @@ export async function registerEngagementRoutes(app: FastifyInstance): Promise<vo
         action: "update",
         objectType: "stakeholder",
         objectId: stakeholderId,
-        payload: { changed: Object.keys(body) },
+        payload: { before, after },
+        storePayload: true,
       });
       return decorateStakeholder(
         await fetchStakeholder(stakeholderId, req.companyId!, req.projectId!),
@@ -479,7 +493,7 @@ export async function registerEngagementRoutes(app: FastifyInstance): Promise<vo
     async (req) => {
       const { engagementId } = req.params as { engagementId: string };
       const body = engagementPatchSchema.parse(req.body);
-      await fetchEngagement(engagementId, req.companyId!, req.projectId!);
+      const current = await fetchEngagement(engagementId, req.companyId!, req.projectId!);
       if (body.stakeholderIds !== undefined) {
         await validateStakeholders(req.companyId!, req.projectId!, body.stakeholderIds);
       }
@@ -487,6 +501,12 @@ export async function registerEngagementRoutes(app: FastifyInstance): Promise<vo
         await validateFiles(app.db, req.companyId!, req.projectId!, body.fileIds);
       }
       const set: Record<string, unknown> = {};
+      // A public-disclosure record's content is the evidence that the
+      // disclosure happened, so an edit stores what it moved from and to —
+      // key names alone cannot show that a consent record's summary was
+      // rewritten after the fact.
+      const before: Record<string, unknown> = {};
+      const after: Record<string, unknown> = {};
       for (const key of [
         "title",
         "kind",
@@ -499,7 +519,11 @@ export async function registerEngagementRoutes(app: FastifyInstance): Promise<vo
         "consentStatus",
         "fileIds",
       ] as const) {
-        if (body[key] !== undefined) set[key] = body[key];
+        if (body[key] !== undefined) {
+          set[key] = body[key];
+          before[key] = current[key];
+          after[key] = body[key];
+        }
       }
       if (Object.keys(set).length > 0) {
         await app.db.update(engagements).set(set).where(eq(engagements.id, engagementId));
@@ -510,7 +534,7 @@ export async function registerEngagementRoutes(app: FastifyInstance): Promise<vo
         action: "update",
         objectType: "engagement",
         objectId: engagementId,
-        payload: { changed: Object.keys(body), consentStatus: body.consentStatus ?? undefined },
+        payload: { before, after },
         storePayload: true,
       });
       return fetchEngagement(engagementId, req.companyId!, req.projectId!);

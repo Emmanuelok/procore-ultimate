@@ -37,7 +37,7 @@ import { formatDateTime, humanize } from "../format";
 import {
   Sparkline,
   type AssetRow,
-  type CompanyUser,
+  type AssignablePerson,
   type ListResponse,
   type ReadingBucket,
   type SensorAlert,
@@ -57,7 +57,7 @@ export default function SensorsTab({
   const [rows, setRows] = useState<SensorOverviewRow[] | null>(null);
   const [alerts, setAlerts] = useState<SensorAlert[] | null>(null);
   const [assets, setAssets] = useState<AssetRow[]>([]);
-  const [users, setUsers] = useState<CompanyUser[]>([]);
+  const [users, setUsers] = useState<AssignablePerson[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -108,8 +108,12 @@ export default function SensorsTab({
       .get<ListResponse<AssetRow>>(`/api/v1/projects/${projectId}/assets?pageSize=200`)
       .then((res) => setAssets(res.items))
       .catch(() => setAssets([]));
+    // owners are paged when a channel breaches, so the picker offers only the
+    // people the API will accept: project members and company admins
     api
-      .get<ListResponse<CompanyUser>>("/api/v1/company/users?pageSize=200")
+      .get<{ items: AssignablePerson[] }>(
+        `/api/v1/projects/${projectId}/twin/assignable-people`,
+      )
       .then((res) => setUsers(res.items))
       .catch(() => setUsers([]));
   }, [projectId]);

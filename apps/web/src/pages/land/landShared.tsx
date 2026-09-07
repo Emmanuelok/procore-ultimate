@@ -67,6 +67,34 @@ export interface ParcelDetail extends ParcelRow {
   acquisitionBases: string[];
   /** bases that require compensation to have been paid before possession */
   cashAcquisitionBases: string[];
+  /**
+   * Whether a payment can be recorded — INCLUDING a supplementary one on an
+   * already-compensated or acquired parcel. The tab used to hard-code the
+   * three pre-payment statuses, so a revised valuation or a crop missed at
+   * the survey had no route and the register stayed on the first figure.
+   */
+  compensable: boolean;
+  /** a correction restates a paid figure, so it needs one to restate */
+  correctable: boolean;
+  compensationPaymentCount: number;
+  /** the latest payment date; `compensationPaidAt` stays the first */
+  compensationLastPaidAt: string | null;
+  compensationPayments: ParcelPayment[];
+}
+
+/** One payment or correction against a parcel; the total is their sum. */
+export interface ParcelPayment {
+  id: string;
+  kind: "initial" | "supplementary" | "correction";
+  /** the parcel total AFTER this entry */
+  amount: number;
+  /** what this entry moved the total by */
+  delta: number;
+  paidAt: string;
+  reason: string | null;
+  evidenceIds: string[];
+  recordedBy: string;
+  recordedAt: string;
 }
 
 export interface Entitlement {
@@ -138,6 +166,12 @@ export interface GrievanceRow {
   acknowledgedAt: string | null;
   resolvedAt: string | null;
   resolution: string | null;
+  /**
+   * Who authored the resolution. Closure verification is segregated from it:
+   * the officer who wrote a resolution cannot also certify that the
+   * complainant accepted it (#573).
+   */
+  resolvedBy: string | null;
   verifiedAt: string | null;
   verifiedBy: string | null;
   complainantSatisfied: boolean | null;

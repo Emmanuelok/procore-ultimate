@@ -1,5 +1,5 @@
 {
-  "id": "fd58e534-6b4b-493a-9d83-3114b5419812",
+  "id": "70076997-ecf4-44be-8072-2526a7424b1d",
   "prevId": "340cf323-a4ed-4b81-8d6c-8f3e94b698e3",
   "version": "7",
   "dialect": "postgresql",
@@ -31381,6 +31381,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "resolved_by": {
+          "name": "resolved_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "complainant_satisfied": {
           "name": "complainant_satisfied",
           "type": "integer",
@@ -31785,6 +31791,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": false
+        },
+        "compensation_payments": {
+          "name": "compensation_payments",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'[]'::jsonb"
         },
         "evidence_ids": {
           "name": "evidence_ids",

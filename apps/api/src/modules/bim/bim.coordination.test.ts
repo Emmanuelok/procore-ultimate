@@ -539,6 +539,49 @@ describe("coordination issues", () => {
     expect(res.json().source).toBe("manual");
   });
 
+  it("offers only the people this project may name, and refuses the rest", async () => {
+    // the picker and the writer must agree: a dropdown that offers someone
+    // the create route then 400s is a lie the user only finds after typing
+    const offProject = await registerActor(built.app);
+    await built.app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: offProject.userId,
+      role: "member",
+    });
+
+    const picker = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/bim/assignable-people`,
+      owner.headers,
+    );
+    expect(picker.statusCode).toBe(200);
+    const people = picker.json().items as Array<{ id: string; basis: string }>;
+    const ids = people.map((p) => p.id);
+    expect(ids).toContain(engineer.userId);
+    expect(ids).not.toContain(offProject.userId);
+    expect(people.find((p) => p.id === owner.userId)?.basis).toBe("company_admin");
+    expect(people.find((p) => p.id === engineer.userId)?.basis).toBe("project_member");
+
+    const refused = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/bim/issues`,
+      owner.headers,
+      { title: "Assigned off-project", assigneeId: offProject.userId },
+    );
+    expect(refused.statusCode).toBe(400);
+    expect(refused.json().message).toMatch(/member of this project/i);
+
+    // and another tenant cannot read this project's people
+    const outsider = await registerActor(built.app);
+    const foreign = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/bim/assignable-people`,
+      outsider.headers,
+    );
+    expect([403, 404]).toContain(foreign.statusCode);
+  });
+
   it("assigns with a notification and walks the lifecycle", async () => {
     const assign = await inject("PATCH", `/api/v1/bim/issues/${issueId}`, owner.headers, {
       status: "assigned",

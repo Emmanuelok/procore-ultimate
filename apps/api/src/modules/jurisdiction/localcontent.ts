@@ -178,7 +178,10 @@ export function computeLocalHeadcount(args: {
         ? `. A national quota is about citizenship, so long-term residents without ` +
           `${args.jurisdiction} nationality are counted in the denominator only — treating them ` +
           `as nationals is how a quota is missed on site and met in the report.`
-        : `.`) +
+        : `. The worker register holds nationality and not residency, so a long-term resident ` +
+          `without ${args.jurisdiction} nationality counts as non-local here and this figure ` +
+          `coincides with the national quota; a regime that scores residents as local needs a ` +
+          `residency attribute on the worker record before the two can differ.`) +
       (unknown > 0
         ? ` ${unknown} worker(s) have no nationality recorded and count as non-local, which ` +
           `understates the share until the register is completed.`

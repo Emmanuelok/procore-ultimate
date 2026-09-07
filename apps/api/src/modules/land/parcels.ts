@@ -1,7 +1,11 @@
 import type { FastifyInstance } from "fastify";
 import { and, asc, count, desc, eq, inArray, ne } from "drizzle-orm";
 import { z } from "zod";
-import { affectedPersons, landParcels } from "@constructos/db";
+import {
+  affectedPersons,
+  landParcels,
+  type ParcelCompensationPayment,
+} from "@constructos/db";
 import { ACQUISITION_BASES, PARCEL_STATUSES, TENURE_TYPES } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
@@ -70,12 +74,24 @@ const acquireSchema = z.object({
 });
 
 const compensateSchema = z.object({
+  /** the amount of THIS payment, not the running total */
   amount: z.number().positive(),
   paidAt: isoDateSchema,
   /** compensation must be evidenced — a bank transaction, a signed receipt,
    *  a beneficiary-verified payment record (#554) */
   evidenceIds: z.array(z.string().min(1)).min(1).max(100),
   note: z.string().max(10000).nullable().optional(),
+});
+
+/**
+ * Restating a figure that was already paid is a different act from paying
+ * more, so it has its own route, its own evidence and a mandatory reason.
+ */
+const correctionSchema = z.object({
+  /** what the parcel's compensation total should have been */
+  correctedAmount: z.number().nonnegative(),
+  reason: z.string().trim().min(10).max(10000),
+  evidenceIds: z.array(z.string().min(1)).min(1).max(100),
 });
 
 const scheduleRiskQuery = z.object({
@@ -89,6 +105,7 @@ const scheduleRiskQuery = z.object({
 export async function registerParcelRoutes(app: FastifyInstance): Promise<void> {
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("land", "read")];
   const standardGate = [app.authenticate, app.requireCompany, app.requireTool("land", "standard")];
+  const adminGate = [app.authenticate, app.requireCompany, app.requireTool("land", "admin")];
 
   async function fetchParcel(parcelId: string, companyId: string, projectId: string) {
     const rows = await app.db
@@ -104,6 +121,28 @@ export async function registerParcelRoutes(app: FastifyInstance): Promise<void> 
       .limit(1);
     if (!rows[0]) throw notFound("Land parcel not found");
     return rows[0];
+  }
+
+  /**
+   * The compensation-derived fields every parcel response carries, so a
+   * workspace that has just recorded a payment does not have to re-fetch the
+   * detail to learn whether a further one (or a correction) is now open.
+   */
+  function compensationView(parcel: typeof landParcels.$inferSelect) {
+    const payments = parcel.compensationPayments;
+    return {
+      compensable: PARCEL_COMPENSABLE_FROM.includes(
+        parcel.status as (typeof PARCEL_COMPENSABLE_FROM)[number],
+      ),
+      /** a correction restates a figure; it needs one to restate */
+      correctable: parcel.compensationPaidAt != null,
+      compensationPaymentCount: payments.length,
+      /** the most recent payment date; `compensationPaidAt` stays the first */
+      compensationLastPaidAt:
+        payments.length > 0
+          ? (payments[payments.length - 1]?.paidAt ?? parcel.compensationPaidAt)
+          : parcel.compensationPaidAt,
+    };
   }
 
   /** Cadastral references are unique per project — a duplicate is a 409. */
@@ -256,6 +295,13 @@ export async function registerParcelRoutes(app: FastifyInstance): Promise<void> 
       acquirable:
         parcel.status !== "acquired" &&
         PARCEL_ACQUIRABLE_FROM.includes(parcel.status as (typeof PARCEL_ACQUIRABLE_FROM)[number]),
+      /*
+       * Whether a payment can be recorded — including a SUPPLEMENTARY one
+       * against an already-compensated or acquired parcel. The workspace
+       * used to hard-code the three pre-payment statuses, so a revised
+       * valuation or a missed crop payment had no route at all.
+       */
+      ...compensationView(parcel),
       /** bases that require a compensation payment before possession */
       cashAcquisitionBases: CASH_ACQUISITION_BASES,
       acquisitionBases: ACQUISITION_BASES,
@@ -292,8 +338,11 @@ export async function registerParcelRoutes(app: FastifyInstance): Promise<void> 
         if (frozen.length > 0) {
           throw conflict(
             `Parcel ${parcel.reference} was compensated on ${parcel.compensationPaidAt}: ` +
-              `${frozen.join(", ")} cannot be edited afterwards. Record a supplementary payment ` +
-              `through POST /parcels/${parcelId}/compensate with its own evidence.`,
+              `${frozen.join(", ")} cannot be edited afterwards. A further payment is ` +
+              `POST /parcels/${parcelId}/compensate (it ADDS to the total, with its own ` +
+              `evidence); restating a mis-keyed figure is ` +
+              `POST /parcels/${parcelId}/compensation-correction, which requires a reason and ` +
+              `evidence and ledgers the movement.`,
           );
         }
       }
@@ -473,6 +522,21 @@ export async function registerParcelRoutes(app: FastifyInstance): Promise<void> 
    * Evidenced compensation (#553-554). Compensation is the single most
    * fraud-exposed transaction in a resettlement programme, so the record
    * cannot be created without evidence of payment reaching the beneficiary.
+   *
+   * PAYMENTS ACCUMULATE. A RAP pays in instalments and in supplements: a
+   * valuation revised on appeal, a crop or an outbuilding missed at the
+   * survey, a court-awarded top-up. The route used to overwrite
+   * `compensationAmount` with the latest figure and to refuse an
+   * already-compensated parcel outright, so the register was frozen on the
+   * first payment and `rap-progress` understated what the programme had
+   * actually paid. Each payment is now appended to `compensationPayments`
+   * with its own evidence and date, and `compensationAmount` is their sum.
+   *
+   * `compensationPaidAt` deliberately stays the date of the FIRST payment:
+   * it is the date compensation began reaching the beneficiary, which is
+   * what the PS5 para 20 "payment before possession" rule and every
+   * downstream detector read it as. The latest date is on the payment
+   * itself and surfaced as `compensationLastPaidAt`.
    */
   app.post(
     "/projects/:projectId/parcels/:parcelId/compensate",
@@ -488,18 +552,65 @@ export async function registerParcelRoutes(app: FastifyInstance): Promise<void> 
         );
       }
       await validateEvidence(app.db, req.companyId!, req.projectId!, body.evidenceIds);
-      const amount = round2(body.amount);
-      const merged = [...new Set([...parcel.evidenceIds, ...body.evidenceIds])];
-      await app.db
-        .update(landParcels)
-        .set({
-          compensationAmount: amount,
-          compensationPaidAt: body.paidAt,
-          evidenceIds: merged,
-          status: "compensated",
-          updatedAt: new Date().toISOString(),
-        })
-        .where(eq(landParcels.id, parcelId));
+      const paymentAmount = round2(body.amount);
+      /*
+       * Now that payments ACCUMULATE, the running total is a read-modify-write
+       * and two disbursements recorded at once (a double-submitted form, two
+       * officers, a retried request) would otherwise both read the same total
+       * and one payment would vanish from the register. The parcel row is
+       * locked for the length of the update, and the arithmetic is re-done
+       * from the locked row rather than from the copy read before it.
+       */
+      const { payment, previousTotal, total, nextStatus, fromStatus, firstPaidAt } =
+        await app.db.transaction(async (tx) => {
+          const locked = (
+            await tx
+              .select()
+              .from(landParcels)
+              .where(eq(landParcels.id, parcelId))
+              .for("update")
+          )[0]!;
+          const supplementary = locked.compensationPaidAt != null;
+          const previousTotal = supplementary ? (locked.compensationAmount ?? 0) : 0;
+          const total = round2(previousTotal + paymentAmount);
+          const merged = [...new Set([...locked.evidenceIds, ...body.evidenceIds])];
+          const payment: ParcelCompensationPayment = {
+            id: newId("pay"),
+            kind: supplementary ? "supplementary" : "initial",
+            amount: total,
+            delta: paymentAmount,
+            paidAt: body.paidAt,
+            reason: body.note ?? null,
+            evidenceIds: body.evidenceIds,
+            recordedBy: req.user!.id,
+            recordedAt: new Date().toISOString(),
+          };
+          /*
+           * An acquired parcel that receives a top-up stays acquired — title
+           * does not travel backwards because more money was paid.
+           */
+          const nextStatus = locked.status === "acquired" ? "acquired" : "compensated";
+          const firstPaidAt = locked.compensationPaidAt ?? body.paidAt;
+          await tx
+            .update(landParcels)
+            .set({
+              compensationAmount: total,
+              compensationPaidAt: firstPaidAt,
+              compensationPayments: [...locked.compensationPayments, payment],
+              evidenceIds: merged,
+              status: nextStatus,
+              updatedAt: new Date().toISOString(),
+            })
+            .where(eq(landParcels.id, parcelId));
+          return {
+            payment,
+            previousTotal,
+            total,
+            nextStatus,
+            fromStatus: locked.status,
+            firstPaidAt,
+          };
+        });
       await appendLedger(app.db, {
         companyId: req.companyId!,
         actorId: req.user!.id,
@@ -507,19 +618,113 @@ export async function registerParcelRoutes(app: FastifyInstance): Promise<void> 
         objectType: "land_parcel",
         objectId: parcelId,
         payload: {
-          from: parcel.status,
-          to: "compensated",
+          from: fromStatus,
+          to: nextStatus,
           reference: parcel.reference,
-          amount,
+          paymentKind: payment.kind,
+          // the payment, and the total it produced — both, so neither has to
+          // be reconstructed by replaying the chain
+          amount: paymentAmount,
+          previousTotal,
+          totalPaid: total,
           currency: parcel.currency,
           paidAt: body.paidAt,
+          firstPaidAt,
           valuationAmount: parcel.valuationAmount,
           evidenceIds: body.evidenceIds,
           note: body.note ?? null,
         },
         storePayload: true,
       });
-      return fetchParcel(parcelId, req.companyId!, req.projectId!);
+      const after = await fetchParcel(parcelId, req.companyId!, req.projectId!);
+      return { ...after, ...compensationView(after) };
+    },
+  );
+
+  /**
+   * Correcting a paid figure (#553-554).
+   *
+   * A supplementary payment says "more money went out"; a correction says
+   * "the register was wrong". Conflating them is how a compensation total
+   * quietly grows without anything leaving the account, so a correction is
+   * its own act: it RESTATES the total, it needs a reason and evidence (the
+   * revised valuation, the corrected receipt, the audit finding), and both
+   * figures plus the movement go to the ledger. It is admin-gated because
+   * changing what the register says was paid, after it was paid, is not an
+   * ordinary data-entry act.
+   */
+  app.post(
+    "/projects/:projectId/parcels/:parcelId/compensation-correction",
+    { preHandler: adminGate },
+    async (req) => {
+      const { parcelId } = req.params as { parcelId: string };
+      const body = correctionSchema.parse(req.body);
+      const parcel = await fetchParcel(parcelId, req.companyId!, req.projectId!);
+      if (!parcel.compensationPaidAt) {
+        throw badRequest(
+          `Parcel ${parcel.reference} has no compensation payment on record, so there is ` +
+            `nothing to correct. Record the payment through /compensate.`,
+        );
+      }
+      const corrected = round2(body.correctedAmount);
+      const previousTotal = round2(parcel.compensationAmount ?? 0);
+      if (corrected === previousTotal) {
+        throw badRequest(
+          `The corrected amount is the figure already on the register (${previousTotal} ` +
+            `${parcel.currency}); nothing would change.`,
+        );
+      }
+      await validateEvidence(app.db, req.companyId!, req.projectId!, body.evidenceIds);
+      // same lock as a payment: a correction races with a concurrent
+      // disbursement, and the loser would silently drop the other's entry
+      const { entry, restatedFrom } = await app.db.transaction(async (tx) => {
+        const locked = (
+          await tx.select().from(landParcels).where(eq(landParcels.id, parcelId)).for("update")
+        )[0]!;
+        const restatedFrom = round2(locked.compensationAmount ?? 0);
+        const merged = [...new Set([...locked.evidenceIds, ...body.evidenceIds])];
+        const entry: ParcelCompensationPayment = {
+          id: newId("pay"),
+          kind: "correction",
+          amount: corrected,
+          delta: round2(corrected - restatedFrom),
+          paidAt: locked.compensationPaidAt ?? parcel.compensationPaidAt!,
+          reason: body.reason,
+          evidenceIds: body.evidenceIds,
+          recordedBy: req.user!.id,
+          recordedAt: new Date().toISOString(),
+        };
+        await tx
+          .update(landParcels)
+          .set({
+            compensationAmount: corrected,
+            compensationPayments: [...locked.compensationPayments, entry],
+            evidenceIds: merged,
+            updatedAt: new Date().toISOString(),
+          })
+          .where(eq(landParcels.id, parcelId));
+        return { entry, restatedFrom };
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "land_parcel",
+        objectId: parcelId,
+        payload: {
+          event: "compensation_corrected",
+          reference: parcel.reference,
+          before: { compensationAmount: restatedFrom },
+          after: { compensationAmount: corrected },
+          delta: entry.delta,
+          currency: parcel.currency,
+          reason: body.reason,
+          evidenceIds: body.evidenceIds,
+        },
+        storePayload: true,
+      });
+      const after = await fetchParcel(parcelId, req.companyId!, req.projectId!);
+      return { ...after, ...compensationView(after) };
     },
   );
 

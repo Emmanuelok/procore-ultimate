@@ -1,3 +1,29 @@
+/**
+ * Capital governance: business cases, stage gates, benefits and assurance
+ * (spec Vol II Domain I #400-406, #410-422, Vol I §7).
+ *
+ * WHAT IT IS
+ * The owner-side approval spine. Five-case business cases with appraisal
+ * arithmetic (NPV/BCR/EIRR, a ±10/20/30% sensitivity grid, tornado and
+ * switching values — appraisal.ts), stage gates whose reviews freeze a
+ * Merkle-rooted evidence pack (pack.ts) so a decision stays reproducible,
+ * a lessons-closure gate (lessons.ts), benefits with a dependency DAG and
+ * upstream at_risk propagation (benefits.ts), assurance actions tracked as
+ * owned obligations, and an uplift-challenge machine so a deviation from
+ * the optimism-bias table is argued, decided and ledgered.
+ *
+ * THE RULE THIS MODULE EXISTS TO ENFORCE
+ * The person who authors an assertion never tests it. Approval and gate
+ * decisions are adminGate AND require an independent reviewer (an
+ * assurance grant covering THIS project, or company owner/admin —
+ * gates.ts); a criterion marked evidence-required cannot be decided
+ * without an artefact; conditions of approval are obligations, not prose.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO
+ * It does not compute programme or portfolio roll-ups (WP-PORTFOLIO reads
+ * these tables), and it does not invent a benefit's realised value — a
+ * benefit with no reading is "not measured", never zero.
+ */
 import type { FastifyPluginAsync } from "fastify";
 import { and, asc, count, desc, eq, inArray, or } from "drizzle-orm";
 import { z } from "zod";
@@ -2400,8 +2426,10 @@ export const governanceModule: FastifyPluginAsync = async (app) => {
   /**
    * What an independent reviewer needs in one place: gates due across the
    * portfolio, open conditions of approval and open assurance actions.
-   * Scoped to the projects the caller can actually see — an assurance grant
-   * is read-all by design, an ordinary member sees only their projects.
+   * Scoped to the projects the caller can actually see: memberships plus
+   * whatever their live assurance grants cover — a tenant-wide grant
+   * (projectId null) is read-all, a grant pinned to one project adds that
+   * project only. An ordinary member sees just their projects.
    */
   app.get("/governance/reviewer-workspace", { preHandler: companyReadGate }, async (req) => {
     const scope = await visibleProjectIds(app, req, "governance");

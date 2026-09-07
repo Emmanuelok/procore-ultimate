@@ -1239,6 +1239,87 @@ describe("reportability reassessment", () => {
     expect(live[0]?.status).toBe("open");
     expect(live[0]?.deadline).toBe(restored.json().reportDueAt);
   });
+
+  it("reopens a discharged obligation when a reassessment adds a duty nobody has answered", async () => {
+    /* The third face of the same defect. The first two were an obligation left
+     * OPEN on an incident reassessed as not reportable, and one left WAIVED on
+     * an incident reassessed back into scope. This is the one that survives a
+     * notification: the RIDDOR duty was filed and the obligation was marked
+     * satisfied, and the reassessment then finds the incident also answerable
+     * to OSHA. The safety register names the undischarged duty; the
+     * obligations register the rest of the platform reads still says the duty
+     * was answered. */
+    const created = await post(`/projects/${gbProject}/safety/incidents`, {
+      incidentType: "injury",
+      title: "Amputation at the bench saw",
+      description: "Two fingers lost to an unguarded blade.",
+      occurredAt: hoursAgo(2),
+      workerId,
+      injuredPersonType: "employee",
+      injuryNature: "amputation",
+      bodyPart: "finger",
+      severity: "major",
+      // assessed under the domestic regime only, to begin with
+      regimes: ["riddor"],
+    });
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+    const obligationId = created.json().obligationId as string;
+    expect(created.json().isReportable).toBe(true);
+    expect(obligationId).toBeTruthy();
+
+    const notified = await post(
+      `/projects/${gbProject}/safety/incidents/${id}/notify-regulator`,
+      { regime: "riddor", reference: "F2508-7781", method: "online_form" },
+    );
+    expect(notified.statusCode).toBe(200);
+    expect(notified.json().notificationResult.allDischarged).toBe(true);
+    const discharged = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, obligationId));
+    expect(discharged[0]?.status).toBe("satisfied");
+
+    // the US parent's counsel asks for the case to be assessed under Part 1904
+    // as well: an amputation carries a 24-hour report nobody has made.
+    const reassessed = await post(
+      `/projects/${gbProject}/safety/incidents/${id}/reportability`,
+      { regimes: ["riddor", "osha"] },
+    );
+    expect(reassessed.statusCode).toBe(200);
+    const duties = reassessed.json().notification.duties as Array<{
+      regime: string;
+      state: string;
+    }>;
+    expect(duties.find((d) => d.regime === "riddor")?.state).toBe("notified");
+    expect(duties.find((d) => d.regime === "osha")?.state).toBe("outstanding");
+
+    const live = await app.db
+      .select()
+      .from(obligations)
+      .where(eq(obligations.id, obligationId));
+    expect(live[0]?.status).toBe("open");
+    expect(live[0]?.deadline).toBe(reassessed.json().reportDueAt);
+
+    // and the incident cannot be closed while it stands
+    await post(`/projects/${gbProject}/safety/incidents/${id}/investigation`, {
+      investigationLeadId: member.userId,
+      rootCauseMethod: "five_why",
+      rootCause: "Blade guard removed to speed up cutting; the change was never challenged.",
+      investigationFindings: "The guard had been off for a fortnight.",
+    });
+    await post(`/projects/${gbProject}/safety/incidents/${id}/investigation/complete`, {});
+    await post(
+      `/projects/${gbProject}/safety/incidents/${id}/investigation/approve`,
+      {},
+      second.headers,
+    );
+    const closed = await post(`/projects/${gbProject}/safety/incidents/${id}/close`, {
+      note: "Trying to close it with the OSHA report outstanding.",
+    });
+    expect(closed.statusCode).toBe(409);
+    expect(closed.json().message).toContain("osha");
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -1649,6 +1730,109 @@ describe("device and lone-worker alarms", () => {
     expect(JSON.stringify(res.json())).not.toContain(workerId);
   });
 
+  it("writes no part of a batch it is going to refuse", async () => {
+    /* A gateway posts what it buffered while it was offline. Validating and
+     * inserting in one pass left the good events before the bad one written
+     * and returned an error, so the retry either duplicated them or somebody
+     * had to work out which half of a rejected batch had landed. */
+    const before = await get(
+      `/projects/${gbProject}/safety/sensor-events?page=1&pageSize=1&source=gas_detector`,
+    );
+    expect(before.statusCode).toBe(200);
+    const countBefore = before.json().total as number;
+
+    const res = await post(`/projects/${gbProject}/safety/sensor-events`, {
+      events: [
+        {
+          kind: "gas_alarm",
+          source: "gas_detector",
+          deviceId: "GD-1",
+          occurredAt: hoursAgo(2),
+          externalId: "batch-good-1",
+        },
+        {
+          kind: "gas_alarm",
+          source: "gas_detector",
+          deviceId: "GD-2",
+          // a device whose clock is a day ahead
+          occurredAt: new Date(Date.now() + 24 * 3_600_000).toISOString(),
+          externalId: "batch-bad-1",
+        },
+      ],
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("event 2 of 2");
+    expect(res.json().message).toContain("Nothing in this batch was written");
+
+    const after = await get(
+      `/projects/${gbProject}/safety/sensor-events?page=1&pageSize=1&source=gas_detector`,
+    );
+    expect(after.json().total).toBe(countBefore);
+  });
+
+  it("refuses a batch that gives two new alarms the same device event id", async () => {
+    const res = await post(`/projects/${gbProject}/safety/sensor-events`, {
+      events: [
+        {
+          kind: "impact",
+          source: "wearable",
+          occurredAt: hoursAgo(3),
+          externalId: "batch-collide",
+        },
+        {
+          kind: "man_down",
+          source: "wearable",
+          occurredAt: hoursAgo(2),
+          externalId: "batch-collide",
+        },
+      ],
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("appears twice in this batch");
+    expect(res.json().message).toContain("different alarms");
+
+    const after = await get(
+      `/projects/${gbProject}/safety/sensor-events?page=1&pageSize=200`,
+    );
+    const externalIds = (after.json().items as Array<{ externalId: string | null }>).map(
+      (e) => e.externalId,
+    );
+    expect(externalIds).not.toContain("batch-collide");
+  });
+
+  it("accepts a batch where every event is sound, and treats a repeat as one alarm", async () => {
+    const res = await post(`/projects/${gbProject}/safety/sensor-events`, {
+      events: [
+        {
+          kind: "gas_alarm",
+          source: "gas_detector",
+          deviceId: "GD-9",
+          occurredAt: hoursAgo(4),
+          externalId: "batch-ok-1",
+        },
+        {
+          kind: "gas_alarm",
+          source: "gas_detector",
+          deviceId: "GD-9",
+          occurredAt: hoursAgo(4),
+          // the gateway resent one it had already delivered in this batch
+          externalId: "batch-ok-1",
+        },
+        {
+          kind: "impact",
+          source: "wearable",
+          occurredAt: hoursAgo(4),
+          externalId: "batch-ok-2",
+        },
+      ],
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().accepted).toBe(3);
+    expect(res.json().duplicates).toHaveLength(1);
+    const ids = (res.json().events as Array<{ id: string }>).map((e) => e.id);
+    expect(new Set(ids).size).toBe(2);
+  });
+
   it("refuses an alarm timestamped in the future", async () => {
     const res = await post(`/projects/${gbProject}/safety/sensor-events`, {
       kind: "impact",
@@ -2016,6 +2200,8 @@ describe("vendor safety scorecard", () => {
       number: 1,
       reference: "PQS-0001",
       status: "assessed",
+      // what an assessor has already saved on the submission
+      detail: { assessedScore: 68, assessorNote: "Two references taken up." },
       createdBy: owner.userId,
     });
 
@@ -2037,9 +2223,19 @@ describe("vendor safety scorecard", () => {
       .select()
       .from(prequalificationSubmissions)
       .where(eq(prequalificationSubmissions.id, submissionId));
-    const observed = (rows[0]?.detail as { observedSafetyRecord?: { source?: string } })
-      .observedSafetyRecord;
-    expect(observed?.source).toBe("safety_vendor_scorecard");
+    const detail = rows[0]?.detail as {
+      observedSafetyRecord?: { source?: string; note?: string };
+      assessedScore?: number;
+      assessorNote?: string;
+    };
+    expect(detail.observedSafetyRecord?.source).toBe("safety_vendor_scorecard");
+    expect(detail.observedSafetyRecord?.note).toContain("no assessor's figure has been altered");
+    /* The merge is a read-modify-write of somebody else's jsonb, so it is done
+     * under a row lock on the submission and against the row as it stands —
+     * not against a copy read before the scorecards were computed. The
+     * assessor's own answers must survive it untouched. */
+    expect(detail.assessedScore).toBe(68);
+    expect(detail.assessorNote).toBe("Two references taken up.");
   });
 });
 

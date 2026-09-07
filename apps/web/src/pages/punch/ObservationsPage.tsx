@@ -61,7 +61,7 @@ interface Vendor {
 
 interface Detail extends Observation {
   links: Array<{ toType: string; toId: string; linkKind: string }>;
-  permissions: { isAdmin: boolean; canStart: boolean; canReadyForReview: boolean; canClose: boolean; canVoid: boolean; canConvert: boolean; canEditVerifier: boolean };
+  permissions: { isAdmin: boolean; canStart: boolean; canReadyForReview: boolean; canClose: boolean; canVoid: boolean; canConvert: boolean; canConvertTo?: string[]; canEditVerifier: boolean };
 }
 
 interface Analytics {
@@ -269,6 +269,12 @@ export default function ObservationsPage() {
   );
 }
 
+const CONVERT_LABELS: Record<string, string> = {
+  punch_item: "Punch item",
+  incident: "Safety incident",
+  change_event: "Change event",
+};
+
 interface EditForm {
   description: string;
   priority: string;
@@ -394,6 +400,13 @@ function ObservationDetail({ base, projectId, id, onClose, onChanged, users, nam
   // The API refuses edits to a closed or void observation; do not offer a form
   // that can only fail.
   const editable = d ? d.status !== "closed" && d.status !== "void" : false;
+  // Stable identity: the list only changes when the API's answer changes, so
+  // the effect below is not re-armed on every render.
+  const convertTargetKey = (d?.permissions.canConvertTo ?? (d?.permissions.canConvert ? ["punch_item"] : [])).join(",");
+  const convertTargets = useMemo(() => (convertTargetKey === "" ? [] : convertTargetKey.split(",")), [convertTargetKey]);
+  useEffect(() => {
+    if (convertTargets.length > 0 && !convertTargets.includes(target)) setTarget(convertTargets[0]!);
+  }, [convertTargets, target]);
   const hrefFor = (type: string, targetId: string) =>
     type === "punch_item" ? `/projects/${projectId}/punch?item=${targetId}` : type === "safety_incident" || type === "incident" ? `/projects/${projectId}/safety?incident=${targetId}` : `/projects/${projectId}/changes?event=${targetId}`;
 
@@ -483,9 +496,16 @@ function ObservationDetail({ base, projectId, id, onClose, onChanged, users, nam
               {d.permissions.canClose ? <Button size="sm" disabled={busy} onClick={() => void transition("closed")}>Verify & close</Button> : null}
               {d.permissions.canVoid ? <Button size="sm" variant="danger" disabled={busy} onClick={() => { if (window.confirm("Void this observation?")) void transition("void"); }}>Void</Button> : null}
             </div>
-            {d.permissions.canConvert ? (
+            {d.permissions.canConvert && convertTargets.length > 0 ? (
               <div className="flex items-center gap-2">
-                <div className="w-40"><Select value={target} onChange={(e) => setTarget(e.target.value)}><option value="punch_item">Punch item</option><option value="incident">Safety incident</option><option value="change_event">Change event</option></Select></div>
+                {/* Only the targets the API says this caller may mint: raising a
+                    safety incident or a change event needs standard access to
+                    those tools, not just to punch. */}
+                <div className="w-40">
+                  <Select value={target} onChange={(e) => setTarget(e.target.value)}>
+                    {convertTargets.map((t) => <option key={t} value={t}>{CONVERT_LABELS[t] ?? humanize(t)}</option>)}
+                  </Select>
+                </div>
                 <Button size="sm" disabled={busy} onClick={() => void convert()}>Convert</Button>
               </div>
             ) : null}

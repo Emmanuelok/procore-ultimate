@@ -41,6 +41,7 @@ import {
   isoDateSchema,
   ledger,
   nowISO,
+  listAssignable,
   resolvePeople,
   todayISO,
 } from "../shared.js";
@@ -136,6 +137,21 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
    */
   const peopleMap = (companyId: string, ids: Array<string | null | undefined>) =>
     resolvePeople(app.db, companyId, ids);
+
+  /**
+   * The people this project's coordination records may name. The picker in
+   * the UI reads this rather than the whole company directory, so it can only
+   * offer someone `assertMembers` will accept — the alternative is a dropdown
+   * that produces a 400 after the issue has been typed out.
+   */
+  app.get(
+    "/projects/:projectId/bim/assignable-people",
+    { preHandler: gates.readGate },
+    async (req) => {
+      const items = await listAssignable(app.db, req.companyId!, req.projectId!);
+      return { items, total: items.length };
+    },
+  );
 
   /* ---------------------------------------------------------------- */
   /* Register                                                          */

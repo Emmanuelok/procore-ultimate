@@ -45,6 +45,7 @@ import {
   DISPOSITION_MEANING,
   DISPOSITION_TONE,
   EM_DASH,
+  EditModal,
   Facts,
   LoadError,
   NCR_SEVERITY_TONE,
@@ -61,8 +62,42 @@ import {
   useAction,
   useReason,
   useResource,
+  type EditFieldSpec,
 } from "./qualityShared";
 import type { CorrectiveAction, NcrDetail } from "./types";
+
+/*
+ * What may be corrected on a raised non-conformance: what it is, where it is,
+ * what it is worth and when a response is due. The status, the disposition and
+ * both signatures are absent by design — the API refuses to move them through
+ * an edit, because a disposition that could be changed by editing the record
+ * would make the two-person control decorative.
+ */
+const NCR_EDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "title", label: "Title", kind: "text", nullable: false, wide: true },
+  { key: "description", label: "What is non-conforming", kind: "textarea" },
+  {
+    key: "severity",
+    label: "Severity",
+    kind: "select",
+    nullable: false,
+    options: ["minor", "major", "critical"].map((value) => ({ value, label: labelize(value) })),
+  },
+  { key: "specClauseRef", label: "Specification clause", kind: "text" },
+  { key: "drawingReference", label: "Drawing", kind: "text" },
+  { key: "locationText", label: "Location", kind: "text" },
+  { key: "quantityAffected", label: "Quantity affected", kind: "number" },
+  { key: "unit", label: "Unit", kind: "text" },
+  { key: "responseDueDate", label: "Response due", kind: "date" },
+  {
+    key: "costImpact",
+    label: "Cost impact",
+    kind: "number",
+    hint: "In the currency below. The register buckets by currency and never sums across them.",
+  },
+  { key: "currency", label: "Currency", kind: "text", placeholder: "GBP" },
+  { key: "scheduleImpactDays", label: "Schedule impact (days)", kind: "number" },
+];
 
 const PROPOSABLE = ["rework", "repair", "use_as_is", "reject", "return_to_supplier", "regrade"];
 
@@ -152,6 +187,7 @@ function NcrBody({
   const [approveOpen, setApproveOpen] = useState(false);
   const [closeOpen, setCloseOpen] = useState(false);
   const [rootCauseOpen, setRootCauseOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
 
   const base = `/api/v1/projects/${projectId}/ncrs/${ncr.id}`;
   const meIsProposer = user !== null && ncr.dispositionProposedBy === user.id;
@@ -541,7 +577,26 @@ function NcrBody({
           >
             Void — it should not have been raised
           </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={ncr.status === "void"}
+            onClick={() => setEditOpen(true)}
+          >
+            Correct the record
+          </Button>
         </div>
+
+        <EditModal
+          open={editOpen}
+          onClose={() => setEditOpen(false)}
+          title={`Correct ${ncr.reference}`}
+          description="What the non-conformance is, where it is and what it is costing. The status, the disposition and the two signatures on it cannot be changed here — they are acts, not fields."
+          url={base}
+          fields={NCR_EDIT_FIELDS}
+          record={ncr as unknown as Record<string, unknown>}
+          onSaved={onMutated}
+        />
       </section>
 
       {/* -------- recovering the cost -------- */}

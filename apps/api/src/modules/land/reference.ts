@@ -116,11 +116,27 @@ export const PARCEL_TRANSITIONS: Record<ParcelStatus, readonly ParcelStatus[]> =
   disputed: ["under_negotiation"],
 };
 
-/** Statuses from which compensation may be recorded (#553-554). */
+/**
+ * Statuses from which compensation may be recorded (#553-554).
+ *
+ * `compensated` and `acquired` are included because a supplementary payment
+ * is ordinary RAP practice — a valuation is revised on appeal, a crop or
+ * structure missed at the survey is paid for later, a court awards a top-up.
+ * Excluding them left the register permanently stuck on the first figure:
+ * the PATCH route refused the edit (rightly) and pointed at /compensate,
+ * which refused it too, so the only reachable path was
+ * `compensated → disputed → under_negotiation → /compensate` — three
+ * fabricated state changes including a fictitious dispute, which is exactly
+ * the register corruption the /acquire route was introduced to eliminate.
+ * A second payment ADDS to the total (it does not restate it); restating a
+ * mis-keyed figure is the separate, reasoned /compensation-correction act.
+ */
 export const PARCEL_COMPENSABLE_FROM: readonly ParcelStatus[] = [
   "under_negotiation",
   "agreed",
   "disputed",
+  "compensated",
+  "acquired",
 ];
 
 /**

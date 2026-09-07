@@ -32,7 +32,7 @@ import { fileVersions, files, photoAlbums, photos, signals } from "@constructos/
 import { SIGNAL_SEVERITIES } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { AppError, badRequest, forbidden, notFound } from "../../lib/errors.js";
+import { AppError, badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { sendRanged } from "../drawings/stream.js";
 import { aiEnabled, runAgent, streamToBuffer } from "../ai/service.js";
@@ -653,6 +653,18 @@ export const photoRoutes: FastifyPluginAsync = async (app) => {
       throw forbidden("Only the album's creator or a photos admin can change it");
     }
     await assertCompanyUsers(app.db, req.companyId!, body.allowedUserIds ?? []);
+    if (body.name !== undefined && body.name !== rec.name) {
+      // (projectId, name) is unique: answer a collision with 409 rather than
+      // letting the constraint surface as a 500.
+      const clash = (
+        await app.db
+          .select({ id: photoAlbums.id })
+          .from(photoAlbums)
+          .where(and(eq(photoAlbums.companyId, req.companyId!), eq(photoAlbums.projectId, req.projectId!), eq(photoAlbums.name, body.name)))
+          .limit(1)
+      )[0];
+      if (clash) throw conflict(`An album called "${body.name}" already exists on this project`);
+    }
     const set: Record<string, unknown> = { updatedAt: nowIso() };
     if (body.name !== undefined) set["name"] = body.name;
     if (body.description !== undefined) set["description"] = body.description;
@@ -661,7 +673,7 @@ export const photoRoutes: FastifyPluginAsync = async (app) => {
     await app.db.transaction(async (tx) => {
       await tx.update(photoAlbums).set(set).where(eq(photoAlbums.id, albumId));
       if (body.name !== undefined && body.name !== rec.name) {
-        await tx.update(photos).set({ album: body.name }).where(and(eq(photos.projectId, req.projectId!), eq(photos.album, rec.name)));
+        await tx.update(photos).set({ album: body.name }).where(and(eq(photos.companyId, req.companyId!), eq(photos.projectId, req.projectId!), eq(photos.album, rec.name)));
       }
     });
     await appendLedger(app.db, {
@@ -785,6 +797,10 @@ export const photoRoutes: FastifyPluginAsync = async (app) => {
    * extracted at upload, `original` when it did not — the client is never
    * told it received a rendition it did not receive. Like /content this is
    * deliberately un-ledgered: a page of tiles is not a page of access events.
+   *
+   * A tile is a preview, never the evidence: an EXIF thumbnail can lag the
+   * image it was written beside, so every evidentiary view (the lightbox, the
+   * download, the bulk archive) serves the original bytes.
    */
   async function sendVariant(req: FastifyRequest, reply: FastifyReply, row: PhotoRow, size: string) {
     const v = row.variants?.[size];

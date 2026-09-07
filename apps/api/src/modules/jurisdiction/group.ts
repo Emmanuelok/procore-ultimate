@@ -37,7 +37,7 @@
  */
 
 import type { FastifyInstance } from "fastify";
-import { and, asc, count, desc, eq, inArray, isNull, lte, ne } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNull, lte, ne, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   consolidationRuns,
@@ -48,6 +48,7 @@ import {
   localContentReadings,
   localContentTargets,
   obligations,
+  projects,
   reportingEntities,
   vendors,
   workers,
@@ -621,6 +622,23 @@ export function registerGroupRoutes(app: FastifyInstance): void {
     if (rows.length !== ids.length) {
       throw badRequest("Every entityId must reference a reporting entity in this company");
     }
+    /*
+     * A consolidation run may be attributed to a project, and that project id
+     * lands on the run AND on the hash-chained ledger entry. It arrives in the
+     * body (this is a company-level route, so there is no :projectId for the
+     * tool gate to resolve), which means it has to be checked the same way the
+     * entity ids immediately above are: a caller could otherwise stamp another
+     * tenant's project id onto their own group financial register and onto the
+     * ledger, leaving a dangling cross-tenant reference in both.
+     */
+    if (body.projectId) {
+      const owned = await app.db
+        .select({ id: projects.id })
+        .from(projects)
+        .where(and(eq(projects.id, body.projectId), eq(projects.companyId, req.companyId!)))
+        .limit(1);
+      if (!owned[0]) throw badRequest("projectId does not belong to this company");
+    }
     const byId = new Map(rows.map((r) => [r.id, r]));
     const entities: ConsolidationEntity[] = body.amounts.map((a) => {
       const e = byId.get(a.entityId)!;
@@ -1001,6 +1019,30 @@ export function registerGroupRoutes(app: FastifyInstance): void {
 
       let computed: ComputedReading;
       if (target.metric === "local_spend_percent") {
+        /*
+         * The reporting period belongs in the WHERE clause, not in a filter
+         * applied after the rows arrive. A quarterly percentage on a
+         * multi-year scheme otherwise materialises every invoice the project
+         * has ever raised to compute one number. The effective date is the
+         * payment date where there is one, the billing date otherwise —
+         * the same coalesce the engine applies — and rows with NEITHER date
+         * are still fetched so the engine can exclude them for the stated
+         * reason rather than have them silently vanish in SQL.
+         */
+        const spendClauses = [
+          eq(invoices.companyId, req.companyId!),
+          eq(invoices.projectId, req.projectId!),
+          inArray(invoices.status, [...SPEND_STATUSES]),
+        ];
+        const effectiveDate = sql`coalesce(${invoices.paidDate}, ${invoices.billingDate})`;
+        if (periodStart) {
+          spendClauses.push(
+            sql`(${effectiveDate} is null or ${effectiveDate} >= ${periodStart})`,
+          );
+        }
+        if (periodEnd) {
+          spendClauses.push(sql`(${effectiveDate} is null or ${effectiveDate} <= ${periodEnd})`);
+        }
         const rows = await app.db
           .select({
             invoiceId: invoices.id,
@@ -1014,13 +1056,7 @@ export function registerGroupRoutes(app: FastifyInstance): void {
           })
           .from(invoices)
           .leftJoin(vendors, eq(vendors.id, invoices.vendorId))
-          .where(
-            and(
-              eq(invoices.companyId, req.companyId!),
-              eq(invoices.projectId, req.projectId!),
-              inArray(invoices.status, [...SPEND_STATUSES]),
-            ),
-          );
+          .where(and(...spendClauses));
         const spend: SpendRow[] = rows.map((r) => ({
           invoiceId: r.invoiceId,
           vendorId: r.vendorId,
@@ -1038,6 +1074,10 @@ export function registerGroupRoutes(app: FastifyInstance): void {
           periodEnd,
         });
       } else {
+        // headcount is measured over the ACTIVE register, so the status
+        // filter is a SQL predicate rather than a post-fetch filter; the
+        // engine keeps its own guard so a caller passing rows directly still
+        // gets the same population.
         const rows = await app.db
           .select({
             id: workers.id,
@@ -1046,7 +1086,11 @@ export function registerGroupRoutes(app: FastifyInstance): void {
           })
           .from(workers)
           .where(
-            and(eq(workers.companyId, req.companyId!), eq(workers.projectId, req.projectId!)),
+            and(
+              eq(workers.companyId, req.companyId!),
+              eq(workers.projectId, req.projectId!),
+              eq(workers.status, "active"),
+            ),
           );
         const population: WorkerRow[] = rows.map((w) => ({
           workerId: w.id,

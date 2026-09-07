@@ -40,6 +40,7 @@ import { api } from "../../lib/api";
 import {
   CHECKLIST_STATUS_TONE,
   EM_DASH,
+  EditModal,
   Facts,
   LoadError,
   NothingHere,
@@ -62,6 +63,7 @@ import {
   toleranceBounds,
   useAction,
   useResource,
+  type EditFieldSpec,
   type ItemSpec,
 } from "./qualityShared";
 import type {
@@ -70,6 +72,25 @@ import type {
   ItemEvaluation,
   TemplateDetail,
 } from "./types";
+
+/*
+ * The header of a record already taken: what it was called, where it was, when
+ * it was scheduled and who performed it. The answers are edited item by item
+ * and only while the record is open; the verdict is computed, never typed; and
+ * the witness and review signatures are refused to whoever performed it. None
+ * of those are here.
+ */
+const CHECKLIST_EDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "title", label: "Title", kind: "text", nullable: false, wide: true },
+  { key: "locationText", label: "Location", kind: "text" },
+  { key: "scheduledFor", label: "Scheduled for", kind: "date" },
+  {
+    key: "performedByName",
+    label: "Performed by (name)",
+    kind: "text",
+    hint: "For somebody with no platform account. It does not move the signature.",
+  },
+];
 
 export default function ChecklistDrawer({
   checklistId,
@@ -181,6 +202,7 @@ function ChecklistBody({
   const [signOff, setSignOff] = useState<null | "witness" | "review">(null);
   const [signName, setSignName] = useState("");
   const [signNote, setSignNote] = useState("");
+  const [editOpen, setEditOpen] = useState(false);
 
   const base = `/api/v1/projects/${projectId}/checklists/${checklist.id}`;
 
@@ -399,11 +421,30 @@ function ChecklistBody({
           >
             Close
           </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={checklist.status === "void"}
+            onClick={() => setEditOpen(true)}
+          >
+            Correct the header
+          </Button>
         </div>
         <p className="text-2xs text-content-subtle">
           Witnessing and reviewing are both refused to whoever performed the record. That is the
           only reason a signed checklist is worth anything.
         </p>
+
+        <EditModal
+          open={editOpen}
+          onClose={() => setEditOpen(false)}
+          title={`Correct ${checklist.reference}`}
+          description="The record's header — what it is called, where it was taken, when it was scheduled. The answers, the verdict and the signatures are not editable here."
+          url={base}
+          fields={CHECKLIST_EDIT_FIELDS}
+          record={checklist as unknown as Record<string, unknown>}
+          onSaved={onMutated}
+        />
       </section>
 
       {/* -------- the items -------- */}

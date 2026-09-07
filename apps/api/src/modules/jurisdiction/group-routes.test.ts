@@ -16,8 +16,10 @@ import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
 import {
   companyMemberships,
+  consolidationRuns,
   contracts,
   files,
+  invoices,
   ledgerEntries,
   obligations,
   permits,
@@ -878,6 +880,51 @@ describe("reporting entities and consolidation", () => {
     expect((res.json() as { total: number }).total).toBe(0);
   });
 
+  /**
+   * A consolidation run may be attributed to a project, and that project id
+   * lands on the run AND on the hash-chained ledger entry. It arrives in the
+   * body — this is a company-level route, so no tool gate resolves it — and
+   * an unchecked id leaves another tenant's project dangling in the group
+   * financial register and in the ledger.
+   */
+  it("refuses a consolidation attributed to another tenant's project", async () => {
+    const mine = await makeEntity({ name: `Attributed ${newId("x")}` });
+    const foreign = await makeProject("Foreign attribution", stranger);
+    const rejected = await app.inject({
+      method: "POST",
+      url: "/api/v1/consolidations",
+      headers: owner.headers,
+      payload: {
+        presentationCurrency: "EUR",
+        projectId: foreign,
+        amounts: [{ entityId: (mine.json() as { id: string }).id, amount: 1000 }],
+      },
+    });
+    expect(rejected.statusCode).toBe(400);
+    expect((rejected.json() as { message: string }).message).toContain("projectId");
+
+    // nothing was written to the register or to the ledger
+    const runs = await app.db
+      .select()
+      .from(consolidationRuns)
+      .where(eq(consolidationRuns.projectId, foreign));
+    expect(runs).toHaveLength(0);
+
+    // the caller's OWN project is accepted
+    const own = await makeProject("Own attribution");
+    const ok = await app.inject({
+      method: "POST",
+      url: "/api/v1/consolidations",
+      headers: owner.headers,
+      payload: {
+        presentationCurrency: "EUR",
+        projectId: own,
+        amounts: [{ entityId: (mine.json() as { id: string }).id, amount: 1000 }],
+      },
+    });
+    expect(ok.statusCode).toBe(201);
+  });
+
   it("refuses consolidation over an entity from another company", async () => {
     const mine = await makeEntity({ name: `Mine ${newId("x")}` });
     const res = await app.inject({
@@ -1101,6 +1148,71 @@ describe("local content computation", () => {
     const body = res.json() as { value: number | null; unavailableReason: string };
     expect(body.value).toBeNull();
     expect(body.unavailableReason).toContain("No active workers");
+  });
+
+  /**
+   * The reporting period is a SQL predicate, not a post-fetch filter: a
+   * quarterly percentage on a multi-year scheme must not materialise every
+   * invoice the project has ever raised. This asserts the arithmetic the
+   * predicate produces (out-of-period spend excluded, an undated invoice
+   * still fetched so the engine can account for it) rather than the plan.
+   */
+  it("bounds a local-spend computation to the reporting period", async () => {
+    const pid = await makeProject("Local content spend period");
+    const target = await makeTarget(pid, {
+      metric: "local_spend_percent",
+      targetValue: 60,
+      periodStart: "2026-01-01",
+      periodEnd: "2026-03-31",
+    });
+    const local = newId("ven");
+    const foreignVendor = newId("ven");
+    await app.db.insert(vendors).values([
+      { id: local, companyId: owner.companyId, name: "Lagos Civils", country: "Nigeria" },
+      { id: foreignVendor, companyId: owner.companyId, name: "Rotterdam Plant", country: "NL" },
+    ]);
+    let n = 0;
+    const invoice = async (
+      vendorId: string,
+      total: number,
+      dates: { billingDate?: string; paidDate?: string },
+    ) => {
+      n += 1;
+      await app.db.insert(invoices).values({
+        id: newId("inv"),
+        companyId: owner.companyId,
+        projectId: pid,
+        kind: "subcontractor_invoice",
+        number: n,
+        reference: `INV-${n}`,
+        status: "paid",
+        vendorId,
+        currency: "NGN",
+        total,
+        createdBy: owner.userId,
+        ...dates,
+      });
+    };
+    // in period: 60 local of 100
+    await invoice(local, 60, { billingDate: "2026-02-01" });
+    await invoice(foreignVendor, 40, { paidDate: "2026-03-30", billingDate: "2025-12-01" });
+    // outside it, in both directions — these must not move the figure
+    await invoice(local, 500, { billingDate: "2025-11-01" });
+    await invoice(foreignVendor, 900, { billingDate: "2026-07-01" });
+    // dated nowhere: fetched, then excluded by the engine for a stated reason
+    await invoice(local, 77, {});
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/local-content-targets/${target.id}/compute`,
+      headers: owner.headers,
+      payload: {},
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as { value: number; inputs: Record<string, unknown> };
+    expect(body.inputs["invoices"]).toBe(2);
+    expect(body.inputs["totalAmount"]).toBe(100);
+    expect(body.value).toBe(60);
   });
 
   it("refuses to compute a metric the platform does not derive", async () => {

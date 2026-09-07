@@ -87,8 +87,11 @@ export const LOCAL_CONTENT_METRIC_RULES: readonly LocalContentMetricRule[] = [
     unit: "%",
     computable: true,
     derivation:
-      "Workers on the project register whose nationality or residency matches the target's " +
-      "jurisdiction, over all workers active in the period.",
+      "Active workers on the project register whose NATIONALITY matches the target's " +
+      "jurisdiction, over all active workers. The worker register carries nationality only, " +
+      "so residency is not read and this figure currently coincides with the national quota; " +
+      "a regime that scores long-term residents as local needs a residency attribute on the " +
+      "worker record before this metric can differ from it.",
   },
   {
     key: "national_quota",

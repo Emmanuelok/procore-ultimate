@@ -20,6 +20,22 @@ const updatedAt = () =>
  * single source of delay on internationally financed infrastructure.
  * Compliance frames: IFC Performance Standard 5 / World Bank ESS5.
  */
+/** One recorded compensation payment or correction against a parcel. */
+export interface ParcelCompensationPayment {
+  id: string;
+  /** initial payment, a later supplement, or a restatement of the total */
+  kind: "initial" | "supplementary" | "correction";
+  /** the parcel total AFTER this entry */
+  amount: number;
+  /** the movement this entry made to the total (negative for a correction down) */
+  delta: number;
+  paidAt: string;
+  reason: string | null;
+  evidenceIds: string[];
+  recordedBy: string;
+  recordedAt: string;
+}
+
 export const landParcels = pgTable(
   "land_parcels",
   {
@@ -42,6 +58,18 @@ export const landParcels = pgTable(
     compensationAmount: doublePrecision("compensation_amount"),
     currency: text("currency").default("USD").notNull(),
     compensationPaidAt: text("compensation_paid_at"), // ISO date
+    /**
+     * Every payment made against this parcel, in order. `compensationAmount`
+     * is their SUM, not the last one keyed: a supplementary payment and a
+     * corrected figure are both routine on a RAP, and a register that can
+     * only hold the first number understates what was actually paid.
+     * [{ id, kind: "initial"|"supplementary"|"correction", amount, delta,
+     *    paidAt, reason, evidenceIds, recordedBy, recordedAt }]
+     */
+    compensationPayments: jsonb("compensation_payments")
+      .$type<ParcelCompensationPayment[]>()
+      .default([])
+      .notNull(),
     /** links to the assurance evidence substantiating payment/verification */
     evidenceIds: jsonb("evidence_ids").$type<string[]>().default([]).notNull(),
     latitude: doublePrecision("latitude"),
@@ -144,6 +172,13 @@ export const grievances = pgTable(
     /** closure verified with the complainant (#573) */
     verifiedAt: timestamp("verified_at", { withTimezone: true, mode: "string" }),
     verifiedBy: text("verified_by"),
+    /**
+     * Who authored the resolution. Recorded so closure verification can be
+     * refused to the person who wrote what is being verified (segregation of
+     * duties: the assertion and the evidence that tests it are not authored
+     * by the same actor through the same pathway).
+     */
+    resolvedBy: text("resolved_by"),
     complainantSatisfied: integer("complainant_satisfied"),
     status: text("status").default("received").notNull(), // GrievanceStatus
     /** escalation ladder position (#572): 0 site officer .. 3 external route */

@@ -335,6 +335,11 @@ describe("Observations", () => {
     const stillOpen = await inject("GET", api(`/observations/${id}`), H(sub));
     expect(stillOpen.json().convertedToType).toBeNull();
     expect(stillOpen.json().permissions.canConvert).toBe(true);
+    // …and the detail route offers only the targets this caller may actually
+    // mint, so the UI never renders a choice that 403s at the preHandler.
+    expect(stillOpen.json().permissions.canConvertTo).toEqual(["punch_item"]);
+    const asPm = await inject("GET", api(`/observations/${id}`), H(pm));
+    expect(asPm.json().permissions.canConvertTo).toEqual(["punch_item", "incident", "change_event"]);
     // The same subcontractor may still convert to punch, which they do hold.
     const punch = await inject("POST", api(`/observations/${id}/convert`), H(sub), { target: "punch_item" });
     expect(punch.statusCode).toBe(201);
@@ -511,6 +516,11 @@ describe("Photos", () => {
     expect(albumsAdmin.json().items.find((a: { album: string }) => a.album === "Owner eyes only").isPrivate).toBe(true);
     const intoPrivate = await upload(engineer, { album: "Owner eyes only" }, tinyPng(), "sneak.png");
     expect(intoPrivate.statusCode).toBe(403);
+    // Renaming onto an existing album name is a 409, not a constraint 500.
+    const second = await inject("POST", api("/photos/albums"), H(owner), { name: "Structure" });
+    expect([201, 409]).toContain(second.statusCode);
+    const clash = await inject("PATCH", api(`/photos/albums/${album.json().id}`), H(owner), { name: "Structure" });
+    expect(clash.statusCode).toBe(409);
     const rename = await inject("PATCH", api(`/photos/albums/${album.json().id}`), H(owner), { name: "Board pack" });
     expect(rename.statusCode).toBe(200);
     expect((await inject("GET", api(`/photos/${secret.json().id}`), H(owner))).json().album).toBe("Board pack");

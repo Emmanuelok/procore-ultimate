@@ -36,6 +36,7 @@ import { api } from "../../lib/api";
 import {
   CountTile,
   EM_DASH,
+  EditModal,
   LoadError,
   NothingHere,
   ReasonList,
@@ -47,12 +48,14 @@ import {
   useAction,
   useReason,
   useResource,
+  type EditFieldSpec,
   type Resource,
 } from "./qualityShared";
 import type {
   ConcretePour,
   ConcretePourDetail,
   ConcreteSummary,
+  HeatTraceResult,
   Instrument,
   InstrumentDetail,
   InstrumentSummary,
@@ -109,6 +112,147 @@ function numOrNull(value: string): number | null {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 }
+
+/* ------------------------------------------------------------------ */
+/* What may be CORRECTED on a record that is already in the register    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * These lists mirror the API's PATCH column allowlists exactly. Every field
+ * here is a descriptive fact somebody typed from site — a heat number, a
+ * thickness, a welder's stamp — and every one of them is routinely typed
+ * wrong under a pour or a shutdown. What is NOT here is the whole point:
+ * results, verdicts, signatures, expiries and statuses have their own
+ * routes, their own segregation and their own ledger entries, and no edit
+ * form may move them.
+ */
+const POUR_EDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "pourName", label: "Pour name", kind: "text", nullable: false },
+  { key: "elementType", label: "Element", kind: "text" },
+  { key: "locationText", label: "Location", kind: "text" },
+  { key: "drawingReference", label: "Drawing", kind: "text" },
+  { key: "plannedDate", label: "Planned date", kind: "date" },
+  { key: "mixReference", label: "Mix reference", kind: "text" },
+  { key: "specifiedGrade", label: "Specified grade", kind: "text", placeholder: "C32/40" },
+  {
+    key: "specifiedStrengthMpa",
+    label: "Specified strength (MPa)",
+    kind: "number",
+    hint: "The acceptance verdict is computed against this, so a typo here is a wrong verdict.",
+  },
+  { key: "testAgeDays", label: "Test age (days)", kind: "integer" },
+  { key: "batchPlant", label: "Batch plant", kind: "text" },
+  { key: "slumpSpecMin", label: "Slump spec min (mm)", kind: "number" },
+  { key: "slumpSpecMax", label: "Slump spec max (mm)", kind: "number" },
+  { key: "curingMethod", label: "Curing method", kind: "text" },
+  { key: "supervisedBy", label: "Supervised by", kind: "text" },
+];
+
+const WELD_EDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "jointReference", label: "Joint reference", kind: "text" },
+  { key: "weldMapRef", label: "Weld map reference", kind: "text" },
+  { key: "jointType", label: "Joint type", kind: "text" },
+  { key: "isometricRef", label: "Isometric / line", kind: "text" },
+  { key: "drawingReference", label: "Drawing", kind: "text" },
+  { key: "materialSpec", label: "Material specification", kind: "text" },
+  { key: "thicknessMm", label: "Thickness (mm)", kind: "number" },
+  { key: "diameterMm", label: "Diameter (mm)", kind: "number" },
+  {
+    key: "heatNumbers",
+    label: "Heat numbers",
+    kind: "list",
+    wide: true,
+    hint: "Comma separated. This is the thread a recall follows from a cast to a joint, so it is worth correcting.",
+  },
+  { key: "ndtRequiredPercent", label: "NDT required (%)", kind: "number" },
+  { key: "description", label: "Description", kind: "textarea" },
+];
+
+const WPS_EDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "title", label: "Title", kind: "text", nullable: false },
+  { key: "revision", label: "Revision", kind: "text" },
+  { key: "standard", label: "Standard", kind: "text", placeholder: "ISO 15614-1" },
+  { key: "baseMaterialGroup", label: "Base material group", kind: "text" },
+  { key: "fillerMaterial", label: "Filler material", kind: "text" },
+  { key: "thicknessMinMm", label: "Thickness min (mm)", kind: "number" },
+  { key: "thicknessMaxMm", label: "Thickness max (mm)", kind: "number" },
+  { key: "diameterMinMm", label: "Diameter min (mm)", kind: "number" },
+  { key: "diameterMaxMm", label: "Diameter max (mm)", kind: "number" },
+  { key: "preheatMinC", label: "Preheat min (°C)", kind: "number" },
+  { key: "interpassMaxC", label: "Interpass max (°C)", kind: "number" },
+  { key: "pqrReference", label: "PQR reference", kind: "text" },
+  { key: "positions", label: "Positions", kind: "list", hint: "Comma separated, e.g. PA, PC, PF." },
+  { key: "validFrom", label: "Valid from", kind: "date" },
+  { key: "validUntil", label: "Valid until", kind: "date" },
+];
+
+const QUAL_EDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "welderName", label: "Welder", kind: "text", nullable: false },
+  { key: "welderStamp", label: "Stamp", kind: "text" },
+  { key: "certificateNumber", label: "Certificate number", kind: "text" },
+  { key: "qualificationStandard", label: "Standard", kind: "text", placeholder: "ISO 9606-1" },
+  { key: "processes", label: "Processes", kind: "list" },
+  { key: "positions", label: "Positions", kind: "list" },
+  { key: "materialGroups", label: "Material groups", kind: "list" },
+  { key: "thicknessMinMm", label: "Thickness min (mm)", kind: "number" },
+  { key: "thicknessMaxMm", label: "Thickness max (mm)", kind: "number" },
+  { key: "diameterMinMm", label: "Diameter min (mm)", kind: "number" },
+  { key: "diameterMaxMm", label: "Diameter max (mm)", kind: "number" },
+  { key: "qualifiedFrom", label: "Qualified from", kind: "date" },
+  {
+    key: "expiryDate",
+    label: "Expiry date",
+    kind: "date",
+    hint: "The lapse sweep reads this date; correcting it moves when the qualification is flagged.",
+  },
+  { key: "continuityMonths", label: "Continuity (months)", kind: "integer" },
+];
+
+const CERTIFICATE_EDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "certificateNumber", label: "Certificate number", kind: "text", nullable: false },
+  { key: "materialDescription", label: "Material", kind: "text", nullable: false },
+  { key: "materialGrade", label: "Grade", kind: "text" },
+  { key: "standard", label: "Standard", kind: "text" },
+  {
+    key: "heatNumber",
+    label: "Heat number",
+    kind: "text",
+    hint: "A certificate filed without its heat number cannot be reached by a recall.",
+  },
+  { key: "batchNumber", label: "Batch number", kind: "text" },
+  { key: "castNumber", label: "Cast number", kind: "text" },
+  { key: "lotNumber", label: "Lot number", kind: "text" },
+  { key: "quantity", label: "Quantity", kind: "number" },
+  { key: "unit", label: "Unit", kind: "text" },
+  { key: "manufacturer", label: "Manufacturer", kind: "text" },
+  { key: "millName", label: "Mill", kind: "text" },
+  { key: "originCountry", label: "Country of origin", kind: "text" },
+  { key: "issuedAt", label: "Issued", kind: "date" },
+  { key: "receivedAt", label: "Received", kind: "date" },
+  { key: "installedDescription", label: "Where it was installed", kind: "textarea" },
+];
+
+const INSTRUMENT_EDIT_FIELDS: readonly EditFieldSpec[] = [
+  { key: "name", label: "Name", kind: "text", nullable: false },
+  { key: "instrumentType", label: "Type", kind: "text" },
+  { key: "manufacturer", label: "Manufacturer", kind: "text" },
+  { key: "model", label: "Model", kind: "text" },
+  { key: "assetTag", label: "Asset tag", kind: "text" },
+  { key: "ownerName", label: "Owner", kind: "text" },
+  { key: "custodian", label: "Custodian", kind: "text" },
+  { key: "storageLocation", label: "Stored", kind: "text" },
+  { key: "rangeMin", label: "Range min", kind: "number" },
+  { key: "rangeMax", label: "Range max", kind: "number" },
+  { key: "rangeUnit", label: "Range unit", kind: "text" },
+  { key: "accuracy", label: "Accuracy", kind: "text" },
+  { key: "calibrationStandard", label: "Calibration standard", kind: "text" },
+  {
+    key: "calibrationIntervalMonths",
+    label: "Interval (months)",
+    kind: "integer",
+    hint: "The due date is derived from the last certificate and this interval.",
+  },
+];
 
 export type RecordsSection = "concrete" | "welding" | "certificates" | "calibration";
 
@@ -505,6 +649,7 @@ function PourModal({
   const [specimenRefs, setSpecimenRefs] = useState("");
   const [resultFor, setResultFor] = useState<string | null>(null);
   const [strength, setStrength] = useState("");
+  const [editOpen, setEditOpen] = useState(false);
   const base = `/api/v1/projects/${projectId}/concrete-pours/${pourId ?? ""}`;
   const pour = useResource<ConcretePourDetail>(
     (signal) => api.get<ConcretePourDetail>(base, { signal }),
@@ -552,7 +697,10 @@ function PourModal({
       title={p ? `${p.reference} — ${p.pourName}` : "Pour"}
       description="Specimens, statistics and the acceptance verdict, computed against the code this pour names."
       footer={
-        <div className="flex justify-end">
+        <div className="flex justify-between gap-2">
+          <Button variant="secondary" size="sm" disabled={!p} onClick={() => setEditOpen(true)}>
+            Correct the record
+          </Button>
           <Button variant="ghost" onClick={onClose}>
             Close
           </Button>
@@ -715,6 +863,20 @@ function PourModal({
               </Button>
             </div>
           )}
+
+          <EditModal
+            open={editOpen}
+            onClose={() => setEditOpen(false)}
+            title={`Correct ${p.reference}`}
+            description="The mix, the specified strength and the test age decide the verdict this pour is judged by, so a transposed figure here is a wrong verdict rather than a cosmetic error. What was measured — the specimens, the slump, the pour itself — is not editable."
+            url={base}
+            fields={POUR_EDIT_FIELDS}
+            record={p as unknown as Record<string, unknown>}
+            onSaved={() => {
+              pour.reload();
+              onMutated();
+            }}
+          />
         </div>
       )}
     </Modal>
@@ -1307,7 +1469,9 @@ function ProcedureList({
 }) {
   const { busy, refusal, clear, run } = useAction();
   const [createOpen, setCreateOpen] = useState(false);
+  const [editId, setEditId] = useState<string | null>(null);
   const rows = procedures.data?.items ?? [];
+  const editing = rows.find((w) => w.id === editId) ?? null;
   return (
     <div className="rounded-md border border-border-subtle p-2.5">
       <div className="flex items-center justify-between gap-2">
@@ -1355,10 +1519,26 @@ function ProcedureList({
                   Approve
                 </Button>
               ) : null}
+              <Button size="xs" variant="ghost" onClick={() => setEditId(w.id)}>
+                Edit
+              </Button>
             </li>
           ))}
         </ul>
       )}
+      <EditModal
+        open={editing !== null}
+        onClose={() => setEditId(null)}
+        title={editing ? `Correct ${editing.wpsNumber}` : "Correct the procedure"}
+        description="The qualified envelope — process, material group, thickness and diameter bounds — is what every joint is checked against, so it is worth correcting rather than working around. Approval is not editable here."
+        url={`/api/v1/projects/${projectId}/welding-procedures/${editId ?? ""}`}
+        fields={WPS_EDIT_FIELDS}
+        record={editing as unknown as Record<string, unknown> | null}
+        onSaved={() => {
+          procedures.reload();
+          onMutated();
+        }}
+      />
       <CreateWps
         open={createOpen}
         projectId={projectId}
@@ -1519,7 +1699,9 @@ function QualificationList({
   const { busy, refusal, clear, run } = useAction();
   const { ask, dialog } = useReason();
   const [createOpen, setCreateOpen] = useState(false);
+  const [editId, setEditId] = useState<string | null>(null);
   const rows = quals.data?.items ?? [];
+  const editing = rows.find((q) => q.id === editId) ?? null;
   return (
     <div className="rounded-md border border-border-subtle p-2.5">
       <div className="flex items-center justify-between gap-2">
@@ -1607,12 +1789,28 @@ function QualificationList({
                     Suspend
                   </Button>
                 ) : null}
+                <Button size="xs" variant="ghost" onClick={() => setEditId(q.id)}>
+                  Edit
+                </Button>
               </div>
               <ReasonList reasons={q.standing?.reasons ?? []} />
             </li>
           ))}
         </ul>
       )}
+      <EditModal
+        open={editing !== null}
+        onClose={() => setEditId(null)}
+        title={editing ? `Correct ${editing.welderName}'s qualification` : "Correct the qualification"}
+        description="The certificate as it reads — the ranges it qualifies and the dates it runs between. Suspension and continuity are acts with their own record and are not editable here."
+        url={`/api/v1/projects/${projectId}/welder-qualifications/${editId ?? ""}`}
+        fields={QUAL_EDIT_FIELDS}
+        record={editing as unknown as Record<string, unknown> | null}
+        onSaved={() => {
+          quals.reload();
+          onMutated();
+        }}
+      />
       <CreateQualification
         open={createOpen}
         projectId={projectId}
@@ -1800,6 +1998,7 @@ function WeldModal({
   const [ndtResult, setNdtResult] = useState("accept");
   const [defectType, setDefectType] = useState("");
   const [reportNumber, setReportNumber] = useState("");
+  const [editOpen, setEditOpen] = useState(false);
   const base = `/api/v1/projects/${projectId}/welds/${weldId ?? ""}`;
   const weld = useResource<WeldDetail>((signal) => api.get<WeldDetail>(base, { signal }), [base], weldId !== null);
   const reload = () => {
@@ -1817,7 +2016,10 @@ function WeldModal({
       title={w ? `${w.reference}${w.jointReference ? ` — ${w.jointReference}` : ""}` : "Joint"}
       description="The procedure, the welder, and every examination of this joint."
       footer={
-        <div className="flex justify-end">
+        <div className="flex justify-between gap-2">
+          <Button variant="secondary" size="sm" disabled={!w} onClick={() => setEditOpen(true)}>
+            Correct the record
+          </Button>
           <Button variant="ghost" onClick={onClose}>
             Close
           </Button>
@@ -2011,6 +2213,17 @@ function WeldModal({
             qualifications={qualifications}
             procedures={procedures}
             onDone={reload}
+          />
+
+          <EditModal
+            open={editOpen}
+            onClose={() => setEditOpen(false)}
+            title={`Correct ${w.reference}`}
+            description="The joint as it is specified — thickness, diameter, material, heats, required examination. The envelope check re-runs against the corrected figures; the welds, the examinations and their results are not editable here."
+            url={base}
+            fields={WELD_EDIT_FIELDS}
+            record={w as unknown as Record<string, unknown>}
+            onSaved={reload}
           />
         </div>
       )}
@@ -2266,6 +2479,7 @@ function CertificatePanel({
   const base = `/api/v1/projects/${projectId}`;
   const { busy, refusal, clear, run } = useAction();
   const [createOpen, setCreateOpen] = useState(false);
+  const [editId, setEditId] = useState<string | null>(null);
   const certificates = useResource<Paged<MaterialCertificate>>(
     (signal) =>
       api.get<Paged<MaterialCertificate>>(`${base}/material-certificates?page=1&pageSize=200`, {
@@ -2360,6 +2574,9 @@ function CertificatePanel({
                 Verify
               </Button>
             ) : null}
+            <Button size="xs" variant="ghost" onClick={() => setEditId(row.id)}>
+              Edit
+            </Button>
           </span>
         ),
       },
@@ -2435,6 +2652,25 @@ function CertificatePanel({
         />
       )}
 
+      <HeatTrace />
+
+      <EditModal
+        open={editId !== null}
+        onClose={() => setEditId(null)}
+        title="Correct the certificate"
+        description="What the certificate says, as it says it. The verification verdict is computed from the required and measured properties and is not editable; correcting a heat number here re-connects the certificate to the material it covers."
+        url={`${base}/material-certificates/${editId ?? ""}`}
+        fields={CERTIFICATE_EDIT_FIELDS}
+        record={
+          (rows.find((r) => r.id === editId) ?? null) as unknown as Record<string, unknown> | null
+        }
+        onSaved={() => {
+          certificates.reload();
+          summary.reload();
+          onMutated();
+        }}
+      />
+
       <CreateCertificate
         open={createOpen}
         projectId={projectId}
@@ -2446,6 +2682,131 @@ function CertificatePanel({
           onMutated();
         }}
       />
+    </div>
+  );
+}
+
+/**
+ * TRACE A HEAT ACROSS THE COMPANY.
+ *
+ * The recall question — "a mill has withdrawn cast H-4471; where did it go?" —
+ * does not respect project boundaries, because the steel did not. This is the
+ * only company-scoped read in the workspace, and it is filtered server-side to
+ * the projects the caller can actually see: the answer says how wide it looked,
+ * so an empty result is never mistaken for "the heat was never certified" when
+ * it really means "not on the projects you hold quality access to".
+ */
+function HeatTrace() {
+  const [term, setTerm] = useState("");
+  const [field, setField] = useState<"heatNumber" | "batchNumber">("heatNumber");
+  const [submitted, setSubmitted] = useState<{ field: string; term: string } | null>(null);
+  const url =
+    submitted === null
+      ? null
+      : `/api/v1/companies/current/material-certificates/trace?${submitted.field}=${encodeURIComponent(submitted.term)}`;
+  const trace = useResource<HeatTraceResult>(
+    (signal) => api.get<HeatTraceResult>(url ?? "", { signal }),
+    [url],
+    url !== null,
+  );
+
+  return (
+    <div className="rounded-md border border-border-subtle p-2.5">
+      <div className="text-label uppercase tracking-wide text-content-subtle">
+        Trace a heat across the company
+      </div>
+      <p className="mt-0.5 text-2xs text-content-subtle">
+        A recall starts with a cast number and asks where the material went. This crosses projects,
+        because the cast did — and it is filtered to the projects you can see, which the answer
+        states.
+      </p>
+      <div className="mt-2 flex flex-wrap items-end gap-2">
+        <Field label="Trace by">
+          <Select
+            value={field}
+            onChange={(e) => setField(e.target.value === "batchNumber" ? "batchNumber" : "heatNumber")}
+          >
+            <option value="heatNumber">Heat / cast number</option>
+            <option value="batchNumber">Batch number</option>
+          </Select>
+        </Field>
+        <Field label="Number" className="flex-1">
+          <Input
+            value={term}
+            onChange={(e) => setTerm(e.target.value)}
+            placeholder="H-4471"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && term.trim() !== "") {
+                setSubmitted({ field, term: term.trim() });
+              }
+            }}
+          />
+        </Field>
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={term.trim() === ""}
+          onClick={() => setSubmitted({ field, term: term.trim() })}
+        >
+          Trace it
+        </Button>
+      </div>
+      {submitted === null ? null : trace.error ? (
+        <div className="mt-2">
+          <LoadError
+            message={trace.error}
+            onRetry={trace.reload}
+            title="The trace could not be run"
+          />
+        </div>
+      ) : trace.loading ? (
+        <p className="mt-2 text-meta text-content-muted">Tracing…</p>
+      ) : trace.data ? (
+        <div className="mt-2 space-y-1.5 text-meta">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge tone={trace.data.total === 0 ? "warning" : "success"} size="xs" dot>
+              {trace.data.total} {plural(trace.data.total, "certificate")}
+            </Badge>
+            <span className="text-2xs text-content-subtle">
+              {trace.data.scope.allProjects
+                ? "across every project in the company"
+                : `across the ${trace.data.scope.projectCount ?? 0} ${plural(trace.data.scope.projectCount ?? 0, "project")} you can see`}
+            </span>
+          </div>
+          <ReasonList reasons={trace.data.reasons} />
+          {trace.data.items.length > 0 ? (
+            <ul className="space-y-1">
+              {trace.data.items.map((c) => (
+                <li
+                  key={c.id}
+                  className="flex flex-wrap items-center gap-1.5 rounded border border-border-subtle px-2 py-1"
+                >
+                  <span className="font-mono text-2xs">{c.reference}</span>
+                  <span className="text-content-muted">{c.materialDescription}</span>
+                  <Badge
+                    tone={
+                      c.verificationStatus === "verified"
+                        ? "success"
+                        : c.verificationStatus === "failed"
+                          ? "danger"
+                          : "warning"
+                    }
+                    size="xs"
+                    dot
+                  >
+                    {labelize(c.verificationStatus)}
+                  </Badge>
+                  <span className="text-2xs text-content-subtle">
+                    {c.manufacturer ?? "manufacturer not recorded"}
+                    {c.heatNumber ? ` · heat ${c.heatNumber}` : ""}
+                    {c.batchNumber ? ` · batch ${c.batchNumber}` : ""}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -2920,6 +3281,7 @@ function InstrumentModal({
   const [asLeft, setAsLeft] = useState("");
   const [status, setStatus] = useState("out_of_service");
   const [statusReason, setStatusReason] = useState("");
+  const [editOpen, setEditOpen] = useState(false);
   if (!instrumentId) return null;
   const row = instrument.data;
 
@@ -2936,7 +3298,10 @@ function InstrumentModal({
       title={row ? `${row.reference} — ${row.name}` : "Instrument"}
       description="Its certificates, its standing today, and the two acts that change either."
       footer={
-        <div className="flex justify-end">
+        <div className="flex justify-between gap-2">
+          <Button variant="secondary" size="sm" disabled={!row} onClick={() => setEditOpen(true)}>
+            Correct the record
+          </Button>
           <Button variant="ghost" onClick={onClose}>
             Close
           </Button>
@@ -3146,6 +3511,17 @@ function InstrumentModal({
               </Button>
             </div>
           </div>
+
+          <EditModal
+            open={editOpen}
+            onClose={() => setEditOpen(false)}
+            title={`Correct ${row.reference}`}
+            description="The instrument as it is described and the interval its certificate runs to. The due date is derived from the last calibration and the interval, and the standing is derived from that — neither is typed in here."
+            url={base}
+            fields={INSTRUMENT_EDIT_FIELDS}
+            record={row as unknown as Record<string, unknown>}
+            onSaved={reload}
+          />
         </div>
       )}
     </Modal>
