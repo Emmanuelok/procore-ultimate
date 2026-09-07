@@ -49,19 +49,24 @@ export const INGESTION_RESOLUTIONS = ["insert", "update", "skip"] as const;
 export type IngestionResolution = (typeof INGESTION_RESOLUTIONS)[number];
 
 /**
- * Datasets the migration wizard accepts BEYOND the ones enumerated in
- * enums.ts. The platform-upgrade wave added modules whose first day needs a
- * spreadsheet import, and the base vocabulary is frozen for the duration of the
- * wave — so the registry reads the union of the two. The database column is
- * plain text, so a member here is a first-class dataset in every respect:
- * mappable, validatable, committable and token-scopable.
+ * The datasets the platform-upgrade wave added to the migration wizard.
+ *
+ * They are ordinary members of `INGESTION_DATASETS` in enums.ts — the ONE
+ * vocabulary the dataset registry (`Record<IngestionDataset, DatasetDef>`),
+ * the commit-writer switch, token scopes and the run filters are typed
+ * against. This list only records which members arrived with the wave;
+ * `satisfies` refuses any entry that is not in the canonical enum, so it can
+ * never grow back into a second vocabulary. (It briefly was one: the registry
+ * read the union of two enums, and the API described datasets the base enum
+ * did not know.)
  */
-export const EXTENDED_INGESTION_DATASETS = ["cost_codes", "budget_lines"] as const;
+export const EXTENDED_INGESTION_DATASETS = [
+  "cost_codes",
+  "budget_lines",
+] as const satisfies readonly IngestionDataset[];
 export type ExtendedIngestionDataset = (typeof EXTENDED_INGESTION_DATASETS)[number];
 
-/** Every dataset an ingestion run may target. */
-export const ALL_INGESTION_DATASETS = [
-  ...INGESTION_DATASETS,
-  ...EXTENDED_INGESTION_DATASETS,
-] as const;
-export type AnyIngestionDataset = IngestionDataset | ExtendedIngestionDataset;
+/** @deprecated Alias of `INGESTION_DATASETS` (enums.ts), kept for callers written against it. */
+export const ALL_INGESTION_DATASETS = INGESTION_DATASETS;
+/** @deprecated Alias of `IngestionDataset` (enums.ts). */
+export type AnyIngestionDataset = IngestionDataset;

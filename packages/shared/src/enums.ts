@@ -849,6 +849,17 @@ export const INGESTION_DATASETS = [
    * with the right scope and so its runs can be filtered like any other.
    */
   "telematics",
+  /**
+   * Platform-upgrade wave (WP-ANALYTICS): the budget tool's first-day imports.
+   * Appended HERE rather than kept in a second enum because the dataset
+   * registry, the commit-writer switch, token scopes and the run/list filters
+   * are all typed off this one list — a dataset that lives anywhere else is
+   * invisible to at least one of them. Committed by the ingestion module's own
+   * writers (cost_codes: the company or project list; budget_lines: the
+   * project's active budget).
+   */
+  "cost_codes",
+  "budget_lines",
 ] as const;
 export type IngestionDataset = (typeof INGESTION_DATASETS)[number];
 
