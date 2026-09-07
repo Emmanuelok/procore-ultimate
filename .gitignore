@@ -19,3 +19,6 @@ uploads/
 # Verifier scratch — live attack scripts, not part of the product
 apps/api/*-attack.mts
 apps/api/sso-takeover.mts
+
+# Derived sandbox Dockerfile (injects a private CA for the build sandbox; never ship it)
+Dockerfile.sandbox
