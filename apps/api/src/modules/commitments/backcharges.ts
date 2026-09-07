@@ -297,10 +297,28 @@ export const backchargeRoutes: FastifyPluginAsync = async (app) => {
     const agreed = body.agreedAmount === undefined ? row.amount : round2(body.agreedAmount);
     if (agreed > row.amount + 0.005) throw badRequest("A settlement cannot exceed the backcharge raised");
     const now = new Date().toISOString();
+    /*
+     * A backcharge whose negative change order is ALREADY APPROVED has had its
+     * money taken out of the commitment sum. Settling it is then a matter of
+     * record, not of arithmetic: the figure cannot move here (a further change
+     * order is the only honest way to move an approved one), and the status
+     * must land on `settled` — leaving it `issued` would keep
+     * `openBackchargeTotal` reserving the same money that the reduced
+     * commitment sum has already taken away.
+     */
+    let changeLocked = false;
     await app.db.transaction(async (tx) => {
       if (row.commitmentChangeId) {
         const change = (await tx.select().from(commitmentChanges).where(eq(commitmentChanges.id, row.commitmentChangeId)).limit(1))[0];
-        if (change && change.status !== "approved" && change.status !== "executed") {
+        changeLocked = change?.status === "approved" || change?.status === "executed";
+        if (changeLocked && Math.abs(agreed - row.amount) > 0.005) {
+          throw conflict(
+            `Backcharge ${row.reference} has already been applied to the commitment sum by an ` +
+              `approved change order for ${row.amount}. Settle it at that figure, or raise a ` +
+              "further change order to move it — an approved change order is not edited here.",
+          );
+        }
+        if (change && !changeLocked) {
           if (agreed <= 0.005) {
             await tx
               .update(commitmentChanges)
@@ -320,10 +338,18 @@ export const backchargeRoutes: FastifyPluginAsync = async (app) => {
       await tx
         .update(backcharges)
         .set({
-          status: agreed <= 0.005 ? "void" : row.commitmentChangeId ? "issued" : "settled",
+          status:
+            agreed <= 0.005
+              ? "void"
+              : changeLocked || !row.commitmentChangeId
+                ? "settled"
+                : "issued",
           amount: agreed,
           detail: { ...(row.detail ?? {}), settlementNote: body.note ?? null, originalAmount: row.amount },
           updatedAt: now,
+          ...(changeLocked || !row.commitmentChangeId
+            ? { settledAt: now, settledBy: req.user!.id }
+            : {}),
           ...(agreed <= 0.005 ? { voidReason: body.note ?? "Settled at zero" } : {}),
         })
         .where(eq(backcharges.id, backchargeId));

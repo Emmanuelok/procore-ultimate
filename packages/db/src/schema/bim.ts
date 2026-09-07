@@ -52,6 +52,16 @@ export const bimModelVersions = pgTable(
     processingError: text("processing_error"),
     /** set when the ingestion worker finished (successfully or not) */
     processedAt: timestamp("processed_at", { withTimezone: true, mode: "string" }),
+    /**
+     * When the CURRENT parse began. The stall sweep keys on this, not on
+     * createdAt: an old version that is actively parsing is not stalled, and
+     * treating it as stalled let a second worker pass start on a version
+     * already in flight (both passes delete and re-insert the same elements).
+     */
+    processingStartedAt: timestamp("processing_started_at", {
+      withTimezone: true,
+      mode: "string",
+    }),
     /** stored file size, so the UI can explain why a big model was queued */
     sizeBytes: doublePrecision("size_bytes"),
     /** number of spatial-structure entities (site/building/storey/space) */

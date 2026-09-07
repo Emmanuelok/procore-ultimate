@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { COMPANY_ROLES } from "@constructos/shared";
 import { api, ApiClientError } from "../../lib/api";
 import {
+  Alert,
   Badge,
   Button,
   EmptyState,
@@ -17,7 +18,9 @@ import {
   Th,
   statusTone,
 } from "../../ui";
-import { humanize, locationLabel } from "../format";
+import { formatDateTime, humanize, locationLabel } from "../format";
+import DirectoryIntelligenceTabs from "./DirectoryIntelligence";
+import type { InviteResult } from "../admin/substrate";
 
 /* ------------------------------- shared bits ------------------------------- */
 
@@ -28,7 +31,7 @@ interface ListResponse<T> {
   pageSize: number;
 }
 
-const TABS = ["Vendors", "Contacts", "Users", "Groups"] as const;
+const TABS = ["Vendors", "Contacts", "Users", "Groups", "Duplicates", "Import"] as const;
 type Tab = (typeof TABS)[number];
 
 function errMsg(err: unknown, fallback: string): string {
@@ -495,7 +498,18 @@ function UsersTab() {
   const [form, setForm] = useState({ name: "", email: "", role: "member" });
   const [formError, setFormError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [tempPassword, setTempPassword] = useState<string | null>(null);
+  /*
+   * `invited` replaces the old `tempPassword`.
+   *
+   * The invite route used to hand the INVITER a working temporary password
+   * for somebody else's account, and this page rendered it as the success
+   * state — so an administrator held a live credential for a colleague and
+   * was never told whether the invitation actually went anywhere. The route
+   * now records an invitation and returns its delivery status; the accept
+   * link is offered ONLY when nothing was dispatched and the account was
+   * created by this invitation.
+   */
+  const [invited, setInvited] = useState<InviteResult | null>(null);
   const [copied, setCopied] = useState(false);
 
   const load = useCallback(async () => {
@@ -517,7 +531,7 @@ function UsersTab() {
   function openInvite() {
     setForm({ name: "", email: "", role: "member" });
     setFormError(null);
-    setTempPassword(null);
+    setInvited(null);
     setCopied(false);
     setInviteOpen(true);
   }
@@ -527,16 +541,12 @@ function UsersTab() {
     setFormError(null);
     setBusy(true);
     try {
-      const res = await api.post<{ tempPassword?: string }>("/api/v1/company/users/invite", {
+      const res = await api.post<InviteResult>("/api/v1/company/users/invite", {
         email: form.email.trim(),
         name: form.name.trim(),
         role: form.role,
       });
-      if (res && res.tempPassword) {
-        setTempPassword(res.tempPassword);
-      } else {
-        setInviteOpen(false);
-      }
+      setInvited(res);
       await load();
     } catch (err) {
       setFormError(errMsg(err, "Failed to invite user"));
@@ -545,10 +555,10 @@ function UsersTab() {
     }
   }
 
-  async function copyPassword() {
-    if (!tempPassword) return;
+  async function copyAcceptUrl() {
+    if (!invited?.acceptUrl) return;
     try {
-      await navigator.clipboard.writeText(tempPassword);
+      await navigator.clipboard.writeText(invited.acceptUrl);
       setCopied(true);
     } catch {
       setCopied(false);
@@ -592,24 +602,51 @@ function UsersTab() {
 
       <Modal
         open={inviteOpen}
-        title={tempPassword ? "User invited" : "Invite user"}
+        title={invited ? "Invitation recorded" : "Invite user"}
         onClose={() => setInviteOpen(false)}
       >
-        {tempPassword ? (
-          <div>
-            <p className="mb-3 text-sm text-ink-600">
-              Share this temporary password securely with the new user. It is shown{" "}
-              <span className="font-semibold">only once</span> — it cannot be retrieved later.
+        {invited ? (
+          <div className="space-y-3">
+            <p className="text-sm text-ink-600">
+              An invitation to <span className="font-medium">{invited.invitedEmail}</span> as{" "}
+              {humanize(invited.role)} was recorded. No account credential exists and no company
+              membership is created until they accept — the invitation carries the role and the
+              projects.
             </p>
-            <div className="flex items-center gap-2 rounded-md bg-amber-50 px-3 py-2 ring-1 ring-amber-200">
-              <code className="flex-1 select-all break-all font-mono text-sm text-amber-900">
-                {tempPassword}
-              </code>
-              <Button variant="secondary" size="sm" onClick={copyPassword}>
-                {copied ? "Copied" : "Copy"}
-              </Button>
-            </div>
-            <div className="mt-4 flex justify-end">
+
+            {invited.delivery?.dispatched ? (
+              <Alert tone="success" size="sm">
+                The invitation email was dispatched
+                {invited.delivery.status ? ` (${humanize(invited.delivery.status)})` : ""}. It
+                expires {formatDateTime(invited.invitation.expiresAt)}.
+              </Alert>
+            ) : (
+              <Alert tone="warning" size="sm">
+                <strong>Recorded, not sent.</strong> No mail transport is configured, so nothing
+                reached the invitee.
+                {invited.delivery?.reason ? ` ${invited.delivery.reason}` : ""}{" "}
+                {invited.acceptUrl
+                  ? "Pass the link below to them through a channel you trust."
+                  : "Because this address already has an account on the platform, the link is not shown here — handing it over would be a takeover route into somebody else's account. Configure the mail transport, then resend."}
+              </Alert>
+            )}
+
+            {invited.acceptUrl ? (
+              <div className="flex items-center gap-2 rounded-md bg-amber-50 px-3 py-2 ring-1 ring-amber-200">
+                <code className="flex-1 select-all break-all font-mono text-xs text-amber-900">
+                  {invited.acceptUrl}
+                </code>
+                <Button variant="secondary" size="sm" onClick={copyAcceptUrl}>
+                  {copied ? "Copied" : "Copy"}
+                </Button>
+              </div>
+            ) : null}
+
+            <p className="text-xs text-ink-500">
+              Invitation {invited.invitation.tokenPrefix}… · {humanize(invited.invitation.status)}
+            </p>
+
+            <div className="flex justify-end">
               <Button onClick={() => setInviteOpen(false)}>Done</Button>
             </div>
           </div>
@@ -919,7 +956,7 @@ export default function DirectoryPage() {
     <div>
       <PageHeader
         title="Directory"
-        subtitle="Vendors, contacts, company users and distribution groups"
+        subtitle="Vendors, contacts, company users, distribution groups, duplicate detection and bulk import"
       />
       <div className="mb-5 flex gap-1 border-b border-ink-200">
         {TABS.map((t) => (
@@ -941,6 +978,8 @@ export default function DirectoryPage() {
       {tab === "Contacts" ? <ContactsTab /> : null}
       {tab === "Users" ? <UsersTab /> : null}
       {tab === "Groups" ? <GroupsTab /> : null}
+      {tab === "Duplicates" ? <DirectoryIntelligenceTabs view="duplicates" /> : null}
+      {tab === "Import" ? <DirectoryIntelligenceTabs view="import" /> : null}
     </div>
   );
 }

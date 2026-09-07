@@ -18,16 +18,25 @@
  * `totalIsComplete` is printed, so a partial figure is never dressed as a
  * full one.
  */
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
+import { toast } from "sonner";
 import {
   Badge,
+  Button,
   Card,
   CardBody,
   EmptyState,
   Select,
   SkeletonTable,
+  Table,
+  TBody,
+  Td,
+  Th,
+  THead,
   Tooltip,
+  Tr,
 } from "../../ui";
+import { api } from "../../lib/api";
 import { DataTable, type DataColumns } from "../../ui/data";
 import { ChartCard, StackedBarChart } from "../../ui/charts";
 import type { Tone } from "../../ui/tokens";
@@ -38,6 +47,8 @@ import {
   FigureCell,
   IDLE_REASON_LABEL,
   LoadError,
+  ReasonList,
+  RefusalNotice,
   SectionHeading,
   bucketsOf,
   hours,
@@ -45,7 +56,11 @@ import {
   labelize,
   money,
   percent,
+  useAction,
+  useOwnershipComparison,
   utilisationTone,
+  OWNERSHIP_VERDICT_LABEL,
+  OWNERSHIP_VERDICT_TONE,
   type ListResponse,
   type Loadable,
   type UtilisationRow,
@@ -53,20 +68,42 @@ import {
   type UtilisationSummaryItem,
 } from "./equipmentShared";
 
+interface PostToBudgetResult {
+  runId: string | null;
+  from: string;
+  to: string;
+  posted: number;
+  lines: Array<{
+    budgetLineItemId: string;
+    costCode: string;
+    plantCost: number;
+    plantHours: number;
+    plantDays: number;
+    currency: string;
+  }>;
+  reasons: string[];
+}
+
 const WINDOWS = [7, 14, 30, 60, 90];
 
 export default function UtilisationTab({
+  projectId,
   summary,
   rows,
   windowDays,
   onWindowDays,
   onOpenMachine,
+  onVerify,
 }: {
+  projectId: string | undefined;
   summary: Loadable<UtilisationSummary>;
   rows: Loadable<ListResponse<UtilisationRow>>;
   windowDays: number;
   onWindowDays: (days: number) => void;
   onOpenMachine: (equipmentId: string) => void;
+  /** Countersign a plant day. Only verified days are posted to the budget,
+   *  so this is the act that lets the hours reach the cost report. */
+  onVerify?: (utilisationId: string, label: string) => void;
 }) {
   const data = summary.data;
   const items = useMemo(() => data?.items ?? [], [data]);
@@ -489,6 +526,20 @@ export default function UtilisationTab({
             <Badge tone="success" size="xs" variant="outline">
               {isoDate(row.verifiedAt)}
             </Badge>
+          ) : onVerify ? (
+            <Button
+              size="xs"
+              variant="secondary"
+              onClick={(e) => {
+                e.stopPropagation();
+                onVerify(
+                  row.id,
+                  `${row.equipmentReference ?? row.equipmentId} on ${row.utilisationDate}`,
+                );
+              }}
+            >
+              Verify
+            </Button>
           ) : (
             <Badge tone="warning" size="xs">
               unchecked
@@ -496,7 +547,7 @@ export default function UtilisationTab({
           ),
       },
     ],
-    [],
+    [onVerify],
   );
 
   if (summary.error) return <LoadError message={summary.error} onRetry={summary.reload} />;
@@ -547,6 +598,18 @@ export default function UtilisationTab({
         label="Plant cost in the window"
         note={data.currencyNote}
       />
+
+      <PostToBudget
+        projectId={projectId}
+        from={data.from}
+        to={data.to}
+        onDone={() => {
+          summary.reload();
+          rows.reload();
+        }}
+      />
+
+      <OwnershipComparisonPanel projectId={projectId} from={data.from} to={data.to} />
 
       {chartRows.length > 0 ? (
         <ChartCard
@@ -651,6 +714,264 @@ export default function UtilisationTab({
         </>
       )}
     </div>
+  );
+}
+
+/**
+ * PUT THE PLANT ON THE COST REPORT (#715).
+ *
+ * `equipment_utilisation.budgetLineItemId` is the column that makes plant a
+ * cost rather than a diary entry. Posting is deliberately explicit and
+ * deliberately narrow:
+ *
+ *  · Only VERIFIED days post. The plant sheet is the claim; the verification
+ *    is the check. Posting unverified hours would put an unchecked claim on
+ *    the cost report as fact — the tick below says so before you send it.
+ *  · A day that could not be costed AT ALL is not posted at zero; a day that
+ *    could be costed only in part is posted at the figure that could be
+ *    computed and the budget line's stamp records it as a FLOOR.
+ *  · Re-posting the same window REPLACES this module's contribution rather
+ *    than adding to it, so a second click is safe.
+ *
+ * Every refusal and every exclusion the server reports is rendered verbatim.
+ */
+function PostToBudget({
+  projectId,
+  from,
+  to,
+  onDone,
+}: {
+  projectId: string | undefined;
+  from: string;
+  to: string;
+  onDone: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const [includeUnverified, setIncludeUnverified] = useState(false);
+  const [result, setResult] = useState<PostToBudgetResult | null>(null);
+
+  if (!projectId) return null;
+
+  return (
+    <Card>
+      <CardBody className="space-y-3">
+        <SectionHeading
+          title="Plant cost onto the cost report"
+          hint="Posts the window's coded, verified plant days onto the budget lines they were coded to. Without this the budget shows a job with no plant on it."
+          className="mb-0"
+          actions={
+            <Button
+              size="sm"
+              variant="primary"
+              loading={busy === "post"}
+              onClick={async () => {
+                const res = await run("post", () =>
+                  api.post<PostToBudgetResult>(
+                    `/api/v1/projects/${projectId}/equipment-utilisation/post-to-budget`,
+                    { from, to, includeUnverified },
+                  ),
+                );
+                if (res) {
+                  setResult(res);
+                  toast.success(
+                    res.posted === 0
+                      ? "Nothing was posted — the reasons are below"
+                      : `Posted to ${res.posted} budget line(s)`,
+                  );
+                  onDone();
+                }
+              }}
+            >
+              Post {from} to {to}
+            </Button>
+          }
+        />
+        {refusal ? <RefusalNotice refusal={refusal} onDismiss={clear} /> : null}
+        <label className="flex items-start gap-2 text-meta text-content-muted">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={includeUnverified}
+            onChange={(event) => setIncludeUnverified(event.target.checked)}
+          />
+          <span>
+            Include days nobody has verified. The plant sheet is the claim and the verification is
+            the check; ticking this posts unchecked claims, and the stamp on the budget line
+            records that you did.
+          </span>
+        </label>
+        {result ? (
+          <div className="space-y-2 rounded-md border border-border p-3">
+            <div className="text-meta text-content-muted">
+              {result.posted === 0
+                ? "Nothing was posted."
+                : `Posted to ${result.posted} budget line(s) for ${result.from} to ${result.to}.`}
+            </div>
+            {result.lines.length > 0 ? (
+              <Table>
+                <THead>
+                  <Tr>
+                    <Th>Cost code</Th>
+                    <Th align="right">Plant cost</Th>
+                    <Th align="right">Hours</Th>
+                    <Th align="right">Days</Th>
+                  </Tr>
+                </THead>
+                <TBody>
+                  {result.lines.map((line) => (
+                    <Tr key={line.budgetLineItemId}>
+                      <Td className="font-mono">{line.costCode}</Td>
+                      <Td align="right">{money(line.plantCost, line.currency)}</Td>
+                      <Td align="right">{hours(line.plantHours)}</Td>
+                      <Td align="right">{line.plantDays}</Td>
+                    </Tr>
+                  ))}
+                </TBody>
+              </Table>
+            ) : null}
+            <ReasonList reasons={result.reasons} />
+          </div>
+        ) : null}
+      </CardBody>
+    </Card>
+  );
+}
+
+/**
+ * RENTAL AGAINST OWNED, per class of machine and per currency.
+ *
+ * The comparison is cost per PRODUCTIVE hour, not cost per day: a machine that
+ * stood four days out of five did not cost a fifth of the week, and cost per
+ * day hides exactly that. The engine refuses far more often than it answers,
+ * and the refusals are rendered because they are the useful part — the
+ * commonest is owned plant carrying no internal charge-out rate, which makes
+ * the owned fleet read as free.
+ *
+ * Depreciation, financing and residual value are deliberately absent. This is
+ * an operational window, not a capital appraisal, and a screen that mixed them
+ * would present a purchase decision as a hire decision.
+ */
+function OwnershipComparisonPanel({
+  projectId,
+  from,
+  to,
+}: {
+  projectId: string | undefined;
+  from: string;
+  to: string;
+}) {
+  const [scope, setScope] = useState<"project" | "company">("project");
+  const comparison = useOwnershipComparison(
+    from,
+    to,
+    scope === "project" ? projectId : undefined,
+    Boolean(projectId),
+  );
+  const data = comparison.data;
+
+  return (
+    <Card>
+      <CardBody className="space-y-3">
+        <SectionHeading
+          title="Rental against owned"
+          hint="Is the hire desk cheaper than our own fleet, for this class of machine, in this currency? Measured per productive hour."
+          className="mb-0"
+          actions={
+            <Select
+              size="sm"
+              value={scope}
+              onChange={(event) => setScope(event.target.value === "company" ? "company" : "project")}
+              aria-label="Comparison scope"
+            >
+              <option value="project">This project</option>
+              <option value="company">Every project I can see</option>
+            </Select>
+          }
+        />
+        {comparison.error ? (
+          <LoadError message={comparison.error} onRetry={comparison.reload} />
+        ) : comparison.loading ? (
+          <SkeletonTable rows={3} />
+        ) : !data ? null : (
+          <>
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge tone="neutral" size="sm">
+                {data.totals.machineDays} machine-day{data.totals.machineDays === 1 ? "" : "s"}
+              </Badge>
+              <Badge tone="neutral" size="sm">
+                {data.totals.hiredDays} hired · {data.totals.ownedDays} owned
+              </Badge>
+              {data.totals.uncostedDays > 0 ? (
+                <Badge tone="warning" size="sm">
+                  {data.totals.uncostedDays} uncosted
+                </Badge>
+              ) : null}
+            </div>
+            {data.buckets.length === 0 ? (
+              <EmptyState
+                icon={<IconClock />}
+                title="Nothing to compare"
+                description="No plant day is recorded in this window. That is an absence of plant sheets, not an absence of plant cost."
+              />
+            ) : (
+              <Table>
+                <THead>
+                  <Tr>
+                    <Th>Class</Th>
+                    <Th>Verdict</Th>
+                    <Th align="right">Hired /productive h</Th>
+                    <Th align="right">Owned /productive h</Th>
+                    <Th align="right">Ratio</Th>
+                    <Th align="right">On the hired hours</Th>
+                    <Th>Why</Th>
+                  </Tr>
+                </THead>
+                <TBody>
+                  {data.buckets.map((bucket) => (
+                    <Tr key={`${bucket.category}|${bucket.currency}`}>
+                      <Td>
+                        {labelize(bucket.category)}
+                        <span className="ml-1 text-2xs text-content-subtle">{bucket.currency}</span>
+                      </Td>
+                      <Td>
+                        <Badge tone={OWNERSHIP_VERDICT_TONE[bucket.verdict]} size="xs" dot>
+                          {OWNERSHIP_VERDICT_LABEL[bucket.verdict]}
+                        </Badge>
+                      </Td>
+                      <Td align="right">
+                        {bucket.hired.costPerWorkingHour === null
+                          ? EM_DASH
+                          : money(bucket.hired.costPerWorkingHour, bucket.currency)}
+                      </Td>
+                      <Td align="right">
+                        {bucket.owned.costPerWorkingHour === null
+                          ? EM_DASH
+                          : money(bucket.owned.costPerWorkingHour, bucket.currency)}
+                      </Td>
+                      <Td align="right">
+                        {bucket.ratio === null ? EM_DASH : `${bucket.ratio.toFixed(2)}×`}
+                      </Td>
+                      <Td align="right">
+                        {bucket.differenceOnHiredHours === null
+                          ? EM_DASH
+                          : money(bucket.differenceOnHiredHours, bucket.currency)}
+                      </Td>
+                      <Td>
+                        <ReasonList reasons={bucket.reasons} />
+                      </Td>
+                    </Tr>
+                  ))}
+                </TBody>
+              </Table>
+            )}
+            <ReasonList reasons={data.reasons} />
+            {data.method ? (
+              <p className="text-2xs text-content-subtle">{data.method}</p>
+            ) : null}
+          </>
+        )}
+      </CardBody>
+    </Card>
   );
 }
 

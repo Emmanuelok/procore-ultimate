@@ -82,9 +82,23 @@ export function resolveSigningKey(
   };
 }
 
-/** Derive an endpoint's signing secret. Deterministic for a given master key. */
-export function deriveEndpointSecret(key: SigningKey, endpointId: string): string {
-  const bytes = hkdfSync("sha256", key.ikm, endpointId, HKDF_INFO, 32);
+/**
+ * Derive an endpoint's signing secret. Deterministic for a given master key.
+ *
+ * SECRET ROTATION (#121). The salt is `<endpointId>` for version 1 and
+ * `<endpointId>:v<N>` from version 2 on, so rotating an endpoint's secret is an
+ * increment of a small integer on the row rather than a stored credential
+ * changing. Version 1 keeps the bare salt so every secret issued before
+ * rotation existed still derives to exactly the same value — a migration that
+ * silently invalidated live secrets would be worse than no rotation at all.
+ */
+export function deriveEndpointSecret(
+  key: SigningKey,
+  endpointId: string,
+  version = 1,
+): string {
+  const salt = version <= 1 ? endpointId : `${endpointId}:v${version}`;
+  const bytes = hkdfSync("sha256", key.ikm, salt, HKDF_INFO, 32);
   return `${SECRET_PREFIX}${Buffer.from(bytes).toString("hex")}`;
 }
 
@@ -137,6 +151,17 @@ export const EVENT_HEADER = "x-constructos-event";
 export const ENDPOINT_HEADER = "x-constructos-endpoint";
 export const COMPANY_HEADER = "x-constructos-company";
 export const ATTEMPT_HEADER = "x-constructos-attempt";
+/**
+ * ROTATION HEADERS. While an endpoint is inside a rotation grace window the
+ * delivery carries TWO valid signatures: the primary header is signed with the
+ * secret the receiver already holds (so nothing breaks the moment rotation
+ * starts), and the alternate header is signed with the newly issued secret.
+ * A receiver adopts the new secret by accepting EITHER header, and once the
+ * grace window closes the primary header carries the new secret alone.
+ */
+export const ALT_SIGNATURE_HEADER = "x-constructos-signature-alt";
+export const SECRET_VERSION_HEADER = "x-constructos-secret-version";
+export const ALT_SECRET_VERSION_HEADER = "x-constructos-secret-version-alt";
 export const SIGNATURE_VERSION = "v1";
 
 export interface WebhookEnvelope {
@@ -148,6 +173,13 @@ export interface WebhookEnvelope {
   projectId: string | null;
   occurredAt: string;
   endpointId: string;
+  /**
+   * Present and true only for a DEVELOPER SANDBOX tenant (#123). A receiver
+   * that acts on webhooks — raising a payable, releasing a shipment — reads it
+   * and refuses. Absent on every ordinary tenant, so the wire format for real
+   * traffic is exactly what it was.
+   */
+  sandbox?: boolean;
   data: Record<string, unknown>;
 }
 

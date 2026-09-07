@@ -2,7 +2,8 @@
  * Shared types + small presentational helpers for the assurance surfaces
  * (project workspace, company register) and the AI workspace.
  */
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
+import { api, fetchBlobUrl } from "../../lib/api";
 
 export interface ListResponse<T> {
   items: T[];
@@ -104,6 +105,10 @@ export interface EntityRow {
   screeningStatus: string | null;
   notes: string | null;
   createdAt: string;
+  /** Soft delete: the row and its relationships are retained as evidence. */
+  deletedAt?: string | null;
+  deletedBy?: string | null;
+  deleteReason?: string | null;
 }
 
 export interface EntityRelationshipRow {
@@ -178,7 +183,100 @@ export function daysUntil(iso: string | null): number | null {
   return Math.ceil((d - Date.now()) / 86_400_000);
 }
 
+/**
+ * Download a file from an API route that requires the bearer token.
+ *
+ * A plain `<a href="/api/v1/…">` cannot work here: the client puts the access
+ * token and the tenant header on every request itself, and a browser
+ * navigation carries neither, so the link returned 401 and the pack never
+ * arrived (nor was its download logged in the chain-of-custody register).
+ */
+export async function downloadAuthenticated(path: string, filename: string): Promise<void> {
+  const url = await fetchBlobUrl(path);
+  try {
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 /* -------------------------------- Components ------------------------------- */
+
+export interface PackAccessRow {
+  id: string;
+  packId: string;
+  actorId: string | null;
+  action: string;
+  detail: Record<string, unknown>;
+  at: string;
+}
+
+/**
+ * Chain of custody for one evidence pack: who created, viewed, verified and
+ * downloaded it, and when.
+ *
+ * The referral-pack feature is sold on this log — "who has seen this bundle"
+ * is part of what makes it evidence — and it was written on every access but
+ * had no surface anywhere, so nobody could read it. It loads on demand rather
+ * than with the pack list: a register of 25 packs should not fire 25 requests
+ * for logs nobody has asked to see.
+ */
+export function PackAccessLog({ packId }: { packId: string }) {
+  const [rows, setRows] = useState<PackAccessRow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setRows(null);
+    setError(null);
+    api
+      .get<{ items: PackAccessRow[] }>(`/api/v1/evidence-packs/${packId}/access`)
+      .then((res) => {
+        if (!cancelled) setRows(res.items);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setRows([]);
+        setError(err instanceof Error ? err.message : "Failed to load the access log");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [packId]);
+
+  if (error) {
+    return <p className="text-xs text-red-700">{error}</p>;
+  }
+  if (rows === null) {
+    return <p className="text-xs text-ink-400">Loading the chain of custody…</p>;
+  }
+  if (rows.length === 0) {
+    return (
+      <p className="text-xs text-ink-400">
+        No access recorded. Generation itself is logged, so an empty log means this pack predates
+        the register rather than that nobody has opened it.
+      </p>
+    );
+  }
+  return (
+    <ul className="space-y-0.5 text-xs">
+      {rows.map((r) => (
+        <li key={r.id} className="flex items-baseline gap-2">
+          <span className="w-16 shrink-0 font-medium text-ink-700">{r.action}</span>
+          <span className="font-mono text-ink-500">{truncateMiddle(r.actorId ?? "system", 6)}</span>
+          <span className="ml-auto whitespace-nowrap text-ink-400">
+            {new Date(r.at).toLocaleString()}
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 export function StatCard({
   label,

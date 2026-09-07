@@ -15,7 +15,7 @@
  * Importing this module registers each kind's default policy, so a tenant
  * that has never opened the policy page still has a ceiling in force.
  */
-import { AI_AGENT_KINDS, type AgentCategory } from "@constructos/shared";
+import { AI_AGENT_KINDS, type AgentCategory, type ToolKey } from "@constructos/shared";
 import { promptVersion } from "./service.js";
 import { registerPolicyDefaults, type PolicyDefaults } from "./policy.js";
 import { assuranceAgents } from "./agents/assurance.js";
@@ -61,6 +61,8 @@ export interface LegacyAgentEntry {
   inputs: string[];
   outputs: string[];
   dataCategories: string[];
+  /** the tools that own the records this agent reads or writes */
+  requiredTools: ToolKey[];
   targetTypes: string[];
   consequential: boolean;
   route: string;
@@ -77,6 +79,7 @@ export const LEGACY_AGENTS: LegacyAgentEntry[] = [
     inputs: ["drawing OCR text", "files", "RFIs", "submittals"],
     outputs: ["cited answer"],
     dataCategories: ["drawing_text", "correspondence", "project_metadata"],
+    requiredTools: ["drawings", "documents", "rfis", "submittals"],
     targetTypes: [],
     consequential: false,
     route: "POST /projects/:projectId/ai/search",
@@ -91,6 +94,7 @@ export const LEGACY_AGENTS: LegacyAgentEntry[] = [
     inputs: ["RFI", "pinned drawing revisions", "linked records"],
     outputs: ["suggested response"],
     dataCategories: ["correspondence", "drawing_text"],
+    requiredTools: ["rfis", "drawings"],
     targetTypes: ["rfi_response"],
     consequential: true,
     route: "POST /projects/:projectId/ai/rfi-evaluate",
@@ -105,6 +109,7 @@ export const LEGACY_AGENTS: LegacyAgentEntry[] = [
     inputs: ["submittal", "attached documents", "specification section text"],
     outputs: ["recommendation", "findings"],
     dataCategories: ["specification_text", "field_records", "images"],
+    requiredTools: ["submittals", "specifications"],
     targetTypes: ["submittal_review"],
     consequential: false,
     route: "POST /projects/:projectId/ai/submittal-review",
@@ -119,6 +124,7 @@ export const LEGACY_AGENTS: LegacyAgentEntry[] = [
     inputs: ["photos", "punch items", "RFIs", "previous daily log"],
     outputs: ["daily log draft"],
     dataCategories: ["field_records", "images"],
+    requiredTools: ["daily_logs", "photos", "punch", "rfis"],
     targetTypes: ["daily_log"],
     consequential: true,
     route: "POST /projects/:projectId/ai/daily-log-draft",
@@ -133,6 +139,7 @@ export const LEGACY_AGENTS: LegacyAgentEntry[] = [
     inputs: ["drawing revision OCR text"],
     outputs: ["sheet number", "title", "discipline"],
     dataCategories: ["drawing_text"],
+    requiredTools: ["drawings"],
     targetTypes: ["drawing_sheet"],
     consequential: true,
     route: "POST /projects/:projectId/ai/sheet-name",
@@ -147,6 +154,7 @@ export const LEGACY_AGENTS: LegacyAgentEntry[] = [
     inputs: ["photo image"],
     outputs: ["tags", "progress summary", "safety signals"],
     dataCategories: ["images", "field_records"],
+    requiredTools: ["photos"],
     targetTypes: [],
     consequential: true,
     route: "POST /projects/:projectId/ai/photo-intel",
@@ -161,6 +169,7 @@ export const LEGACY_AGENTS: LegacyAgentEntry[] = [
     inputs: ["project metadata", "record counts"],
     outputs: ["answer"],
     dataCategories: ["project_metadata"],
+    requiredTools: ["projects"],
     targetTypes: [],
     consequential: false,
     route: "POST /projects/:projectId/ai/assist",
@@ -187,6 +196,12 @@ export interface AgentInventoryEntry {
   inputs: string[];
   outputs: string[];
   dataCategories: string[];
+  /**
+   * Tools the caller must hold (at "read") on the run's project before the
+   * agent gathers anything. Published on GET /agents so an administrator can
+   * see which permission actually governs each agent rather than guessing.
+   */
+  requiredTools: ToolKey[];
   targetTypes: string[];
   consequential: boolean;
   schedulable: boolean;
@@ -207,6 +222,7 @@ export const AGENT_INVENTORY: AgentInventoryEntry[] = [
     inputs: d.inputs,
     outputs: d.outputs,
     dataCategories: [...d.dataCategories],
+    requiredTools: [...d.requiredTools],
     targetTypes: [...d.targetTypes],
     consequential: d.consequential,
     schedulable: d.schedulable,
@@ -224,6 +240,7 @@ export const AGENT_INVENTORY: AgentInventoryEntry[] = [
     inputs: l.inputs,
     outputs: l.outputs,
     dataCategories: l.dataCategories,
+    requiredTools: l.requiredTools,
     targetTypes: l.targetTypes,
     consequential: l.consequential,
     schedulable: false,

@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from "fastify";
 import { and, asc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import {
+  bidAwards,
   bidLevellingEntries,
   bidLevellingItems,
   bidPackages,
@@ -192,6 +193,33 @@ export const levellingRoutes: FastifyPluginAsync = async (app) => {
     return rows[0];
   }
 
+  /**
+   * A LEVELLING FROZEN BY AN AWARD DOES NOT MOVE.
+   *
+   * `normalisedAmount` is the figure the award was measured against and the
+   * figure recorded on the award as the lowest comparable bid. Re-running the
+   * levelling after an award existed silently rewrote it, so the record of
+   * why that bidder won stopped matching the numbers it was based on. Only
+   * the seal was guarded before; the award is the other lock.
+   */
+  async function assertNoLiveAward(packageId: string, what: string): Promise<void> {
+    const awards = await app.db
+      .select({ id: bidAwards.id, reference: bidAwards.reference, status: bidAwards.status })
+      .from(bidAwards)
+      .where(eq(bidAwards.packageId, packageId));
+    const live = awards.find(
+      (a) => !["rejected", "withdrawn", "cancelled"].includes(a.status),
+    );
+    if (live) {
+      throw conflict(
+        `${what} refused — this package carries award ${live.reference} at status ` +
+          `"${live.status}", and the levelled amounts are what that award was measured against. ` +
+          "Changing them now would leave the recommendation standing on figures that no longer " +
+          "exist. Withdraw or reject the award first if the levelling was wrong.",
+      );
+    }
+  }
+
   async function fetchEntry(entryId: string, companyId: string) {
     const rows = await app.db
       .select()
@@ -214,6 +242,14 @@ export const levellingRoutes: FastifyPluginAsync = async (app) => {
       const parsed = itemsCreateSchema.parse(req.body);
       const wanted = "items" in parsed ? parsed.items : [parsed];
       const pkg = await fetchPackage(app.db, packageId, req.companyId!, req.projectId!);
+      /*
+       * ADDING a scope row under a live award moves what the award covers.
+       * `planAwardScope` reports "remaining" from these rows, so a new
+       * mandatory row after a partial award silently changes what the
+       * platform believes was bought, with no record that the scope moved.
+       * The edit and delete paths were already frozen; this is the third.
+       */
+      await assertNoLiveAward(packageId, "Adding a levelling scope row");
       const existing = await app.db
         .select({ position: bidLevellingItems.position, itemCode: bidLevellingItems.itemCode })
         .from(bidLevellingItems)
@@ -302,6 +338,8 @@ export const levellingRoutes: FastifyPluginAsync = async (app) => {
     const { itemId } = req.params as { itemId: string };
     const item = await fetchItem(itemId, req.companyId!);
     await requireBiddingLevel(app, req, reply, item.projectId, "standard");
+    /* A scope row is part of the basis a live award was decided on. */
+    await assertNoLiveAward(item.packageId, "Editing a levelling scope row");
     const body = itemSchema.partial().parse(req.body);
     const patch: Record<string, unknown> = { updatedAt: new Date().toISOString() };
     for (const key of [
@@ -337,6 +375,7 @@ export const levellingRoutes: FastifyPluginAsync = async (app) => {
     const { itemId } = req.params as { itemId: string };
     const item = await fetchItem(itemId, req.companyId!);
     await requireBiddingLevel(app, req, reply, item.projectId, "standard");
+    await assertNoLiveAward(item.packageId, "Deleting a levelling scope row");
     const entries = await app.db
       .select({ id: bidLevellingEntries.id })
       .from(bidLevellingEntries)
@@ -369,6 +408,7 @@ export const levellingRoutes: FastifyPluginAsync = async (app) => {
       const wanted = "entries" in parsed ? parsed.entries : [parsed];
       const pkg = await fetchPackage(app.db, packageId, req.companyId!, req.projectId!);
       assertUnsealedForAnalysis(pkg, "Levelling");
+      await assertNoLiveAward(packageId, "Editing the levelling");
 
       const itemRows = await app.db
         .select()
@@ -543,6 +583,7 @@ export const levellingRoutes: FastifyPluginAsync = async (app) => {
       const { packageId } = req.params as { packageId: string };
       const pkg = await fetchPackage(app.db, packageId, req.companyId!, req.projectId!);
       assertUnsealedForAnalysis(pkg, "Auto-mapping bid lines onto scope rows");
+      await assertNoLiveAward(packageId, "Auto-mapping bid lines onto scope rows");
       const items = await app.db
         .select()
         .from(bidLevellingItems)
@@ -706,7 +747,18 @@ export const levellingRoutes: FastifyPluginAsync = async (app) => {
           reference: pkg.reference,
           currency: pkg.currency,
           engineersEstimate: pkg.engineersEstimate,
-          levelledAt: pkg.status === "levelled" ? pkg.updatedAt : null,
+          /*
+           * Derived from the submissions, not from the package status: the
+           * levelling was completed at a moment, and that moment does not
+           * stop having happened when the package moves on to
+           * under_evaluation or awarded.
+           */
+          levelledAt:
+            submissionRows
+              .map((s) => s.levellingCompletedAt)
+              .filter((x): x is string => Boolean(x))
+              .sort()
+              .at(-1) ?? null,
         },
         items: comparison.items,
         submissions: facts.map((f) => ({
@@ -735,6 +787,7 @@ export const levellingRoutes: FastifyPluginAsync = async (app) => {
       const { packageId } = req.params as { packageId: string };
       const pkg = await fetchPackage(app.db, packageId, req.companyId!, req.projectId!);
       assertUnsealedForAnalysis(pkg, "Completing the levelling");
+      await assertNoLiveAward(packageId, "Re-completing the levelling");
       const { items, entries, submissionRows } = await loadLevellingFacts(app.db, packageId);
       const facts = comparisonFacts(submissionRows);
       const comparison = buildComparison(items, entries, facts);
@@ -759,10 +812,19 @@ export const levellingRoutes: FastifyPluginAsync = async (app) => {
           .where(eq(bidSubmissions.id, levelled.submissionId));
         frozen.push({ submissionId: levelled.submissionId, normalisedAmount: amount });
       }
-      await app.db
-        .update(bidPackages)
-        .set({ status: "levelled", updatedAt: now })
-        .where(eq(bidPackages.id, packageId));
+      /*
+       * Never regress: a package at under_evaluation (a recommendation
+       * exists), awarded or partially_awarded is past "levelled", and moving
+       * it backwards was what made the grid's `levelledAt` go null as soon as
+       * anybody recommended a bidder.
+       */
+      const PAST_LEVELLED = ["under_evaluation", "awarded", "partially_awarded"];
+      if (!PAST_LEVELLED.includes(pkg.status)) {
+        await app.db
+          .update(bidPackages)
+          .set({ status: "levelled", updatedAt: now })
+          .where(eq(bidPackages.id, packageId));
+      }
 
       await ledger(
         app.db,

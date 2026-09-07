@@ -40,12 +40,12 @@ import { appendLedger } from "../../lib/ledger.js";
 import { forEachCompany } from "../../lib/scheduler.js";
 import { pushNotifications, type NotifyTarget } from "../notifications/service.js";
 import { addDaysISO } from "./dates.js";
-import { projectManagerIds } from "./access.js";
+import { hasToolAdmin, projectManagerIds } from "./access.js";
 import { ageInDays, daysOverdue, escalationLevelFor } from "./ageingEngine.js";
 import { businessDaysBetween } from "./dailyLogEngine.js";
 import { PUNCH_OPEN_STATUSES } from "./punchEngine.js";
 import { loadFieldSettings } from "./settings.js";
-import { pad3 } from "./shared.js";
+import { actorOf, pad3 } from "./shared.js";
 
 export const ESCALATION_JOB = "field.overdue-escalation";
 const DAILY_LOG_LOOKBACK_DAYS = 14;
@@ -364,7 +364,15 @@ export const escalationRoutes: FastifyPluginAsync = async (app) => {
       .limit(q.limit);
     const byLevel: Record<string, number> = { "1": 0, "2": 0, "3": 0 };
     for (const i of items) byLevel[String(i.level)] = (byLevel[String(i.level)] ?? 0) + 1;
-    return { items, byLevel, job: ESCALATION_JOB };
+    // `canRun` mirrors the POST .../run gate (rfis:admin), which a
+    // project_manager holds without being a company admin — the UI must not
+    // hide the button from the role the API grants it to.
+    return {
+      items,
+      byLevel,
+      job: ESCALATION_JOB,
+      permissions: { canRun: await hasToolAdmin(app, actorOf(req), req.projectId!, "rfis") },
+    };
   });
 
   app.post("/projects/:projectId/field/escalations/run", { preHandler: adminGate }, async (req) => {

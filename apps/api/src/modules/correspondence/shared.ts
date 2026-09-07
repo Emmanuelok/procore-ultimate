@@ -8,8 +8,10 @@
  *  - LEDGER. Every consequential mutation appends. `ledger()` fixes the
  *    object-type vocabulary so the correspondence chain reads as one record.
  *  - IDEMPOTENT SIGNALS. A sweep that re-detects the same condition must
- *    produce nothing the second time. `alreadySignalled` reads the dedupe
- *    keys carried in `signals.evidenceRefs.key`, the platform convention.
+ *    produce nothing the second time. `alreadySignalled` asks the register
+ *    about the exact dedupe keys the sweep is considering — the keys live in
+ *    `signals.evidenceRefs.key`, the platform convention — so the answer is
+ *    never truncated by a row cap.
  *  - DEADLINES ARE OBLIGATIONS. A response due date and an acknowledgement
  *    due date are promises someone made; `openObligation` puts them in the
  *    assurance register rather than inventing a second deadline store.
@@ -17,7 +19,7 @@
  *    `{ value: null, reasons }`, never a fabricated zero.
  */
 import type { FastifyInstance } from "fastify";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   companyMemberships,
@@ -169,32 +171,40 @@ export interface CorrSignalDraft {
 }
 
 /**
- * Dedupe keys already raised for a detector (open or closed). Every key this
- * module mints names a record inside one project, so a per-project sweep
- * passes `projectId` and reads only that project's signals rather than the
- * whole company's history on every pass.
+ * Which of `candidates` have already been raised for these detectors (open or
+ * closed). The query asks about the exact keys the sweep is considering rather
+ * than reading the project's whole signal history and hoping it fits under a
+ * row cap: a dedupe set that silently truncates raises the same signal twice,
+ * which is the one thing a sweep must never do.
  */
 export async function alreadySignalled(
   db: Db,
   companyId: string,
   detectors: readonly CorrespondenceDetector[],
-  projectId?: string | null,
+  projectId: string | null,
+  candidates: readonly string[],
 ): Promise<Set<string>> {
-  const rows = await db
-    .select({ refs: signals.evidenceRefs })
-    .from(signals)
-    .where(
-      and(
-        eq(signals.companyId, companyId),
-        projectId ? eq(signals.projectId, projectId) : undefined,
-        inArray(signals.detector, [...detectors]),
-      ),
-    )
-    .limit(20_000);
   const keys = new Set<string>();
-  for (const row of rows) {
-    const refs = row.refs as { key?: unknown } | null;
-    if (typeof refs?.key === "string") keys.add(refs.key);
+  const unique = [...new Set(candidates)];
+  if (unique.length === 0) return keys;
+  // Chunked so a sweep over thousands of records never builds one enormous IN
+  // list, and so every candidate is actually asked about.
+  for (let i = 0; i < unique.length; i += 500) {
+    const chunk = unique.slice(i, i + 500);
+    const rows = await db
+      .select({ key: sql<string>`(${signals.evidenceRefs} ->> 'key')` })
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, companyId),
+          projectId ? eq(signals.projectId, projectId) : undefined,
+          inArray(signals.detector, [...detectors]),
+          inArray(sql`(${signals.evidenceRefs} ->> 'key')`, chunk),
+        ),
+      );
+    for (const row of rows) {
+      if (typeof row.key === "string") keys.add(row.key);
+    }
   }
   return keys;
 }
@@ -279,6 +289,46 @@ export async function openObligation(
     payload: { for: input.objectType, recordId: input.objectId, deadline: input.deadlineDate },
   });
   return id;
+}
+
+/**
+ * Move the deadline of an obligation this module opened. A record whose
+ * acknowledgement or response date moves must not leave the assurance register
+ * chasing the superseded date: two sources of truth for one deadline is how a
+ * register starts lying. Returns true when an OPEN obligation actually moved.
+ */
+export async function moveObligationDeadline(
+  db: Db,
+  companyId: string,
+  projectId: string,
+  actorId: string | null,
+  obligationId: string | null,
+  deadlineDate: string,
+  why: string,
+): Promise<boolean> {
+  if (!obligationId) return false;
+  const rows = await db
+    .update(obligations)
+    .set({ deadline: `${deadlineDate}T00:00:00.000Z` })
+    .where(
+      and(
+        eq(obligations.id, obligationId),
+        eq(obligations.companyId, companyId),
+        eq(obligations.status, "open"),
+      ),
+    )
+    .returning({ id: obligations.id });
+  if (rows.length === 0) return false;
+  await ledger(db, {
+    companyId,
+    projectId,
+    actorId,
+    action: "update",
+    objectType: "obligation",
+    objectId: obligationId,
+    payload: { deadline: deadlineDate, why },
+  });
+  return true;
 }
 
 /** Close an obligation that this module opened, recording why. */

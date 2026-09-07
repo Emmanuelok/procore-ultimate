@@ -13,7 +13,8 @@
  * are printed. `percentComplete` on a zero-value line is the common case, and
  * a 0 there would be a factual claim that no work has been done.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { toast } from "sonner";
 import { api } from "../../lib/api";
 import {
   Alert,
@@ -43,7 +44,7 @@ import {
   useReceipts,
   type Loadable,
 } from "./shared";
-import type { BillingView, ContractView, G703Line } from "./types";
+import type { AiaExportPayload, BillingView, ContractView, G703Line } from "./types";
 
 export default function Certificate({
   contract,
@@ -62,6 +63,7 @@ export default function Certificate({
   const [submitting, setSubmitting] = useState(false);
   const [certifying, setCertifying] = useState(false);
   const [receiving, setReceiving] = useState(false);
+  const [exporting, setExporting] = useState(false);
 
   const view = billing.data;
   const receipts = useReceipts(contract.id, view?.application.id ?? null);
@@ -364,6 +366,9 @@ export default function Certificate({
             Record a receipt
           </Button>
         ) : null}
+        <Button size="sm" variant="ghost" onClick={() => setExporting(true)} disabled={busy !== null}>
+          Export G702/G703
+        </Button>
         {a.status === "draft" || a.status === "submitted" || a.status === "rejected" ? (
           <Button
             size="sm"
@@ -553,6 +558,15 @@ export default function Certificate({
           onChanged();
         }}
       />
+      <AiaExportDialog
+        open={exporting}
+        contractId={contract.id}
+        contractReference={contract.reference}
+        applicationId={a.id}
+        applicationReference={a.reference}
+        currency={cur}
+        onClose={() => setExporting(false)}
+      />
       <CertifyDialog
         open={certifying}
         contractId={contract.id}
@@ -589,6 +603,216 @@ export default function Certificate({
  * short-pays a retention dispute, or pays in two wires — so the receipt is
  * the record and the application's settlement is derived from the receipts.
  */
+/**
+ * The AIA export (#514) — the one artefact an owner hands to a lender or an
+ * architect. The structured payload is shown first so what leaves the system
+ * is visible before it leaves it; the CSV is the same figures, fetched from
+ * the same endpoint (which ledgers the access) and written to a file.
+ */
+function AiaExportDialog({
+  open,
+  contractId,
+  contractReference,
+  applicationId,
+  applicationReference,
+  currency,
+  onClose,
+}: {
+  open: boolean;
+  contractId: string;
+  contractReference: string;
+  applicationId: string;
+  applicationReference: string;
+  currency: string;
+  onClose: () => void;
+}) {
+  const [data, setData] = useState<AiaExportPayload | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    let live = true;
+    setLoading(true);
+    setError(null);
+    api
+      .get<AiaExportPayload>(
+        `/api/v1/prime-contracts/${contractId}/billings/${applicationId}/export?format=json`,
+      )
+      .then((d) => {
+        if (live) setData(d);
+      })
+      .catch((e: unknown) => {
+        if (live) setError(e instanceof Error ? e.message : "The export could not be built.");
+      })
+      .finally(() => {
+        if (live) setLoading(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [open, contractId, applicationId]);
+
+  async function downloadCsv() {
+    setDownloading(true);
+    try {
+      const csv = await api.get<string>(
+        `/api/v1/prime-contracts/${contractId}/billings/${applicationId}/export?format=csv`,
+      );
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `${contractReference}-${applicationReference}-g702-g703.csv`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      toast.success(`${applicationReference} exported as CSV`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "The CSV could not be downloaded.");
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  const g703Headers = data?.g703[0] ? Object.keys(data.g703[0]) : [];
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      size="xl"
+      title={`AIA G702/G703 data — ${applicationReference}`}
+      footer={
+        <div className="flex items-center justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Close
+          </Button>
+          <Button onClick={downloadCsv} disabled={loading || downloading || data === null}>
+            {downloading ? "Preparing…" : "Download CSV"}
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {error ? (
+          <Alert tone="danger" title="The export could not be produced">
+            {error}
+          </Alert>
+        ) : null}
+        {loading ? (
+          <div className="flex items-center gap-2 py-6 text-meta">
+            <Spinner size="sm" /> Building the export…
+          </div>
+        ) : null}
+        {data ? (
+          <>
+            <p className="text-2xs text-content-subtle">
+              {data.form} · {currency}. Every figure below is read from the certified application
+              and its continuation sheet; nothing here is re-derived by this screen. The download
+              is recorded in the ledger as an access event.
+            </p>
+            <div>
+              <h4 className="mb-1 text-xs font-semibold uppercase tracking-wide text-content-subtle">
+                G702 — application and certificate for payment
+              </h4>
+              <dl className="grid gap-x-4 gap-y-1 sm:grid-cols-2">
+                {Object.entries(data.g702).map(([k, v]) => (
+                  <div key={k} className="flex justify-between gap-3 border-b border-border-subtle py-1">
+                    <dt className="text-2xs text-content-subtle">{k}</dt>
+                    <dd className="font-mono text-2xs tabular-nums">
+                      {v === null || v === "" ? (
+                        <span className="italic text-content-subtle">not recorded</span>
+                      ) : (
+                        String(v)
+                      )}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+            <div>
+              <h4 className="mb-1 text-xs font-semibold uppercase tracking-wide text-content-subtle">
+                Change order summary
+              </h4>
+              {data.changeOrderSummary.rows.length === 0 ? (
+                <p className="text-2xs text-content-subtle">
+                  No executed change orders on this contract, so the summary is empty rather than
+                  zero-filled.
+                </p>
+              ) : (
+                <ul className="text-2xs">
+                  {data.changeOrderSummary.rows.map((r) => (
+                    <li key={r.reference} className="flex justify-between gap-3 border-b border-border-subtle py-1">
+                      <span className="font-mono">{r.reference}</span>
+                      <span className="font-mono tabular-nums">
+                        +{money(r.additions, currency)} / −{money(r.deductions, currency)}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <p className="mt-1 text-2xs">
+                Net change by change order:{" "}
+                <span className="font-mono tabular-nums">{money(data.changeOrderSummary.net, currency)}</span>
+              </p>
+            </div>
+            <div>
+              <h4 className="mb-1 text-xs font-semibold uppercase tracking-wide text-content-subtle">
+                G703 — continuation sheet ({data.g703.length} line
+                {data.g703.length === 1 ? "" : "s"})
+              </h4>
+              {g703Headers.length === 0 ? (
+                <p className="text-2xs text-content-subtle">
+                  This application has no continuation sheet lines.
+                </p>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="min-w-full text-2xs">
+                    <thead>
+                      <tr className="border-b border-border">
+                        {g703Headers.map((h) => (
+                          <th key={h} className="whitespace-nowrap px-2 py-1 text-left font-medium text-content-subtle">
+                            {h}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.g703.map((row, i) => (
+                        <tr key={`${String(row["A. ITEM NO"] ?? i)}-${i}`} className="border-b border-border-subtle">
+                          {g703Headers.map((h) => (
+                            <td key={h} className="whitespace-nowrap px-2 py-1 font-mono tabular-nums">
+                              {row[h] === null ? "—" : String(row[h])}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                      <tr className="font-semibold">
+                        {g703Headers.map((h) => (
+                          <td key={h} className="whitespace-nowrap px-2 py-1 font-mono tabular-nums">
+                            {h in data.g703Totals
+                              ? String(data.g703Totals[h])
+                              : h === "A. ITEM NO"
+                                ? "TOTALS"
+                                : ""}
+                          </td>
+                        ))}
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </>
+        ) : null}
+      </div>
+    </Modal>
+  );
+}
+
 function ReceiptDialog({
   open,
   contractId,

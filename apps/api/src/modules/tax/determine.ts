@@ -464,12 +464,21 @@ function determineWithholding(ctx: Ctx): WhtResult {
     }
     const baseAmount = baseAmountFor(rd.base, input);
     ctx.citations.push({ element: "withholding", rule: `${rd.summary} ${basis}.`, source: rd.citation });
-    if (rd.base === "gross_excl_materials" && input.materialsAmount > 0) {
-      ctx.citations.push({
-        element: "withholding",
-        rule: `Materials of ${input.currency} ${input.materialsAmount.toFixed(2)} excluded from the deduction base`,
-        source: rd.citation,
-      });
+    if (rd.base === "gross_excl_materials" || rd.base === "labour_only") {
+      if (input.materialsAmount > 0) {
+        ctx.citations.push({
+          element: "withholding",
+          rule: `Materials of ${input.currency} ${input.materialsAmount.toFixed(2)} excluded from the deduction base`,
+          source: rd.citation,
+        });
+      } else if (rate > 0 && (input.supplyType === "construction_services" || input.supplyType === "mixed")) {
+        // The scheme deducts net of materials (#802). Nothing told us what the
+        // materials were, so the whole amount is being deducted on: say so and
+        // drop the confidence rather than present an over-deduction as certain.
+        ctx.assumptions.push(
+          `No materials split was supplied, so the whole ${input.currency} ${input.amount.toFixed(2)} is treated as the deduction base. ${rd.base === "labour_only" ? "Only labour" : "The amount net of materials"} is deductible under ${wht.name}: split the invoice if it includes materials.`,
+        );
+      }
     }
     return {
       scheme: wht.scheme,
@@ -747,6 +756,7 @@ export interface RegistrationLike {
   status: string;
   verificationStatus: string;
   deductionRate: number | null;
+  validFrom: string | null;
   validTo: string | null;
 }
 
@@ -757,8 +767,15 @@ export function positionFromRegistrations(
   asOf: string,
   isIndividual = false,
 ): PartyTaxPosition {
+  // A registration is live on the determination date only inside its own
+  // validity window: one recorded today as valid from next April says nothing
+  // about a supply made today, and must not flip the party's position early.
   const live = rows.filter(
-    (r) => r.regime === regime && r.status === "active" && (!r.validTo || r.validTo >= asOf),
+    (r) =>
+      r.regime === regime &&
+      r.status === "active" &&
+      (!r.validFrom || r.validFrom <= asOf) &&
+      (!r.validTo || r.validTo >= asOf),
   );
   const any = rows.some((r) => r.regime === regime);
   const vat = live.find((r) => r.kind === "vat");

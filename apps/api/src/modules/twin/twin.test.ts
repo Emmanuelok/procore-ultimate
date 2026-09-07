@@ -135,6 +135,61 @@ describe("twin — asset register", () => {
     expect(badOwner.statusCode).toBe(400);
   });
 
+  it("refuses an owner who cannot open the project, and keeps them out of the picker", async () => {
+    // an owner is paged when this asset's warranty expires or its sensors
+    // breach, and the alert names the project — company membership alone put
+    // a colleague with no access on the hook for equipment they cannot see
+    const offProject = await registerActor(built.app);
+    await built.app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: offProject.userId,
+      role: "member",
+    });
+
+    const refused = await inject("POST", `/api/v1/projects/${projectId}/assets`, owner.headers, {
+      tagCode: "OWN-01",
+      name: "Owned by an outsider",
+      ownerId: offProject.userId,
+    });
+    expect(refused.statusCode).toBe(400);
+    expect(refused.json().message).toMatch(/member of this project/i);
+
+    const sensorRefused = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/sensors`,
+      owner.headers,
+      { name: "Outsider channel", kind: "temperature", unit: "C", ownerId: offProject.userId },
+    );
+    expect(sensorRefused.statusCode).toBe(400);
+
+    // ... and the picker never offers them in the first place
+    const picker = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/twin/assignable-people`,
+      owner.headers,
+    );
+    expect(picker.statusCode).toBe(200);
+    const ids = (picker.json().items as Array<{ id: string; basis: string }>).map((p) => p.id);
+    expect(ids).not.toContain(offProject.userId);
+    expect(ids).toContain(manager.userId);
+    // the company owner is offered even without a project membership row,
+    // because requireTool lets them into every project
+    expect(ids).toContain(owner.userId);
+    const ownerRow = (
+      picker.json().items as Array<{ id: string; basis: string }>
+    ).find((p) => p.id === owner.userId);
+    expect(ownerRow?.basis).toBe("company_admin");
+
+    // a project member remains a valid owner
+    const accepted = await inject("POST", `/api/v1/projects/${projectId}/assets`, owner.headers, {
+      tagCode: "OWN-02",
+      name: "Owned by the PM",
+      ownerId: manager.userId,
+    });
+    expect(accepted.statusCode).toBe(201);
+  });
+
   it("enforces the forward-only lifecycle and stamps the dates", async () => {
     const commissioned = await inject("PATCH", `/api/v1/assets/${assetId}`, owner.headers, {
       status: "commissioned",
@@ -283,6 +338,54 @@ describe("twin — asset register", () => {
     expect(again.json().createdCount).toBe(0);
     expect(again.json().skippedAlreadyLinked).toBe(2);
   });
+
+  it("terminates on a tag pattern that cannot vary with {seq}", async () => {
+    // "AHU-{storey}" renders identically for every element on a storey, which
+    // is the norm in IFC. The collision loop used to bump seq and re-render
+    // the same string for ever — a synchronous spin that wedges the event
+    // loop for EVERY tenant, reachable with one request.
+    const versionId = newId("bmv");
+    await built.app.db.insert(bimElements).values([
+      {
+        id: newId("bel"),
+        modelVersionId: versionId,
+        projectId,
+        globalId: "3NOSEQELEMENTGUID00AAA",
+        ifcType: "IFCAIRTERMINAL",
+        name: "AHU 1",
+        storey: "Level 02",
+      },
+      {
+        id: newId("bel"),
+        modelVersionId: versionId,
+        projectId,
+        globalId: "3NOSEQELEMENTGUID00BBB",
+        ifcType: "IFCAIRTERMINAL",
+        name: "AHU 2",
+        storey: "Level 02",
+      },
+      {
+        id: newId("bel"),
+        modelVersionId: versionId,
+        projectId,
+        globalId: "3NOSEQELEMENTGUID00CCC",
+        ifcType: "IFCAIRTERMINAL",
+        name: "AHU 3",
+        storey: "Level 02",
+      },
+    ]);
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/assets/from-elements`,
+      owner.headers,
+      { modelVersionId: versionId, ifcType: "IFCAIRTERMINAL", tagPattern: "AHU-{storey}" },
+    );
+    expect(res.statusCode).toBe(201);
+    expect(res.json().createdCount).toBe(3);
+    const tags = (res.json().created as Array<{ tagCode: string }>).map((c) => c.tagCode);
+    expect(new Set(tags).size).toBe(3);
+    expect(tags[0]).toBe("AHU-Level02");
+  }, 20_000);
 
   it("links and unlinks elements by GlobalId, refusing unknown ones", async () => {
     const bad = await inject("POST", `/api/v1/assets/${assetId}/elements`, owner.headers, {
@@ -479,13 +582,68 @@ describe("twin — sensors, ingestion and alerts", () => {
     expect(res.statusCode).toBe(201);
     expect(res.json().inserted).toBe(0);
     expect(res.json().duplicates).toBe(2);
-    expect(res.json().alerts.raised).toBe(0);
-    expect(res.json().alerts.refreshed).toBe(1);
+    // nothing was stored, so nothing is new evidence: the alert register is
+    // left exactly as it was — not re-counted, and (the sharper case) not
+    // cleared by a batch that "contains no breach" only because every row in
+    // it was a duplicate
+    expect(res.json().alerts).toMatchObject({ raised: 0, refreshed: 0, cleared: 0 });
+    expect(res.json().advanced).toBe(false);
     const rows = await built.app.db
       .select()
       .from(sensorReadings)
       .where(eq(sensorReadings.sensorId, sensorId));
     expect(rows).toHaveLength(4);
+    const stillOpen = await built.app.db
+      .select()
+      .from(sensorAlerts)
+      .where(eq(sensorAlerts.sensorId, sensorId));
+    expect(stillOpen[0]).toMatchObject({ status: "open", breachCount: 3 });
+  });
+
+  it("does not rewind lastReadingAt when a gateway backfills older history", async () => {
+    // a dedicated channel so the backfill cannot perturb the alert register
+    // the surrounding tests assert on
+    const made = await inject("POST", `/api/v1/projects/${projectId}/sensors`, owner.headers, {
+      name: "Backfill probe",
+      kind: "temperature",
+      unit: "C",
+      minValue: 4,
+      maxValue: 12,
+      // carries a design setpoint so it does not become the "neither readings
+      // nor a baseline" channel the performance test looks for
+      designSetpoint: 8,
+      staleAfterMinutes: 60,
+    });
+    expect(made.statusCode).toBe(201);
+    const probeId = made.json().id as string;
+
+    const live = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/sensors/${probeId}/readings`,
+      owner.headers,
+      { readings: [{ value: 8, at: "2026-05-10T00:00:00.000Z" }] },
+    );
+    expect(live.json().advanced).toBe(true);
+    const before = await built.app.db.select().from(sensors).where(eq(sensors.id, probeId));
+    expect(before[0]!.lastReadingAt).toBeTruthy();
+
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/sensors/${probeId}/readings`,
+      owner.headers,
+      { readings: [{ value: 9, at: "2026-04-01T00:00:00.000Z" }] },
+    );
+    expect(res.statusCode).toBe(201);
+    expect(res.json().inserted).toBe(1);
+    // the row is stored, but the channel's "last heard from" high-water mark
+    // does not move backwards — sweepStaleSensors reads exactly that column,
+    // so rewinding it would report a healthy sensor as silent and the
+    // overview would show a week-old value as current
+    expect(res.json().advanced).toBe(false);
+
+    const after = await built.app.db.select().from(sensors).where(eq(sensors.id, probeId));
+    expect(after[0]!.lastReadingAt).toBe(before[0]!.lastReadingAt);
+    expect(after[0]!.lastValue).toBe(8);
   });
 
   it("clears the alert when the readings come back inside the thresholds", async () => {
@@ -615,6 +773,47 @@ describe("twin — sensors, ingestion and alerts", () => {
     expect(raised).toHaveLength(1);
   });
 
+  it("clears the stale alert and auto-closes its signal when the channel reports again", async () => {
+    // a separate channel from "Silent meter" so that one stays permanently
+    // silent for the performance report's "no readings in the window" case
+    const made = await inject("POST", `/api/v1/projects/${projectId}/sensors`, owner.headers, {
+      name: "Recovering meter",
+      kind: "energy",
+      unit: "kWh",
+      designSetpoint: 100,
+      staleAfterMinutes: 1,
+    });
+    const recoveringId = made.json().id as string;
+    await built.app.scheduler.runNow("twin.sensor-stale");
+    const opened = await built.app.db
+      .select()
+      .from(sensorAlerts)
+      .where(eq(sensorAlerts.sensorId, recoveringId));
+    expect(opened).toHaveLength(1);
+    expect(opened[0]!.signalId).toBeTruthy();
+
+    const resumed = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/sensors/${recoveringId}/readings`,
+      owner.headers,
+      { readings: [{ value: 102, at: new Date().toISOString() }] },
+    );
+    expect(resumed.statusCode).toBe(201);
+    expect(resumed.json().advanced).toBe(true);
+
+    const cleared = await built.app.db
+      .select()
+      .from(sensorAlerts)
+      .where(eq(sensorAlerts.sensorId, recoveringId));
+    expect(cleared[0]!.status).toBe("cleared");
+    const [closedSignal] = await built.app.db
+      .select()
+      .from(signals)
+      .where(eq(signals.id, opened[0]!.signalId!));
+    expect(closedSignal?.disposition).toBe("closed");
+    expect(closedSignal?.autoClosedAt).toBeTruthy();
+  });
+
   it("refuses ingestion and deletion below the required tool level", async () => {
     const viewerIngest = await inject(
       "POST",
@@ -729,6 +928,61 @@ describe("twin — warranties, claims and expiry", () => {
     expect(raised).toHaveLength(1);
   });
 
+  it("sweeps only the project it is authorised against", async () => {
+    // the route is gated on :projectId, so it must not create obligations or
+    // fire notifications on a sibling project the caller may not hold
+    const otherProject = newId("prj");
+    await built.app.db
+      .insert(projects)
+      .values({ id: otherProject, companyId: owner.companyId, name: "Sibling site" });
+    const otherAssetId = newId("ast");
+    await built.app.db.insert(assets).values({
+      id: otherAssetId,
+      companyId: owner.companyId,
+      projectId: otherProject,
+      tagCode: "SIB-01",
+      name: "Sibling chiller",
+      createdBy: owner.userId,
+    });
+    const otherWarrantyId = newId("wty");
+    await built.app.db.insert(warranties).values({
+      id: otherWarrantyId,
+      companyId: owner.companyId,
+      projectId: otherProject,
+      assetId: otherAssetId,
+      provider: "Sibling FM",
+      startDate: todayISO(),
+      endDate: addDays(todayISO(), 15),
+      status: "active",
+      createdBy: owner.userId,
+    });
+
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/warranties/sweep`,
+      owner.headers,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.json().scope).toBe("project");
+    expect(res.json().projectId).toBe(projectId);
+
+    const [untouched] = await built.app.db
+      .select()
+      .from(warranties)
+      .where(eq(warranties.id, otherWarrantyId));
+    expect(untouched?.obligationId).toBeNull();
+    expect(untouched?.notifiedDays).toBeNull();
+
+    // the scheduler job, which runs as the system actor over the whole
+    // company, is the thing that does pick it up
+    await built.app.scheduler.runNow("twin.warranty-expiry");
+    const [swept] = await built.app.db
+      .select()
+      .from(warranties)
+      .where(eq(warranties.id, otherWarrantyId));
+    expect(swept?.obligationId).toBeTruthy();
+  });
+
   it("reports the expiring horizon with days remaining", async () => {
     const res = await inject(
       "GET",
@@ -834,6 +1088,37 @@ describe("twin — delivery milestones", () => {
       { label: "Neither", modelId, documentFileId: "fil_x" },
     );
     expect(both.statusCode).toBe(400);
+  });
+
+  it("refuses delivery of a milestone with nothing attached, and says the same in /evaluate", async () => {
+    // "delivered" is an assertion about information that exists; an empty
+    // container set used to slip straight through the transition while
+    // /evaluate reported canDeliver=false about the same record
+    const bare = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/delivery-milestones`,
+      owner.headers,
+      { name: "Nothing attached", dueDate: "2026-12-01", requiredState: "published" },
+    );
+    expect(bare.statusCode).toBe(201);
+    const bareId = bare.json().id as string;
+
+    const evaluate = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/delivery-milestones/${bareId}/evaluate`,
+      owner.headers,
+    );
+    expect(evaluate.json().canDeliver).toBe(false);
+    expect(evaluate.json().reason).toContain("No information containers");
+
+    const res = await inject(
+      "PATCH",
+      `/api/v1/projects/${projectId}/delivery-milestones/${bareId}`,
+      owner.headers,
+      { status: "delivered" },
+    );
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("at least one information container");
   });
 
   it("refuses delivery until every container is at the required state", async () => {

@@ -152,6 +152,14 @@ export default function FleetTab({
                   <dt className="text-ink-400">Policy source</dt>
                   <dd>{humanize(a.policySource)}</dd>
                 </div>
+                <div className="col-span-2">
+                  <dt className="text-ink-400">Permissions required to run it</dt>
+                  <dd>
+                    {(a.requiredTools ?? []).length === 0
+                      ? "—"
+                      : `${(a.requiredTools ?? []).map(humanize).join(", ")} (read) on the project`}
+                  </dd>
+                </div>
               </dl>
 
               {!a.runnable ? (
@@ -229,6 +237,7 @@ function PolicyDrawer({
     minConfidence: "",
     maxRunsPerDay: "",
     maxInputTokensPerDay: "",
+    allowedRoles: [] as string[],
     notes: "",
   });
 
@@ -248,6 +257,7 @@ function PolicyDrawer({
         maxRunsPerDay: res.policy.maxRunsPerDay === null ? "" : String(res.policy.maxRunsPerDay),
         maxInputTokensPerDay:
           res.policy.maxInputTokensPerDay === null ? "" : String(res.policy.maxInputTokensPerDay),
+        allowedRoles: res.policy.allowedRoles ?? [],
         notes: res.policy.notes ?? "",
       });
     } catch (err) {
@@ -277,6 +287,7 @@ function PolicyDrawer({
         minConfidence: numOrNull(form.minConfidence),
         maxRunsPerDay: numOrNull(form.maxRunsPerDay),
         maxInputTokensPerDay: numOrNull(form.maxInputTokensPerDay),
+        allowedRoles: form.allowedRoles,
         notes: form.notes.trim() === "" ? null : form.notes,
       });
       toast.success("Policy saved and ledgered");
@@ -364,6 +375,32 @@ function PolicyDrawer({
               />
             </Field>
           </div>
+
+          <Field
+            label="Company roles allowed to run it by hand"
+            hint="None selected = any member who also holds the tools the agent reads. This is enforced on every manual run and when a schedule is created."
+          >
+            <div className="flex flex-wrap gap-3 py-1">
+              {["owner", "admin", "member"].map((role) => (
+                <label key={role} className="flex items-center gap-1.5 text-xs text-ink-700">
+                  <input
+                    type="checkbox"
+                    disabled={!isAdmin}
+                    checked={form.allowedRoles.includes(role)}
+                    onChange={(e) =>
+                      setForm((f) => ({
+                        ...f,
+                        allowedRoles: e.target.checked
+                          ? [...f.allowedRoles, role]
+                          : f.allowedRoles.filter((r) => r !== role),
+                      }))
+                    }
+                  />
+                  {humanize(role)}
+                </label>
+              ))}
+            </div>
+          </Field>
 
           <Field label="Notes">
             <Textarea

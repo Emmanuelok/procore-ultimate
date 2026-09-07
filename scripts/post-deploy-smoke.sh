@@ -27,9 +27,28 @@ printf '\033[1mConstructOS smoke test → %s\033[0m\n' "$BASE"
 
 # --- 1. health --------------------------------------------------------------
 H="$(curl -sf "$BASE/api/v1/health" || true)"
-[ -n "$H" ] && ok "health endpoint responds" || bad "health endpoint unreachable"
+[ -n "$H" ] && ok "liveness endpoint responds" || bad "liveness endpoint unreachable"
 DB="$(printf '%s' "$H" | jget db)"
 if [ "$DB" = "postgres" ]; then ok "database is Postgres"; else bad "database is '$DB' — DATABASE_URL is not set! (running on embedded fallback)"; fi
+
+# --- 1b. readiness, and the reduced-shape warnings it reports ---------------
+# Liveness says the process is up. READINESS executes a query against the
+# database and names every configuration smell that makes this deployment
+# smaller than it looks. Both are checked because a container that is up and
+# cannot reach its database passes the first and fails the second.
+RCODE="$(curl -s -o /tmp/constructos-ready.json -w '%{http_code}' "$BASE/api/v1/health/ready" || true)"
+if [ "$RCODE" = "200" ]; then ok "readiness endpoint reports ready (200)"; else bad "readiness returned $RCODE — the deployment is up but not serving"; fi
+DBOK="$(cat /tmp/constructos-ready.json 2>/dev/null | jget checks.database.ok)"
+[ "$DBOK" = "true" ] && ok "readiness proved a live database query" || bad "readiness could not query the database"
+WARNINGS="$(node -e 'let d={};try{d=JSON.parse(require("fs").readFileSync("/tmp/constructos-ready.json","utf8"))}catch{}const w=d.warnings||[];process.stdout.write(String(w.length))' 2>/dev/null || echo 0)"
+if [ "$WARNINGS" = "0" ]; then
+  ok "no configuration warnings"
+else
+  printf '  \033[1;33mWARN\033[0m %s configuration warning(s) reported by /api/v1/health/ready:\n' "$WARNINGS"
+  node -e 'let d={};try{d=JSON.parse(require("fs").readFileSync("/tmp/constructos-ready.json","utf8"))}catch{}for(const w of d.warnings||[])console.log("        - "+w)' 2>/dev/null || true
+  echo "        (warnings describe a smaller deployment, not a broken one — see docs/deployment.md)"
+fi
+rm -f /tmp/constructos-ready.json
 
 # --- 2. SPA + headers -------------------------------------------------------
 CODE="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/")"
@@ -79,6 +98,24 @@ if [ -n "$PID" ]; then
   fi
   rm -f "$TMP"
 fi
+
+# --- 5b. security posture ---------------------------------------------------
+# Three refusals that must hold on a live deployment. None of them mutates
+# anything, and none touches the lockout counters — a smoke test that locked
+# out its own account would be worse than no smoke test.
+SCIM="$(curl -s "$BASE/api/v1/scim/v2/Users" || true)"
+printf '%s' "$SCIM" | grep -q 'scim:api:messages:2.0:Error' \
+  && ok "SCIM refuses an unauthenticated call in SCIM's own error envelope" \
+  || bad "SCIM 401 is not a SCIM error document: $SCIM"
+
+POLCODE="$(curl -s -o /tmp/constructos-policy.json -w '%{http_code}' "$BASE/api/v1/company/security-policy" "${AUTH[@]}")"
+[ "$POLCODE" = "200" ] && ok "tenant security policy is readable" || bad "security policy returned $POLCODE"
+MINLEN="$(cat /tmp/constructos-policy.json 2>/dev/null | jget effective.passwordMinLength)"
+[ -n "$MINLEN" ] && ok "password policy in force: minimum $MINLEN characters" || bad "security policy carried no effective password rules"
+rm -f /tmp/constructos-policy.json
+
+ANON="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/v1/company/security-events")"
+[ "$ANON" = "401" ] && ok "the login audit refuses an unauthenticated caller" || bad "unauthenticated audit read returned $ANON, expected 401"
 
 # --- 6. ledger integrity ----------------------------------------------------
 LV="$(curl -sf "$BASE/api/v1/ledger/verify" "${AUTH[@]}" || true)"

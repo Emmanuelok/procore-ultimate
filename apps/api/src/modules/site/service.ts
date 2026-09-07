@@ -1,0 +1,1778 @@
+/**
+ * Site operations — the services the routes and the scheduler jobs share.
+ *
+ * Nothing here is a route handler and nothing here is a pure engine: this is
+ * the layer that loads the rows, calls an engine, writes the consequences
+ * (statuses, signals, notifications, ledger entries) and hands back a summary.
+ * Every sweep is exposed both as a scheduler job (jobs.ts) and as a POST
+ * endpoint, so an operator and the ticker run the same code.
+ *
+ * Idempotence is the rule that shapes this file: a sweep that runs every ten
+ * minutes must not raise the same signal ten times an hour, so every signal
+ * carries a dedupe key naming the record and the condition, and every status
+ * change is guarded by the status it moves from.
+ */
+import { and, asc, count, desc, eq, gte, inArray, lt, lte, or, sql, type AnyColumn } from "drizzle-orm";
+import {
+  assertions,
+  evidence,
+  projects,
+  reconciliations,
+  siteAccessPasses,
+  siteEnvironmentalEvents,
+  siteExclusionZones,
+  siteDroneFlights,
+  siteGateEvents,
+  siteGeotechInvestigations,
+  siteGroundFindings,
+  siteInductions,
+  siteLoneWorkerSessions,
+  siteMusterCheckins,
+  siteMusters,
+  sitePermitEntries,
+  sitePermits,
+  sitePhotoTours,
+  siteProgressObservations,
+  siteScanDeviations,
+  siteScans,
+  siteSettingOutRecords,
+  siteUtilityStrikes,
+  siteWeatherAnalyses,
+  siteWeatherBaselines,
+  siteWeatherObservations,
+  projectMemberships,
+  signals,
+} from "@constructos/db";
+import { hashPayload } from "@constructos/ledger";
+import { SITE_DETECTORS } from "@constructos/shared";
+import type { Db } from "../../lib/db.js";
+import { newId } from "../../lib/ids.js";
+import { buildRegister, type GateEventInput, type OccupancySummary } from "./engines/occupancy.js";
+import { reconcileMuster, type CheckinEntry, type RegisterEntry } from "./engines/muster.js";
+import { EXPIRABLE_PERMIT_STATUSES, expiredPermits, loneWorkerDue, overdueEntries } from "./engines/permits.js";
+import { analyseWeather, type Threshold, type WeatherReading } from "./engines/weather.js";
+import { fetchArchive, type FetchLike } from "./engines/provider.js";
+import {
+  alreadySignalled,
+  allocateReference,
+  figure,
+  ledger,
+  notifyUsers,
+  nowISO,
+  raiseSignal,
+  round1,
+  type Figure,
+} from "./shared.js";
+
+/** How far back the on-site register folds gate events by default. A shift
+ *  that started three weeks ago and never ended is an overstay, not a person
+ *  the register should still be carrying. */
+export const REGISTER_WINDOW_DAYS = 14;
+
+/** Hours on site after which a still-open session is treated as an overstay. */
+export const OVERSTAY_HOURS = 16;
+
+export const OPEN_PERMIT_STATUSES = ["requested", "approved", "active", "suspended"] as const;
+
+/** Every detector this module raises — used to count its own open signals. */
+export const SITE_DETECTOR_LIST = SITE_DETECTORS;
+
+/* ================================================================== */
+/* The on-site register                                                */
+/* ================================================================== */
+
+/** Stable identity for a person across the gate feed. */
+export function personKeyOf(row: {
+  passId?: string | null;
+  workerId?: string | null;
+  badgeCode?: string | null;
+  personName?: string | null;
+}): string {
+  if (row.passId) return `pass:${row.passId}`;
+  if (row.workerId) return `worker:${row.workerId}`;
+  if (row.badgeCode) return `badge:${row.badgeCode}`;
+  return `name:${(row.personName ?? "unknown").trim().toLowerCase()}`;
+}
+
+export async function loadGateEvents(
+  db: Db,
+  companyId: string,
+  projectId: string,
+  fromIso: string,
+  toIso: string,
+  limit = 20_000,
+): Promise<GateEventInput[]> {
+  const rows = await db
+    .select()
+    .from(siteGateEvents)
+    .where(
+      and(
+        eq(siteGateEvents.companyId, companyId),
+        eq(siteGateEvents.projectId, projectId),
+        gte(siteGateEvents.occurredAt, fromIso),
+        lte(siteGateEvents.occurredAt, toIso),
+      ),
+    )
+    .orderBy(asc(siteGateEvents.occurredAt))
+    .limit(limit);
+  return rows.map((row) => ({
+    id: row.id,
+    occurredAt: row.occurredAt,
+    direction: row.direction,
+    accepted: row.accepted,
+    personKey: personKeyOf(row),
+    personName: row.personName,
+    passId: row.passId,
+    workerId: row.workerId,
+    vendorId: row.vendorId,
+    personKind: row.personKind,
+    gateName: row.gateName,
+    source: row.source,
+    refusalReason: row.refusalReason,
+  }));
+}
+
+export interface RegisterResult extends OccupancySummary {
+  windowFrom: string;
+  windowTo: string;
+  truncated: boolean;
+  reasons: string[];
+}
+
+/**
+ * Who is on site as at `asOf`, folded from the gate feed over a bounded
+ * window. The window is stated in the result so nobody mistakes "nobody is on
+ * site" for "nobody badged in during the last fortnight".
+ */
+export async function loadRegister(
+  db: Db,
+  companyId: string,
+  projectId: string,
+  asOf: string,
+  options: { windowDays?: number; overstayHours?: number } = {},
+): Promise<RegisterResult> {
+  const windowDays = options.windowDays ?? REGISTER_WINDOW_DAYS;
+  const windowFrom = new Date(Date.parse(asOf) - windowDays * 86_400_000).toISOString();
+  const limit = 20_000;
+  const events = await loadGateEvents(db, companyId, projectId, windowFrom, asOf, limit);
+  const summary = buildRegister(events, {
+    asOf,
+    overstayHours: options.overstayHours ?? OVERSTAY_HOURS,
+  });
+  const reasons: string[] = [];
+  if (events.length === 0) {
+    reasons.push(
+      `No gate events in the ${windowDays} days to ${asOf}. Either nobody badged, or the gate feed is not connected — the register is empty for want of data, not because the site is.`,
+    );
+  }
+  if (events.length >= limit) {
+    reasons.push(
+      `The gate feed returned the maximum of ${limit} events for this window; the register may be folded from a partial stream. Narrow the window.`,
+    );
+  }
+  return {
+    ...summary,
+    windowFrom,
+    windowTo: asOf,
+    truncated: events.length >= limit,
+    reasons,
+  };
+}
+
+/* ================================================================== */
+/* Gate event ingestion (the machine feed)                             */
+/* ================================================================== */
+
+export interface GateEventPayload {
+  badgeCode?: string | null;
+  passId?: string | null;
+  workerId?: string | null;
+  personName?: string | null;
+  personKind?: string | null;
+  direction: string;
+  occurredAt: string;
+  gateName?: string | null;
+  deviceId?: string | null;
+  source?: string | null;
+  accepted?: boolean;
+  refusalReason?: string | null;
+  zoneId?: string | null;
+  lat?: number | null;
+  lon?: number | null;
+  externalRef?: string | null;
+  raw?: Record<string, unknown> | null;
+}
+
+export interface GateIngestResult {
+  accepted: number;
+  refused: number;
+  duplicates: number;
+  unmatched: number;
+  eventIds: string[];
+  notes: string[];
+}
+
+/**
+ * Ingest a batch from a reader.
+ *
+ * The reader is the source of truth for WHAT HAPPENED (a badge was presented
+ * at 07:03), never for whether it should have happened. This function resolves
+ * the badge to a pass, and where the pass is not valid it stores the event as
+ * REFUSED with a reason rather than dropping it — a refused read at 03:00 is
+ * exactly the record an investigation needs.
+ */
+export async function ingestGateEvents(
+  db: Db,
+  input: { companyId: string; projectId: string; actorId: string | null },
+  events: readonly GateEventPayload[],
+): Promise<GateIngestResult> {
+  const result: GateIngestResult = {
+    accepted: 0,
+    refused: 0,
+    duplicates: 0,
+    unmatched: 0,
+    eventIds: [],
+    notes: [],
+  };
+  if (events.length === 0) return result;
+
+  const badgeCodes = [...new Set(events.map((e) => e.badgeCode).filter((b): b is string => Boolean(b)))];
+  const passIds = [...new Set(events.map((e) => e.passId).filter((p): p is string => Boolean(p)))];
+  const passRows =
+    badgeCodes.length + passIds.length === 0
+      ? []
+      : await db
+          .select()
+          .from(siteAccessPasses)
+          .where(
+            and(
+              eq(siteAccessPasses.companyId, input.companyId),
+              eq(siteAccessPasses.projectId, input.projectId),
+              or(
+                badgeCodes.length > 0 ? inArray(siteAccessPasses.badgeCode, badgeCodes) : undefined,
+                passIds.length > 0 ? inArray(siteAccessPasses.id, passIds) : undefined,
+              ),
+            ),
+          );
+  const byBadge = new Map(passRows.map((p) => [p.badgeCode, p]));
+  const byId = new Map(passRows.map((p) => [p.id, p]));
+
+  const externalRefs = [...new Set(events.map((e) => e.externalRef).filter((r): r is string => Boolean(r)))];
+  const existing =
+    externalRefs.length === 0
+      ? []
+      : await db
+          .select({ externalRef: siteGateEvents.externalRef })
+          .from(siteGateEvents)
+          .where(
+            and(
+              eq(siteGateEvents.projectId, input.projectId),
+              inArray(siteGateEvents.externalRef, externalRefs),
+            ),
+          );
+  const seenRefs = new Set(existing.map((r) => r.externalRef).filter((r): r is string => Boolean(r)));
+
+  const today = new Date().toISOString().slice(0, 10);
+  const rows: Array<typeof siteGateEvents.$inferInsert> = [];
+
+  for (const event of events) {
+    if (event.externalRef && seenRefs.has(event.externalRef)) {
+      result.duplicates += 1;
+      continue;
+    }
+    if (event.externalRef) seenRefs.add(event.externalRef);
+
+    const pass = (event.passId ? byId.get(event.passId) : undefined) ?? (event.badgeCode ? byBadge.get(event.badgeCode) : undefined);
+    let accepted = event.accepted === undefined ? true : event.accepted;
+    let refusalReason = event.refusalReason ?? null;
+
+    if (!pass) {
+      result.unmatched += 1;
+      if (event.badgeCode || event.passId) {
+        accepted = false;
+        refusalReason = refusalReason ?? "unknown_credential";
+      }
+    } else if (accepted) {
+      const day = (event.occurredAt ?? nowISO()).slice(0, 10);
+      if (pass.status === "revoked") {
+        accepted = false;
+        refusalReason = "pass_revoked";
+      } else if (pass.status === "suspended") {
+        accepted = false;
+        refusalReason = "pass_suspended";
+      } else if (pass.status === "expired" || (pass.validUntil && pass.validUntil < day)) {
+        accepted = false;
+        refusalReason = "pass_expired";
+      } else if (pass.validFrom && pass.validFrom > day) {
+        accepted = false;
+        refusalReason = "pass_expired";
+      }
+    }
+
+    if (accepted) result.accepted += 1;
+    else result.refused += 1;
+
+    const id = newId("gev");
+    result.eventIds.push(id);
+    rows.push({
+      id,
+      companyId: input.companyId,
+      projectId: input.projectId,
+      gateName: event.gateName ?? "main",
+      deviceId: event.deviceId ?? null,
+      passId: pass?.id ?? event.passId ?? null,
+      workerId: event.workerId ?? pass?.workerId ?? null,
+      badgeCode: event.badgeCode ?? pass?.badgeCode ?? null,
+      personName: event.personName ?? pass?.personName ?? null,
+      personKind: event.personKind ?? pass?.personKind ?? null,
+      vendorId: pass?.vendorId ?? null,
+      direction: event.direction,
+      occurredAt: event.occurredAt,
+      source: event.source ?? "turnstile",
+      accepted: accepted ? 1 : 0,
+      refusalReason,
+      zoneId: event.zoneId ?? null,
+      lat: event.lat ?? null,
+      lon: event.lon ?? null,
+      externalRef: event.externalRef ?? null,
+      raw: event.raw ?? null,
+    });
+  }
+
+  if (rows.length > 0) {
+    // The pre-check above catches a replay inside this batch and most replays
+    // across batches; ON CONFLICT DO NOTHING closes the race between two
+    // readers posting the same device reference at the same moment. Counts are
+    // taken from what actually landed, never from what was offered.
+    const landed = await db
+      .insert(siteGateEvents)
+      .values(rows)
+      .onConflictDoNothing({ target: [siteGateEvents.projectId, siteGateEvents.externalRef] })
+      .returning({ id: siteGateEvents.id, accepted: siteGateEvents.accepted });
+    const landedIds = new Set(landed.map((r) => r.id));
+    result.eventIds = result.eventIds.filter((id) => landedIds.has(id));
+    result.accepted = landed.filter((r) => r.accepted === 1).length;
+    result.refused = landed.length - result.accepted;
+    result.duplicates += rows.length - landed.length;
+    if (landed.length === 0) return result;
+    await ledger(db, {
+      companyId: input.companyId,
+      projectId: input.projectId,
+      actorId: input.actorId,
+      action: "create",
+      objectType: "site_gate_event",
+      objectId: result.eventIds[0]!,
+      payload: {
+        batch: landed.length,
+        accepted: result.accepted,
+        refused: result.refused,
+        duplicates: result.duplicates,
+        firstEventId: result.eventIds[0]!,
+        lastEventId: result.eventIds[result.eventIds.length - 1]!,
+        day: today,
+      },
+    });
+  }
+  if (result.unmatched > 0) {
+    result.notes.push(
+      `${result.unmatched} read(s) presented a credential this project does not hold. They are stored as refused reads, not discarded.`,
+    );
+  }
+  if (result.duplicates > 0) {
+    result.notes.push(
+      `${result.duplicates} read(s) had an external reference already in the feed and were ignored — a replayed batch does not double the headcount.`,
+    );
+  }
+  return result;
+}
+
+/* ================================================================== */
+/* Musters                                                             */
+/* ================================================================== */
+
+export async function reconcileMusterRecord(
+  db: Db,
+  companyId: string,
+  projectId: string,
+  actorId: string | null,
+  musterId: string,
+): Promise<{
+  muster: typeof siteMusters.$inferSelect;
+  reconciliation: ReturnType<typeof reconcileMuster>;
+  signalId: string | null;
+}> {
+  const musterRows = await db
+    .select()
+    .from(siteMusters)
+    .where(and(eq(siteMusters.id, musterId), eq(siteMusters.companyId, companyId), eq(siteMusters.projectId, projectId)))
+    .limit(1);
+  const muster = musterRows[0];
+  if (!muster) throw new Error(`Muster ${musterId} not found`);
+
+  const checkinRows = await db
+    .select()
+    .from(siteMusterCheckins)
+    .where(and(eq(siteMusterCheckins.musterId, musterId), eq(siteMusterCheckins.companyId, companyId)));
+
+  const register: RegisterEntry[] = (muster.expectedRegister ?? []).map((p) => ({
+    key: p.key,
+    name: p.name,
+    passId: p.passId,
+    workerId: p.workerId,
+    sinceAt: p.sinceAt,
+  }));
+  const checkins: CheckinEntry[] = checkinRows.map((c) => ({
+    personKey: c.personKey,
+    personName: c.personName,
+    status: c.status,
+    checkedInAt: c.checkedInAt,
+  }));
+
+  const reconciliation = reconcileMuster(register, checkins, { declaredAt: muster.declaredAt });
+
+  let signalId: string | null = muster.signalId;
+  if (reconciliation.unaccountedCount > 0 && !signalId) {
+    const key = `muster:${muster.id}`;
+    const raised = await alreadySignalled(db, companyId, ["site_muster_unaccounted"], { projectId, keys: [key] });
+    if (!raised.has(key)) {
+      signalId = await raiseSignal(db, companyId, projectId, actorId, {
+        detector: "site_muster_unaccounted",
+        severity: muster.kind === "emergency" ? "critical" : "high",
+        confidence: 0.9,
+        title: `${reconciliation.unaccountedCount} person(s) unaccounted for at ${muster.reference}`,
+        explanation: `The on-site register held ${reconciliation.expectedCount} person(s) when ${muster.reference} was declared at ${muster.declaredAt}. ${reconciliation.accountedCount} reached the muster point or were accounted for off site. Unaccounted: ${reconciliation.unaccounted.map((p) => p.name).join(", ")}.`,
+        key,
+        subjectType: "site_muster",
+        subjectId: muster.id,
+        evidence: {
+          musterId: muster.id,
+          unaccounted: reconciliation.unaccounted.map((p) => ({ key: p.key, name: p.name, sinceAt: p.sinceAt })),
+          unexpected: reconciliation.unexpected.map((p) => p.name),
+        },
+      });
+    }
+  }
+
+  const [updated] = await db
+    .update(siteMusters)
+    .set({
+      status: muster.status === "closed" ? "closed" : reconciliation.clear ? "reconciled" : "open",
+      expectedCount: reconciliation.expectedCount,
+      accountedCount: reconciliation.accountedCount,
+      unaccountedCount: reconciliation.unaccountedCount,
+      unexpectedCount: reconciliation.unexpectedCount,
+      durationSeconds: reconciliation.durationSeconds,
+      reconciledAt: nowISO(),
+      reconciledBy: actorId,
+      clearedAt: reconciliation.clear ? nowISO() : null,
+      signalId,
+      updatedAt: nowISO(),
+    })
+    .where(and(eq(siteMusters.id, musterId), eq(siteMusters.companyId, companyId)))
+    .returning();
+
+  await ledger(db, {
+    companyId,
+    projectId,
+    actorId,
+    action: "state_change",
+    objectType: "site_muster",
+    objectId: musterId,
+    payload: {
+      expected: reconciliation.expectedCount,
+      accounted: reconciliation.accountedCount,
+      unaccounted: reconciliation.unaccountedCount,
+      unexpected: reconciliation.unexpectedCount,
+      clear: reconciliation.clear,
+    },
+  });
+
+  return { muster: updated ?? muster, reconciliation, signalId };
+}
+
+/* ================================================================== */
+/* Sweeps                                                              */
+/* ================================================================== */
+
+async function projectWatchers(db: Db, companyId: string, projectId: string): Promise<string[]> {
+  const rows = await db
+    .select({ userId: projectMemberships.userId })
+    .from(projectMemberships)
+    .where(and(eq(projectMemberships.companyId, companyId), eq(projectMemberships.projectId, projectId)))
+    .limit(200);
+  return rows.map((r) => r.userId);
+}
+
+/**
+ * Permits whose validity window closed while they were still open.
+ *
+ * `scope` narrows a sweep to one project. The scheduler runs it company-wide
+ * with the system actor; a project route passes its own projectId so a grant
+ * on one project never writes to another.
+ */
+export interface SweepScope {
+  projectId?: string | null;
+}
+
+export async function sweepPermitExpiry(db: Db, companyId: string, now: Date, scope: SweepScope = {}) {
+  const nowIso = now.toISOString();
+  const open = await db
+    .select({
+      id: sitePermits.id,
+      projectId: sitePermits.projectId,
+      reference: sitePermits.reference,
+      title: sitePermits.title,
+      permitType: sitePermits.permitType,
+      status: sitePermits.status,
+      validTo: sitePermits.validTo,
+      requestedBy: sitePermits.requestedBy,
+      createdBy: sitePermits.createdBy,
+    })
+    .from(sitePermits)
+    .where(
+      and(
+        eq(sitePermits.companyId, companyId),
+        scope.projectId ? eq(sitePermits.projectId, scope.projectId) : undefined,
+        inArray(sitePermits.status, [...EXPIRABLE_PERMIT_STATUSES]),
+      ),
+    )
+    .limit(5000);
+
+  const due = expiredPermits(open, nowIso);
+  if (due.length === 0) return { expired: 0, signalsRaised: 0 };
+
+  const raised = await alreadySignalled(db, companyId, ["site_permit_expired_open"], {
+    keys: due.map((permit) => `permit-expired:${permit.id}`),
+  });
+  let signalsRaised = 0;
+
+  for (const permit of due) {
+    await db
+      .update(sitePermits)
+      .set({ status: "expired", expiredAt: nowIso, updatedAt: nowIso })
+      .where(
+        and(
+          eq(sitePermits.id, permit.id),
+          eq(sitePermits.companyId, companyId),
+          inArray(sitePermits.status, [...EXPIRABLE_PERMIT_STATUSES]),
+        ),
+      );
+    await ledger(db, {
+      companyId,
+      projectId: permit.projectId,
+      actorId: null,
+      action: "state_change",
+      objectType: "site_permit",
+      objectId: permit.id,
+      payload: { from: permit.status, to: "expired", validTo: permit.validTo, sweep: "site.permit-expiry" },
+    });
+
+    const key = `permit-expired:${permit.id}`;
+    if (!raised.has(key)) {
+      const wasActive = permit.status === "active";
+      await raiseSignal(db, companyId, permit.projectId, null, {
+        detector: "site_permit_expired_open",
+        severity: wasActive ? "high" : "medium",
+        confidence: 1,
+        title: `Permit ${permit.reference} lapsed while still ${permit.status}`,
+        explanation: `${permit.reference} (${permit.permitType.replace(/_/g, " ")}, "${permit.title}") was ${permit.status} when its validity ended at ${permit.validTo}. It has been set to expired. ${wasActive ? "Work under it must stop until a new permit is issued." : "It was never activated."}`,
+        key,
+        subjectType: "site_permit",
+        subjectId: permit.id,
+        evidence: { permitId: permit.id, reference: permit.reference, validTo: permit.validTo, priorStatus: permit.status },
+      });
+      signalsRaised += 1;
+      await notifyUsers(db, {
+        companyId,
+        projectId: permit.projectId,
+        userIds: [permit.requestedBy, permit.createdBy],
+        title: `Permit ${permit.reference} expired`,
+        body: `The ${permit.permitType.replace(/_/g, " ")} permit "${permit.title}" lapsed at ${permit.validTo} while ${permit.status}.`,
+        recordType: "site_permit",
+        recordId: permit.id,
+      });
+    }
+  }
+  return { expired: due.length, signalsRaised };
+}
+
+/** People still recorded inside a confined space past their expected exit. */
+export async function sweepPermitEntries(db: Db, companyId: string, now: Date, scope: SweepScope = {}) {
+  const nowIso = now.toISOString();
+  const rows = await db
+    .select()
+    .from(sitePermitEntries)
+    .where(
+      and(
+        eq(sitePermitEntries.companyId, companyId),
+        scope.projectId ? eq(sitePermitEntries.projectId, scope.projectId) : undefined,
+        eq(sitePermitEntries.status, "inside"),
+      ),
+    )
+    .limit(5000);
+  const due = overdueEntries(
+    rows.map((r) => ({
+      id: r.id,
+      personName: r.personName,
+      enteredAt: r.enteredAt,
+      expectedExitAt: r.expectedExitAt,
+      status: r.status,
+    })),
+    nowIso,
+  );
+  if (due.length === 0) return { overdue: 0, signalsRaised: 0 };
+
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const raised = await alreadySignalled(db, companyId, ["site_confined_space_overdue"], {
+    keys: due.map((entry) => `entry-overdue:${entry.id}`),
+  });
+  let signalsRaised = 0;
+
+  for (const entry of due) {
+    const row = byId.get(entry.id);
+    if (!row) continue;
+    const key = `entry-overdue:${row.id}`;
+    let signalId = row.signalId;
+    if (!raised.has(key)) {
+      signalId = await raiseSignal(db, companyId, row.projectId, null, {
+        detector: "site_confined_space_overdue",
+        severity: entry.overdueMinutes >= 30 ? "critical" : "high",
+        confidence: 1,
+        title: `${entry.personName} is ${entry.overdueMinutes} minute(s) overdue out of a permitted space`,
+        explanation: `${entry.personName} entered under permit at ${row.enteredAt} and was expected out at ${entry.expectedExitAt}. No exit has been recorded. They have been inside for ${entry.insideMinutes} minute(s).`,
+        key,
+        subjectType: "site_permit_entry",
+        subjectId: row.id,
+        evidence: {
+          entryId: row.id,
+          permitId: row.permitId,
+          enteredAt: row.enteredAt,
+          expectedExitAt: entry.expectedExitAt,
+          overdueMinutes: entry.overdueMinutes,
+        },
+      });
+      signalsRaised += 1;
+      await notifyUsers(db, {
+        companyId,
+        projectId: row.projectId,
+        userIds: [row.recordedBy, ...(await projectWatchers(db, companyId, row.projectId))],
+        title: `${entry.personName} overdue out of a permitted space`,
+        body: `Expected out at ${entry.expectedExitAt}; ${entry.overdueMinutes} minute(s) late. Attendant: ${row.attendantName ?? "not recorded"}.`,
+        recordType: "site_permit_entry",
+        recordId: row.id,
+      });
+    }
+    await db
+      .update(sitePermitEntries)
+      .set({ status: "overdue", overdueAt: nowIso, signalId, updatedAt: nowIso })
+      .where(and(eq(sitePermitEntries.id, row.id), eq(sitePermitEntries.companyId, companyId), eq(sitePermitEntries.status, "inside")));
+    await ledger(db, {
+      companyId,
+      projectId: row.projectId,
+      actorId: null,
+      action: "state_change",
+      objectType: "site_permit_entry",
+      objectId: row.id,
+      payload: { to: "overdue", overdueMinutes: entry.overdueMinutes, sweep: "site.confined-space" },
+    });
+  }
+  return { overdue: due.length, signalsRaised };
+}
+
+/** Lone workers who have missed a check-in. */
+export async function sweepLoneWorkers(db: Db, companyId: string, now: Date, scope: SweepScope = {}) {
+  const nowIso = now.toISOString();
+  const rows = await db
+    .select()
+    .from(siteLoneWorkerSessions)
+    .where(
+      and(
+        eq(siteLoneWorkerSessions.companyId, companyId),
+        scope.projectId ? eq(siteLoneWorkerSessions.projectId, scope.projectId) : undefined,
+        inArray(siteLoneWorkerSessions.status, ["active", "overdue"]),
+      ),
+    )
+    .limit(5000);
+  const verdicts = loneWorkerDue(
+    rows.map((r) => ({
+      id: r.id,
+      personName: r.personName,
+      status: r.status,
+      nextDueAt: r.nextDueAt,
+      intervalMinutes: r.intervalMinutes,
+      missedCount: r.missedCount,
+      expectedEndAt: r.expectedEndAt,
+    })),
+    nowIso,
+  );
+  if (verdicts.length === 0) return { overdue: 0, escalated: 0, signalsRaised: 0 };
+
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const raised = await alreadySignalled(db, companyId, ["site_lone_worker_overdue"], {
+    keys: verdicts.map((verdict) => `lone-worker:${verdict.id}`),
+  });
+  let signalsRaised = 0;
+  let escalated = 0;
+
+  for (const verdict of verdicts) {
+    const row = byId.get(verdict.id);
+    if (!row) continue;
+    if (verdict.action === "escalate") {
+      escalated += 1;
+      const key = `lone-worker:${row.id}`;
+      let signalId = row.escalationSignalId;
+      if (!raised.has(key)) {
+        signalId = await raiseSignal(db, companyId, row.projectId, null, {
+          detector: "site_lone_worker_overdue",
+          severity: "critical",
+          confidence: 1,
+          title: `${row.personName} has missed a lone-working check-in`,
+          explanation: `${verdict.reason} Activity: ${row.activity}. Last known position: ${row.locationDescription ?? (row.lat !== null && row.lon !== null ? `${row.lat}, ${row.lon}` : "not recorded")}. Emergency contact: ${row.contactName ?? "not recorded"} ${row.contactPhone ?? ""}`.trim(),
+          key,
+          subjectType: "site_lone_worker_session",
+          subjectId: row.id,
+          evidence: {
+            sessionId: row.id,
+            nextDueAt: verdict.nextDueAt,
+            lateMinutes: verdict.lateMinutes,
+            lat: row.lat,
+            lon: row.lon,
+          },
+        });
+        signalsRaised += 1;
+      }
+      await db
+        .update(siteLoneWorkerSessions)
+        .set({
+          status: "escalated",
+          escalatedAt: row.escalatedAt ?? nowIso,
+          escalationSignalId: signalId,
+          missedCount: row.missedCount + 1,
+          updatedAt: nowIso,
+        })
+        .where(and(eq(siteLoneWorkerSessions.id, row.id), eq(siteLoneWorkerSessions.companyId, companyId), inArray(siteLoneWorkerSessions.status, ["active", "overdue"])));
+      await notifyUsers(db, {
+        companyId,
+        projectId: row.projectId,
+        userIds: [row.createdBy, ...row.watcherUserIds, ...(await projectWatchers(db, companyId, row.projectId))],
+        kind: "escalation",
+        title: `Lone worker check-in missed: ${row.personName}`,
+        body: verdict.reason,
+        recordType: "site_lone_worker_session",
+        recordId: row.id,
+      });
+      await ledger(db, {
+        companyId,
+        projectId: row.projectId,
+        actorId: null,
+        action: "state_change",
+        objectType: "site_lone_worker_session",
+        objectId: row.id,
+        payload: { to: "escalated", lateMinutes: verdict.lateMinutes, sweep: "site.lone-worker" },
+      });
+    } else if (row.status === "active") {
+      await db
+        .update(siteLoneWorkerSessions)
+        .set({ status: "overdue", updatedAt: nowIso })
+        .where(and(eq(siteLoneWorkerSessions.id, row.id), eq(siteLoneWorkerSessions.companyId, companyId), eq(siteLoneWorkerSessions.status, "active")));
+      await notifyUsers(db, {
+        companyId,
+        projectId: row.projectId,
+        userIds: [row.createdBy, ...row.watcherUserIds],
+        kind: "overdue",
+        title: `Lone worker check-in overdue: ${row.personName}`,
+        body: verdict.reason,
+        recordType: "site_lone_worker_session",
+        recordId: row.id,
+      });
+      await ledger(db, {
+        companyId,
+        projectId: row.projectId,
+        actorId: null,
+        action: "state_change",
+        objectType: "site_lone_worker_session",
+        objectId: row.id,
+        payload: { to: "overdue", lateMinutes: verdict.lateMinutes, sweep: "site.lone-worker" },
+      });
+    }
+  }
+  return { overdue: verdicts.length, escalated, signalsRaised };
+}
+
+/** Expire passes and inductions whose validity has run out, and flag any live
+ *  pass standing on an induction that no longer is. */
+export async function sweepAccessCredentials(db: Db, companyId: string, now: Date, scope: SweepScope = {}) {
+  const today = now.toISOString().slice(0, 10);
+  const nowIso = now.toISOString();
+  // `validUntil` is INCLUSIVE — a pass valid until the 4th is good all of the
+  // 4th, which is the rule the gate feed already applies (`validUntil < day`
+  // refuses). The sweep must expire strictly BEFORE today or it locks people
+  // out on their last valid day.
+
+  const expiredInductions = await db
+    .update(siteInductions)
+    .set({ status: "expired", updatedAt: nowIso })
+    .where(
+      and(
+        eq(siteInductions.companyId, companyId),
+        scope.projectId ? eq(siteInductions.projectId, scope.projectId) : undefined,
+        eq(siteInductions.status, "valid"),
+        sql`${siteInductions.validUntil} is not null`,
+        lt(siteInductions.validUntil, today),
+      ),
+    )
+    .returning({ id: siteInductions.id, projectId: siteInductions.projectId, personName: siteInductions.personName });
+
+  for (const row of expiredInductions) {
+    await ledger(db, {
+      companyId,
+      projectId: row.projectId,
+      actorId: null,
+      action: "state_change",
+      objectType: "site_induction",
+      objectId: row.id,
+      payload: { to: "expired", sweep: "site.access-credentials" },
+    });
+  }
+
+  const expiredPasses = await db
+    .update(siteAccessPasses)
+    .set({ status: "expired", updatedAt: nowIso })
+    .where(
+      and(
+        eq(siteAccessPasses.companyId, companyId),
+        scope.projectId ? eq(siteAccessPasses.projectId, scope.projectId) : undefined,
+        eq(siteAccessPasses.status, "active"),
+        sql`${siteAccessPasses.validUntil} is not null`,
+        lt(siteAccessPasses.validUntil, today),
+      ),
+    )
+    .returning({ id: siteAccessPasses.id, projectId: siteAccessPasses.projectId, personName: siteAccessPasses.personName, badgeCode: siteAccessPasses.badgeCode });
+
+  for (const row of expiredPasses) {
+    await ledger(db, {
+      companyId,
+      projectId: row.projectId,
+      actorId: null,
+      action: "state_change",
+      objectType: "site_access_pass",
+      objectId: row.id,
+      payload: { to: "expired", sweep: "site.access-credentials" },
+    });
+  }
+
+  // Live passes whose induction is not valid.
+  const suspect = await db
+    .select({
+      passId: siteAccessPasses.id,
+      projectId: siteAccessPasses.projectId,
+      personName: siteAccessPasses.personName,
+      badgeCode: siteAccessPasses.badgeCode,
+      inductionId: siteAccessPasses.inductionId,
+      inductionStatus: siteInductions.status,
+      createdBy: siteAccessPasses.createdBy,
+    })
+    .from(siteAccessPasses)
+    .leftJoin(siteInductions, eq(siteAccessPasses.inductionId, siteInductions.id))
+    .where(
+      and(
+        eq(siteAccessPasses.companyId, companyId),
+        scope.projectId ? eq(siteAccessPasses.projectId, scope.projectId) : undefined,
+        eq(siteAccessPasses.status, "active"),
+      ),
+    )
+    .limit(5000);
+
+  const raised = await alreadySignalled(db, companyId, ["site_pass_without_induction"], {
+    keys: suspect.map((row) => `pass-induction:${row.passId}`),
+  });
+  let signalsRaised = 0;
+  for (const row of suspect) {
+    const ok = row.inductionId !== null && row.inductionStatus === "valid";
+    if (ok) continue;
+    const key = `pass-induction:${row.passId}`;
+    if (raised.has(key)) continue;
+    await raiseSignal(db, companyId, row.projectId, null, {
+      detector: "site_pass_without_induction",
+      severity: "high",
+      confidence: 0.95,
+      title: `Active site pass for ${row.personName} with no valid induction`,
+      explanation:
+        row.inductionId === null
+          ? `Badge ${row.badgeCode} is active but is not linked to any induction record. Nobody can show this person was inducted.`
+          : `Badge ${row.badgeCode} is active but its induction is ${row.inductionStatus ?? "missing"}, not valid.`,
+      key,
+      subjectType: "site_access_pass",
+      subjectId: row.passId,
+      evidence: { passId: row.passId, badgeCode: row.badgeCode, inductionId: row.inductionId, inductionStatus: row.inductionStatus },
+    });
+    signalsRaised += 1;
+    await notifyUsers(db, {
+      companyId,
+      projectId: row.projectId,
+      userIds: [row.createdBy],
+      kind: "compliance",
+      title: `Site pass without a valid induction: ${row.personName}`,
+      body: `Badge ${row.badgeCode} is active. Suspend the pass or record a valid induction.`,
+      recordType: "site_access_pass",
+      recordId: row.passId,
+    });
+  }
+
+  return {
+    inductionsExpired: expiredInductions.length,
+    passesExpired: expiredPasses.length,
+    signalsRaised,
+  };
+}
+
+/** Exclusion zones whose active window has closed. */
+export async function sweepExclusionZones(db: Db, companyId: string, now: Date, scope: SweepScope = {}) {
+  const nowIso = now.toISOString();
+  const lifted = await db
+    .update(siteExclusionZones)
+    .set({ status: "lifted", liftedAt: nowIso, updatedAt: nowIso })
+    .where(
+      and(
+        eq(siteExclusionZones.companyId, companyId),
+        scope.projectId ? eq(siteExclusionZones.projectId, scope.projectId) : undefined,
+        eq(siteExclusionZones.status, "active"),
+        sql`${siteExclusionZones.activeTo} is not null`,
+        lte(siteExclusionZones.activeTo, nowIso),
+      ),
+    )
+    .returning({ id: siteExclusionZones.id, projectId: siteExclusionZones.projectId, name: siteExclusionZones.name });
+  for (const row of lifted) {
+    await ledger(db, {
+      companyId,
+      projectId: row.projectId,
+      actorId: null,
+      action: "state_change",
+      objectType: "site_exclusion_zone",
+      objectId: row.id,
+      payload: { to: "lifted", sweep: "site.exclusion-zones" },
+    });
+  }
+  return { lifted: lifted.length };
+}
+
+/** Anyone the register still holds on site after a full working day and more. */
+export async function sweepOverstays(db: Db, companyId: string, now: Date, scope: SweepScope = {}) {
+  const nowIso = now.toISOString();
+  const projectRows = await db
+    .selectDistinct({ projectId: siteGateEvents.projectId })
+    .from(siteGateEvents)
+    .where(
+      and(
+        eq(siteGateEvents.companyId, companyId),
+        scope.projectId ? eq(siteGateEvents.projectId, scope.projectId) : undefined,
+        gte(siteGateEvents.occurredAt, new Date(now.getTime() - REGISTER_WINDOW_DAYS * 86_400_000).toISOString()),
+      ),
+    );
+
+  // Fold every project's register first: the keys are then known, so the
+  // dedupe read is a point lookup on the signal fingerprints rather than a
+  // scan of the company's signal history.
+  const folded: Array<{ projectId: string; register: RegisterResult }> = [];
+  for (const { projectId } of projectRows) {
+    folded.push({ projectId, register: await loadRegister(db, companyId, projectId, nowIso) });
+  }
+  const overstayKey = (projectId: string, person: { personKey: string; sinceAt: string | null }): string =>
+    `overstay:${projectId}:${person.personKey}:${person.sinceAt ?? ""}`;
+  const raised = await alreadySignalled(db, companyId, ["site_overstay"], {
+    keys: folded.flatMap(({ projectId, register }) => register.overstays.map((person) => overstayKey(projectId, person))),
+  });
+  let signalsRaised = 0;
+  let overstays = 0;
+
+  for (const { projectId, register } of folded) {
+    for (const person of register.overstays) {
+      overstays += 1;
+      const key = overstayKey(projectId, person);
+      if (raised.has(key)) continue;
+      await raiseSignal(db, companyId, projectId, null, {
+        detector: "site_overstay",
+        severity: "medium",
+        confidence: 0.8,
+        title: `${person.personName} has been on the register for ${Math.round((person.openMinutes ?? 0) / 60)} hours`,
+        explanation: `The gate feed records an entry at ${person.sinceAt} with no exit. Either the person is still on site well beyond a shift, or an exit read was missed. The platform does not invent the exit.`,
+        key,
+        subjectType: "site_access_pass",
+        subjectId: person.passId ?? person.personKey,
+        evidence: { personKey: person.personKey, sinceAt: person.sinceAt, openMinutes: person.openMinutes },
+      });
+      signalsRaised += 1;
+    }
+  }
+  return { overstays, signalsRaised };
+}
+
+/* ================================================================== */
+/* Weather                                                             */
+/* ================================================================== */
+
+export function toWeatherReading(row: typeof siteWeatherObservations.$inferSelect): WeatherReading {
+  return {
+    observedOn: row.observedOn,
+    precipitationMm: row.precipitationMm,
+    snowfallMm: row.snowfallMm,
+    tempMinC: row.tempMinC,
+    tempMaxC: row.tempMaxC,
+    windMeanKph: row.windMeanKph,
+    windGustKph: row.windGustKph,
+    humidityPct: row.humidityPct,
+    visibilityM: row.visibilityM,
+    seaStateM: row.seaStateM,
+    workStopped: row.workStopped,
+    hoursLost: row.hoursLost,
+  };
+}
+
+/**
+ * Run the exceptional-weather comparison and store it as a numbered analysis.
+ * Every observation inside the window is stamped with its adverse verdict and
+ * the reasons, so the archive itself carries the finding, not just the report.
+ */
+export async function runWeatherAnalysis(
+  db: Db,
+  companyId: string,
+  projectId: string,
+  actorId: string | null,
+  input: { baselineId: string; periodStart: string; periodEnd: string; notes?: string | null },
+) {
+  const baselineRows = await db
+    .select()
+    .from(siteWeatherBaselines)
+    .where(
+      and(
+        eq(siteWeatherBaselines.id, input.baselineId),
+        eq(siteWeatherBaselines.companyId, companyId),
+        eq(siteWeatherBaselines.projectId, projectId),
+      ),
+    )
+    .limit(1);
+  const baseline = baselineRows[0];
+  if (!baseline) throw new Error(`Weather baseline ${input.baselineId} not found in this project`);
+
+  const observationRows = await db
+    .select()
+    .from(siteWeatherObservations)
+    .where(
+      and(
+        eq(siteWeatherObservations.companyId, companyId),
+        eq(siteWeatherObservations.projectId, projectId),
+        gte(siteWeatherObservations.observedOn, input.periodStart),
+        lte(siteWeatherObservations.observedOn, input.periodEnd),
+      ),
+    )
+    .orderBy(asc(siteWeatherObservations.observedOn))
+    .limit(5000);
+
+  const thresholds = (baseline.thresholds ?? []) as Threshold[];
+  const analysis = analyseWeather(observationRows.map(toWeatherReading), thresholds, {
+    periodStart: input.periodStart,
+    periodEnd: input.periodEnd,
+    monthlyExpectedAdverseDays: baseline.monthlyExpectedAdverseDays ?? {},
+  });
+
+  // Stamp the archive with the verdict for each day so the register itself
+  // carries the finding, not only the report.
+  const adverseByDate = new Map(analysis.adverseDayDetail.map((d) => [d.date, d.reasons]));
+  for (const row of observationRows) {
+    const reasons = adverseByDate.get(row.observedOn);
+    const adverse = reasons ? 1 : 0;
+    if (row.adverse === adverse && JSON.stringify(row.adverseReasons ?? []) === JSON.stringify(reasons ?? [])) continue;
+    await db
+      .update(siteWeatherObservations)
+      .set({ adverse, adverseReasons: reasons ?? [], updatedAt: nowISO() })
+      .where(and(eq(siteWeatherObservations.id, row.id), eq(siteWeatherObservations.companyId, companyId)));
+  }
+
+  const { number, reference } = await allocateReference(db, projectId, "site_weather_analysis", "WX");
+  const id = newId("wxa");
+  const [saved] = await db
+    .insert(siteWeatherAnalyses)
+    .values({
+      id,
+      companyId,
+      projectId,
+      number,
+      reference,
+      baselineId: baseline.id,
+      periodStart: input.periodStart,
+      periodEnd: input.periodEnd,
+      status: "draft",
+      daysInPeriod: analysis.daysInPeriod,
+      daysObserved: analysis.daysObserved,
+      observedAdverseDays: analysis.observedAdverseDays,
+      baselineAdverseDays: analysis.baselineAdverseDays,
+      exceptionalDays: analysis.exceptionalDays,
+      hoursLost: analysis.hoursLost,
+      coveragePercent: analysis.coveragePercent,
+      byMonth: analysis.byMonth,
+      adverseDayDetail: analysis.adverseDayDetail,
+      reasons: analysis.reasons,
+      notes: input.notes ?? null,
+      generatedBy: actorId ?? "system",
+    })
+    .returning();
+
+  await ledger(db, {
+    companyId,
+    projectId,
+    actorId,
+    action: "create",
+    objectType: "site_weather_analysis",
+    objectId: id,
+    payload: {
+      reference,
+      baselineId: baseline.id,
+      periodStart: input.periodStart,
+      periodEnd: input.periodEnd,
+      observedAdverseDays: analysis.observedAdverseDays,
+      exceptionalDays: analysis.exceptionalDays,
+    },
+  });
+
+  return { analysis: saved!, engine: analysis, baseline };
+}
+
+/**
+ * Pull provider observations for a window and store what came back. Existing
+ * rows for (date, provider) are updated rather than duplicated; a manual
+ * observation for the same date is never overwritten, because a person on the
+ * site outranks a model of it.
+ */
+export async function captureWeather(
+  db: Db,
+  companyId: string,
+  projectId: string,
+  actorId: string | null,
+  input: { from: string; to: string },
+  options: { fetchImpl?: FetchLike; enabled?: boolean } = {},
+) {
+  const projectRows = await db
+    .select({ id: projects.id, latitude: projects.latitude, longitude: projects.longitude })
+    .from(projects)
+    .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
+    .limit(1);
+  const project = projectRows[0];
+  if (!project) throw new Error(`Project ${projectId} not found`);
+
+  const result = await fetchArchive(
+    { latitude: project.latitude, longitude: project.longitude, from: input.from, to: input.to },
+    options,
+  );
+
+  if (result.readings.length === 0) {
+    return { inserted: 0, updated: 0, provider: result.provider, reasons: result.reasons };
+  }
+
+  const existing = await db
+    .select({ id: siteWeatherObservations.id, observedOn: siteWeatherObservations.observedOn })
+    .from(siteWeatherObservations)
+    .where(
+      and(
+        eq(siteWeatherObservations.companyId, companyId),
+        eq(siteWeatherObservations.projectId, projectId),
+        eq(siteWeatherObservations.source, "provider"),
+        gte(siteWeatherObservations.observedOn, input.from),
+        lte(siteWeatherObservations.observedOn, input.to),
+      ),
+    );
+  const byDate = new Map(existing.map((r) => [r.observedOn, r.id]));
+
+  let inserted = 0;
+  let updated = 0;
+  for (const reading of result.readings) {
+    const values = {
+      tempMinC: reading.tempMinC,
+      tempMaxC: reading.tempMaxC,
+      tempMeanC: reading.tempMeanC,
+      precipitationMm: reading.precipitationMm,
+      snowfallMm: reading.snowfallMm,
+      windMeanKph: reading.windMeanKph,
+      windGustKph: reading.windGustKph,
+      conditions: reading.conditions,
+      provider: result.provider,
+      raw: reading.raw,
+      updatedAt: nowISO(),
+    };
+    const existingId = byDate.get(reading.observedOn);
+    if (existingId) {
+      await db
+        .update(siteWeatherObservations)
+        .set(values)
+        .where(and(eq(siteWeatherObservations.id, existingId), eq(siteWeatherObservations.companyId, companyId)));
+      updated += 1;
+    } else {
+      const id = newId("wxo");
+      await db.insert(siteWeatherObservations).values({
+        id,
+        companyId,
+        projectId,
+        observedOn: reading.observedOn,
+        source: "provider",
+        recordedBy: actorId,
+        ...values,
+      });
+      inserted += 1;
+    }
+  }
+
+  await ledger(db, {
+    companyId,
+    projectId,
+    actorId,
+    action: "create",
+    objectType: "site_weather_observation",
+    objectId: `${projectId}:${input.from}:${input.to}`,
+    payload: { provider: result.provider, inserted, updated, from: input.from, to: input.to },
+  });
+
+  return { inserted, updated, provider: result.provider, reasons: result.reasons };
+}
+
+/* ================================================================== */
+/* Progress determination — the assurance primitives                   */
+/* ================================================================== */
+
+export interface ProgressRecordInput {
+  zoneName: string;
+  locationId?: string | null;
+  scheduleTaskId?: string | null;
+  workPackageRef?: string | null;
+  claimedPercent: number;
+  observedPercent: number;
+  method: string;
+  observedAt: string;
+  claimSourceType: string;
+  claimSourceId?: string | null;
+  claimantId: string;
+  claimantKind: string;
+  claimantName?: string | null;
+  claimedAt?: string | null;
+  scanId?: string | null;
+  droneFlightId?: string | null;
+  fileIds: string[];
+  notes?: string | null;
+  tolerancePercent?: number;
+}
+
+/**
+ * Write the Assertion / Evidence / Reconciliation triple for one progress
+ * observation and the site record that points at all three.
+ *
+ * The caller has already run `assessProgress` (which enforces the
+ * different-actor rule and refuses a self-verified claim), so this function
+ * only persists — it never decides.
+ */
+export async function recordProgressObservation(
+  db: Db,
+  companyId: string,
+  projectId: string,
+  observer: { userId: string; vendorId?: string | null },
+  input: ProgressRecordInput,
+  assessment: {
+    variancePercent: number;
+    result: string;
+    confidence: number;
+    independenceScore: number;
+    independenceBasis: string[];
+    overclaim: boolean;
+    reasons: string[];
+  },
+) {
+  const { number, reference } = await allocateReference(db, projectId, "site_progress_observation", "PRG");
+  const at = nowISO();
+
+  const assertionId = newId("asr");
+  const evidenceId = newId("evd");
+  const reconciliationId = newId("rec");
+  const id = newId("spo");
+  const contentHash = hashPayload({
+    zone: input.zoneName,
+    observedPercent: input.observedPercent,
+    method: input.method,
+    observedAt: input.observedAt,
+    observedBy: observer.userId,
+    scanId: input.scanId ?? null,
+    droneFlightId: input.droneFlightId ?? null,
+    fileIds: [...input.fileIds].sort(),
+  });
+
+  // The triple is ONE fact in three rows. An Assertion nobody tested, or an
+  // Evidence row with no Reconciliation pointing at it, is precisely the shape
+  // the assurance layer reads as an untested claim — so the four inserts land
+  // together or not at all, and the ledger is appended only once they have.
+  const saved = await db.transaction(async (tx) => {
+    await tx.insert(assertions).values({
+      id: assertionId,
+      companyId,
+      projectId,
+      kind: "progress_percent",
+      claimantId: input.claimantId,
+      claimantKind: input.claimantKind,
+      value: input.claimedPercent,
+      unit: "percent",
+      basis: `${input.claimSourceType.replace(/_/g, " ")} claim of ${input.claimedPercent}% for ${input.zoneName}${input.claimantName ? ` by ${input.claimantName}` : ""}`,
+      sourceType: input.claimSourceType,
+      sourceId: input.claimSourceId ?? null,
+      assertedAt: input.claimedAt ?? input.observedAt,
+      createdBy: observer.userId,
+    });
+
+    await tx.insert(evidence).values({
+      id: evidenceId,
+      companyId,
+      projectId,
+      kind: input.method === "scan" || input.method === "drone" ? "reality_capture" : input.method === "photo" ? "photograph" : input.method === "survey" ? "survey" : "inspection",
+      source: `site observation (${input.method})`,
+      contentHash,
+      fileId: input.fileIds[0] ?? null,
+      capturedAt: input.observedAt,
+      independenceScore: assessment.independenceScore,
+      provenance: {
+        observedBy: observer.userId,
+        observerVendorId: observer.vendorId ?? null,
+        claimantId: input.claimantId,
+        claimantKind: input.claimantKind,
+        claimantName: input.claimantName ?? null,
+        method: input.method,
+        basis: assessment.independenceBasis,
+        scanId: input.scanId ?? null,
+        droneFlightId: input.droneFlightId ?? null,
+      },
+      metadata: {
+        zoneName: input.zoneName,
+        observedPercent: input.observedPercent,
+        fileIds: input.fileIds,
+      },
+      submittedBy: observer.userId,
+    });
+
+    await tx.insert(reconciliations).values({
+      id: reconciliationId,
+      companyId,
+      projectId,
+      assertionId,
+      evidenceIds: [evidenceId],
+      method: `progress_${input.method}`,
+      result: assessment.result,
+      variance: Math.round((input.claimedPercent - input.observedPercent) * 100) / 100,
+      variancePercent: assessment.variancePercent,
+      confidence: assessment.confidence,
+      notes: assessment.reasons.join(" "),
+      createdBy: observer.userId,
+    });
+
+    const [row] = await tx
+      .insert(siteProgressObservations)
+      .values({
+        id,
+        companyId,
+        projectId,
+        number,
+        reference,
+        zoneName: input.zoneName,
+        locationId: input.locationId ?? null,
+        scheduleTaskId: input.scheduleTaskId ?? null,
+        workPackageRef: input.workPackageRef ?? null,
+        claimedPercent: input.claimedPercent,
+        observedPercent: input.observedPercent,
+        variancePercent: assessment.variancePercent,
+        method: input.method,
+        observedAt: input.observedAt,
+        observedBy: observer.userId,
+        claimSourceType: input.claimSourceType,
+        claimSourceId: input.claimSourceId ?? null,
+        claimantId: input.claimantId,
+        claimantKind: input.claimantKind,
+        claimantName: input.claimantName ?? null,
+        claimedAt: input.claimedAt ?? null,
+        scanId: input.scanId ?? null,
+        droneFlightId: input.droneFlightId ?? null,
+        fileIds: input.fileIds,
+        assertionId,
+        evidenceId,
+        reconciliationId,
+        result: assessment.result,
+        confidence: assessment.confidence,
+        independenceScore: assessment.independenceScore,
+        notes: input.notes ?? null,
+        createdBy: observer.userId,
+      })
+      .returning();
+    return row!;
+  });
+
+  for (const [objectType, objectId] of [
+    ["assertion", assertionId],
+    ["evidence", evidenceId],
+    ["reconciliation", reconciliationId],
+    ["site_progress_observation", id],
+  ] as const) {
+    await ledger(db, {
+      companyId,
+      projectId,
+      actorId: observer.userId,
+      action: "create",
+      objectType,
+      objectId,
+      payload: {
+        reference,
+        zone: input.zoneName,
+        claimedPercent: input.claimedPercent,
+        observedPercent: input.observedPercent,
+        result: assessment.result,
+        at,
+      },
+    });
+  }
+
+  return { record: saved, assertionId, evidenceId, reconciliationId };
+}
+
+/* ================================================================== */
+/* Summary and health inputs                                           */
+/* ================================================================== */
+
+export interface SiteSummary {
+  asOf: string;
+  register: {
+    headcount: number;
+    windowFrom: string;
+    /** gate reads folded to produce this register — 0 means no feed, not an empty site */
+    eventsConsidered: number;
+    overstays: number;
+    anomalies: number;
+    refusedEvents: number;
+    reasons: string[];
+  };
+  access: { activePasses: number; validInductions: number; expiringPasses: number; passesWithoutValidInduction: number };
+  permits: { open: number; active: number; expired: number; byType: Record<string, number> };
+  entries: { inside: number; overdue: number };
+  loneWorkers: { active: number; overdue: number; escalated: number };
+  zones: { active: number };
+  weather: { observations: number; lastObservedOn: string | null; analyses: number; lastExceptionalDays: number | null };
+  capture: { flights: number; scans: number; deviationsOutOfTolerance: number; toursPublished: number };
+  ground: { investigations: number; openFindings: number; strikes: number; nearMisses: number };
+  environmental: { open: number; exceedances: number };
+  progress: { observations: number; overclaims: number; worstVariance: Figure };
+  settingOut: { awaitingCheck: number };
+  signals: { open: number };
+}
+
+/** Rows of `{ k, n }` folded into a map, dropping nulls. */
+function countMap(rows: readonly { k: string | null; n: number | string }[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const row of rows) {
+    if (row.k === null) continue;
+    out[row.k] = (out[row.k] ?? 0) + Number(row.n);
+  }
+  return out;
+}
+
+const sumOf = (map: Record<string, number>): number => Object.values(map).reduce((a, b) => a + b, 0);
+const pick = (map: Record<string, number>, ...keys: string[]): number =>
+  keys.reduce((total, key) => total + (map[key] ?? 0), 0);
+
+/**
+ * The workspace header and the intelligence layer's input.
+ *
+ * Every figure is a GROUPED COUNT in the database — `count(*) … group by
+ * status` — not a table read folded in JavaScript: this endpoint is polled
+ * per project by WP-INTEL as well as rendered on every page load, and a
+ * mature site would otherwise move hundreds of thousands of rows to produce
+ * twenty numbers (and silently truncate them at the row cap). The one fold
+ * that still reads rows is the on-site register, which genuinely needs the
+ * gate feed in order.
+ */
+export async function siteSummary(
+  db: Db,
+  companyId: string,
+  projectId: string,
+  asOf: string,
+): Promise<SiteSummary> {
+  const today = asOf.slice(0, 10);
+  const soon = new Date(Date.parse(`${today}T00:00:00.000Z`) + 30 * 86_400_000).toISOString().slice(0, 10);
+  /** every one of this module's tables is company- and project-scoped */
+  const scope = (t: { companyId: AnyColumn; projectId: AnyColumn }) =>
+    and(eq(t.companyId, companyId), eq(t.projectId, projectId));
+
+  const [
+    register,
+    passStats,
+    inductionStats,
+    permitRows,
+    entryRows,
+    loneRows,
+    zoneRows,
+    weatherStats,
+    analysisStats,
+    lastAnalysis,
+    flightStats,
+    scanStats,
+    deviationRows,
+    tourStats,
+    strikeStats,
+    investigationStats,
+    findingStats,
+    envStats,
+    progressRows,
+    settingOutStats,
+    openSignals,
+  ] = await Promise.all([
+    loadRegister(db, companyId, projectId, asOf),
+    db
+      .select({
+        active: sql<number>`count(*) filter (where ${siteAccessPasses.status} = 'active')`,
+        expiring: sql<number>`count(*) filter (where ${siteAccessPasses.status} = 'active' and ${siteAccessPasses.validUntil} is not null and ${siteAccessPasses.validUntil} <= ${soon})`,
+        withoutInduction: sql<number>`count(*) filter (where ${siteAccessPasses.status} = 'active' and (${siteInductions.status} is null or ${siteInductions.status} <> 'valid'))`,
+      })
+      .from(siteAccessPasses)
+      .leftJoin(siteInductions, eq(siteAccessPasses.inductionId, siteInductions.id))
+      .where(scope(siteAccessPasses)),
+    db
+      .select({ valid: sql<number>`count(*) filter (where ${siteInductions.status} = 'valid')` })
+      .from(siteInductions)
+      .where(scope(siteInductions)),
+    db
+      .select({ status: sitePermits.status, permitType: sitePermits.permitType, n: count() })
+      .from(sitePermits)
+      .where(scope(sitePermits))
+      .groupBy(sitePermits.status, sitePermits.permitType),
+    db
+      .select({ k: sitePermitEntries.status, n: count() })
+      .from(sitePermitEntries)
+      .where(scope(sitePermitEntries))
+      .groupBy(sitePermitEntries.status),
+    db
+      .select({ k: siteLoneWorkerSessions.status, n: count() })
+      .from(siteLoneWorkerSessions)
+      .where(scope(siteLoneWorkerSessions))
+      .groupBy(siteLoneWorkerSessions.status),
+    db
+      .select({ k: siteExclusionZones.status, n: count() })
+      .from(siteExclusionZones)
+      .where(scope(siteExclusionZones))
+      .groupBy(siteExclusionZones.status),
+    db
+      .select({ n: count(), lastObservedOn: sql<string | null>`max(${siteWeatherObservations.observedOn})` })
+      .from(siteWeatherObservations)
+      .where(scope(siteWeatherObservations)),
+    db.select({ n: count() }).from(siteWeatherAnalyses).where(scope(siteWeatherAnalyses)),
+    db
+      .select({ exceptionalDays: siteWeatherAnalyses.exceptionalDays })
+      .from(siteWeatherAnalyses)
+      .where(scope(siteWeatherAnalyses))
+      .orderBy(desc(siteWeatherAnalyses.generatedAt))
+      .limit(1),
+    db.select({ n: count() }).from(siteDroneFlights).where(scope(siteDroneFlights)),
+    db.select({ n: count() }).from(siteScans).where(scope(siteScans)),
+    db
+      .select({ k: siteScanDeviations.verdict, n: count() })
+      .from(siteScanDeviations)
+      .where(scope(siteScanDeviations))
+      .groupBy(siteScanDeviations.verdict),
+    db
+      .select({ published: sql<number>`count(*) filter (where ${sitePhotoTours.status} = 'published')` })
+      .from(sitePhotoTours)
+      .where(scope(sitePhotoTours)),
+    db
+      .select({
+        n: count(),
+        nearMisses: sql<number>`count(*) filter (where ${siteUtilityStrikes.severity} = 'near_miss')`,
+      })
+      .from(siteUtilityStrikes)
+      .where(scope(siteUtilityStrikes)),
+    db.select({ n: count() }).from(siteGeotechInvestigations).where(scope(siteGeotechInvestigations)),
+    db
+      .select({ open: sql<number>`count(*) filter (where ${siteGroundFindings.status} = 'open')` })
+      .from(siteGroundFindings)
+      .where(scope(siteGroundFindings)),
+    db
+      .select({
+        open: sql<number>`count(*) filter (where ${siteEnvironmentalEvents.status} <> 'closed')`,
+        exceedances: sql<number>`count(*) filter (where ${siteEnvironmentalEvents.exceededThreshold} = 1)`,
+      })
+      .from(siteEnvironmentalEvents)
+      .where(scope(siteEnvironmentalEvents)),
+    db
+      .select({
+        k: siteProgressObservations.result,
+        n: count(),
+        worst: sql<number | null>`max(${siteProgressObservations.variancePercent})`,
+      })
+      .from(siteProgressObservations)
+      .where(scope(siteProgressObservations))
+      .groupBy(siteProgressObservations.result),
+    db
+      .select({ awaitingCheck: sql<number>`count(*) filter (where ${siteSettingOutRecords.status} = 'set_out')` })
+      .from(siteSettingOutRecords)
+      .where(scope(siteSettingOutRecords)),
+    db
+      .select({ n: count() })
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, companyId),
+          eq(signals.projectId, projectId),
+          inArray(signals.detector, [...SITE_DETECTOR_LIST]),
+          inArray(signals.disposition, ["new", "under_review", "escalated"]),
+        ),
+      ),
+  ]);
+
+  const byType: Record<string, number> = {};
+  let permitsOpen = 0;
+  let permitsActive = 0;
+  let permitsExpired = 0;
+  for (const p of permitRows) {
+    const n = Number(p.n);
+    if ((OPEN_PERMIT_STATUSES as readonly string[]).includes(p.status)) {
+      permitsOpen += n;
+      byType[p.permitType] = (byType[p.permitType] ?? 0) + n;
+    }
+    if (p.status === "active") permitsActive += n;
+    if (p.status === "expired") permitsExpired += n;
+  }
+
+  const entries = countMap(entryRows);
+  const lone = countMap(loneRows);
+  const zones = countMap(zoneRows);
+  const deviations = countMap(deviationRows);
+
+  const OVERCLAIM_RESULTS = ["unsupported", "contradicted", "partially_supported"] as const;
+  const progressByResult = countMap(progressRows);
+  const observations = sumOf(progressByResult);
+  const overclaims = pick(progressByResult, ...OVERCLAIM_RESULTS);
+  let worstVariance: number | null = null;
+  for (const row of progressRows) {
+    if (row.k === null || !(OVERCLAIM_RESULTS as readonly string[]).includes(row.k)) continue;
+    const worst = row.worst === null || row.worst === undefined ? null : Number(row.worst);
+    if (worst !== null && (worstVariance === null || worst > worstVariance)) worstVariance = worst;
+  }
+
+  return {
+    asOf,
+    register: {
+      headcount: register.headcount,
+      windowFrom: register.windowFrom,
+      eventsConsidered: register.eventsConsidered,
+      overstays: register.overstays.length,
+      anomalies: register.anomalyCount,
+      refusedEvents: register.refusedEvents,
+      reasons: register.reasons,
+    },
+    access: {
+      activePasses: Number(passStats[0]?.active ?? 0),
+      validInductions: Number(inductionStats[0]?.valid ?? 0),
+      expiringPasses: Number(passStats[0]?.expiring ?? 0),
+      passesWithoutValidInduction: Number(passStats[0]?.withoutInduction ?? 0),
+    },
+    permits: { open: permitsOpen, active: permitsActive, expired: permitsExpired, byType },
+    entries: { inside: entries["inside"] ?? 0, overdue: entries["overdue"] ?? 0 },
+    loneWorkers: {
+      active: lone["active"] ?? 0,
+      overdue: lone["overdue"] ?? 0,
+      escalated: lone["escalated"] ?? 0,
+    },
+    zones: { active: zones["active"] ?? 0 },
+    weather: {
+      observations: Number(weatherStats[0]?.n ?? 0),
+      lastObservedOn: weatherStats[0]?.lastObservedOn ?? null,
+      analyses: Number(analysisStats[0]?.n ?? 0),
+      lastExceptionalDays: lastAnalysis[0]?.exceptionalDays ?? null,
+    },
+    capture: {
+      flights: Number(flightStats[0]?.n ?? 0),
+      scans: Number(scanStats[0]?.n ?? 0),
+      deviationsOutOfTolerance: deviations["out_of_tolerance"] ?? 0,
+      toursPublished: Number(tourStats[0]?.published ?? 0),
+    },
+    ground: {
+      investigations: Number(investigationStats[0]?.n ?? 0),
+      openFindings: Number(findingStats[0]?.open ?? 0),
+      strikes: Number(strikeStats[0]?.n ?? 0),
+      nearMisses: Number(strikeStats[0]?.nearMisses ?? 0),
+    },
+    environmental: {
+      open: Number(envStats[0]?.open ?? 0),
+      exceedances: Number(envStats[0]?.exceedances ?? 0),
+    },
+    progress: {
+      observations,
+      overclaims,
+      worstVariance:
+        worstVariance === null
+          ? figure(null, "percentage points", { observations }, [
+              "No progress observation has found an overclaim.",
+            ])
+          : figure(round1(worstVariance), "percentage points", { observations }),
+    },
+    settingOut: { awaitingCheck: Number(settingOutStats[0]?.awaitingCheck ?? 0) },
+    signals: { open: Number(openSignals[0]?.n ?? 0) },
+  };
+}
+
+/* ================================================================== */
+/* Health inputs (contract 3.5)                                        */
+/* ================================================================== */
+
+export interface HealthInputs {
+  metrics: Record<string, number | null>;
+  reasons: string[];
+}
+
+/**
+ * What the intelligence layer reads from site operations. Every metric that
+ * cannot be derived is `null` with a reason — a project with no gate feed has
+ * an UNKNOWN headcount, not a headcount of zero, and a health score built on
+ * a fabricated zero would be worse than no score.
+ */
+export async function siteHealthInputs(
+  db: Db,
+  companyId: string,
+  projectId: string,
+  asOf: string,
+): Promise<HealthInputs> {
+  const summary = await siteSummary(db, companyId, projectId, asOf);
+  const reasons: string[] = [...summary.register.reasons];
+  // A feed exists when reads were folded, NOT when somebody is still inside:
+  // a site everybody has gone home from has a headcount of 0, and reporting
+  // that as "unknown, there is no gate feed" would be a false reason.
+  const hasGateFeed = summary.register.eventsConsidered > 0;
+
+  const metrics: Record<string, number | null> = {
+    siteHeadcount: hasGateFeed ? summary.register.headcount : null,
+    siteOverstays: hasGateFeed ? summary.register.overstays : null,
+    sitePermitsActive: summary.permits.active,
+    sitePermitsExpiredOpen: summary.permits.expired,
+    siteConfinedSpaceOverdue: summary.entries.overdue,
+    siteLoneWorkerEscalated: summary.loneWorkers.escalated,
+    sitePassesWithoutInduction: summary.access.passesWithoutValidInduction,
+    siteOpenGroundFindings: summary.ground.openFindings,
+    siteUtilityStrikes: summary.ground.strikes,
+    siteEnvironmentalExceedances: summary.environmental.exceedances,
+    siteProgressOverclaims: summary.progress.observations > 0 ? summary.progress.overclaims : null,
+    siteWorstProgressVariance: summary.progress.worstVariance.value,
+    siteScanDeviationsOutOfTolerance: summary.capture.deviationsOutOfTolerance,
+    siteExceptionalWeatherDays: summary.weather.lastExceptionalDays,
+    siteSettingOutAwaitingCheck: summary.settingOut.awaitingCheck,
+    siteOpenSignals: summary.signals.open,
+  };
+
+  if (!hasGateFeed) {
+    reasons.push(
+      "Headcount and overstay figures are not available: this project has no gate feed to fold — no read at all was recorded inside the register window.",
+    );
+  }
+  if (summary.progress.observations === 0) {
+    reasons.push("No independent progress observation has been recorded, so claimed progress is untested here.");
+  }
+  if (summary.weather.lastExceptionalDays === null) {
+    reasons.push("No exceptional-weather analysis has been run, so weather entitlement is not quantified.");
+  }
+  return { metrics, reasons };
+}

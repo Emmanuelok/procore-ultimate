@@ -71,6 +71,17 @@ export interface PolicyRow {
   createdBy: string;
   createdAt: string;
   updatedAt: string;
+  /*
+   * RENEWAL PIPELINE (#775). Deliberately separate from `status`: a policy is
+   * comfortably `active` right up to the day it is not, and the only useful
+   * question ninety days out is whether anyone has started.
+   */
+  renewalStatus: string;
+  renewalOwnerId: string | null;
+  renewalTargetDate: string | null;
+  renewalNotes: string | null;
+  previousPolicyId: string | null;
+  renewedByPolicyId: string | null;
   /** derived — expiry is computed from periodEnd, never typed */
   derivedStatus: string;
   daysToExpiry: number;
@@ -162,6 +173,58 @@ export interface BondExposure {
   unparsableSteps: number;
 }
 
+/**
+ * The bonding line a bond draws on (#796).
+ *
+ * `utilisation` is derived server-side from the live bonds against the line,
+ * so the headroom shown beside a bond is the same figure the facilities
+ * register shows — there is no second arithmetic here to drift from it.
+ */
+export interface BondFacilityUtilisation {
+  facilityId: string;
+  currency: string;
+  limitAmount: number;
+  drawnAmount: number;
+  headroom: number | null;
+  utilisationPct: number | null;
+  bondCount: number;
+  excludedForeignCurrency: { bondId: string; currency: string; amount: number }[];
+  outsidePermittedTypes: string[];
+  inForce: boolean | null;
+  daysToReview: number | null;
+  reasons: string[];
+}
+
+/** What the list route attaches to each bond: the line's identity, not its maths. */
+export interface BondFacilityLite {
+  id: string;
+  number: string;
+  name: string;
+  provider: string;
+  currency: string;
+  limitAmount: number;
+  status: string;
+}
+
+/** What the detail route attaches: identity plus the live line state. */
+export interface BondFacilitySummary extends BondFacilityLite {
+  utilisation: BondFacilityUtilisation;
+}
+
+/** A pickable line, from GET /insurance/facilities. */
+export interface FacilityOption {
+  id: string;
+  number: string;
+  name: string;
+  provider: string;
+  currency: string;
+  limitAmount: number;
+  status: string;
+  projectId: string | null;
+  permittedBondTypes: string[];
+  utilisation: BondFacilityUtilisation;
+}
+
 export interface BondRow {
   id: string;
   companyId: string;
@@ -185,6 +248,8 @@ export interface BondRow {
   status: string;
   documentId: string | null;
   releasedAt: string | null;
+  /** the line this bond draws on, when it draws on one */
+  facilityId: string | null;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
@@ -193,6 +258,7 @@ export interface BondRow {
   daysToDemandDeadline: number | null;
   daysToExpiry: number | null;
   demandStillPossible: boolean | null;
+  facility?: BondFacilityLite | null;
 }
 
 export interface BondCallRow {
@@ -212,6 +278,8 @@ export interface BondCallRow {
 
 export interface BondDetail extends BondRow {
   calls: BondCallRow[];
+  facility?: BondFacilitySummary | null;
+  facilityWarnings?: string[];
 }
 
 export interface BondCallResult {
@@ -253,6 +321,10 @@ export interface ClaimRow {
   createdBy: string;
   createdAt: string;
   updatedAt: string;
+  packFileId: string | null;
+  packSha256: string | null;
+  packGeneratedAt: string | null;
+  packItemCount: number;
   /** derived */
   daysToNotificationDue: number | null;
   notificationOutstanding: boolean;
@@ -463,6 +535,29 @@ export interface InsuranceSummary {
     called: number;
     released: number;
     note: string;
+    /**
+     * Bonding lines (#796). Utilisation is DERIVED from the bonds drawn
+     * against each facility, never stored, and headroom is refused across
+     * currencies — a bond in another currency is excluded and named rather
+     * than converted at a rate nobody recorded.
+     */
+    facilities: {
+      facilityId: string;
+      number: string;
+      name: string;
+      provider: string;
+      currency: string;
+      limitAmount: number;
+      drawnAmount: number;
+      headroom: number | null;
+      utilisationPct: number | null;
+      bondCount: number;
+      excludedForeignCurrency: { bondId: string; currency: string; amount: number }[];
+      outsidePermittedTypes: string[];
+      inForce: boolean | null;
+      daysToReview: number | null;
+      reasons: string[];
+    }[];
     headroomNote: string;
   };
   claims: {
@@ -628,6 +723,11 @@ export const DETECTOR_LABELS: Record<string, string> = {
   bond_demand_deadline_passed: "Bond demand deadline passed",
   policy_lapsed_during_works: "Policy lapsed during works",
   insurance_notification_missed: "Claim notification missed",
+  policy_period_gap: "Policy period gap",
+  uninsured_loss_candidate: "Uninsured loss candidate",
+  policy_renewal_overdue: "Renewal overdue",
+  insurance_certificate_mismatch: "Certificate does not match the document",
+  bond_demand_deadline_approaching: "Bond demand deadline approaching",
 };
 
 /* --------------------------- Transition tables ---------------------------- */
@@ -1226,4 +1326,169 @@ export function Pager({
       </div>
     </div>
   );
+}
+
+/* --------------------- Claim pack and the loss adjuster -------------------- */
+
+/** One entry on the adjuster's task list (#785). `overdue` is derived server-side. */
+export interface ClaimRequest {
+  id: string;
+  claimId: string;
+  kind: string;
+  title: string;
+  description: string | null;
+  requestedBy: string | null;
+  requestedAt: string | null;
+  dueDate: string | null;
+  obligationId: string | null;
+  ownerId: string | null;
+  status: string;
+  respondedAt: string | null;
+  respondedBy: string | null;
+  responseNote: string | null;
+  overdue: boolean;
+  daysToDue: number | null;
+}
+
+export interface ClaimRequestList {
+  items: ClaimRequest[];
+  total: number;
+  open: number;
+  overdue: number;
+}
+
+/** POST /claims/:id/pack — the assembled, content-addressed documentation. */
+export interface ClaimPackResult {
+  claimId: string;
+  fileId: string;
+  sha256: string;
+  sizeBytes: number;
+  contentType: string;
+  generatedAt: string;
+  itemCount: number;
+  gaps: string[];
+  note: string;
+}
+
+export const CLAIM_REQUEST_KIND_LABELS: Record<string, string> = {
+  information_request: "Information request",
+  site_visit: "Site visit",
+  interim_report: "Interim report",
+  expert_appointment: "Expert appointment",
+};
+
+/* ------------------------------------------------------------------ */
+/* Certificate authenticity (#772, #781)                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Two independent claims about the same piece of paper, and neither of them
+ * comes from the party who typed the record: what the DOCUMENT says
+ * (extraction), and what the broker or insurer says (confirmation).
+ */
+export interface ExtractionMismatch {
+  field: string;
+  typed: string | number | null;
+  extracted: string | number | null;
+  severity: "high" | "medium" | "low";
+  detail: string;
+  /** the words on the document the finding rests on, when the model quoted them */
+  quote: string | null;
+}
+
+export interface CertificateExtraction {
+  insurer: string | null;
+  policyNumber: string | null;
+  insuredName: string | null;
+  policyType: string | null;
+  limitOfIndemnity: number | null;
+  currency: string | null;
+  validFrom: string | null;
+  validTo: string | null;
+  waiverOfSubrogation: boolean | null;
+  additionalInsured: boolean | null;
+  endorsements: string[];
+  citations: Array<{ field: string; quote: string }>;
+  notes: string | null;
+}
+
+export interface ExtractionResult {
+  certificateId: string;
+  runId: string;
+  extracted: CertificateExtraction;
+  mismatches: ExtractionMismatch[];
+  summary: string;
+  appliedToRecord: boolean;
+  note: string;
+}
+
+export interface StoredExtraction {
+  certificateId: string;
+  extractedAt: string | null;
+  runId: string | null;
+  extracted: CertificateExtraction | null;
+  mismatches: ExtractionMismatch[];
+  available: boolean;
+  reason: string | null;
+}
+
+export const CONFIRMATION_CHANNELS = ["broker", "insurer"] as const;
+
+export const CONFIRMATION_OUTCOME_LABELS: Record<string, string> = {
+  confirmed: "Confirmed on risk",
+  corrected: "Corrected the details",
+  not_on_risk: "Says it is NOT on risk",
+  unknown: "Could not say",
+};
+
+export interface ConfirmationRow {
+  id: string;
+  companyId: string;
+  projectId: string | null;
+  certificateId: string;
+  channel: string;
+  recipientName: string | null;
+  recipientEmail: string;
+  recipientContactId: string | null;
+  recipientVendorId: string | null;
+  /** the hash only — the bearer token is never returned after issue */
+  tokenHash: string;
+  expiresAt: string;
+  status: string;
+  responseOutcome: string | null;
+  responseNote: string | null;
+  responseSha256: string | null;
+  respondedAt: string | null;
+  assertedFields: Record<string, unknown>;
+  correctedFields: Record<string, unknown>;
+  emailMessageId: string | null;
+  sentAt: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  overdue?: boolean;
+}
+
+/** POST returns the link ONCE, so it can be pasted if mail is not configured. */
+export interface ConfirmationCreated extends ConfirmationRow {
+  dispatched: boolean;
+  deliveryReasons: string[];
+  link: string;
+}
+
+export function confirmationTone(row: ConfirmationRow): "gray" | "green" | "amber" | "red" {
+  if (row.status === "responded") {
+    if (row.responseOutcome === "confirmed") return "green";
+    if (row.responseOutcome === "not_on_risk") return "red";
+    return "amber";
+  }
+  if (row.status === "expired") return "red";
+  if (row.status === "withdrawn") return "gray";
+  return row.overdue ? "red" : "amber";
+}
+
+export function mismatchTone(severity: string): "red" | "amber" | "gray" {
+  if (severity === "high") return "red";
+  if (severity === "medium") return "amber";
+  return "gray";
 }

@@ -5,7 +5,12 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
-import { companyMemberships, notifications, watchers } from "@constructos/db";
+import {
+  companyMemberships,
+  notificationPreferences,
+  notifications,
+  watchers,
+} from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
 import type { BuiltApp } from "../../app.js";
 import { newId } from "../../lib/ids.js";
@@ -309,5 +314,132 @@ describe("digest", () => {
       headers: memberHeaders,
     });
     expect(res.statusCode).toBe(403);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* The digest actually DEFERS (#96)                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * `decideDelivery` computed `digested` and `pushNotifications` ignored it: the
+ * row landed immediately and badged the bell, so a weekly digest was an extra
+ * weekly summary of interruptions the reader had already had. Two comments in
+ * the codebase described the deferral; nothing implemented it.
+ */
+describe("digest hold-back", () => {
+  async function unreadCount() {
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v1/notifications/unread-count",
+      headers: memberHeaders,
+    });
+    return res.json() as { count: number; heldForDigest: number };
+  }
+
+  it("writes a digested notification but keeps it out of the unread count", async () => {
+    // The member's cadence is `daily` (set in the preferences test above).
+    const before = await unreadCount();
+    const result = await pushNotifications(app.db, [
+      {
+        companyId: owner.companyId,
+        userId: member.userId,
+        projectId: projectA,
+        kind: "assignment",
+        title: "Deferred to the digest",
+      },
+    ]);
+    expect(result.inserted).toBe(1);
+
+    const after = await unreadCount();
+    // Written, and visible in the feed…
+    const feed = await app.inject({
+      method: "GET",
+      url: "/api/v1/notifications?pageSize=100",
+      headers: memberHeaders,
+    });
+    expect(
+      (feed.json().items as Array<{ title: string }>).some(
+        (n) => n.title === "Deferred to the digest",
+      ),
+    ).toBe(true);
+    // …but not counted as an interruption yet.
+    expect(after.count).toBe(before.count);
+    expect(after.heldForDigest).toBe(before.heldForDigest + 1);
+  });
+
+  it("releases held notifications when the digest goes out", async () => {
+    // Make the digest due again: the sweep above stamped lastDigestAt.
+    await app.db
+      .update(notificationPreferences)
+      .set({ lastDigestAt: new Date(Date.now() - 3 * 86_400_000).toISOString() })
+      .where(
+        and(
+          eq(notificationPreferences.companyId, owner.companyId),
+          eq(notificationPreferences.userId, member.userId),
+        ),
+      );
+    const before = await unreadCount();
+    expect(before.heldForDigest).toBeGreaterThan(0);
+
+    const run = await app.scheduler.runNow(NOTIFICATION_DIGEST_JOB);
+    expect(run.state).toBe("succeeded");
+    expect((run.lastResult as { released: number }).released).toBeGreaterThan(0);
+
+    const after = await unreadCount();
+    expect(after.heldForDigest).toBe(0);
+    // A deferral, not a suppression: they become ordinary unread items.
+    expect(after.count).toBeGreaterThanOrEqual(before.count + before.heldForDigest);
+  });
+});
+
+/**
+ * Turning the cadence off must hand back what it was holding.
+ *
+ * The release only ever happened inside the digest sweep, and the sweep only
+ * looks at preferences whose digest is not `off` — so a user who tried a
+ * weekly digest and went back to immediate delivery kept a permanently
+ * uncounted pile of notifications.
+ */
+describe("switching the digest off", () => {
+  it("releases everything the cadence was holding", async () => {
+    await app.inject({
+      method: "PUT",
+      url: "/api/v1/me/notification-preferences",
+      headers: memberHeaders,
+      payload: { digest: "weekly" },
+    });
+    await pushNotifications(app.db, [
+      {
+        companyId: owner.companyId,
+        userId: member.userId,
+        projectId: projectA,
+        kind: "assignment",
+        title: "Held by a cadence about to be abandoned",
+      },
+    ]);
+    const held = await app.inject({
+      method: "GET",
+      url: "/api/v1/notifications/unread-count",
+      headers: memberHeaders,
+    });
+    expect(held.json().heldForDigest).toBeGreaterThan(0);
+
+    const off = await app.inject({
+      method: "PUT",
+      url: "/api/v1/me/notification-preferences",
+      headers: memberHeaders,
+      payload: { digest: "off" },
+    });
+    expect(off.statusCode).toBe(200);
+    expect(off.json().releasedFromHold).toBeGreaterThan(0);
+
+    const after = await app.inject({
+      method: "GET",
+      url: "/api/v1/notifications/unread-count",
+      headers: memberHeaders,
+    });
+    expect(after.json().heldForDigest).toBe(0);
+    expect(after.json().count).toBeGreaterThanOrEqual(held.json().count + 1);
   });
 });

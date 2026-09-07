@@ -13,10 +13,15 @@
  *    can ever fail the business write that produced the event.
  *  · schedule rules: `scanSchedules` runs from the scheduler job
  *    `automation.schedules`. For each due rule it lists the company's live
- *    records of the trigger type (bounded by SCAN_LIMIT), evaluates conditions
- *    BEFORE creating a run so a daily scan over 500 open RFIs does not leave
- *    500 "skipped" rows, dedupes against runs inside the cooldown window, and
- *    executes the matches.
+ *    records of the trigger type — bounded by `scanLimit` and ordered OLDEST
+ *    FIRST on the field the rule ages on (its "overdue by"/"older than" field,
+ *    else the type's deadline, else createdAt), because every schedule rule is
+ *    about the records that have waited LONGEST — evaluates conditions BEFORE creating a
+ *    run so a daily scan over 500 open RFIs does not leave 500 "skipped" rows,
+ *    dedupes against runs inside the cooldown window, and executes the
+ *    matches. When the cap cuts the list short the rule is stamped
+ *    (`lastScanTruncated`) and the scan says so: a partial scan is never
+ *    reported as "nothing matched".
  *  · queued (non-immediate) runs are executed by the `automation.drain` job.
  *
  * LOOP GUARD
@@ -55,8 +60,8 @@ import {
   type ExecutorDeps,
   type RunFacts,
 } from "./actions.js";
-import { evaluateCondition, referencedFields, type EvaluationContext } from "./predicates.js";
-import { loadSnapshot, scanCandidates, snapshotEntry, type LoadedSnapshot } from "./snapshots.js";
+import { ageingOrderField, evaluateCondition, referencedFields, type EvaluationContext } from "./predicates.js";
+import { loadSnapshot, scanCandidates, SCAN_LIMIT, snapshotEntry, type LoadedSnapshot } from "./snapshots.js";
 
 export type RuleRow = typeof automationRules.$inferSelect;
 export type RunRow = typeof automationRuns.$inferSelect;
@@ -66,6 +71,8 @@ export interface EngineOptions {
   maxChainDepth: number;
   maxAttempts: number;
   drainBatch: number;
+  /** rows one schedule scan may look at (hard-capped by SCAN_LIMIT) */
+  scanLimit: number;
   requestTimeoutMs: number;
   responseBodyLimit: number;
   /** origin entries older than this are forgotten */
@@ -90,6 +97,7 @@ export function defaultEngineOptions(
     maxChainDepth: Math.max(0, intFromEnv(env, "AUTOMATION_MAX_CHAIN_DEPTH", 3)),
     maxAttempts: Math.max(1, intFromEnv(env, "AUTOMATION_MAX_ATTEMPTS", 5)),
     drainBatch: Math.max(1, intFromEnv(env, "AUTOMATION_DRAIN_BATCH", 50)),
+    scanLimit: Math.min(SCAN_LIMIT, Math.max(1, intFromEnv(env, "AUTOMATION_SCAN_LIMIT", SCAN_LIMIT))),
     requestTimeoutMs: intFromEnv(env, "AUTOMATION_WEBHOOK_TIMEOUT_MS", 10_000),
     responseBodyLimit: intFromEnv(env, "AUTOMATION_RESPONSE_BODY_LIMIT", 2_048),
     originTtlMs: 5 * 60_000,
@@ -98,6 +106,12 @@ export function defaultEngineOptions(
   };
 }
 
+/**
+ * Engine counters. They are kept PER COMPANY: one process serves every
+ * tenant, and an error message routinely embeds another tenant's rule or run
+ * id, so a company-scoped status route must never be handed the platform's
+ * numbers or the platform's last error text.
+ */
 export interface EngineHealth {
   eventsSeen: number;
   eventsMatched: number;
@@ -106,6 +120,7 @@ export interface EngineHealth {
   runsFailed: number;
   runsThrottled: number;
   hookFailures: number;
+  scansTruncated: number;
   lastError: string | null;
   lastErrorAt: string | null;
 }
@@ -117,6 +132,21 @@ export interface DrainSummary {
   skipped: number;
   deferred: number;
   throttled: number;
+  /**
+   * true when this call did no work because another drain was already in
+   * flight. Zero counters then mean "nothing was attempted", not "there was
+   * nothing to do" — the caller must say which.
+   */
+  busy: boolean;
+  reason: string | null;
+}
+
+export interface TruncatedScan {
+  ruleId: string;
+  ruleName: string;
+  objectType: string;
+  limit: number;
+  orderedBy: string;
 }
 
 export interface ScanSummary {
@@ -125,6 +155,8 @@ export interface ScanSummary {
   matched: number;
   deduped: number;
   executed: number;
+  /** rules whose scan hit the SCAN_LIMIT cap: some live records were not looked at */
+  truncated: TruncatedScan[];
 }
 
 interface Origin {
@@ -145,17 +177,7 @@ export class AutomationEngine {
   private http: AutomationHttpClient;
   private readonly origins = new Map<string, Origin>();
   private draining = false;
-  private readonly health: EngineHealth = {
-    eventsSeen: 0,
-    eventsMatched: 0,
-    runsEnqueued: 0,
-    runsExecuted: 0,
-    runsFailed: 0,
-    runsThrottled: 0,
-    hookFailures: 0,
-    lastError: null,
-    lastErrorAt: null,
-  };
+  private readonly healthByCompany = new Map<string, EngineHealth>();
 
   constructor(
     private readonly db: Db,
@@ -174,15 +196,64 @@ export class AutomationEngine {
     this.options = { ...this.options, ...partial };
   }
 
-  getHealth(): EngineHealth {
-    return { ...this.health };
+  private static emptyHealth(): EngineHealth {
+    return {
+      eventsSeen: 0,
+      eventsMatched: 0,
+      runsEnqueued: 0,
+      runsExecuted: 0,
+      runsFailed: 0,
+      runsThrottled: 0,
+      hookFailures: 0,
+      scansTruncated: 0,
+      lastError: null,
+      lastErrorAt: null,
+    };
   }
 
-  private recordError(err: unknown, where: string): void {
+  /** The mutable counter bucket for one company (created on first use). */
+  private health(companyId: string): EngineHealth {
+    let h = this.healthByCompany.get(companyId);
+    if (!h) {
+      h = AutomationEngine.emptyHealth();
+      this.healthByCompany.set(companyId, h);
+    }
+    return h;
+  }
+
+  /**
+   * Counters for ONE company. Called without a company id it returns the
+   * process-wide totals with NO error text — those messages name another
+   * tenant's records, so only the per-company view carries them.
+   */
+  getHealth(companyId?: string): EngineHealth {
+    if (companyId !== undefined) {
+      const h = this.healthByCompany.get(companyId);
+      return h ? { ...h } : AutomationEngine.emptyHealth();
+    }
+    const total = AutomationEngine.emptyHealth();
+    for (const h of this.healthByCompany.values()) {
+      total.eventsSeen += h.eventsSeen;
+      total.eventsMatched += h.eventsMatched;
+      total.runsEnqueued += h.runsEnqueued;
+      total.runsExecuted += h.runsExecuted;
+      total.runsFailed += h.runsFailed;
+      total.runsThrottled += h.runsThrottled;
+      total.hookFailures += h.hookFailures;
+      total.scansTruncated += h.scansTruncated;
+      if (h.lastErrorAt && (!total.lastErrorAt || h.lastErrorAt > total.lastErrorAt)) total.lastErrorAt = h.lastErrorAt;
+    }
+    return total;
+  }
+
+  private recordError(err: unknown, where: string, companyId: string | null): void {
     const message = `${where}: ${err instanceof Error ? err.message : String(err)}`;
-    this.health.lastError = message.slice(0, 1000);
-    this.health.lastErrorAt = this.options.now().toISOString();
-    this.logger.error({ err: message }, "automation engine error");
+    if (companyId) {
+      const h = this.health(companyId);
+      h.lastError = message.slice(0, 1000);
+      h.lastErrorAt = this.options.now().toISOString();
+    }
+    this.logger.error({ err: message, companyId }, "automation engine error");
   }
 
   /* ---------------------------------------------------------------- */
@@ -236,7 +307,7 @@ export class AutomationEngine {
    * Returns the number of runs enqueued.
    */
   async onLedgerEvent(event: LedgerEvent): Promise<number> {
-    this.health.eventsSeen += 1;
+    this.health(event.companyId).eventsSeen += 1;
     if (event.objectType.startsWith(AUTOMATION_PREFIX)) return 0;
     // Consumed before the rule lookup so a mark never outlives the event it
     // was made for, whether or not any rule matches that event.
@@ -256,7 +327,7 @@ export class AutomationEngine {
         )
         .orderBy(asc(automationRules.priority), asc(automationRules.createdAt));
       if (rules.length === 0) return 0;
-      this.health.eventsMatched += 1;
+      this.health(event.companyId).eventsMatched += 1;
 
       const snapshot = await loadSnapshot(this.db, event.companyId, event.objectType, event.objectId);
       const projectId = event.projectId ?? snapshot?.projectId ?? null;
@@ -296,14 +367,14 @@ export class AutomationEngine {
           try {
             await this.executeRun(run.id);
           } catch (err) {
-            this.recordError(err, `immediate run ${run.id}`);
+            this.recordError(err, `immediate run ${run.id}`, run.companyId);
           }
         }
       }
       return enqueued;
     } catch (err) {
-      this.health.hookFailures += 1;
-      this.recordError(err, "ledger hook");
+      this.health(event.companyId).hookFailures += 1;
+      this.recordError(err, "ledger hook", event.companyId);
       return 0;
     }
   }
@@ -345,7 +416,7 @@ export class AutomationEngine {
       queuedAt: now,
     };
     const inserted = await this.db.insert(automationRuns).values(row).returning();
-    this.health.runsEnqueued += 1;
+    this.health(rule.companyId).runsEnqueued += 1;
     return inserted[0]!;
   }
 
@@ -484,7 +555,7 @@ export class AutomationEngine {
         )
         .where(eq(automationRuns.id, run.id))
         .returning();
-      if (exhausted) this.health.runsThrottled += 1;
+      if (exhausted) this.health(run.companyId).runsThrottled += 1;
       return row!;
     }
 
@@ -565,7 +636,7 @@ export class AutomationEngine {
     } catch (err) {
       finalStatus = "failed";
       error = (err instanceof Error ? err.message : String(err)).slice(0, 1000);
-      this.recordError(err, `run ${run.id}`);
+      this.recordError(err, `run ${run.id}`, run.companyId);
     }
 
     const finishedAt = this.options.now().toISOString();
@@ -583,8 +654,9 @@ export class AutomationEngine {
       .where(eq(automationRuns.id, run.id))
       .returning();
 
-    this.health.runsExecuted += 1;
-    if (finalStatus === "failed") this.health.runsFailed += 1;
+    const health = this.health(run.companyId);
+    health.runsExecuted += 1;
+    if (finalStatus === "failed") health.runsFailed += 1;
 
     // Rule statistics — only when the rule actually did something or failed.
     if (finalStatus !== "skipped") {
@@ -616,31 +688,58 @@ export class AutomationEngine {
           },
         });
       } catch (err) {
-        this.recordError(err, `ledger for run ${run.id}`);
+        this.recordError(err, `ledger for run ${run.id}`, run.companyId);
       }
     }
     return final!;
   }
 
-  /** Execute every due queued run, oldest first, up to the batch size. */
-  async drain(limit = this.options.drainBatch): Promise<DrainSummary> {
-    const summary: DrainSummary = { executed: 0, succeeded: 0, failed: 0, skipped: 0, deferred: 0, throttled: 0 };
-    if (this.draining) return summary;
+  /**
+   * Execute every due queued run, oldest first, up to the batch size. The
+   * scheduler job drains the whole platform; a tenant-facing caller (the
+   * manual cycle route) MUST pass its own companyId so one company can never
+   * drive — or count — another company's runs.
+   */
+  async drain(limit = this.options.drainBatch, companyId?: string): Promise<DrainSummary> {
+    const summary: DrainSummary = {
+      executed: 0,
+      succeeded: 0,
+      failed: 0,
+      skipped: 0,
+      deferred: 0,
+      throttled: 0,
+      busy: false,
+      reason: null,
+    };
+    // Re-entrancy: the scheduler job drains the whole platform and can still
+    // be running when an operator clicks "Run cycle". Say so — all-zero
+    // counters must never be reported as "nothing was queued".
+    if (this.draining) {
+      summary.busy = true;
+      summary.reason = "A drain is already running; queued runs were left for it.";
+      return summary;
+    }
     this.draining = true;
     try {
       const nowIso = this.options.now().toISOString();
       const due = await this.db
-        .select({ id: automationRuns.id })
+        .select({ id: automationRuns.id, companyId: automationRuns.companyId })
         .from(automationRuns)
-        .where(and(eq(automationRuns.status, "queued"), lte(automationRuns.queuedAt, nowIso)))
+        .where(
+          and(
+            eq(automationRuns.status, "queued"),
+            lte(automationRuns.queuedAt, nowIso),
+            companyId ? eq(automationRuns.companyId, companyId) : undefined,
+          ),
+        )
         .orderBy(asc(automationRuns.queuedAt), asc(automationRuns.id))
         .limit(limit);
-      for (const { id } of due) {
+      for (const { id, companyId: runCompanyId } of due) {
         let row: RunRow;
         try {
           row = await this.executeRun(id);
         } catch (err) {
-          this.recordError(err, `drain ${id}`);
+          this.recordError(err, `drain ${id}`, runCompanyId);
           summary.failed += 1;
           continue;
         }
@@ -663,7 +762,7 @@ export class AutomationEngine {
 
   /** Evaluate every due schedule rule for one company. Idempotent per cooldown window. */
   async scanSchedules(companyId: string, now = this.options.now(), force = false): Promise<ScanSummary> {
-    const summary: ScanSummary = { rulesScanned: 0, candidates: 0, matched: 0, deduped: 0, executed: 0 };
+    const summary: ScanSummary = { rulesScanned: 0, candidates: 0, matched: 0, deduped: 0, executed: 0, truncated: [] };
     const rules = await this.db
       .select()
       .from(automationRules)
@@ -680,9 +779,38 @@ export class AutomationEngine {
       if (!force && rule.lastScanAt && now.getTime() - Date.parse(rule.lastScanAt) < everyMs) continue;
       summary.rulesScanned += 1;
       const cooldownMs = Math.max(1, rule.trigger.cooldownHours ?? 24) * 3_600_000;
+      let scanned = 0;
+      let truncated = false;
+      let orderedBy = "none";
       try {
-        const candidates = await scanCandidates(this.db, companyId, rule.triggerObjectType, rule.projectId);
+        // Order the capped scan by the field this rule ages on when it has
+        // one ("open 14+ days" → createdAt), otherwise by the type's deadline.
+        const page = await scanCandidates(
+          this.db,
+          companyId,
+          rule.triggerObjectType,
+          rule.projectId,
+          this.options.scanLimit,
+          ageingOrderField(rule.conditions ?? null),
+        );
+        const candidates = page.candidates;
+        scanned = candidates.length;
+        truncated = page.truncated;
+        orderedBy = page.orderedBy;
         summary.candidates += candidates.length;
+        if (truncated) {
+          // A capped scan is a partial answer. It is reported here, stamped on
+          // the rule, and counted in the company's health so the Engine tab
+          // can say "this rule saw 500 of N" instead of showing a silent 0.
+          summary.truncated.push({
+            ruleId: rule.id,
+            ruleName: rule.name,
+            objectType: rule.triggerObjectType,
+            limit: page.limit,
+            orderedBy: page.orderedBy,
+          });
+          this.health(companyId).scansTruncated += 1;
+        }
         for (const candidate of candidates) {
           const objectId = String(candidate.record["id"] ?? "");
           if (!objectId) continue;
@@ -728,15 +856,20 @@ export class AutomationEngine {
             await this.executeRun(run.id);
             summary.executed += 1;
           } catch (err) {
-            this.recordError(err, `schedule run ${run.id}`);
+            this.recordError(err, `schedule run ${run.id}`, companyId);
           }
         }
       } catch (err) {
-        this.recordError(err, `scan rule ${rule.id}`);
+        this.recordError(err, `scan rule ${rule.id}`, companyId);
       }
       await this.db
         .update(automationRules)
-        .set({ lastScanAt: now.toISOString() })
+        .set({
+          lastScanAt: now.toISOString(),
+          lastScanCandidates: scanned,
+          lastScanTruncated: truncated ? 1 : 0,
+          lastScanOrderedBy: orderedBy,
+        })
         .where(eq(automationRules.id, rule.id));
     }
     return summary;

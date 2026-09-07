@@ -322,6 +322,160 @@ describe("clash detection", () => {
     expect(raised[0]?.autoClosedAt).toBeTruthy();
   });
 
+  it("raises the backlog signal again when clashes come back after an auto-close", async () => {
+    // the close/raise cycle must run more than once: an auto-closed signal
+    // that can never be re-raised means the flagship detector goes silent for
+    // that test for ever, however many clashes a later model version brings
+    const before = await built.app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "bim_clash_unresolved"),
+        ),
+      );
+    expect(before[0]?.disposition).toBe("closed");
+
+    // put the MEP model back in the federation and re-run: the clashes return
+    const readd = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/bim/federations/${federationId}/members`,
+      owner.headers,
+      { modelVersionId: mepVersionId },
+    );
+    expect(readd.statusCode).toBe(201);
+    const run = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/bim/clash-tests/${testId}/run`,
+      owner.headers,
+    );
+    expect(run.statusCode).toBe(200);
+
+    const after = await built.app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "bim_clash_unresolved"),
+        ),
+      );
+    // the same row, re-opened — not a second row, and not silence
+    expect(after).toHaveLength(1);
+    expect(after[0]!.id).toBe(before[0]!.id);
+    expect(after[0]!.disposition).toBe("new");
+    expect(after[0]!.autoClosedAt).toBeNull();
+    expect(after[0]!.closedAt).toBeNull();
+    expect(after[0]!.occurrences).toBeGreaterThan(1);
+  });
+
+  it("leaves a signal a reviewer dismissed closed", async () => {
+    const [current] = await built.app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "bim_clash_unresolved"),
+        ),
+      );
+    // a human dismissal (closed, with no autoClosedAt) is a judgement the
+    // next sweep must not overrule, or alert fatigue comes straight back
+    await built.app.db
+      .update(signals)
+      .set({ disposition: "closed", closedAt: new Date().toISOString(), autoClosedAt: null })
+      .where(eq(signals.id, current!.id));
+    await inject("POST", `/api/v1/projects/${projectId}/bim/clash-tests/${testId}/run`, owner.headers);
+    const [after] = await built.app.db
+      .select()
+      .from(signals)
+      .where(eq(signals.id, current!.id));
+    expect(after?.disposition).toBe("closed");
+    const all = await built.app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "bim_clash_unresolved"),
+        ),
+      );
+    expect(all).toHaveLength(1);
+  });
+
+  it("refuses a federation group from outside this project on create and patch", async () => {
+    const otherProject = newId("prj");
+    await built.app.db
+      .insert(projects)
+      .values({ id: otherProject, companyId: owner.companyId, name: "Other site" });
+    const foreignGroup = await inject(
+      "POST",
+      `/api/v1/projects/${otherProject}/bim/federations`,
+      owner.headers,
+      { name: "Elsewhere" },
+    );
+    expect(foreignGroup.statusCode).toBe(201);
+
+    const create = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/bim/clash-tests`,
+      owner.headers,
+      { name: "Wrong federation", federationId: foreignGroup.json().id },
+    );
+    expect(create.statusCode).toBe(400);
+    expect(create.json().message).toContain("not in this project");
+
+    const patch = await inject(
+      "PATCH",
+      `/api/v1/projects/${projectId}/bim/clash-tests/${testId}`,
+      owner.headers,
+      { federationId: foreignGroup.json().id },
+    );
+    expect(patch.statusCode).toBe(400);
+  });
+
+  it("refuses to raise an issue for someone outside the project", async () => {
+    const stranger = await registerActor(built.app);
+    await built.app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: stranger.userId,
+      role: "member",
+    });
+    const results = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/bim/clash-tests/${testId}/results`,
+      owner.headers,
+    );
+    const free = (results.json().items as Array<Record<string, unknown>>).find(
+      (i) => !i["issueId"],
+    );
+    expect(free).toBeTruthy();
+
+    // a company colleague with no membership on this project would still be
+    // notified and recorded as responsible for a record they cannot open
+    const res = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/bim/clash-tests/${testId}/raise-issue`,
+      owner.headers,
+      { resultIds: [free!["id"]], assigneeId: stranger.userId },
+    );
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("not a member of this project");
+
+    // and an id from another tenant never resolves at all
+    const outsider = await registerActor(built.app);
+    const foreign = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/bim/clash-tests/${testId}/raise-issue`,
+      owner.headers,
+      { resultIds: [free!["id"]], assigneeId: outsider.userId },
+    );
+    expect(foreign.statusCode).toBe(400);
+    expect(foreign.json().message).toContain("not a member of this company");
+  });
+
   it("refuses to run a test with nothing in scope", async () => {
     const empty = await inject(
       "POST",
@@ -383,6 +537,49 @@ describe("coordination issues", () => {
     issueNumber = res.json().number;
     expect(res.json().status).toBe("open");
     expect(res.json().source).toBe("manual");
+  });
+
+  it("offers only the people this project may name, and refuses the rest", async () => {
+    // the picker and the writer must agree: a dropdown that offers someone
+    // the create route then 400s is a lie the user only finds after typing
+    const offProject = await registerActor(built.app);
+    await built.app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: offProject.userId,
+      role: "member",
+    });
+
+    const picker = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/bim/assignable-people`,
+      owner.headers,
+    );
+    expect(picker.statusCode).toBe(200);
+    const people = picker.json().items as Array<{ id: string; basis: string }>;
+    const ids = people.map((p) => p.id);
+    expect(ids).toContain(engineer.userId);
+    expect(ids).not.toContain(offProject.userId);
+    expect(people.find((p) => p.id === owner.userId)?.basis).toBe("company_admin");
+    expect(people.find((p) => p.id === engineer.userId)?.basis).toBe("project_member");
+
+    const refused = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/bim/issues`,
+      owner.headers,
+      { title: "Assigned off-project", assigneeId: offProject.userId },
+    );
+    expect(refused.statusCode).toBe(400);
+    expect(refused.json().message).toMatch(/member of this project/i);
+
+    // and another tenant cannot read this project's people
+    const outsider = await registerActor(built.app);
+    const foreign = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/bim/assignable-people`,
+      outsider.headers,
+    );
+    expect([403, 404]).toContain(foreign.statusCode);
   });
 
   it("assigns with a notification and walks the lifecycle", async () => {

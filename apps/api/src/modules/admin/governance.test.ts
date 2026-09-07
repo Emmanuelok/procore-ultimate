@@ -240,11 +240,25 @@ describe("retention and legal hold", () => {
       headers: owner.headers,
     });
     expect(res.statusCode).toBe(200);
-    const items = res.json().items as Array<{ objectType: string; enforced: boolean; note: string }>;
-    expect(items.find((i) => i.objectType === "project")!.enforced).toBe(true);
+    const items = res.json().items as Array<{
+      objectType: string;
+      counted: boolean;
+      executed: boolean;
+      dueForAction: number | null;
+      note: string;
+    }>;
+    // `counted` is what the flag now says: the substrate can count what the
+    // policy WOULD act on. It never claimed to enforce it, and no longer says
+    // it does.
+    const project = items.find((i) => i.objectType === "project")!;
+    expect(project.counted).toBe(true);
+    expect(project.executed).toBe(false);
+    expect(typeof project.dueForAction).toBe("number");
     const documents = items.find((i) => i.objectType === "document")!;
-    expect(documents.enforced).toBe(false);
-    expect(documents.note).toContain("does not delete records it does not own");
+    expect(documents.counted).toBe(false);
+    // Not countable is null, never 0.
+    expect(documents.dueForAction).toBeNull();
+    expect(documents.note).toContain("cannot count or act on records it does not own");
   });
 
   it("blocks and then permits a delete around a hold's lifecycle", async () => {
@@ -485,5 +499,236 @@ describe("scheduler job admin.authority-expiry", () => {
     const second = await app.scheduler.runNow(ADMIN_EXPIRY_JOB);
     expect(second.state).toBe("succeeded");
     expect((second.lastResult as { grants: number }).grants).toBe(0);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Delegated administration is ENFORCED (#27)                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * `admin_delegations` rows were created, listed, revoked, expired and
+ * ledgered, and no route in the platform read one: an owner could delegate
+ * `memberships` over a project, remove the person's admin role, and the
+ * delegate was refused on every call while the tab showed the delegation as
+ * live. These tests are the enforcement.
+ */
+describe("admin delegations change an authorisation decision", () => {
+  let delegate: TestActor;
+  let delegateHeaders: Record<string, string>;
+
+  beforeAll(async () => {
+    delegate = await registerActor(app);
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: delegate.userId,
+      role: "member",
+    });
+    delegateHeaders = {
+      authorization: delegate.headers["authorization"]!,
+      "x-company-id": owner.companyId,
+    };
+  });
+
+  it("refuses a plain member before the delegation exists", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/memberships`,
+      headers: delegateHeaders,
+    });
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("admits the delegate on the named project, and only there", async () => {
+    const other = await app.inject({
+      method: "POST",
+      url: "/api/v1/projects",
+      headers: owner.headers,
+      payload: { name: "Not delegated" },
+    });
+    const otherProjectId = other.json().id as string;
+
+    const granted = await app.inject({
+      method: "POST",
+      url: "/api/v1/company/admin-delegations",
+      headers: owner.headers,
+      payload: {
+        userId: delegate.userId,
+        capabilities: ["memberships"],
+        projectIds: [projectId],
+        note: "Regional lead",
+      },
+    });
+    expect(granted.statusCode).toBe(201);
+
+    const allowed = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/memberships`,
+      headers: delegateHeaders,
+    });
+    expect(allowed.statusCode).toBe(200);
+
+    const added = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${projectId}/memberships`,
+      headers: delegateHeaders,
+      payload: { userId: reviewer.userId, templateKey: "project_manager" },
+    });
+    expect(added.statusCode).toBe(201);
+
+    // The delegation names one project; it opens exactly that one.
+    const refused = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${otherProjectId}/memberships`,
+      headers: delegateHeaders,
+    });
+    expect(refused.statusCode).toBe(403);
+
+    // And it is scoped to its capability: `memberships` is not `directory`.
+    const notDirectory = await app.inject({
+      method: "GET",
+      url: "/api/v1/vendors/duplicates",
+      headers: delegateHeaders,
+    });
+    expect(notDirectory.statusCode).toBe(403);
+  });
+
+  it("publishes what each capability opens, and at which scope", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v1/company/admin-delegations",
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const scopes = res.json().capabilityScopes as Array<{ key: string; scope: string }>;
+    expect(scopes.find((s) => s.key === "memberships")?.scope).toBe("project");
+    expect(scopes.find((s) => s.key === "directory")?.scope).toBe("company");
+  });
+
+  it("opens a company-level route only for a tenant-wide delegation", async () => {
+    const wide = await registerActor(app);
+    await app.db.insert(companyMemberships).values({
+      id: newId("cm"),
+      companyId: owner.companyId,
+      userId: wide.userId,
+      role: "member",
+    });
+    const wideHeaders = {
+      authorization: wide.headers["authorization"]!,
+      "x-company-id": owner.companyId,
+    };
+    await app.inject({
+      method: "POST",
+      url: "/api/v1/company/admin-delegations",
+      headers: owner.headers,
+      payload: { userId: wide.userId, capabilities: ["directory"], projectIds: [] },
+    });
+    const allowed = await app.inject({
+      method: "GET",
+      url: "/api/v1/vendors/duplicates",
+      headers: wideHeaders,
+    });
+    expect(allowed.statusCode).toBe(200);
+
+    // It still does not open people administration: a directory delegate who
+    // could demote an owner would have escaped the bound entirely.
+    const escalation = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/company/users/${owner.userId}/role`,
+      headers: wideHeaders,
+      payload: { role: "member" },
+    });
+    expect(escalation.statusCode).toBe(403);
+  });
+
+  it("grants nothing once revoked", async () => {
+    const list = await app.inject({
+      method: "GET",
+      url: "/api/v1/company/admin-delegations",
+      headers: owner.headers,
+    });
+    const mine = (list.json().items as Array<{ id: string; userId: string }>).find(
+      (d) => d.userId === delegate.userId,
+    )!;
+    await app.inject({
+      method: "DELETE",
+      url: `/api/v1/company/admin-delegations/${mine.id}`,
+      headers: owner.headers,
+    });
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${projectId}/memberships`,
+      headers: delegateHeaders,
+    });
+    expect(res.statusCode).toBe(403);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* The export bundle is actually handed over (#45)                     */
+/* ------------------------------------------------------------------ */
+
+describe("POST /company/exports", () => {
+  it("returns the data, not only a manifest and a row count", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/v1/company/exports",
+      headers: owner.headers,
+      payload: { datasets: ["projects"] },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json();
+    expect(body.format).toBe("json");
+    expect(Array.isArray(body.data.projects)).toBe(true);
+    expect(body.data.projects.length).toBe(body.manifest.projects);
+    expect(body.data.projects.length).toBeGreaterThan(0);
+  });
+
+  it("produces a CSV sheet per dataset when asked (the brief says JSON/CSV)", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/v1/company/exports",
+      headers: owner.headers,
+      payload: { datasets: ["projects", "vendors"], format: "csv" },
+    });
+    expect(res.statusCode).toBe(201);
+    const files = res.json().files as Array<{ dataset: string; fileName: string; csv: string }>;
+    expect(files.map((f) => f.dataset).sort()).toEqual(["projects", "vendors"]);
+    const projectsCsv = files.find((f) => f.dataset === "projects")!;
+    expect(projectsCsv.fileName).toBe("projects.csv");
+    // A header row plus at least the project created in setup.
+    expect(projectsCsv.csv.split("\n").length).toBeGreaterThan(1);
+    expect(projectsCsv.csv.split("\n")[0]).toContain("name");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Retention preview says what is true                                 */
+/* ------------------------------------------------------------------ */
+
+describe("GET /company/retention-policies/preview", () => {
+  it("does not claim a policy is enforced when nothing acts on one", async () => {
+    await app.inject({
+      method: "PUT",
+      url: "/api/v1/company/retention-policies/project",
+      headers: owner.headers,
+      payload: { retainMonths: 84, action: "purge", basis: "Statute of limitations" },
+    });
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/v1/company/retention-policies/preview",
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const row = (res.json().items as Array<Record<string, unknown>>).find(
+      (r) => r["objectType"] === "project",
+    )!;
+    expect(row["executed"]).toBe(false);
+    expect(row["counted"]).toBe(true);
+    expect(String(row["note"])).not.toContain("Enforced by the substrate");
+    expect(String(res.json().enforcement)).toContain("No scheduler job");
+    // `holdsCovering` is a count of holds, and is named as such.
+    expect(typeof row["holdsCovering"]).toBe("number");
   });
 });

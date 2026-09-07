@@ -1,8 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  assessFaults,
+  checkGeofence,
   classifyDay,
   coerceTelematicsRow,
+  engineHoursForDay,
   engineHoursFromCounter,
+  engineHoursSeries,
+  localDateOf,
+  reconcileFuel,
   reconcileEquipment,
   reconcileTelematics,
   telematicsKey,
@@ -214,5 +220,237 @@ describe("coerceTelematicsRow", () => {
     expect(telematicsKey("generic_aemp", "DEV-1", "2026-08-03T06:00:00Z")).toBe(
       telematicsKey("generic_aemp", "DEV-1", "2026-08-03T06:00:00.000Z"),
     );
+  });
+});
+
+/* ================================================================== */
+/* Telematics intelligence (WP-EQUIP upgrade)                          */
+/* ================================================================== */
+
+describe("engineHoursForDay — the counter does not stop at midnight", () => {
+  it("carries the previous day's last reading in as the opening point", () => {
+    const out = engineHoursForDay({
+      openingReading: { recordedAt: "2026-08-02T21:00:00.000Z", engineHours: 1200 },
+      dayReadings: [
+        { recordedAt: "2026-08-03T08:00:00.000Z", engineHours: 1201 },
+        { recordedAt: "2026-08-03T17:00:00.000Z", engineHours: 1210 },
+      ],
+    });
+    // 1210 − 1200 = 10, not the 9 that last-minus-first inside the day gives.
+    expect(out.hours).toBe(10);
+    expect(out.reasons).toHaveLength(0);
+  });
+
+  it("states a day's hours from a device that reports once a day", () => {
+    const out = engineHoursForDay({
+      openingReading: { recordedAt: "2026-08-02T23:00:00.000Z", engineHours: 1200 },
+      dayReadings: [{ recordedAt: "2026-08-03T23:00:00.000Z", engineHours: 1208.5 }],
+    });
+    expect(out.hours).toBe(8.5);
+  });
+
+  it("falls back to within-day and says what was lost when there is no carry-in", () => {
+    const out = engineHoursForDay({
+      openingReading: null,
+      dayReadings: [
+        { recordedAt: "2026-08-03T08:00:00.000Z", engineHours: 1201 },
+        { recordedAt: "2026-08-03T17:00:00.000Z", engineHours: 1210 },
+      ],
+    });
+    expect(out.hours).toBe(9);
+    expect(out.reasons.join(" ")).toContain("no reading exists before this day");
+  });
+
+  it("refuses a figure when the counter went backwards", () => {
+    const out = engineHoursForDay({
+      openingReading: { recordedAt: "2026-08-02T21:00:00.000Z", engineHours: 1200 },
+      dayReadings: [{ recordedAt: "2026-08-03T17:00:00.000Z", engineHours: 40 }],
+    });
+    expect(out.hours).toBeNull();
+    expect(out.reasons.join(" ")).toContain("reset or replaced");
+  });
+
+  it("does not turn silence into zero hours", () => {
+    const out = engineHoursForDay({
+      openingReading: { recordedAt: "2026-08-02T21:00:00.000Z", engineHours: 1200 },
+      dayReadings: [],
+    });
+    expect(out.hours).toBeNull();
+    expect(out.reasons.join(" ")).toContain("not distinguishable");
+  });
+});
+
+describe("engineHoursSeries — every day carries in from the day before", () => {
+  /** one reading a day at 17:00, a device that reports once. */
+  const daily = [
+    { recordedAt: "2026-08-02T17:00:00.000Z", engineHours: 1000 },
+    { recordedAt: "2026-08-03T17:00:00.000Z", engineHours: 1008 },
+    { recordedAt: "2026-08-04T17:00:00.000Z", engineHours: 1017 },
+  ];
+
+  it("states hours for a once-a-day device, which within-day grouping cannot", () => {
+    const series = engineHoursSeries({
+      dates: ["2026-08-03", "2026-08-04"],
+      readings: daily,
+    });
+    expect(series.map((d) => d.delta.hours)).toEqual([8, 9]);
+    // the same readings, grouped inside the calendar day, say nothing at all
+    expect(engineHoursFromCounter([daily[1]!]).hours).toBeNull();
+  });
+
+  it("counts the hours run between one day's last reading and the next day's first", () => {
+    const series = engineHoursSeries({
+      dates: ["2026-08-04"],
+      readings: [
+        { recordedAt: "2026-08-03T18:00:00.000Z", engineHours: 100 },
+        { recordedAt: "2026-08-04T08:00:00.000Z", engineHours: 104 },
+        { recordedAt: "2026-08-04T17:00:00.000Z", engineHours: 111 },
+      ],
+    });
+    // 111 - 100 = 11h, not the 7h the 08:00-17:00 window would have credited
+    expect(series[0]!.delta.hours).toBe(11);
+  });
+
+  it("says the opening is unknown for the first day of an unbacked feed", () => {
+    const series = engineHoursSeries({
+      dates: ["2026-08-03"],
+      readings: [
+        { recordedAt: "2026-08-03T08:00:00.000Z", engineHours: 50 },
+        { recordedAt: "2026-08-03T17:00:00.000Z", engineHours: 57 },
+      ],
+    });
+    expect(series[0]!.delta.hours).toBe(7);
+    expect(series[0]!.delta.reasons.join(" ")).toContain("no reading exists before this day");
+  });
+
+  it("returns null, never zero, for a day the feed never reached", () => {
+    const series = engineHoursSeries({
+      dates: ["2026-08-03", "2026-08-04", "2026-08-05"],
+      readings: daily,
+    });
+    expect(series[2]!.delta.hours).toBeNull();
+    expect(series[2]!.delta.reasons.join(" ")).toContain("did not report at all");
+  });
+
+  it("cuts the day on the site clock, so a night shift east of UTC lands on one date", () => {
+    // UTC+8. The shift runs 20:00-04:00 local = 12:00-20:00 UTC on 2026-08-03.
+    const readings = [
+      { recordedAt: "2026-08-03T10:00:00.000Z", engineHours: 200 }, // 18:00 local, before shift
+      { recordedAt: "2026-08-03T20:00:00.000Z", engineHours: 208 }, // 04:00 local NEXT day
+    ];
+    expect(localDateOf(readings[1]!.recordedAt, 480)).toBe("2026-08-04");
+    const utc = engineHoursSeries({ dates: ["2026-08-03"], readings });
+    const local = engineHoursSeries({ dates: ["2026-08-04"], readings, tzOffsetMinutes: 480 });
+    expect(utc[0]!.delta.hours).toBe(8);
+    // on the site's clock the eight hours belong to the 4th, which is the
+    // date the plant sheet for that night shift carries
+    expect(local[0]!.delta.hours).toBe(8);
+  });
+
+  it("deduplicates and orders the dates it was handed", () => {
+    const series = engineHoursSeries({
+      dates: ["2026-08-04", "2026-08-03", "2026-08-04"],
+      readings: daily,
+    });
+    expect(series.map((d) => d.date)).toEqual(["2026-08-03", "2026-08-04"]);
+  });
+});
+
+describe("checkGeofence", () => {
+  const site = { latitude: 51.5, longitude: -0.12 };
+
+  it("says nothing when the project has no location", () => {
+    const out = checkGeofence({
+      site: null,
+      readings: [{ latitude: 52, longitude: 0, recordedAt: "2026-08-03T09:00:00.000Z", engineRunning: 1 }],
+    });
+    expect(out.breaches).toHaveLength(0);
+    expect(out.reasons.join(" ")).toContain("no fence to test");
+  });
+
+  it("finds a machine running well outside the fence", () => {
+    const out = checkGeofence({
+      site,
+      radiusMetres: 1000,
+      readings: [
+        { latitude: 51.5, longitude: -0.121, recordedAt: "2026-08-03T08:00:00.000Z", engineRunning: 1 },
+        { latitude: 51.7, longitude: -0.12, recordedAt: "2026-08-03T09:00:00.000Z", engineRunning: 1 },
+        { latitude: 51.7, longitude: -0.12, recordedAt: "2026-08-03T13:00:00.000Z", engineRunning: 1 },
+      ],
+    });
+    expect(out.breaches).toHaveLength(2);
+    expect(out.maxDistanceMetres).toBeGreaterThan(20_000);
+    expect(out.spanHours).toBe(4);
+  });
+
+  it("ignores a machine parked off site with the engine off", () => {
+    const out = checkGeofence({
+      site,
+      radiusMetres: 1000,
+      readings: [
+        { latitude: 51.9, longitude: -0.12, recordedAt: "2026-08-03T22:00:00.000Z", engineRunning: 0 },
+      ],
+    });
+    expect(out.breaches).toHaveLength(0);
+    expect(out.reasons.join(" ")).toContain("engine running");
+  });
+});
+
+describe("reconcileFuel", () => {
+  it("refuses to compare when the feed reports no consumption", () => {
+    const out = reconcileFuel({
+      telematicsFuelUsedLitres: [null, null],
+      fills: [{ litres: 400, at: "2026-08-03T08:00:00.000Z" }],
+    });
+    expect(out.burnLitres).toBeNull();
+    expect(out.unexplained).toBe(false);
+    expect(out.reasons.join(" ")).toContain("gap in the feed, not evidence of a loss");
+  });
+
+  it("passes a fill that matches the burn inside tolerance", () => {
+    const out = reconcileFuel({
+      telematicsFuelUsedLitres: [180, 200],
+      fills: [{ litres: 400, at: "2026-08-03T08:00:00.000Z" }],
+    });
+    expect(out.unexplained).toBe(false);
+    expect(out.differenceLitres).toBe(20);
+  });
+
+  it("flags fills that materially outrun the burn", () => {
+    const out = reconcileFuel({
+      telematicsFuelUsedLitres: [100, 100],
+      fills: [
+        { litres: 300, at: "2026-08-03T08:00:00.000Z" },
+        { litres: 300, at: "2026-08-05T08:00:00.000Z" },
+      ],
+    });
+    expect(out.unexplained).toBe(true);
+    expect(out.differenceLitres).toBe(400);
+    expect(out.reasons.join(" ")).toContain("most stolen commodity");
+  });
+});
+
+describe("assessFaults", () => {
+  it("ignores dashboard-light severities", () => {
+    const out = assessFaults([{ code: "SPN-100", severity: "warning" }]);
+    expect(out.actionable).toHaveLength(0);
+    expect(out.stopWork).toBe(false);
+  });
+
+  it("raises a service for a severe fault", () => {
+    const out = assessFaults([{ code: "SPN-110", description: "Coolant temp", severity: "severe" }]);
+    expect(out.worst).toBe("severe");
+    expect(out.stopWork).toBe(false);
+    expect(out.reason).toContain("SPN-110");
+  });
+
+  it("stops the machine on a critical fault", () => {
+    const out = assessFaults([
+      { code: "SPN-110", severity: "severe" },
+      { code: "SPN-190", description: "Overspeed", severity: "critical" },
+    ]);
+    expect(out.worst).toBe("critical");
+    expect(out.stopWork).toBe(true);
+    expect(out.reason).toContain("stop it");
   });
 });

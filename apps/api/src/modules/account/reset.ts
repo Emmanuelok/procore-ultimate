@@ -7,7 +7,9 @@ import { badRequest } from "../../lib/errors.js";
 import { isExpired } from "../../lib/time.js";
 import { dispatchEmail } from "./mailer.js";
 import { recordAuthEvent, recordLegacyAuthEvent } from "./events.js";
-import { assessPassword, hashPassword } from "./password.js";
+import { hashPassword } from "./password.js";
+import { assessPasswordWithPolicy, effectivePolicyForUser } from "./policy.js";
+import { isPasswordReused, recordPasswordHistory } from "./password-history.js";
 import { revokeAllUserSessions, type RequestContext } from "./sessions.js";
 import { hashToken, mintToken } from "./tokens.js";
 
@@ -193,12 +195,42 @@ export async function completePasswordReset(
   const [user] = await app.db.select().from(users).where(eq(users.id, row.userId)).limit(1);
   if (!user || !user.isActive) throw invalid();
 
-  const assessment = assessPassword(input.password, { email: user.email, name: user.name });
+  // #25 — the tenant's rules, not only the platform's. Resolved across every
+  // company this account belongs to, strictest wins.
+  const policy = await effectivePolicyForUser(app.db, user.id);
+  const assessment = assessPasswordWithPolicy(
+    input.password,
+    { email: user.email, name: user.name },
+    policy,
+  );
   if (!assessment.ok) {
     // Checked BEFORE the token is spent: a rejected password must not cost the
     // user their only link.
     throw badRequest("Password does not meet the password policy.", {
       reasons: assessment.reasons,
+    });
+  }
+  const reuse = await isPasswordReused(
+    app.db,
+    user.id,
+    input.password,
+    policy.passwordHistoryDepth,
+    user.passwordHash,
+  );
+  if (reuse.reused) {
+    await recordAuthEvent(app.db, {
+      kind: "password_reuse_refused",
+      outcome: "blocked",
+      userId: user.id,
+      email: user.email,
+      ip: ctx.ip,
+      userAgent: ctx.userAgent,
+      reason: reuse.reason,
+      metadata: { checked: reuse.checked, depth: policy.passwordHistoryDepth },
+    });
+    // Also checked before the token is spent, for the same reason.
+    throw badRequest("Password does not meet the password policy.", {
+      reasons: [reuse.reason ?? "That password has been used on this account before."],
     });
   }
 
@@ -215,6 +247,13 @@ export async function completePasswordReset(
     .returning({ id: passwordResets.id });
   if (claimed.length === 0) throw invalid();
 
+  await recordPasswordHistory(
+    app.db,
+    user.id,
+    user.passwordHash,
+    "reset",
+    policy.passwordHistoryDepth,
+  );
   await app.db
     .update(users)
     .set({

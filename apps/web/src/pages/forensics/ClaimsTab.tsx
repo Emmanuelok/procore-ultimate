@@ -4,10 +4,11 @@
  * (#299-301), chronology auto-assembly (#318) and independent assessment
  * (#310 — the self-assessment 403 surfaces as an info banner, not an error).
  */
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { CLAIM_KINDS } from "@constructos/shared";
-import { api, ApiClientError } from "../../lib/api";
+import { api, ApiClientError, fetchBlobUrl } from "../../lib/api";
 import {
+  Alert,
   Badge,
   Button,
   EmptyState,
@@ -35,6 +36,7 @@ import {
   TiaChip,
   type ClaimDetail,
   type ClaimRow,
+  type SufficiencyResult,
   type ContractLite,
   type DelayEventRow,
   type ListResponse,
@@ -62,13 +64,22 @@ const SOURCE_TONES: Record<string, string> = {
   variation: "amber",
 };
 
-export default function ClaimsTab({ projectId }: { projectId: string }) {
+export default function ClaimsTab({
+  projectId,
+  focusId,
+}: {
+  projectId: string;
+  /** deep link from ⌘K search: open this claim's drawer once, on arrival */
+  focusId?: string | null;
+}) {
   const base = `/api/v1/projects/${projectId}`;
 
   const [items, setItems] = useState<ClaimRow[] | null>(null);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [error, setError] = useState<string | null>(null);
+  /** bumped on every successful list load so the exposure strip refollows it */
+  const [exposureKey, setExposureKey] = useState(0);
 
   const load = useCallback(async () => {
     setError(null);
@@ -77,6 +88,7 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
       const res = await api.get<ListResponse<ClaimRow>>(`${base}/claims?${params}`);
       setItems(res.items);
       setTotal(res.total);
+      setExposureKey((k) => k + 1);
     } catch (err) {
       setItems([]);
       setError(err instanceof Error ? err.message : "Failed to load claims");
@@ -168,6 +180,17 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
 
   const [chronoBusy, setChronoBusy] = useState(false);
 
+  /* --- claim assurance: sufficiency, valuation, Scott Schedule, package --- */
+  const [sufficiency, setSufficiency] = useState<SufficiencyResult | null>(null);
+  const [sufficiencyBusy, setSufficiencyBusy] = useState(false);
+  const [valuation, setValuation] = useState({ best: "", likely: "", worst: "", probability: "" });
+  const [valuationBusy, setValuationBusy] = useState(false);
+  const [scottBusy, setScottBusy] = useState(false);
+  const [packageInfo, setPackageInfo] = useState<{ ready: boolean; missing: string[] } | null>(null);
+  const [printBusy, setPrintBusy] = useState(false);
+
+  const [reasonFor, setReasonFor] = useState<string | null>(null);
+  const [reasonText, setReasonText] = useState("");
   const [assessOpen, setAssessOpen] = useState(false);
   const [assessDays, setAssessDays] = useState("");
   const [assessAmount, setAssessAmount] = useState("");
@@ -181,6 +204,7 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
     try {
       const detail = await api.get<ClaimDetail>(`${base}/claims/${id}`);
       setSelected(detail);
+      setLinkEditing(false);
       setChain({
         cause: detail.chain.cause ?? "",
         effect: detail.chain.effect ?? "",
@@ -209,6 +233,20 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
     }
   }
 
+  /*
+   * Arriving from company search (or any link that names a claim) opens that
+   * claim. Once per id: reopening after the user closes the drawer would trap
+   * them on the record they just dismissed.
+   */
+  const openedFocus = useRef<string | null>(null);
+  useEffect(() => {
+    if (!focusId || openedFocus.current === focusId) return;
+    openedFocus.current = focusId;
+    void openDrawer(focusId);
+    // openDrawer is stable for a given base; the id is what drives this.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusId, base]);
+
   async function refresh() {
     if (selected) await openDrawer(selected.id);
     await load();
@@ -230,6 +268,49 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
       setDrawerError(err instanceof ApiClientError ? err.message : "Failed to save the chain.");
     } finally {
       setChainBusy(false);
+    }
+  }
+
+  /*
+   * The set of events a claim is built on is editable only while the claim is
+   * in draft — after that the API freezes it, and rightly so. Nothing in the
+   * product reached that window: delayEventIds could be chosen in the create
+   * modal and never again, so a claim raised against the wrong event had to be
+   * withdrawn and re-raised.
+   */
+  const [linkEditing, setLinkEditing] = useState(false);
+  const [linkIds, setLinkIds] = useState<string[]>([]);
+  const [linkBusy, setLinkBusy] = useState(false);
+
+  async function openLinkEditor() {
+    if (!selected) return;
+    setDrawerError(null);
+    setLinkIds(selected.delayEventIds ?? selected.delayEvents.map((e) => e.id));
+    setLinkEditing(true);
+    if (eventPool.length === 0) {
+      try {
+        const ev = await api.get<ListResponse<DelayEventRow>>(`${base}/delay-events?pageSize=100`);
+        setEventPool(ev.items);
+      } catch {
+        // the picker stays empty; the current links are still listed
+      }
+    }
+  }
+
+  async function saveLinks() {
+    if (!selected) return;
+    setDrawerError(null);
+    setLinkBusy(true);
+    try {
+      await api.patch(`${base}/claims/${selected.id}`, { delayEventIds: linkIds });
+      setLinkEditing(false);
+      await refresh();
+    } catch (err) {
+      setDrawerError(
+        err instanceof ApiClientError ? err.message : "Failed to save the linked delay events.",
+      );
+    } finally {
+      setLinkBusy(false);
     }
   }
 
@@ -280,14 +361,121 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
     setDrawerError(null);
     setChronoBusy(true);
     try {
-      await api.post(`${base}/claims/${selected.id}/chronology`);
+      const res = await api.post<{ persisted?: boolean; count?: number }>(
+        `${base}/claims/${selected.id}/chronology`,
+      );
+      const note =
+        res.persisted === false
+          ? `Assembled ${res.count ?? 0} entr${res.count === 1 ? "y" : "ies"} for reading — a ${humanize(selected.status)} claim's chronology is part of the closed record and was not overwritten.`
+          : null;
       await refresh();
+      if (note) setDrawerInfo(note);
     } catch (err) {
       setDrawerError(
         err instanceof ApiClientError ? err.message : "Chronology generation failed.",
       );
     } finally {
       setChronoBusy(false);
+    }
+  }
+
+  async function scoreSufficiency() {
+    if (!selected) return;
+    setDrawerError(null);
+    setSufficiencyBusy(true);
+    try {
+      const res = await api.post<SufficiencyResult & { persisted?: boolean }>(
+        `${base}/claims/${selected.id}/sufficiency`,
+      );
+      setSufficiency(res);
+      const note =
+        res.persisted === false
+          ? `Scored for reading — a ${humanize(selected.status)} claim's sufficiency score is part of the closed record and was not overwritten.`
+          : null;
+      await refresh();
+      if (note) setDrawerInfo(note);
+    } catch (err) {
+      setDrawerError(err instanceof ApiClientError ? err.message : "Record scoring failed.");
+    } finally {
+      setSufficiencyBusy(false);
+    }
+  }
+
+  async function saveValuation() {
+    if (!selected) return;
+    setDrawerError(null);
+    setValuationBusy(true);
+    try {
+      const num = (v: string) => (v.trim() === "" ? null : Number(v));
+      await api.put(`${base}/claims/${selected.id}/valuation`, {
+        quantumBest: num(valuation.best),
+        quantumLikely: num(valuation.likely),
+        quantumWorst: num(valuation.worst),
+        successProbability: num(valuation.probability),
+      });
+      await refresh();
+    } catch (err) {
+      setDrawerError(err instanceof ApiClientError ? err.message : "The valuation could not be saved.");
+    } finally {
+      setValuationBusy(false);
+    }
+  }
+
+  async function generateScottSchedule() {
+    if (!selected) return;
+    setDrawerError(null);
+    setScottBusy(true);
+    try {
+      const res = await api.post<{ persisted?: boolean; notPersistedReason?: string | null }>(
+        `${base}/claims/${selected.id}/scott-schedule`,
+      );
+      const note = res.persisted === false ? res.notPersistedReason : null;
+      await refresh();
+      if (note) setDrawerInfo(note);
+    } catch (err) {
+      setDrawerError(err instanceof ApiClientError ? err.message : "The Scott Schedule could not be generated.");
+    } finally {
+      setScottBusy(false);
+    }
+  }
+
+  async function checkPackage() {
+    if (!selected) return;
+    setDrawerError(null);
+    try {
+      const res = await api.get<{ completeness: { ready: boolean; missing: string[] } }>(
+        `${base}/claims/${selected.id}/package`,
+      );
+      setPackageInfo(res.completeness);
+    } catch (err) {
+      setDrawerError(err instanceof ApiClientError ? err.message : "The package could not be assembled.");
+    }
+  }
+
+  /**
+   * Open the printable submission package in a new tab. The document is
+   * guarded by the same gates as everything else, so a plain link would send
+   * neither the bearer token nor the tenant header and the reader would get a
+   * 401 body where the submission should be; fetch + object URL sends both.
+   */
+  async function openPackage() {
+    if (!selected) return;
+    setDrawerError(null);
+    setPrintBusy(true);
+    let url: string | null = null;
+    try {
+      url = await fetchBlobUrl(`${base}/claims/${selected.id}/package/html`);
+      const opened = window.open(url, "_blank", "noopener");
+      if (!opened) throw new Error("The browser blocked the new tab. Allow pop-ups for this site.");
+      const toRevoke = url;
+      window.setTimeout(() => URL.revokeObjectURL(toRevoke), 60_000);
+    } catch (err) {
+      if (url) URL.revokeObjectURL(url);
+      setDrawerError(
+        err instanceof Error ? err.message : "The submission package could not be opened.",
+      );
+    } finally {
+      setPrintBusy(false);
     }
   }
 
@@ -340,6 +528,8 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
       </div>
 
       <ErrorAlert message={error} />
+
+      <ExposureStrip projectId={projectId} reloadKey={exposureKey} />
 
       {items === null ? (
         <Spinner />
@@ -595,8 +785,75 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
 
           {/* Linked delay events */}
           <div className="mb-4">
-            <SectionTitle>Linked delay events ({selected.delayEvents.length})</SectionTitle>
-            {selected.delayEvents.length === 0 ? (
+            <div className="flex items-center justify-between gap-3">
+              <SectionTitle>Linked delay events ({selected.delayEvents.length})</SectionTitle>
+              {selected.status === "draft" && !linkEditing ? (
+                <Button size="sm" variant="secondary" onClick={() => void openLinkEditor()}>
+                  Edit links
+                </Button>
+              ) : null}
+            </div>
+            {selected.totals ? (
+              <p className="mb-1 text-[11px] text-ink-500">
+                Modelled delay:{" "}
+                <span className="font-medium text-ink-800">
+                  {selected.totals.tiaDeltaDays === null
+                    ? "not measured"
+                    : `${selected.totals.tiaDeltaDays} d`}
+                </span>{" "}
+                · {selected.totals.tiaBasis}
+                {selected.totals.staleTia > 0
+                  ? ` · ${selected.totals.staleTia} analysis/analyses are stale since the programme was recomputed`
+                  : ""}
+              </p>
+            ) : null}
+            {selected.status !== "draft" ? (
+              <p className="mb-1 text-[11px] text-ink-400">
+                Frozen — the set of events a {humanize(selected.status)} claim rests on is part of
+                the case that was submitted. Revise the claim back to draft to change it.
+              </p>
+            ) : null}
+            {linkEditing ? (
+              <div className="rounded-md border border-ink-200 p-3">
+                {eventPool.length === 0 ? (
+                  <p className="text-xs text-ink-400">
+                    No live delay events in this project — a withdrawn event cannot be linked.
+                  </p>
+                ) : (
+                  <div className="max-h-48 space-y-1 overflow-y-auto">
+                    {eventPool.map((ev) => (
+                      <label key={ev.id} className="flex items-center gap-2 text-sm text-ink-700">
+                        <input
+                          type="checkbox"
+                          checked={linkIds.includes(ev.id)}
+                          onChange={() =>
+                            setLinkIds((cur) =>
+                              cur.includes(ev.id)
+                                ? cur.filter((x) => x !== ev.id)
+                                : [...cur, ev.id],
+                            )
+                          }
+                          className="h-4 w-4 rounded border-ink-300 text-brand-600 focus:ring-brand-500"
+                        />
+                        <span className="font-mono text-xs text-ink-400">{deLabel(ev.number)}</span>
+                        <span className="max-w-64 truncate">{ev.title}</span>
+                        <span className="text-xs text-ink-400">
+                          {ev.durationDays}d from {formatDate(ev.startDate)}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+                <div className="mt-3 flex justify-end gap-2">
+                  <Button size="sm" variant="secondary" onClick={() => setLinkEditing(false)}>
+                    Cancel
+                  </Button>
+                  <Button size="sm" disabled={linkBusy} onClick={() => void saveLinks()}>
+                    {linkBusy ? "Saving…" : "Save links"}
+                  </Button>
+                </div>
+              </div>
+            ) : selected.delayEvents.length === 0 ? (
               <p className="text-xs text-ink-400">No delay events linked.</p>
             ) : (
               <div className="flex flex-wrap gap-2">
@@ -608,7 +865,10 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
                   >
                     <span className="font-mono">{deLabel(ev.number)}</span>
                     <span className="max-w-40 truncate">{ev.title}</span>
-                    <TiaChip deltaDays={ev.tiaResult?.completionDeltaDays ?? null} />
+                    <TiaChip
+                      deltaDays={ev.tiaResult?.completionDeltaDays ?? null}
+                      stale={ev.tia?.stale}
+                    />
                   </span>
                 ))}
               </div>
@@ -717,6 +977,164 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
             )}
           </div>
 
+          {/* Claim assurance: does the record actually support the claim? */}
+          <div className="rounded-lg border border-ink-100 p-4">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="text-sm font-semibold text-ink-900">Record sufficiency</div>
+              <Button size="sm" variant="secondary" disabled={sufficiencyBusy} onClick={() => void scoreSufficiency()}>
+                {sufficiencyBusy ? "Scoring…" : "Score the record"}
+              </Button>
+            </div>
+            {sufficiency ? (
+              <div className="space-y-2">
+                <div className="text-sm text-ink-800">
+                  Overall {Math.round(sufficiency.overallScore * 100)}% — presence, independence,
+                  contemporaneity and coverage of the contemporaneous record.
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {sufficiency.limbs.map((l) => (
+                    <Badge key={l.key} tone={l.present ? (l.score >= 0.6 ? "green" : "amber") : "red"}>
+                      {l.key} {Math.round(l.score * 100)}%
+                    </Badge>
+                  ))}
+                </div>
+                {sufficiency.gaps.length > 0 ? (
+                  <div className="text-xs text-amber-700">
+                    Record gaps:{" "}
+                    {sufficiency.gaps
+                      .slice(0, 4)
+                      .map((g) => `${g.from} → ${g.to} (${g.days}d, no daily log)`)
+                      .join("; ")}
+                    {sufficiency.gaps.length > 4 ? ` and ${sufficiency.gaps.length - 4} more` : ""}
+                  </div>
+                ) : null}
+                {sufficiency.missingNotices.length > 0 ? (
+                  <div className="text-xs text-red-700">
+                    {sufficiency.missingNotices.map((n) => `${n.title}: ${n.reason}`).join("; ")}
+                  </div>
+                ) : null}
+                {sufficiency.reasons.length > 0 ? (
+                  <ul className="ml-4 list-disc text-xs text-ink-500">
+                    {sufficiency.reasons.map((r) => (
+                      <li key={r}>{r}</li>
+                    ))}
+                  </ul>
+                ) : null}
+              </div>
+            ) : (
+              <p className="text-xs text-ink-400">
+                Not scored yet. Scoring reports which limbs are thin, which delay days have no daily
+                log behind them, and which events were never noticed inside the contract time bar.
+              </p>
+            )}
+          </div>
+
+          {/* Valuation range and provision (#312-313) */}
+          <div className="rounded-lg border border-ink-100 p-4">
+            <div className="mb-2 text-sm font-semibold text-ink-900">
+              Valuation range & provision
+              {selected.currency ? (
+                <span className="ml-2 text-xs font-normal text-ink-400">{selected.currency}</span>
+              ) : null}
+            </div>
+            <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+              <Field label="Best">
+                <Input
+                  inputMode="decimal"
+                  value={valuation.best}
+                  onChange={(e) => setValuation({ ...valuation, best: e.target.value })}
+                  placeholder={selected.quantumBest !== null && selected.quantumBest !== undefined ? String(selected.quantumBest) : ""}
+                />
+              </Field>
+              <Field label="Likely">
+                <Input
+                  inputMode="decimal"
+                  value={valuation.likely}
+                  onChange={(e) => setValuation({ ...valuation, likely: e.target.value })}
+                  placeholder={selected.quantumLikely !== null && selected.quantumLikely !== undefined ? String(selected.quantumLikely) : ""}
+                />
+              </Field>
+              <Field label="Worst">
+                <Input
+                  inputMode="decimal"
+                  value={valuation.worst}
+                  onChange={(e) => setValuation({ ...valuation, worst: e.target.value })}
+                  placeholder={selected.quantumWorst !== null && selected.quantumWorst !== undefined ? String(selected.quantumWorst) : ""}
+                />
+              </Field>
+              <Field label="P(success) 0-1">
+                <Input
+                  inputMode="decimal"
+                  value={valuation.probability}
+                  onChange={(e) => setValuation({ ...valuation, probability: e.target.value })}
+                  placeholder={
+                    selected.successProbability !== null && selected.successProbability !== undefined
+                      ? String(selected.successProbability)
+                      : ""
+                  }
+                />
+              </Field>
+            </div>
+            <div className="mt-2 flex items-center gap-3">
+              <Button size="sm" disabled={valuationBusy} onClick={() => void saveValuation()}>
+                {valuationBusy ? "Saving…" : "Save valuation"}
+              </Button>
+              <span className="text-xs text-ink-600">
+                Provision:{" "}
+                {selected.provisionAmount === null || selected.provisionAmount === undefined ? (
+                  <span className="text-ink-400">— no likely value or probability recorded</span>
+                ) : (
+                  <strong>{selected.provisionAmount}</strong>
+                )}
+              </span>
+            </div>
+          </div>
+
+          {/* Submission package */}
+          <div className="rounded-lg border border-ink-100 p-4">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="text-sm font-semibold text-ink-900">Submission package</div>
+              <div className="flex gap-2">
+                <Button size="sm" variant="secondary" disabled={scottBusy} onClick={() => void generateScottSchedule()}>
+                  {scottBusy ? "Generating…" : "Scott Schedule"}
+                </Button>
+                <Button size="sm" variant="secondary" onClick={() => void checkPackage()}>
+                  Check readiness
+                </Button>
+                <Button size="sm" disabled={printBusy} onClick={() => void openPackage()}>
+                  {printBusy ? "Opening…" : "Open submission"}
+                </Button>
+              </div>
+            </div>
+            <p className="text-xs text-ink-400">
+              The Scott Schedule fills the claimant columns from the register and leaves the
+              respondent and tribunal columns empty — this platform does not write the other side's
+              case. <strong>Open submission</strong> assembles the whole package — chain,
+              chronology, events, analysis, quantum and Scott Schedule — as one printable document,
+              with anything still missing stated at the top rather than left out.
+            </p>
+            {selected.scottSchedule ? (
+              <div className="mt-1 text-xs text-ink-600">
+                {selected.scottSchedule.length} item
+                {selected.scottSchedule.length === 1 ? "" : "s"} generated.
+              </div>
+            ) : null}
+            {packageInfo ? (
+              packageInfo.ready ? (
+                <div className="mt-2 text-xs text-emerald-700">
+                  The package is complete: chronology, sufficiency, analysis and quantum are all
+                  linked.
+                </div>
+              ) : (
+                <ul className="mt-2 ml-4 list-disc text-xs text-amber-700">
+                  {packageInfo.missing.map((m) => (
+                    <li key={m}>{m}</li>
+                  ))}
+                </ul>
+              )
+            ) : null}
+          </div>
+
           {/* Status actions */}
           <div className="rounded-lg border border-ink-100 p-4">
             <div className="mb-2 text-sm font-semibold text-ink-900">Lifecycle</div>
@@ -749,7 +1167,14 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
                           : "secondary"
                     }
                     disabled={statusBusy}
-                    onClick={() => void transition(next)}
+                    onClick={() => {
+                      if (next === "draft" || next === "withdrawn") {
+                        setReasonFor(next);
+                        setReasonText("");
+                        return;
+                      }
+                      void transition(next);
+                    }}
                   >
                     {next === "submitted"
                       ? "Submit"
@@ -757,7 +1182,9 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
                         ? "Agree"
                         : next === "rejected"
                           ? "Reject"
-                          : "Withdraw"}
+                          : next === "draft"
+                            ? "Revise (clears the assessment)…"
+                            : "Withdraw"}
                   </Button>
                 ),
               )}
@@ -772,6 +1199,51 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
       ) : null}
 
       {/* ------------------------------- assess modal ------------------------------- */}
+      {/* ------------------------------ reason modal ------------------------------ */}
+      <Modal
+        open={reasonFor !== null}
+        title={reasonFor === "draft" ? "Revise this claim" : "Withdraw this claim"}
+        onClose={() => setReasonFor(null)}
+      >
+        <p className="mb-3 text-sm text-ink-500">
+          {reasonFor === "draft"
+            ? "Taking the claim back to draft clears the recorded assessment — an assessed figure must never survive against changed numbers. The reason is written to the ledger."
+            : "Withdrawing removes this claim from the register's open position. The reason is written to the ledger."}
+        </p>
+        <form
+          className="space-y-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const status = reasonFor;
+            if (!status) return;
+            setReasonFor(null);
+            void transition(status, { reason: reasonText.trim() });
+          }}
+        >
+          <Field label="Reason">
+            <Textarea
+              rows={3}
+              value={reasonText}
+              onChange={(e) => setReasonText(e.target.value)}
+              required
+              placeholder={
+                reasonFor === "draft"
+                  ? "Quantum restated after the measured mile."
+                  : "Raised in error — duplicated by CLM-004."
+              }
+            />
+          </Field>
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="secondary" onClick={() => setReasonFor(null)}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={statusBusy || reasonText.trim().length === 0}>
+              {statusBusy ? "Recording…" : "Confirm"}
+            </Button>
+          </div>
+        </form>
+      </Modal>
+
       <Modal open={assessOpen} title="Assess claim" onClose={() => setAssessOpen(false)}>
         <p className="mb-3 text-sm text-ink-500">
           Record the independent determination. The assessor must not be the user who prepared the
@@ -808,6 +1280,119 @@ export default function ClaimsTab({ projectId }: { projectId: string }) {
           </div>
         </form>
       </Modal>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Exposure strip (#313, #320)                                         */
+/* ------------------------------------------------------------------ */
+
+interface ExposureBucket {
+  currency: string;
+  claims: number;
+  claimed: number;
+  /** claims in this currency with no amount claimed — excluded from `claimed` */
+  unpriced: number;
+  provision: number;
+  unprovisioned: number;
+}
+
+interface ExposureResponse {
+  generatedAt: string;
+  openClaims: number;
+  totalClaims: number;
+  byCurrency: ExposureBucket[];
+  reasons: string[];
+}
+
+/**
+ * Open claim exposure and the provision carried against it, per currency.
+ *
+ * Reads the company-level endpoint narrowed to this project, so the figure a
+ * commercial manager sees here is the same figure that rolls into the
+ * portfolio. Currencies are never added together and a claim with no
+ * valuation range is counted as unprovisioned rather than as zero exposure.
+ */
+function ExposureStrip({ projectId, reloadKey }: { projectId: string; reloadKey: number }) {
+  const [data, setData] = useState<ExposureResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setError(null);
+    api
+      .get<ExposureResponse>(`/api/v1/claims/exposure?projectId=${encodeURIComponent(projectId)}`)
+      .then((res) => {
+        if (!cancelled) setData(res);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        /*
+         * The endpoint is company-level and narrows to the projects the caller
+         * can see. A reader who holds the forensics tool on this project but
+         * no company-wide visibility gets a 403; that is not an error worth
+         * shouting about on a page they may legitimately read, so the strip
+         * simply does not appear.
+         */
+        if (err instanceof ApiClientError && (err.status === 403 || err.status === 404)) return;
+        setError(
+          err instanceof ApiClientError ? err.message : "Claim exposure could not be loaded.",
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, reloadKey]);
+
+  if (error) {
+    return (
+      <Alert tone="warning" title="Exposure unavailable" className="mb-4">
+        {error}
+      </Alert>
+    );
+  }
+  if (!data || data.openClaims === 0) return null;
+
+  return (
+    <div className="mb-4 rounded border border-ink-200 bg-ink-50/40 p-3">
+      <SectionTitle>
+        Open exposure — {data.openClaims} of {data.totalClaims} claim
+        {data.totalClaims === 1 ? "" : "s"}
+      </SectionTitle>
+      <div className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        {data.byCurrency.map((b) => (
+          <div key={b.currency} className="rounded border border-ink-200 bg-white p-3">
+            <div className="flex items-baseline justify-between">
+              <span className="font-mono text-xs uppercase text-ink-500">{b.currency}</span>
+              <span className="text-xs text-ink-500">
+                {b.claims} claim{b.claims === 1 ? "" : "s"}
+              </span>
+            </div>
+            <div className="mt-1 text-lg font-semibold tabular-nums text-ink-900">
+              {formatMoney(b.claimed, b.currency)}
+            </div>
+            <div className="mt-1 text-xs text-ink-500">
+              Provision {formatMoney(b.provision, b.currency)}
+              {b.unprovisioned > 0 ? (
+                <span className="text-amber-700"> · {b.unprovisioned} unvalued</span>
+              ) : null}
+            </div>
+            {b.unpriced > 0 ? (
+              <div className="mt-1 text-xs text-amber-700">
+                {b.unpriced} claim{b.unpriced === 1 ? "" : "s"} carry no amount — not counted above
+              </div>
+            ) : null}
+          </div>
+        ))}
+      </div>
+      {data.reasons.length > 0 ? (
+        <ul className="mt-2 list-disc pl-5 text-xs text-ink-500">
+          {data.reasons.map((r) => (
+            <li key={r}>{r}</li>
+          ))}
+        </ul>
+      ) : null}
     </div>
   );
 }

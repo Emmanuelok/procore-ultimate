@@ -170,6 +170,11 @@ export const rfiRoutes: FastifyPluginAsync = async (app) => {
     await assertProjectLocation(app.db, req.companyId!, req.projectId!, body.locationId);
   }
 
+  /**
+   * Related-RFI references are resolved through the SAME visibility clause as
+   * the register: referencing an RFI you cannot see must not be a way to read
+   * its subject line back out of your own record's `related` block.
+   */
   async function validateRelated(req: FastifyRequest, ids: string[] | undefined, selfId?: string) {
     if (!ids || ids.length === 0) return [];
     const unique = [...new Set(ids)].filter((id) => id !== selfId);
@@ -177,11 +182,18 @@ export const rfiRoutes: FastifyPluginAsync = async (app) => {
     const rows = await app.db
       .select({ id: rfis.id })
       .from(rfis)
-      .where(and(eq(rfis.companyId, req.companyId!), eq(rfis.projectId, req.projectId!), inArray(rfis.id, unique)));
+      .where(and(...(await relatedScope(req)), inArray(rfis.id, unique)));
     const found = new Set(rows.map((r) => r.id));
     const missing = unique.find((id) => !found.has(id));
     if (missing) throw badRequest(`Related RFI "${missing}" is not in this project`);
     return unique;
+  }
+
+  /** Tenant + project + private-draft visibility, for every related-RFI read. */
+  async function relatedScope(req: FastifyRequest): Promise<SQL[]> {
+    const clauses: SQL[] = [eq(rfis.companyId, req.companyId!), eq(rfis.projectId, req.projectId!)];
+    if (!(await isRfiAdmin(req))) clauses.push(visibilityClause(req.user!.id));
+    return clauses;
   }
 
   /* ---------------------------------------------------------------- */
@@ -464,7 +476,7 @@ export const rfiRoutes: FastifyPluginAsync = async (app) => {
         ? await app.db
             .select({ id: rfis.id, number: rfis.number, subject: rfis.subject, status: rfis.status })
             .from(rfis)
-            .where(and(eq(rfis.projectId, req.projectId!), inArray(rfis.id, rfi.relatedRfiIds)))
+            .where(and(...(await relatedScope(req)), inArray(rfis.id, rfi.relatedRfiIds)))
         : [];
     const today = todayISO();
     const me = req.user!.id;
@@ -478,6 +490,9 @@ export const rfiRoutes: FastifyPluginAsync = async (app) => {
       permissions: {
         canRespond: rfi.status === "open" && (admin || me === rfi.assigneeId || me === rfi.ballInCourtId),
         canAdopt: rfi.status === "open" && (admin || me === rfi.createdBy || me === rfi.assigneeId || me === rfi.ballInCourtId),
+        canClose:
+          (rfi.status === "open" || rfi.status === "answered") &&
+          (admin || me === rfi.createdBy || me === rfi.assigneeId || me === rfi.ballInCourtId),
         canVoid: rfi.status !== "closed" && rfi.status !== "void" && (admin || me === rfi.createdBy),
         canEditQuestion: rfi.status === "draft",
       },
@@ -795,6 +810,10 @@ export const rfiRoutes: FastifyPluginAsync = async (app) => {
     const rfi = await fetchRfi(rfiId, req);
     if (rfi.status !== "open" && rfi.status !== "answered") {
       throw badRequest("Only an open or answered RFI can be closed");
+    }
+    const me = req.user!.id;
+    if (me !== rfi.createdBy && me !== rfi.assigneeId && me !== rfi.ballInCourtId && !(await isRfiAdmin(req))) {
+      throw forbidden("Only the RFI creator, its assignee, the ball-in-court holder or an admin can close an RFI");
     }
     await app.db.update(rfis).set({ status: "closed", updatedAt: nowIso() }).where(eq(rfis.id, rfiId));
     await ledgerRfi("state_change", rfiId, req, { from: rfi.status, to: "closed" });

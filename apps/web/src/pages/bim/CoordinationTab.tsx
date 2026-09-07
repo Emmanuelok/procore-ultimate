@@ -36,7 +36,7 @@ import {
   downloadText,
   ISSUE_NEXT_STATUSES,
   issueStatusTone,
-  type CompanyUser,
+  type AssignablePerson,
   type CoordinationIssue,
   type IssueDetail,
   type ListResponse,
@@ -65,7 +65,7 @@ export default function CoordinationTab({
   const [filter, setFilter] = useState<Filter>("all");
   const [search, setSearch] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [users, setUsers] = useState<CompanyUser[]>([]);
+  const [users, setUsers] = useState<AssignablePerson[]>([]);
   const [busy, setBusy] = useState(false);
 
   const [createOpen, setCreateOpen] = useState(false);
@@ -107,12 +107,17 @@ export default function CoordinationTab({
     return () => clearTimeout(t);
   }, [load, search]);
 
+  // Only the people this project may actually name — the API validates every
+  // assignee against the same set, so the whole company directory would offer
+  // colleagues the write path then rejects.
   useEffect(() => {
     api
-      .get<ListResponse<CompanyUser>>("/api/v1/company/users?pageSize=200")
+      .get<{ items: AssignablePerson[] }>(
+        `/api/v1/projects/${projectId}/bim/assignable-people`,
+      )
       .then((res) => setUsers(res.items))
       .catch(() => setUsers([]));
-  }, []);
+  }, [projectId]);
 
   async function openDetail(issue: CoordinationIssue) {
     setDetail(null);

@@ -1,9 +1,27 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { authSecurityEvents } from "@constructos/db";
 import type { BuiltApp } from "../../app.js";
 import { buildTestApp } from "../../test/helpers.js";
+
+/**
+ * WHAT A RED SUITE HERE MUST MEAN.
+ *
+ * `buildTestApp()` boots PGlite (WASM Postgres) and replays every migration
+ * from 0000, and nearly every test registers an account — a bcrypt hash plus a
+ * company, a membership and a project. On an idle machine that is seconds. On
+ * the shared machine this wave runs on, a single run measured 878 seconds of
+ * module IMPORT alone, and vitest's 30-second defaults then fail suites for a
+ * reason that has nothing to do with the code under test. "Hook timed out" and
+ * "Test timed out" are the two failures that teach people to ignore red.
+ *
+ * Raising the ceilings changes no assertion: a test that is going to pass
+ * still passes, and one that is going to fail still fails on its assertion.
+ */
+const HOOK_TIMEOUT_MS = 300_000;
+vi.setConfig({ testTimeout: 120_000, hookTimeout: HOOK_TIMEOUT_MS });
+
 
 /**
  * Lockout, through the real login route.
@@ -41,7 +59,7 @@ describe("account lockout", () => {
   beforeAll(async () => {
     built = await buildTestApp();
     app = built.app;
-  });
+  }, HOOK_TIMEOUT_MS);
 
   afterAll(async () => {
     await built.close();
@@ -119,7 +137,7 @@ describe("per-IP lockout", () => {
   beforeAll(async () => {
     built = await buildTestApp();
     app = built.app;
-  });
+  }, HOOK_TIMEOUT_MS);
 
   afterAll(async () => {
     await built.close();

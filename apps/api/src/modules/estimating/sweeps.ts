@@ -1,10 +1,15 @@
 /**
  * ESTIMATING SWEEPS — the time-driven half of the module.
  *
- * Two scheduler jobs, both idempotent and both bounded by company plus an
+ * Three scheduler jobs, all idempotent and all bounded by company plus an
  * index-backed predicate, because an estimating library is one of the biggest
  * tables a tenant owns and a sweep that loads it is a sweep that stops
  * running.
+ *
+ * Each takes an optional `projectId`. The scheduler runs them company-wide
+ * with the system actor; a person triggering them by hand from a project runs
+ * them against THAT project only, because standard access to one project is
+ * not authority over another (plan §6.3).
  *
  *   estimating.quote-validity   A subcontract quote out of validity is not a
  *                               price. The sweep expires it, raises a signal
@@ -16,6 +21,12 @@
  *                               stale, approved estimates nobody converted to
  *                               a budget, and measured takeoff nobody priced.
  *
+ *   estimating.quote-outliers   Levels every trade package with three or more
+ *                               live quotes and puts the bidders who are a
+ *                               long way from the pack on a scope row into
+ *                               the signal register, rather than leaving them
+ *                               visible only while the levelling tab is open.
+ *
  * Every finding is fingerprinted so a re-run does not manufacture a second
  * one, and every finding is CLOSED when its condition clears — a register
  * that only ever grows is a register nobody reads.
@@ -25,6 +36,7 @@ import { and, eq, inArray, isNotNull, isNull, lt, lte, ne, sql } from "drizzle-o
 import {
   costCatalogueItems,
   estimateLineItems,
+  estimateSubQuoteLines,
   estimateSubQuotes,
   estimates,
   takeoffItems,
@@ -33,6 +45,8 @@ import { forEachCompany } from "../../lib/scheduler.js";
 import type { Db } from "../../lib/db.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { pushNotifications } from "../notifications/service.js";
+import { round2 } from "./pricing.js";
+import { levelQuotes } from "./quotes.js";
 import { addDays, daysBetween, raiseSignalOnce, reconcileSignals } from "./shared.js";
 
 /** How old a catalogue rate may be before it is flagged for review. */
@@ -53,31 +67,35 @@ export interface QuoteValidityResult {
   signalsRaised: number;
   signalsClosed: number;
   notified: number;
+  scope: "company" | "project";
   ranAt: string;
 }
 
 /**
  * Expire sub-quotes past their validity date and warn about the ones about to
  * go. Bounded by (companyId, validUntil) — the index on the table.
+ *
+ * `projectId` narrows the whole sweep to one project. The scheduler runs it
+ * company-wide; a person triggering it from a project may only reach that
+ * project's records, because standard access to one project is not authority
+ * over another (plan §6.3).
  */
 export async function sweepQuoteValidity(
   db: Db,
   companyId: string,
   now: Date,
+  projectId?: string | null,
 ): Promise<QuoteValidityResult> {
   const today = now.toISOString().slice(0, 10);
   const horizon = addDays(today, QUOTE_EXPIRY_WARN_DAYS);
-  const rows = await db
-    .select()
-    .from(estimateSubQuotes)
-    .where(
-      and(
-        eq(estimateSubQuotes.companyId, companyId),
-        isNotNull(estimateSubQuotes.validUntil),
-        lte(estimateSubQuotes.validUntil, horizon),
-        inArray(estimateSubQuotes.status, [...LIVE_QUOTE_STATUSES]),
-      ),
-    );
+  const quoteClauses = [
+    eq(estimateSubQuotes.companyId, companyId),
+    isNotNull(estimateSubQuotes.validUntil),
+    lte(estimateSubQuotes.validUntil, horizon),
+    inArray(estimateSubQuotes.status, [...LIVE_QUOTE_STATUSES]),
+  ];
+  if (projectId) quoteClauses.push(eq(estimateSubQuotes.projectId, projectId));
+  const rows = await db.select().from(estimateSubQuotes).where(and(...quoteClauses));
 
   let expired = 0;
   let expiring = 0;
@@ -200,6 +218,7 @@ export async function sweepQuoteValidity(
       "sub_quote_expiring",
       expiringKeys,
       "The quote was accepted, withdrawn, re-dated or has now lapsed; the warning no longer applies.",
+      projectId,
     )) +
     (await reconcileSignals(
       db,
@@ -207,6 +226,7 @@ export async function sweepQuoteValidity(
       "sub_quote_expired",
       expiredKeys,
       "The quote's validity was extended or the quote was withdrawn.",
+      projectId,
     ));
 
   return {
@@ -215,6 +235,7 @@ export async function sweepQuoteValidity(
     signalsRaised,
     signalsClosed,
     notified,
+    scope: projectId ? "project" : "company",
     ranAt: now.toISOString(),
   };
 }
@@ -227,6 +248,8 @@ export interface HygieneResult {
   unpricedTakeoffItems: number;
   signalsRaised: number;
   signalsClosed: number;
+  scope: "company" | "project";
+  notes: string[];
   ranAt: string;
 }
 
@@ -234,11 +257,17 @@ export interface HygieneResult {
  * Catalogue staleness, unconverted approved estimates, and measured takeoff
  * nobody priced. All three are "the record says one thing and the work says
  * another" conditions — cheap to detect, expensive to discover in a tender.
+ *
+ * `projectId` narrows it to one project. The company rate library is then
+ * deliberately left alone: flipping a company-wide rate to "review" affects
+ * every project, and a person with access to one of them is not entitled to
+ * do that. Project-override rates are still swept, and the result says so.
  */
 export async function sweepEstimatingHygiene(
   db: Db,
   companyId: string,
   now: Date,
+  projectId?: string | null,
 ): Promise<HygieneResult> {
   const today = now.toISOString().slice(0, 10);
   const staleBefore = addDays(today, -RATE_STALENESS_DAYS);
@@ -246,19 +275,25 @@ export async function sweepEstimatingHygiene(
   const takeoffCutoff = new Date(now.getTime() - UNPRICED_TAKEOFF_DAYS * 86_400_000).toISOString();
 
   let signalsRaised = 0;
+  const notes: string[] = [];
 
   /* --- 1. catalogue rates that have gone stale -------------------------- */
+  const catalogueClauses = [
+    eq(costCatalogueItems.companyId, companyId),
+    eq(costCatalogueItems.status, "active"),
+    isNotNull(costCatalogueItems.rateAsAt),
+    lt(costCatalogueItems.rateAsAt, staleBefore),
+  ];
+  if (projectId) {
+    catalogueClauses.push(eq(costCatalogueItems.projectId, projectId));
+    notes.push(
+      "Only this project's own override rates were re-flagged; the company rate library is swept by the scheduler, because retiring a company rate reaches every project.",
+    );
+  }
   const staleItems = await db
     .select({ id: costCatalogueItems.id })
     .from(costCatalogueItems)
-    .where(
-      and(
-        eq(costCatalogueItems.companyId, companyId),
-        eq(costCatalogueItems.status, "active"),
-        isNotNull(costCatalogueItems.rateAsAt),
-        lt(costCatalogueItems.rateAsAt, staleBefore),
-      ),
-    );
+    .where(and(...catalogueClauses));
   for (const item of staleItems) {
     await db
       .update(costCatalogueItems)
@@ -267,6 +302,13 @@ export async function sweepEstimatingHygiene(
   }
 
   /* --- 2. live estimates resting on stale rates ------------------------- */
+  const staleLineClauses = [
+    eq(estimateLineItems.companyId, companyId),
+    isNotNull(estimateLineItems.rateAsAt),
+    lt(estimateLineItems.rateAsAt, staleBefore),
+    inArray(estimates.status, ["draft", "in_review", "approved"]),
+  ];
+  if (projectId) staleLineClauses.push(eq(estimateLineItems.projectId, projectId));
   const staleLineRows = await db
     .select({
       estimateId: estimateLineItems.estimateId,
@@ -276,14 +318,7 @@ export async function sweepEstimatingHygiene(
     })
     .from(estimateLineItems)
     .innerJoin(estimates, eq(estimates.id, estimateLineItems.estimateId))
-    .where(
-      and(
-        eq(estimateLineItems.companyId, companyId),
-        isNotNull(estimateLineItems.rateAsAt),
-        lt(estimateLineItems.rateAsAt, staleBefore),
-        inArray(estimates.status, ["draft", "in_review", "approved"]),
-      ),
-    )
+    .where(and(...staleLineClauses))
     .groupBy(estimateLineItems.estimateId, estimateLineItems.projectId);
 
   const staleKeys = new Set<string>();
@@ -328,6 +363,7 @@ export async function sweepEstimatingHygiene(
         isNull(estimates.convertedBudgetId),
         isNotNull(estimates.approvedAt),
         lt(estimates.approvedAt, conversionCutoff),
+        ...(projectId ? [eq(estimates.projectId, projectId)] : []),
       ),
     );
   const unconvertedKeys = new Set<string>();
@@ -363,6 +399,7 @@ export async function sweepEstimatingHygiene(
         lt(takeoffItems.createdAt, takeoffCutoff),
         ne(takeoffItems.quantity, 0),
         isNull(estimateLineItems.id),
+        ...(projectId ? [eq(takeoffItems.projectId, projectId)] : []),
       ),
     );
   const byProject = new Map<string, Array<{ id: string; name: string }>>();
@@ -403,6 +440,7 @@ export async function sweepEstimatingHygiene(
       "estimate_stale_rates",
       staleKeys,
       "The estimate's rates were refreshed, or it is no longer live.",
+      projectId,
     )) +
     (await reconcileSignals(
       db,
@@ -410,6 +448,7 @@ export async function sweepEstimatingHygiene(
       "estimate_unconverted",
       unconvertedKeys,
       "The estimate was converted to a budget, superseded or withdrawn.",
+      projectId,
     )) +
     (await reconcileSignals(
       db,
@@ -417,6 +456,7 @@ export async function sweepEstimatingHygiene(
       "takeoff_unpriced",
       unpricedKeys,
       "Every measured takeoff on this project is now priced or voided.",
+      projectId,
     ));
 
   return {
@@ -427,19 +467,214 @@ export async function sweepEstimatingHygiene(
     unpricedTakeoffItems: unpricedRows.length,
     signalsRaised,
     signalsClosed,
+    scope: projectId ? "project" : "company",
+    notes,
     ranAt: now.toISOString(),
   };
 }
 
-/** Run both sweeps for one project's company and return the combined result. */
+/* ================================================================== */
+/* Quote outliers (#203)                                               */
+/* ================================================================== */
+
+/** Quote statuses whose prices are still worth comparing. */
+const COMPARABLE_QUOTE_STATUSES = ["received", "under_review", "levelled", "accepted"] as const;
+/** Bound on the work a single company's sweep does. */
+const MAX_QUOTES_PER_SWEEP = 500;
+const MAX_QUOTE_LINES_PER_SWEEP = 20_000;
+
+export interface QuoteOutlierResult {
+  packs: number;
+  quotesCompared: number;
+  outliers: number;
+  signalsRaised: number;
+  signalsClosed: number;
+  scope: "company" | "project";
+  ranAt: string;
+}
+
+/**
+ * The levelling engine finds outliers per request, which means they are only
+ * visible while somebody has the levelling tab open. This puts them in the
+ * signal register instead, where they get a disposition and reach the
+ * attention feed: one bidder a long way from the pack on the same scope row
+ * is the estimating finding a commercial manager most needs told.
+ *
+ * Fingerprinted on quote + scope row, so a re-run does not manufacture a
+ * second finding, and closed the moment the price is amended, the row is
+ * re-levelled or the quote leaves the comparison.
+ */
+export async function sweepQuoteOutliers(
+  db: Db,
+  companyId: string,
+  now: Date,
+  projectId?: string | null,
+): Promise<QuoteOutlierResult> {
+  const clauses = [
+    eq(estimateSubQuotes.companyId, companyId),
+    inArray(estimateSubQuotes.status, [...COMPARABLE_QUOTE_STATUSES]),
+  ];
+  if (projectId) clauses.push(eq(estimateSubQuotes.projectId, projectId));
+  const quotes = await db
+    .select()
+    .from(estimateSubQuotes)
+    .where(and(...clauses))
+    .limit(MAX_QUOTES_PER_SWEEP);
+
+  // A pack is one project's quotes for one trade package. Fewer than three
+  // prices is not evidence of anything, and the engine refuses to judge it,
+  // so those packs are never loaded.
+  const packs = new Map<string, typeof quotes>();
+  for (const quote of quotes) {
+    const key = `${quote.projectId}|${quote.tradePackage}`;
+    const bucket = packs.get(key) ?? [];
+    bucket.push(quote);
+    packs.set(key, bucket);
+  }
+  const comparable = [...packs.entries()].filter(([, list]) => list.length >= 3);
+  const currentKeys = new Set<string>();
+  let outliers = 0;
+  let signalsRaised = 0;
+  let quotesCompared = 0;
+
+  if (comparable.length > 0) {
+    const quoteIds = comparable.flatMap(([, list]) => list.map((q) => q.id));
+    const lines = await db
+      .select()
+      .from(estimateSubQuoteLines)
+      .where(inArray(estimateSubQuoteLines.subQuoteId, quoteIds))
+      .limit(MAX_QUOTE_LINES_PER_SWEEP);
+
+    for (const [, list] of comparable) {
+      quotesCompared += list.length;
+      const result = levelQuotes(
+        list.map((quote) => ({
+          id: quote.id,
+          vendorId: quote.vendorId,
+          vendorName: quote.vendorName,
+          tradePackage: quote.tradePackage,
+          status: quote.status,
+          currency: quote.currency,
+          quotedTotal: quote.quotedTotal,
+          adjustmentAmount: quote.adjustmentAmount,
+          validUntil: quote.validUntil,
+          lines: lines
+            .filter((l) => l.subQuoteId === quote.id)
+            .map((l) => ({
+              quoteId: quote.id,
+              vendorName: quote.vendorName,
+              lineId: l.id,
+              scopeKey: l.scopeKey ?? l.description,
+              description: l.description,
+              unit: l.unit,
+              quantity: l.quantity,
+              unitRate: l.unitRate,
+              amount: l.amount,
+              excluded: l.excluded === 1,
+            })),
+        })),
+      );
+      for (const outlier of result.outliers) {
+        outliers += 1;
+        const quote = list.find((q) => q.id === outlier.quoteId);
+        if (!quote) continue;
+        const key = `${outlier.quoteId}:${outlier.scopeKey}`;
+        currentKeys.add(key);
+        const gap = round2(outlier.amount - outlier.median);
+        const raised = await raiseSignalOnce(db, {
+          companyId,
+          projectId: quote.projectId,
+          detector: "quote_outlier",
+          key,
+          // A price a long way BELOW the pack is the dangerous one: it is
+          // usually scope that was never priced, and it wins the package.
+          severity: outlier.direction === "low" ? "high" : "medium",
+          confidence: 0.7,
+          title: `${outlier.vendorName} is ${outlier.direction} on "${outlier.description}" — ${quote.tradePackage}`,
+          explanation:
+            `On the scope row "${outlier.description}", ${outlier.vendorName} priced ${outlier.amount} ${quote.currency} against a pack median of ${outlier.median} (${gap > 0 ? "+" : ""}${gap}), ` +
+            `${outlier.deviation.toFixed(1)}× the median absolute deviation of the ${list.length} quotes for ${quote.tradePackage}. ` +
+            (outlier.direction === "low"
+              ? "A price that far below the pack is normally scope that was not priced. Confirm in writing what is included before the package is let."
+              : "Confirm what is included, or whether the row has been double-counted against another line."),
+          subjectType: "estimate_sub_quote",
+          subjectId: quote.id,
+          evidenceRefs: {
+            quoteId: quote.id,
+            reference: quote.reference,
+            vendorName: outlier.vendorName,
+            tradePackage: quote.tradePackage,
+            scopeKey: outlier.scopeKey,
+            description: outlier.description,
+            amount: outlier.amount,
+            packMedian: outlier.median,
+            deviation: round2(outlier.deviation),
+            direction: outlier.direction,
+            quotesInPack: list.length,
+            currency: quote.currency,
+          },
+        });
+        if (raised.raised) {
+          signalsRaised += 1;
+          // The person who entered the quote is the person who can confirm
+          // the scope with the bidder, so the finding goes to them rather
+          // than only into the register.
+          await pushNotifications(db, [
+            {
+              companyId,
+              userId: quote.createdBy,
+              projectId: quote.projectId,
+              kind: "estimate",
+              title: `${outlier.vendorName} is ${outlier.direction} on "${outlier.description}"`,
+              body: `${outlier.amount} ${quote.currency} against a pack median of ${outlier.median} for ${quote.tradePackage}.`,
+              recordType: "estimate_sub_quote",
+              recordId: quote.id,
+            },
+          ]);
+        }
+      }
+    }
+  }
+
+  const signalsClosed = await reconcileSignals(
+    db,
+    companyId,
+    "quote_outlier",
+    currentKeys,
+    "The price was amended, the pack was re-levelled, or the quote left the comparison.",
+    projectId,
+  );
+
+  return {
+    packs: comparable.length,
+    quotesCompared,
+    outliers,
+    signalsRaised,
+    signalsClosed,
+    scope: projectId ? "project" : "company",
+    ranAt: now.toISOString(),
+  };
+}
+
+/**
+ * Run all three sweeps and return the combined result. `projectId` narrows
+ * every one of them to a single project — the shape a person triggering the
+ * sweep by hand is entitled to.
+ */
 export async function runEstimatingSweeps(
   db: Db,
   companyId: string,
   now: Date,
-): Promise<{ quotes: QuoteValidityResult; hygiene: HygieneResult }> {
-  const quotes = await sweepQuoteValidity(db, companyId, now);
-  const hygiene = await sweepEstimatingHygiene(db, companyId, now);
-  return { quotes, hygiene };
+  projectId?: string | null,
+): Promise<{
+  quotes: QuoteValidityResult;
+  hygiene: HygieneResult;
+  outliers: QuoteOutlierResult;
+}> {
+  const quotes = await sweepQuoteValidity(db, companyId, now, projectId);
+  const hygiene = await sweepEstimatingHygiene(db, companyId, now, projectId);
+  const outliers = await sweepQuoteOutliers(db, companyId, now, projectId);
+  return { quotes, hygiene, outliers };
 }
 
 export function registerEstimatingJobs(app: FastifyInstance): void {
@@ -461,7 +696,20 @@ export function registerEstimatingJobs(app: FastifyInstance): void {
     run: async ({ db, now }) =>
       forEachCompany(db, (companyId) => sweepEstimatingHygiene(db, companyId, now)),
   });
+  app.scheduler.register({
+    name: "estimating.quote-outliers",
+    description:
+      "Level every trade package with three or more live quotes and raise a signal where one bidder's price on a scope row is a long way from the pack",
+    everyMs: 12 * 60 * 60_000,
+    runOnBoot: true,
+    run: async ({ db, now }) =>
+      forEachCompany(db, (companyId) => sweepQuoteOutliers(db, companyId, now)),
+  });
 }
 
 /** Exposed for the route that lets an operator run the sweeps on demand. */
-export const SWEEP_JOB_NAMES = ["estimating.quote-validity", "estimating.hygiene"] as const;
+export const SWEEP_JOB_NAMES = [
+  "estimating.quote-validity",
+  "estimating.hygiene",
+  "estimating.quote-outliers",
+] as const;

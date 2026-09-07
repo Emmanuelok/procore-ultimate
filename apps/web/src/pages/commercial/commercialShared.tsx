@@ -411,6 +411,90 @@ export interface RetentionPosition {
   reasons: string[];
 }
 
+export interface RetentionRegister {
+  items: RetentionPosition[];
+  releases: RetentionReleaseRow[];
+}
+
+export interface RetentionReleaseRow {
+  id: string;
+  contractId: string | null;
+  boqId: string | null;
+  kind: string;
+  amount: number;
+  currency: string;
+  releasedOn: string;
+  bondReference: string | null;
+  reason: string | null;
+  createdAt: string;
+}
+
+export interface ScheduleLinkRow {
+  id: string;
+  boqItemId: string;
+  taskId: string;
+  allocationPercent: number;
+}
+
+export interface ScheduleTaskOption {
+  id: string;
+  name: string;
+  wbsCode: string | null;
+  startDate: string | null;
+  finishDate: string | null;
+}
+
+export interface RateBenchmarkRow {
+  id: string;
+  code: string | null;
+  description: string;
+  unit: string;
+  rate: number;
+  currency: string;
+  region: string | null;
+  source: string;
+  asOfDate: string | null;
+  notes: string | null;
+  createdAt: string;
+}
+
+export interface FluctuationFormulaInfo {
+  formula: string;
+  name: string;
+  description: string;
+  reference: string;
+}
+
+export interface CertifyPreview {
+  valuationId: string;
+  currency: string;
+  retentionPercent: number;
+  retentionCap: number | null;
+  applied: {
+    workDoneToDate: number;
+    materials: number;
+    sectionsTotal: number;
+    grossTotal: number;
+    retentionHeld: number;
+    previousNet: number;
+    netDue: number;
+  };
+  certificate: {
+    certifiedWorkDone: number;
+    certifiedMaterials: number;
+    certifiedSections: number;
+    certifiedGross: number;
+    nonRetainableSections: number;
+    certifiedRetentionBase: number;
+    retentionHeld: number;
+    retentionCapped: boolean;
+    retentionReleased: number;
+    previousCertified: number;
+    netCertified: number;
+    varianceFromApplication: number;
+  };
+}
+
 export interface FluctuationCalcRow {
   id: string;
   formula: string;

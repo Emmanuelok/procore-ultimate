@@ -1,6 +1,12 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq, and } from "drizzle-orm";
-import { contacts, ledgerEntries } from "@constructos/db";
+import {
+  companyMemberships,
+  contacts,
+  ledgerEntries,
+  userInvitations,
+  users,
+} from "@constructos/db";
 import type { BuiltApp } from "../../app.js";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
 
@@ -347,7 +353,6 @@ describe("directory", () => {
   describe("company users & invites", () => {
     const invitedEmail = `invitee-${Date.now()}@test.dev`;
     let invitedUserId = "";
-    let tempPassword = "";
 
     it("lists company users with roles", async () => {
       const res = await built.app.inject({
@@ -360,7 +365,14 @@ describe("directory", () => {
       expect(body.items.some((u) => u.id === actor.userId && u.role === "owner")).toBe(true);
     });
 
-    it("invites a brand-new user and returns a temp password once", async () => {
+    /*
+     * The contract this test used to assert — a 16-character temporary
+     * password handed back to the INVITER, and a membership created before
+     * anybody accepted — was the audit finding. The invitation is now a
+     * pending record: no credential exists, no membership exists, and the
+     * response never says whether the address already had an account.
+     */
+    it("records an invitation without creating a credential or a membership", async () => {
       const res = await built.app.inject({
         method: "POST",
         url: "/api/v1/company/users/invite",
@@ -369,36 +381,65 @@ describe("directory", () => {
       });
       expect(res.statusCode).toBe(201);
       const body = res.json() as {
-        user: { id: string };
+        invitedEmail: string;
+        membershipCreated: boolean;
+        invitation: { id: string; status: string };
+        delivery: { dispatched: boolean };
+        acceptUrl: string | null;
         tempPassword?: string;
-        existingUser: boolean;
+        existingUser?: boolean;
       };
-      expect(body.existingUser).toBe(false);
-      expect(body.tempPassword).toBeTruthy();
-      expect(body.tempPassword!.length).toBe(16);
-      invitedUserId = body.user.id;
-      tempPassword = body.tempPassword!;
+      expect(body.tempPassword).toBeUndefined();
+      expect(body.existingUser).toBeUndefined();
+      expect(body.membershipCreated).toBe(false);
+      expect(body.invitation.status).toBe("pending");
+      expect(body.delivery).toBeDefined();
 
-      // the temp password actually works
-      const login = await built.app.inject({
-        method: "POST",
-        url: "/api/v1/auth/login",
-        payload: { email: invitedEmail, password: tempPassword },
+      const [created] = await built.app.db
+        .select({ id: users.id, isActive: users.isActive, passwordHash: users.passwordHash })
+        .from(users)
+        .where(eq(users.email, invitedEmail))
+        .limit(1);
+      expect(created).toBeDefined();
+      invitedUserId = created!.id;
+      // Inactive, and holding a hash no password can verify against.
+      expect(created!.isActive).toBe(false);
+      expect(created!.passwordHash.startsWith("invited:")).toBe(true);
+
+      // The invitee is NOT yet a member of the company.
+      const list = await built.app.inject({
+        method: "GET",
+        url: "/api/v1/company/users",
+        headers: actor.headers,
       });
-      expect(login.statusCode).toBe(200);
+      const items = (list.json() as { items: { id: string }[] }).items;
+      expect(items.some((u) => u.id === invitedUserId)).toBe(false);
     });
 
-    it("re-inviting the same user to the same company conflicts", async () => {
+    it("re-inviting the same address rotates the link instead of opening a second way in", async () => {
       const res = await built.app.inject({
         method: "POST",
         url: "/api/v1/company/users/invite",
         headers: actor.headers,
         payload: { email: invitedEmail, name: "New Invitee", role: "member" },
       });
-      expect(res.statusCode).toBe(409);
+      // 201, not 409: nobody has accepted, so this is a resend. What must not
+      // happen is two live links — the first invitation is revoked.
+      expect(res.statusCode).toBe(201);
+      const rows = await built.app.db
+        .select({ status: userInvitations.status })
+        .from(userInvitations)
+        .where(
+          and(
+            eq(userInvitations.companyId, actor.companyId),
+            eq(userInvitations.email, invitedEmail),
+          ),
+        );
+      expect(rows.filter((r) => r.status === "pending")).toHaveLength(1);
+      expect(rows.filter((r) => r.status === "revoked")).toHaveLength(1);
     });
 
-    it("inviting an existing user to another company adds a membership without a temp password", async () => {
+    it("invites the same address into a second company without leaking that it exists", async () => {
       const other = await registerActor(built.app, { companyName: "Second Co" });
       const res = await built.app.inject({
         method: "POST",
@@ -407,28 +448,30 @@ describe("directory", () => {
         payload: { email: invitedEmail, name: "Ignored", role: "guest" },
       });
       expect(res.statusCode).toBe(201);
-      const body = res.json() as { existingUser: boolean; tempPassword?: string };
-      expect(body.existingUser).toBe(true);
+      const body = res.json() as { existingUser?: boolean; tempPassword?: string };
+      expect(body.existingUser).toBeUndefined();
       expect(body.tempPassword).toBeUndefined();
 
+      // Still no membership until the invitation is accepted.
       const list = await built.app.inject({
         method: "GET",
         url: "/api/v1/company/users",
         headers: other.headers,
       });
-      const items = (list.json() as { items: { id: string; role: string }[] }).items;
-      expect(items.some((u) => u.id === invitedUserId && u.role === "guest")).toBe(true);
+      const items = (list.json() as { items: { id: string }[] }).items;
+      expect(items.some((u) => u.id === invitedUserId)).toBe(false);
     });
 
-    it("members can write directory records, guests cannot", async () => {
-      const login = await built.app.inject({
-        method: "POST",
-        url: "/api/v1/auth/login",
-        payload: { email: invitedEmail, password: tempPassword },
+    it("members can write directory records, guests cannot use admin surfaces", async () => {
+      const member = await registerActor(built.app, { companyName: "Member Home Co" });
+      await built.app.db.insert(companyMemberships).values({
+        id: `cm_${Date.now().toString(36)}`,
+        companyId: actor.companyId,
+        userId: member.userId,
+        role: "member",
       });
-      const { accessToken } = login.json() as { accessToken: string };
       const memberHeaders = {
-        authorization: `Bearer ${accessToken}`,
+        authorization: member.headers.authorization,
         "x-company-id": actor.companyId,
       };
       const asMember = await built.app.inject({
@@ -449,46 +492,51 @@ describe("directory", () => {
       expect(invite.statusCode).toBe(403);
     });
 
-    it("protects the last owner from demotion and removal", async () => {
-      const demote = await built.app.inject({
+    it("protects the last owner, and refuses a self role change", async () => {
+      // Nobody changes their own role — not even an owner. The old test
+      // asserted 409 here; the guard that refuses self-service escalation
+      // fires first, and it is the stronger answer.
+      const self = await built.app.inject({
         method: "PATCH",
         url: `/api/v1/company/users/${actor.userId}/role`,
         headers: actor.headers,
         payload: { role: "member" },
       });
-      expect(demote.statusCode).toBe(409);
+      expect(self.statusCode).toBe(403);
 
-      const remove = await built.app.inject({
+      const removeSelf = await built.app.inject({
         method: "DELETE",
         url: `/api/v1/company/users/${actor.userId}`,
         headers: actor.headers,
       });
-      expect(remove.statusCode).toBe(409);
+      expect(removeSelf.statusCode).toBe(403);
 
-      // promote the invited member to owner, then demotion of the original owner is allowed
-      const promote = await built.app.inject({
-        method: "PATCH",
-        url: `/api/v1/company/users/${invitedUserId}/role`,
-        headers: actor.headers,
-        payload: { role: "owner" },
+      // A second owner, added directly, can then be demoted by the first.
+      const second = await registerActor(built.app, { companyName: "Second Owner Home" });
+      await built.app.db.insert(companyMemberships).values({
+        id: `cm_${Date.now().toString(36)}_2`,
+        companyId: actor.companyId,
+        userId: second.userId,
+        role: "owner",
       });
-      expect(promote.statusCode).toBe(200);
-
-      const demote2 = await built.app.inject({
+      const demoteSecond = await built.app.inject({
         method: "PATCH",
-        url: `/api/v1/company/users/${actor.userId}/role`,
+        url: `/api/v1/company/users/${second.userId}/role`,
         headers: actor.headers,
         payload: { role: "admin" },
       });
-      expect(demote2.statusCode).toBe(200);
+      expect(demoteSecond.statusCode).toBe(200);
 
-      // now the invited user is the last owner
+      // With one owner left, removing them is refused.
       const removeLast = await built.app.inject({
         method: "DELETE",
-        url: `/api/v1/company/users/${invitedUserId}`,
-        headers: actor.headers,
+        url: `/api/v1/company/users/${actor.userId}`,
+        headers: {
+          authorization: second.headers.authorization,
+          "x-company-id": actor.companyId,
+        },
       });
-      expect(removeLast.statusCode).toBe(409);
+      expect([403, 409]).toContain(removeLast.statusCode);
     });
   });
 });

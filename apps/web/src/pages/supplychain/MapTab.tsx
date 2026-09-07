@@ -6,7 +6,7 @@
 import { useMemo, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 import { SUPPLY_CRITICALITIES, SUPPLY_LINK_KINDS, SUPPLY_NODE_KINDS } from "@constructos/shared";
-import { Badge, Button, Card, CardBody, Checkbox, Drawer, EmptyState, Field, Input, Select, Skeleton, Textarea } from "../../ui";
+import { Alert, Badge, Button, Card, CardBody, Checkbox, Drawer, EmptyState, Field, Input, Select, Skeleton, Textarea } from "../../ui";
 import { DataTable, type DataColumns } from "../../ui/data";
 import { IconPlus } from "../../ui/icons";
 import { api } from "../../lib/api";
@@ -84,6 +84,11 @@ export default function MapTab({ projectId, lookups, onChanged }: { projectId: s
   return (
     <div className="space-y-4">
       {map.error ? <LoadError message={map.error} onRetry={map.reload} /> : null}
+      {(map.data?.truncated ?? []).length > 0 ? (
+        <Alert tone="warning" title="This map is a lower bound">
+          <ReasonList reasons={map.data?.truncated ?? []} tone="danger" />
+        </Alert>
+      ) : null}
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <StatCard label="Nodes" value={stats ? num(stats.nodes) : EM_DASH} hint={stats ? `${stats.maxTier} tier${stats.maxTier === 1 ? "" : "s"} deep · ${stats.links} link${stats.links === 1 ? "" : "s"}` : undefined} />
         <StatCard label="Sole-source links" value={stats ? num(stats.soleSourceLinks) : EM_DASH} hint="Declared by the buyer: no alternative source" tone={stats && stats.soleSourceLinks > 0 ? "warning" : undefined} />
@@ -122,7 +127,7 @@ export default function MapTab({ projectId, lookups, onChanged }: { projectId: s
       </Card>
 
       <NodeForm projectId={projectId} open={createOpen} lookups={lookups} onClose={() => setCreateOpen(false)} onCreated={() => { setCreateOpen(false); changed(); }} />
-      <NodeDrawer projectId={projectId} nodeId={openNode} detail={detail} nodes={map.data?.nodes ?? []} nodeName={nodeName} onClose={() => setOpenNode(null)} onChanged={changed} />
+      <NodeDrawer projectId={projectId} nodeId={openNode} detail={detail} nodes={map.data?.nodes ?? []} nodeName={nodeName} lookups={lookups} onClose={() => setOpenNode(null)} onChanged={changed} />
     </div>
   );
 }
@@ -237,7 +242,22 @@ function NodeForm({ projectId, open, lookups, onClose, onCreated }: { projectId:
   );
 }
 
-function NodeDrawer({ projectId, nodeId, detail, nodes, nodeName, onClose, onChanged }: { projectId: string; nodeId: string | null; detail: { data: NodeDetail | null; loading: boolean; error: string | null; reload: () => void }; nodes: NodeRow[]; nodeName: Map<string, string>; onClose: () => void; onChanged: () => void }) {
+interface NodeEdit {
+  name: string;
+  kind: string;
+  tier: string;
+  country: string;
+  city: string;
+  criticality: string;
+  categories: string;
+  vendorId: string;
+  leadTimeDays: string;
+  notes: string;
+}
+
+const EMPTY_EDIT: NodeEdit = { name: "", kind: "vendor", tier: "1", country: "", city: "", criticality: "medium", categories: "", vendorId: "", leadTimeDays: "", notes: "" };
+
+function NodeDrawer({ projectId, nodeId, detail, nodes, nodeName, lookups, onClose, onChanged }: { projectId: string; nodeId: string | null; detail: { data: NodeDetail | null; loading: boolean; error: string | null; reload: () => void }; nodes: NodeRow[]; nodeName: Map<string, string>; lookups: Lookups; onClose: () => void; onChanged: () => void }) {
   const base = `/api/v1/projects/${projectId}/supply-chain`;
   const action = useAction();
   const d = detail.data;
@@ -246,6 +266,54 @@ function NodeDrawer({ projectId, nodeId, detail, nodes, nodeName, onClose, onCha
   const [linkCategory, setLinkCategory] = useState("");
   const [soleSource, setSoleSource] = useState(false);
   const [direction, setDirection] = useState<"downstream" | "upstream">("downstream");
+  const [editing, setEditing] = useState(false);
+  const [edit, setEdit] = useState<NodeEdit>(EMPTY_EDIT);
+
+  function startEditing() {
+    if (!d) return;
+    setEdit({
+      name: d.name,
+      kind: d.kind,
+      tier: String(d.tier),
+      country: d.country ?? "",
+      city: d.city ?? "",
+      criticality: d.criticality,
+      categories: d.categories.join(", "),
+      vendorId: d.vendorId ?? "",
+      leadTimeDays: d.leadTimeDays === null ? "" : String(d.leadTimeDays),
+      notes: d.notes ?? "",
+    });
+    setEditing(true);
+  }
+
+  /**
+   * Everything the create form collects stays editable. A tier or a lead time
+   * typed wrong at registration drives the risk engine and the long-lead
+   * order-by date; cancelling and re-creating the node would orphan every
+   * record that names it.
+   */
+  async function saveEdit(e: FormEvent) {
+    e.preventDefault();
+    if (!d) return;
+    const payload: Record<string, unknown> = {
+      name: edit.name.trim(),
+      kind: edit.kind,
+      tier: Number(edit.tier),
+      criticality: edit.criticality,
+      categories: edit.categories.split(",").map((c) => c.trim()).filter(Boolean),
+      country: edit.country.trim() ? edit.country.trim() : null,
+      city: edit.city.trim() ? edit.city.trim() : null,
+      vendorId: edit.vendorId ? edit.vendorId : null,
+      leadTimeDays: edit.leadTimeDays.trim() ? Number(edit.leadTimeDays) : null,
+      notes: edit.notes.trim() ? edit.notes.trim() : null,
+    };
+    const r = await action.run("edit", () => api.patch<NodeRow>(`${base}/nodes/${d.id}`, payload));
+    if (r) {
+      toast.success(`${r.name} updated`);
+      setEditing(false);
+      onChanged();
+    }
+  }
 
   async function addLink(e: FormEvent) {
     e.preventDefault();
@@ -341,17 +409,91 @@ function NodeDrawer({ projectId, nodeId, detail, nodes, nodeName, onClose, onCha
           </section>
 
           <section>
-            <SectionHeading title="Record" />
-            <KeyValue
-              items={[
-                { label: "Vendor", value: d.vendorId ?? <span className="italic text-content-subtle">not linked</span> },
-                { label: "Screened entity", value: d.entityId ?? <span className="italic text-content-subtle">not linked</span> },
-                { label: "Supplies", value: d.categories.length > 0 ? d.categories.join(", ") : EM_DASH },
-                { label: "Lead time", value: d.leadTimeDays === null ? EM_DASH : `${d.leadTimeDays} days` },
-                { label: "Status", value: labelize(d.status) },
-                { label: "Notes", value: d.notes ?? EM_DASH },
-              ]}
+            <SectionHeading
+              title="Record"
+              actions={
+                editing ? (
+                  <Button size="sm" variant="ghost" onClick={() => setEditing(false)}>
+                    Cancel edit
+                  </Button>
+                ) : (
+                  <Button size="sm" variant="secondary" onClick={startEditing}>
+                    Edit node
+                  </Button>
+                )
+              }
             />
+            {editing ? (
+              <form onSubmit={(e) => void saveEdit(e)} className="space-y-3 rounded-md border border-border p-3">
+                <Field label="Name" required>
+                  <Input value={edit.name} onChange={(e) => setEdit({ ...edit, name: e.target.value })} required maxLength={200} />
+                </Field>
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="Kind">
+                    <Select value={edit.kind} onChange={(e) => setEdit({ ...edit, kind: e.target.value })}>
+                      {SUPPLY_NODE_KINDS.map((k) => (
+                        <option key={k} value={k}>
+                          {labelize(k)}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                  <Field label="Tier" hint="1 = contracted directly">
+                    <Input type="number" min={1} max={6} value={edit.tier} onChange={(e) => setEdit({ ...edit, tier: e.target.value })} />
+                  </Field>
+                  <Field label="Country" hint="ISO alpha-2">
+                    <Input value={edit.country} onChange={(e) => setEdit({ ...edit, country: e.target.value })} maxLength={3} placeholder="GB" />
+                  </Field>
+                  <Field label="City">
+                    <Input value={edit.city} onChange={(e) => setEdit({ ...edit, city: e.target.value })} maxLength={120} />
+                  </Field>
+                  <Field label="Criticality" hint="feeds the risk engine">
+                    <Select value={edit.criticality} onChange={(e) => setEdit({ ...edit, criticality: e.target.value })}>
+                      {SUPPLY_CRITICALITIES.map((c) => (
+                        <option key={c} value={c}>
+                          {labelize(c)}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                  <Field label="Lead time (days)">
+                    <Input type="number" min={0} value={edit.leadTimeDays} onChange={(e) => setEdit({ ...edit, leadTimeDays: e.target.value })} />
+                  </Field>
+                </div>
+                <Field label="Vendor record">
+                  <Select value={edit.vendorId} onChange={(e) => setEdit({ ...edit, vendorId: e.target.value })}>
+                    {optionList(lookups.vendors, (v) => v.name).map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+                <Field label="What they supply" hint="Comma-separated categories or trade codes">
+                  <Input value={edit.categories} onChange={(e) => setEdit({ ...edit, categories: e.target.value })} />
+                </Field>
+                <Field label="Notes">
+                  <Textarea rows={3} value={edit.notes} onChange={(e) => setEdit({ ...edit, notes: e.target.value })} />
+                </Field>
+                <ReasonList reasons={lookups.notes} />
+                <div className="flex justify-end">
+                  <Button type="submit" size="sm" loading={action.busy === "edit"}>
+                    Save changes
+                  </Button>
+                </div>
+              </form>
+            ) : (
+              <KeyValue
+                items={[
+                  { label: "Vendor", value: d.vendorId ?? <span className="italic text-content-subtle">not linked</span> },
+                  { label: "Screened entity", value: d.entityId ?? <span className="italic text-content-subtle">not linked</span> },
+                  { label: "Supplies", value: d.categories.length > 0 ? d.categories.join(", ") : EM_DASH },
+                  { label: "Lead time", value: d.leadTimeDays === null ? EM_DASH : `${d.leadTimeDays} days` },
+                  { label: "Status", value: labelize(d.status) },
+                  { label: "Notes", value: d.notes ?? EM_DASH },
+                ]}
+              />
+            )}
             <div className="mt-2 flex gap-2">
               {d.status !== "active" ? <Button size="sm" variant="secondary" onClick={() => void setStatus("active")}>Reactivate</Button> : null}
               {d.status === "active" ? <Button size="sm" variant="ghost" onClick={() => void setStatus("suspended")}>Suspend</Button> : null}

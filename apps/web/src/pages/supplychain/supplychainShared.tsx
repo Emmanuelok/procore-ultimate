@@ -76,6 +76,8 @@ export interface LinkRow {
 export interface MapResponse {
   nodes: NodeRow[];
   links: LinkRow[];
+  /** a register that hit the read ceiling says so; the figures are a lower bound */
+  truncated: string[];
   stats: {
     nodes: number;
     links: number;
@@ -190,6 +192,7 @@ export interface ExpeditingLogRow {
 export interface LongLeadDetail extends LongLeadRow {
   assessment: LongLeadAssessment;
   expeditingLog: ExpeditingLogRow[];
+  expeditingLogHasMore: boolean;
   task: { id: string; name: string; startDate: string | null; actualStart: string | null; isCritical: boolean } | null;
   supplierNode: NodeRow | null;
   obligationId: string | null;
@@ -294,7 +297,15 @@ export interface UnitDetail extends UnitRow {
   stages: StageRow[];
   inspections: InspectionRow[];
   rollup: UnitRollup;
-  verifiedForPayment: { percent: number | null; inspectionCount: number; reasons: string[] };
+  verifiedForPayment: {
+    percent: number | null;
+    inspectionCount: number;
+    /** how many passed/conditional inspections carry a percent at all */
+    usableCount: number;
+    /** the inspection the percent came from — the most recent one that stands */
+    source: { id: string | null; inspectorId: string | null; performedAt: string | null } | null;
+    reasons: string[];
+  };
   task: { id: string; name: string; startDate: string | null; actualStart: string | null; isCritical: boolean } | null;
   factoryNode: NodeRow | null;
   traceRecords: Array<{ id: string; reference: string; description: string; status: string; chainComplete: number }>;
@@ -479,6 +490,8 @@ export interface TraceCoverage {
   installedWithoutCertificate: number;
   completenessPercent: number | null;
   reasons: string[];
+  /** the register hit the read ceiling: these figures are a lower bound */
+  truncated?: string[];
   byStatus: Record<string, number>;
   byMaterialType: Array<{ materialType: string; records: number; complete: number; installed: number; installedWithoutCertificate: number; completenessPercent: number | null }>;
   installedWithoutCertificateItems: Array<{ id: string; reference: string; description: string; installedLocationId: string | null }>;
@@ -512,6 +525,8 @@ export interface RiskResponse {
   }>;
   summary: Record<string, number>;
   concentration: { byCountry: ConcentrationBucket[]; flagged: ConcentrationBucket[]; threshold: number; reasons: string[] };
+  /** the node register hit the read ceiling: these counts are a lower bound */
+  truncated?: string[];
   lastRunAt: string | null;
   reasons: string[];
 }

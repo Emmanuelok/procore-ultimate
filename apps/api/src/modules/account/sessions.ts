@@ -10,6 +10,8 @@ import { unauthorized } from "../../lib/errors.js";
 import { isExpired } from "../../lib/time.js";
 import type { Db } from "../../lib/db.js";
 import type { PreHandler } from "../../types.js";
+import { recordAuthEvent } from "./events.js";
+import { effectivePolicyForUser, isIdleExpired } from "./policy.js";
 
 /**
  * Sessions as DEVICES, not as tokens.
@@ -138,6 +140,13 @@ export interface IssueSessionOptions {
   identityId?: string | null;
   providerId?: string | null;
   nowMs?: number;
+  /**
+   * #23 — the tenant's absolute session lifetime in hours, from the resolved
+   * security policy (modules/account/policy.ts). Unset falls back to
+   * SESSION_ABSOLUTE_TTL_DAYS, which is what every caller did before tenant
+   * policy existed.
+   */
+  absoluteTtlHours?: number | null;
 }
 
 export interface IssuedSession {
@@ -183,9 +192,11 @@ export async function issueUserSession(
 
   const deviceLabel = deviceLabelFor(ctx.userAgent);
   const fingerprint = deviceFingerprintOf(ctx.userAgent, ctx.ip);
-  const expiresAt = new Date(
-    nowMs + app.appConfig.SESSION_ABSOLUTE_TTL_DAYS * 24 * 3600 * 1000,
-  ).toISOString();
+  const ttlHours =
+    options.absoluteTtlHours && options.absoluteTtlHours > 0
+      ? Math.min(options.absoluteTtlHours, app.appConfig.SESSION_ABSOLUTE_TTL_DAYS * 24)
+      : app.appConfig.SESSION_ABSOLUTE_TTL_DAYS * 24;
+  const expiresAt = new Date(nowMs + ttlHours * 3600 * 1000).toISOString();
 
   if (options.sessionId) {
     const [existing] = await app.db
@@ -334,14 +345,83 @@ export function requireLiveSession(app: FastifyInstance): PreHandler {
       throw unauthorized("Session has expired");
     }
     req.accountSessionId = session.id;
-    const lastSeen = Date.parse(session.lastSeenAt);
-    if (!Number.isFinite(lastSeen) || nowMs - lastSeen > 60_000) {
-      await app.db
-        .update(authSessions)
-        .set({ lastSeenAt: new Date(nowMs).toISOString() })
-        .where(eq(authSessions.id, session.id));
-    }
+    await touchSession(app, req, session, nowMs);
   };
+}
+
+/**
+ * #23 — THE IDLE TIMEOUT, AND THE ONLY WRITER OF `last_seen_at`.
+ *
+ * EXTRACTED SO THE PLUGIN CAN CALL IT. This block used to live inside
+ * `requireLiveSession`, which is attached to the account module's routes and
+ * nothing else — so a user who worked all day in /projects, /financials or
+ * /pulse and never opened /account/* was never idled out no matter what their
+ * tenant had set, and the device list showed "last seen" as the sign-in time
+ * for everyone who never crossed this one gate. Half of #23 (the absolute
+ * lifetime) was enforced in plugins/auth.ts; this is the other half, in a
+ * function that gate can call. See the WIRING note in the package report for
+ * the one line in `authenticate` that closes it platform-wide.
+ *
+ * Order matters and is the whole correctness of the block: refreshing
+ * `last_seen_at` first would reset the very clock the check reads, and the
+ * timeout would never fire for anybody who kept a tab open. The policy is the
+ * STRICTEST across the user's tenants (policy.ts `resolvePolicies`), because a
+ * session admitted under a lax tenant's rules is a session a strict tenant's
+ * data is then read through.
+ *
+ * The session is REVOKED, not merely refused: a session that timed out is
+ * over, and leaving the row live would let the same token work again from a
+ * second tab that happened to touch a route this check is not on.
+ *
+ * THE COST. Reading the policy is a query and this runs on every authenticated
+ * request, so it is taken only when the session has not been seen for a minute
+ * — the same threshold that already decides whether to write `last_seen_at`.
+ * That is sound rather than merely cheap: the shortest idle timeout the policy
+ * route accepts is five minutes (security-routes.ts `min(5)`), so a session
+ * seen within the last minute cannot have crossed any timeable threshold. The
+ * tenant's policy is therefore read at most once a minute per session, not
+ * once per request.
+ *
+ * Idempotent, so calling it from both the plugin and this module's own
+ * prehandler (as happens until the plugin edit lands) costs one extra
+ * comparison and no extra query.
+ */
+export async function touchSession(
+  app: FastifyInstance,
+  req: FastifyRequest,
+  session: SessionRow,
+  nowMs: number = Date.now(),
+): Promise<void> {
+  const lastSeenMs = Date.parse(session.lastSeenAt);
+  const stale = !Number.isFinite(lastSeenMs) || nowMs - lastSeenMs > 60_000;
+  if (!stale) return;
+  const policy = await effectivePolicyForUser(app.db, session.userId);
+  if (isIdleExpired(policy, session.lastSeenAt, nowMs)) {
+    await revokeSessions(app.db, [session.id], {
+      reason: "expired",
+      byUser: false,
+      actorId: null,
+      nowMs,
+    });
+    const ctx = requestContext(req);
+    await recordAuthEvent(app.db, {
+      kind: "session_idle_timeout",
+      outcome: "success",
+      userId: session.userId,
+      companyId: session.companyId ?? null,
+      sessionId: session.id,
+      ip: ctx.ip,
+      userAgent: ctx.userAgent,
+      reason: `Signed out after ${policy.sessionIdleTimeoutMinutes} minutes of inactivity, as this organisation requires.`,
+    });
+    throw unauthorized(
+      `Session ended after ${policy.sessionIdleTimeoutMinutes} minutes of inactivity, as this organisation requires.`,
+    );
+  }
+  await app.db
+    .update(authSessions)
+    .set({ lastSeenAt: new Date(nowMs).toISOString() })
+    .where(eq(authSessions.id, session.id));
 }
 
 /* ------------------------------------------------------------------ */

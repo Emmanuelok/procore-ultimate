@@ -261,6 +261,50 @@ export function recommendSingleProjectLimit(
   const netAssets = num(f.netAssets);
   const largest = num(f.largestContractValue);
 
+  /*
+   * NEGATIVE NET ASSETS ARE A HARD STOP, NOT A MISSING FIGURE.
+   *
+   * The balance-sheet test was only added when netAssets > 0, and gearing is
+   * Unknowable when net assets are zero or negative, so the gearing haircut
+   * never fired either. A balance-sheet-insolvent contractor with a healthy
+   * turnover therefore received the full turnover-based limit with no
+   * haircut, no stop and — because the "could not apply" reason was only
+   * emitted when net assets were null — no reason text at all. That is the
+   * exact case this screen exists to catch: a company whose liabilities
+   * exceed its assets has nothing to absorb a loss on the contract with, and
+   * the loss lands on the buyer.
+   */
+  if (netAssets !== null && netAssets <= 0) {
+    return {
+      value: 0,
+      currency,
+      basis:
+        `No single-project limit is recommended: net assets are ${currency} ${round2(netAssets)}. ` +
+        "A balance sheet at or below zero has nothing left to absorb a loss on the contract " +
+        "with — the loss is absorbed by the buyer, through an insolvency, a novation and a " +
+        "second procurement at whatever the market charges to finish somebody else's work. " +
+        "This is a hard stop rather than a haircut because there is no multiple of nothing " +
+        "that produces a defensible cap. Where the parent will stand behind the contract, take " +
+        "a parent company guarantee or a performance bond and record THAT as the basis; where " +
+        "the figures are out of date, collect current ones.",
+      bindingTest: "hard_stop",
+      tests: [],
+      factors: [],
+      headroomBeforeFactors: null,
+      reasons: [
+        `Net assets of ${currency} ${round2(netAssets)} are at or below zero.`,
+        ...(turnover !== null && turnover > 0
+          ? [
+              `Turnover of ${currency} ${round2(turnover)} would otherwise have allowed ` +
+                `${currency} ${round2(turnover * rule.turnoverShare)}; it does not, because a ` +
+                "turnover figure describes activity and a net asset figure describes solvency.",
+            ]
+          : []),
+      ],
+      rule,
+    };
+  }
+
   const tests: LimitTest[] = [];
   if (turnover !== null && turnover > 0) {
     tests.push({

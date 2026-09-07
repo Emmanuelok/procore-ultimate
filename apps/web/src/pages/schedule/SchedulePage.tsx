@@ -1,11 +1,19 @@
 /**
- * Schedule workspace — native CPM scheduling (spec Vol I §2.6 subset:
- * #351 creation/editing, #353 critical path, #354 typed dependencies,
- * #355-357 baselines & comparison, #358/#361 progress, #359 lookahead,
- * #371 DCMA-style health). Left: editable task table + per-task dependency
- * editor. Right: pure-SVG Gantt with baseline ghost bars. Below: baseline
- * compare, lookahead and schedule-health panels. All mutations recompute
- * server-side; the page refetches and flashes a subtle "recomputed" note.
+ * Schedule workspace — the programme and everything a planner defends it with
+ * (spec Vol I §2.6): #349-350 P6 XER / MS Project import with a revision diff
+ * and MSPDI export, #351 creation and editing, #353 critical path and float,
+ * #354 typed dependencies with lag, #355-357 baselines, revisions and
+ * comparison, #358/#361 progress and the data date, #359 the lookahead and its
+ * make-ready constraints log, #360 responsible/location assignment, #362 key
+ * milestones against contractual dates, #363-366 work calendars, #370
+ * resource loading, #371 / Domain D #283 the full DCMA 14-point assessment,
+ * plus earned value and update narratives.
+ *
+ * Left: editable task table + per-task dependency editor. Right: pure-SVG
+ * Gantt with baseline ghost bars. Below: one panel per capability, each with
+ * its own loading, error and empty state so a failing panel never blanks the
+ * page. All mutations recompute server-side; the page refetches and flashes a
+ * subtle "recomputed" note.
  */
 import {
   useCallback,
@@ -16,10 +24,12 @@ import {
   type FormEvent,
   type KeyboardEvent,
 } from "react";
-import { useParams } from "react-router-dom";
-import { DEPENDENCY_TYPES, TASK_CONSTRAINT_TYPES } from "@constructos/shared";
+import { useParams, useSearchParams } from "react-router-dom";
+import { toast } from "sonner";
+import { DEPENDENCY_TYPES, SCHEDULE_TASK_TYPES, TASK_CONSTRAINT_TYPES } from "@constructos/shared";
 import { api, ApiClientError } from "../../lib/api";
 import {
+  Alert,
   Badge,
   Button,
   Card,
@@ -37,6 +47,18 @@ import {
 import { formatDate, formatDateTime, humanize } from "../format";
 import GanttSvg from "./GanttSvg";
 import QualityPanel from "./QualityPanel";
+import {
+  CalendarViewPanel,
+  CalendarsPanel,
+  ConstraintsPanel,
+  EarnedValuePanel,
+  ImportPanel,
+  MilestonesPanel,
+  NarrativesPanel,
+  ResourcesPanel,
+  RevisionsPanel,
+} from "./ProgrammePanels";
+import { useTaskOptions, type OptionList, type TaskOptions } from "./taskOptions";
 import {
   shortDate,
   type BaselineDetail,
@@ -56,7 +78,19 @@ import {
 /** Constraint types that require a date (mirrors the server rule). */
 const DATED_CONSTRAINTS = ["start_no_earlier_than", "finish_no_later_than", "must_start_on"];
 
-type Panel = "compare" | "lookahead" | "health";
+type Panel =
+  | "compare"
+  | "revisions"
+  | "lookahead"
+  | "calendar"
+  | "health"
+  | "earned-value"
+  | "resources"
+  | "milestones"
+  | "constraints"
+  | "calendars"
+  | "narratives"
+  | "import";
 
 function errMessage(err: unknown, fallback: string): string {
   return err instanceof ApiClientError || err instanceof Error ? err.message : fallback;
@@ -174,19 +208,89 @@ function InlineNumber({
 /* Expanded task row — constraint + actual dates, draft with Save      */
 /* ------------------------------------------------------------------ */
 
+function OptionSelect({
+  label,
+  hint,
+  value,
+  options,
+  placeholder,
+  onChange,
+}: {
+  label: string;
+  hint?: string;
+  value: string;
+  options: OptionList;
+  placeholder: string;
+  onChange: (next: string) => void;
+}) {
+  /* A value the record still holds but the list no longer offers must remain
+     visible — otherwise saving the form would silently clear it. */
+  const missing = value !== "" && !options.items.some((o) => o.id === value);
+  return (
+    <Field label={label} hint={hint}>
+      <Select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="py-1.5 text-xs"
+        disabled={options.loading}
+      >
+        <option value="">{options.loading ? "Loading…" : placeholder}</option>
+        {options.items.map((o) => (
+          <option key={o.id} value={o.id}>
+            {o.label}
+          </option>
+        ))}
+        {missing ? <option value={value}>{value} (no longer listed)</option> : null}
+      </Select>
+      {options.reason ? <p className="mt-0.5 text-[11px] text-ink-400">{options.reason}</p> : null}
+    </Field>
+  );
+}
+
+/**
+ * Everything about one activity that is not editable inline on the row.
+ * Every field here is validated server-side against a real record, so the form
+ * offers the real records: #360 responsible (a company member) and location (a
+ * project location), #361 remaining duration, #362 key milestone + contractual
+ * date, #363-366 the work calendar the activity is scheduled on, #370 the cost
+ * basis (budget line, budgeted cost and hours) that earned value and the
+ * earned-value disruption method read.
+ */
 function TaskDetailsEditor({
   task,
   busy,
+  options,
   onSave,
 }: {
   task: TaskRow;
   busy: boolean;
+  options: TaskOptions;
   onSave: (patch: Record<string, unknown>) => Promise<boolean>;
 }) {
   const [constraintType, setConstraintType] = useState(task.constraintType ?? "");
   const [constraintDate, setConstraintDate] = useState(task.constraintDate ?? "");
   const [actualStart, setActualStart] = useState(task.actualStart ?? "");
   const [actualFinish, setActualFinish] = useState(task.actualFinish ?? "");
+  const [isKeyMilestone, setIsKeyMilestone] = useState(task.isKeyMilestone === 1);
+  const [contractualDate, setContractualDate] = useState(task.contractualDate ?? "");
+  const [taskType, setTaskType] = useState(task.taskType ?? "task");
+  const [responsibleId, setResponsibleId] = useState(task.responsibleId ?? "");
+  const [locationId, setLocationId] = useState(task.locationId ?? "");
+  const [calendarId, setCalendarId] = useState(task.calendarId ?? "");
+  const [remaining, setRemaining] = useState(
+    task.remainingDurationDays === null || task.remainingDurationDays === undefined
+      ? ""
+      : String(task.remainingDurationDays),
+  );
+  const [wbsPath, setWbsPath] = useState(task.wbsPath ?? "");
+  const [budgetLineItemId, setBudgetLineItemId] = useState(task.budgetLineItemId ?? "");
+  const [budgetedCost, setBudgetedCost] = useState(
+    task.budgetedCost === null || task.budgetedCost === undefined ? "" : String(task.budgetedCost),
+  );
+  const [budgetedHours, setBudgetedHours] = useState(
+    task.budgetedHours === null || task.budgetedHours === undefined ? "" : String(task.budgetedHours),
+  );
+  const [notes, setNotes] = useState(task.notes ?? "");
   const [localError, setLocalError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -194,14 +298,60 @@ function TaskDetailsEditor({
     setConstraintDate(task.constraintDate ?? "");
     setActualStart(task.actualStart ?? "");
     setActualFinish(task.actualFinish ?? "");
+    setIsKeyMilestone(task.isKeyMilestone === 1);
+    setContractualDate(task.contractualDate ?? "");
+    setTaskType(task.taskType ?? "task");
+    setResponsibleId(task.responsibleId ?? "");
+    setLocationId(task.locationId ?? "");
+    setCalendarId(task.calendarId ?? "");
+    setRemaining(
+      task.remainingDurationDays === null || task.remainingDurationDays === undefined
+        ? ""
+        : String(task.remainingDurationDays),
+    );
+    setWbsPath(task.wbsPath ?? "");
+    setBudgetLineItemId(task.budgetLineItemId ?? "");
+    setBudgetedCost(
+      task.budgetedCost === null || task.budgetedCost === undefined ? "" : String(task.budgetedCost),
+    );
+    setBudgetedHours(
+      task.budgetedHours === null || task.budgetedHours === undefined
+        ? ""
+        : String(task.budgetedHours),
+    );
+    setNotes(task.notes ?? "");
     setLocalError(null);
   }, [task]);
 
+  const numText = (n: number | null | undefined) => (n === null || n === undefined ? "" : String(n));
   const dirty =
     constraintType !== (task.constraintType ?? "") ||
     constraintDate !== (task.constraintDate ?? "") ||
     actualStart !== (task.actualStart ?? "") ||
-    actualFinish !== (task.actualFinish ?? "");
+    actualFinish !== (task.actualFinish ?? "") ||
+    isKeyMilestone !== (task.isKeyMilestone === 1) ||
+    contractualDate !== (task.contractualDate ?? "") ||
+    taskType !== (task.taskType ?? "task") ||
+    responsibleId !== (task.responsibleId ?? "") ||
+    locationId !== (task.locationId ?? "") ||
+    calendarId !== (task.calendarId ?? "") ||
+    remaining !== numText(task.remainingDurationDays) ||
+    wbsPath !== (task.wbsPath ?? "") ||
+    budgetLineItemId !== (task.budgetLineItemId ?? "") ||
+    budgetedCost !== numText(task.budgetedCost) ||
+    budgetedHours !== numText(task.budgetedHours) ||
+    notes !== (task.notes ?? "");
+
+  /** "" → null (clear the field); a non-number is refused, never sent as 0. */
+  function numberOrNull(raw: string, label: string): number | null | undefined {
+    if (raw.trim() === "") return null;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) {
+      setLocalError(`${label} must be a number of 0 or more.`);
+      return undefined;
+    }
+    return n;
+  }
 
   async function save() {
     setLocalError(null);
@@ -217,18 +367,48 @@ function TaskDetailsEditor({
       setLocalError("The actual finish must be on or after the actual start.");
       return;
     }
+    if (contractualDate && !isKeyMilestone) {
+      setLocalError("Only a key milestone carries a contractual date — tick “Key milestone” first.");
+      return;
+    }
+    const remainingValue = numberOrNull(remaining, "Remaining duration");
+    if (remainingValue === undefined) return;
+    if (remainingValue !== null && !Number.isInteger(remainingValue)) {
+      setLocalError("Remaining duration is a whole number of working days.");
+      return;
+    }
+    const costValue = numberOrNull(budgetedCost, "Budgeted cost");
+    if (costValue === undefined) return;
+    const hoursValue = numberOrNull(budgetedHours, "Budgeted hours");
+    if (hoursValue === undefined) return;
+
     await onSave({
       constraintType: constraintType || null,
       constraintDate: constraintType && constraintDate ? constraintDate : null,
       actualStart: actualStart || null,
       actualFinish: actualFinish || null,
+      isKeyMilestone,
+      contractualDate: isKeyMilestone && contractualDate ? contractualDate : null,
+      taskType,
+      responsibleId: responsibleId || null,
+      locationId: locationId || null,
+      calendarId: calendarId || null,
+      remainingDurationDays: remainingValue,
+      wbsPath: wbsPath.trim() === "" ? null : wbsPath.trim(),
+      budgetLineItemId: budgetLineItemId || null,
+      budgetedCost: costValue,
+      budgetedHours: hoursValue,
+      notes: notes.trim() === "" ? null : notes.trim(),
     });
   }
 
+  const currency = options.budgetCurrency;
   return (
-    <div className="space-y-2 bg-ink-50/70 px-4 py-3">
+    <div className="space-y-3 bg-ink-50/70 px-4 py-3">
       {localError ? <div className="text-xs text-red-600">{localError}</div> : null}
-      <div className="grid grid-cols-2 items-end gap-3 lg:grid-cols-5">
+
+      {/* dates, constraints and the milestone pair */}
+      <div className="grid grid-cols-2 items-end gap-3 lg:grid-cols-4 xl:grid-cols-6">
         <Field label="Constraint">
           <Select
             value={constraintType}
@@ -268,16 +448,147 @@ function TaskDetailsEditor({
             className="py-1.5 text-xs"
           />
         </Field>
-        <div className="flex items-center gap-2 pb-0.5">
-          <Button size="sm" disabled={busy || !dirty} onClick={() => void save()}>
-            Save details
-          </Button>
+        <Field label="Key milestone">
+          <label className="flex h-[34px] items-center gap-2 text-xs text-ink-600">
+            <input
+              type="checkbox"
+              checked={isKeyMilestone}
+              onChange={(e) => setIsKeyMilestone(e.target.checked)}
+            />
+            Track against a contractual date
+          </label>
+        </Field>
+        <Field label="Contractual date">
+          <Input
+            type="date"
+            value={contractualDate}
+            onChange={(e) => setContractualDate(e.target.value)}
+            className="py-1.5 text-xs"
+            disabled={!isKeyMilestone}
+          />
+        </Field>
+      </div>
+
+      {/* assignment, calendar, remaining duration and activity type */}
+      <div className="grid grid-cols-2 items-start gap-3 lg:grid-cols-4 xl:grid-cols-6">
+        <OptionSelect
+          label="Responsible"
+          hint="#360 — drives the slip notification"
+          value={responsibleId}
+          options={options.users}
+          placeholder="Unassigned"
+          onChange={setResponsibleId}
+        />
+        <OptionSelect
+          label="Location"
+          hint="#360"
+          value={locationId}
+          options={options.locations}
+          placeholder="No location"
+          onChange={setLocationId}
+        />
+        <OptionSelect
+          label="Work calendar"
+          hint="#363-366 — blank uses the programme default"
+          value={calendarId}
+          options={options.calendars}
+          placeholder="Programme default"
+          onChange={setCalendarId}
+        />
+        <Field label="Remaining duration" hint="#361 — working days left from the data date">
+          <Input
+            type="number"
+            min={0}
+            value={remaining}
+            onChange={(e) => setRemaining(e.target.value)}
+            className="py-1.5 text-xs"
+            placeholder="from % complete"
+          />
+        </Field>
+        <Field label="Activity type">
+          <Select
+            value={taskType}
+            onChange={(e) => setTaskType(e.target.value)}
+            className="py-1.5 text-xs"
+          >
+            {SCHEDULE_TASK_TYPES.map((t) => (
+              <option key={t} value={t}>
+                {humanize(t)}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        <Field label="WBS path" hint="Hierarchy from the imported programme">
+          <Input
+            value={wbsPath}
+            onChange={(e) => setWbsPath(e.target.value)}
+            className="py-1.5 text-xs"
+            placeholder="Substructure / Piling"
+          />
+        </Field>
+      </div>
+
+      {/* cost basis (#370) — what earned value and disruption read */}
+      <div className="grid grid-cols-2 items-start gap-3 lg:grid-cols-4 xl:grid-cols-6">
+        <div className="col-span-2">
+          <OptionSelect
+            label="Budget line"
+            hint="#370 — the cost basis for earned value"
+            value={budgetLineItemId}
+            options={options.budgetLines}
+            placeholder="Not mapped"
+            onChange={setBudgetLineItemId}
+          />
+        </div>
+        <Field
+          label={`Budgeted cost${currency ? ` (${currency})` : ""}`}
+          hint="Overrides the budget line for this activity"
+        >
+          <Input
+            type="number"
+            min={0}
+            step="0.01"
+            value={budgetedCost}
+            onChange={(e) => setBudgetedCost(e.target.value)}
+            className="py-1.5 text-xs"
+            placeholder="—"
+          />
+        </Field>
+        <Field label="Budgeted hours" hint="Earned-value disruption needs these">
+          <Input
+            type="number"
+            min={0}
+            step="0.5"
+            value={budgetedHours}
+            onChange={(e) => setBudgetedHours(e.target.value)}
+            className="py-1.5 text-xs"
+            placeholder="—"
+          />
+        </Field>
+        <div className="col-span-2">
+          <Field label="Notes">
+            <Input
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              className="py-1.5 text-xs"
+              placeholder="Planning assumption, method, sequence note…"
+            />
+          </Field>
         </div>
       </div>
-      <p className="text-[11px] text-ink-400">
-        Actuals pin the CPM pass — actual start pins the start, actual finish pins the finish and
-        overrides duration. Duration 0 renders as a milestone.
-      </p>
+
+      <div className="flex items-center gap-3">
+        <Button size="sm" disabled={busy || !dirty} onClick={() => void save()}>
+          Save details
+        </Button>
+        <p className="text-[11px] text-ink-400">
+          Actuals pin the CPM pass — actual start pins the start, actual finish pins the finish and
+          overrides duration. Duration 0 renders as a milestone. A key milestone with a contractual
+          date is swept for slip and raises an attention signal when it moves past it (#362). An
+          activity with no budget line, budgeted cost or resource cost is left out of earned value
+          rather than counted as zero.
+        </p>
+      </div>
     </div>
   );
 }
@@ -393,7 +704,13 @@ function varianceBadge(days: number | null) {
 
 export default function SchedulePage() {
   const { projectId } = useParams<{ projectId: string }>();
+  const [searchParams] = useSearchParams();
   const base = `/api/v1/projects/${projectId}`;
+
+  /** activity named by a deep link, consumed once it has been shown */
+  const [pendingTaskId, setPendingTaskId] = useState<string | null>(() =>
+    searchParams.get("taskId"),
+  );
 
   const [schedules, setSchedules] = useState<ScheduleRow[] | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -422,7 +739,17 @@ export default function SchedulePage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [schedName, setSchedName] = useState("");
   const [schedStart, setSchedStart] = useState("");
+  const [schedDataDate, setSchedDataDate] = useState("");
   const [modalError, setModalError] = useState<string | null>(null);
+
+  // schedule settings modal (#361 data date, #363-366 default calendar)
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  /** null = not asked for; string = the API's 409, which names what still points here */
+  const [deleteBlocked, setDeleteBlocked] = useState<string | null>(null);
+  const [settingsName, setSettingsName] = useState("");
+  const [settingsStart, setSettingsStart] = useState("");
+  const [settingsDataDate, setSettingsDataDate] = useState("");
+  const [settingsCalendarId, setSettingsCalendarId] = useState("");
 
   // capture-baseline modal
   const [baselineOpen, setBaselineOpen] = useState(false);
@@ -455,8 +782,18 @@ export default function SchedulePage() {
   const [lookaheadLoading, setLookaheadLoading] = useState(false);
   const [quality, setQuality] = useState<QualityReport | null>(null);
   const [qualityLoading, setQualityLoading] = useState(false);
+  /**
+   * Which baseline BEI, missed tasks and the critical-path test are measured
+   * against. Empty = the earliest baseline, which is what the API picks when
+   * no id is given; naming it here lets a planner test the programme against
+   * a re-baselined position instead of the original contract programme.
+   */
+  const [qualityBaselineId, setQualityBaselineId] = useState("");
 
   const bump = useCallback(() => setVersion((v) => v + 1), []);
+
+  /** Real records behind responsible / location / calendar / budget line. */
+  const taskOptions = useTaskOptions(base, projectId, version);
 
   /* ------------------------------ loading ------------------------------ */
 
@@ -523,6 +860,9 @@ export default function SchedulePage() {
   }, [base, selectedId, version]);
 
   useEffect(() => {
+    // A baseline belongs to one programme; carrying the selection across would
+    // ask the server for a baseline of a schedule it does not belong to.
+    setQualityBaselineId("");
     if (!selectedId) {
       setBaselines(null);
       return;
@@ -599,8 +939,9 @@ export default function SchedulePage() {
     if (!selectedId || panel !== "health") return;
     let cancelled = false;
     setQualityLoading(true);
+    const qs = qualityBaselineId ? `?baselineId=${encodeURIComponent(qualityBaselineId)}` : "";
     api
-      .get<QualityReport>(`${base}/schedules/${selectedId}/quality`)
+      .get<QualityReport>(`${base}/schedules/${selectedId}/quality${qs}`)
       .then((res) => {
         if (!cancelled) setQuality(res);
       })
@@ -613,7 +954,7 @@ export default function SchedulePage() {
     return () => {
       cancelled = true;
     };
-  }, [base, selectedId, panel, version]);
+  }, [base, selectedId, panel, version, qualityBaselineId]);
 
   /* ------------------------------ derived ------------------------------ */
 
@@ -626,6 +967,38 @@ export default function SchedulePage() {
     () => tasks.find((t) => t.id === selectedTaskId) ?? null,
     [tasks, selectedTaskId],
   );
+
+  /*
+   * Deep link from company search (?taskId=…): resolve the activity to the
+   * programme it lives in, switch to that programme, then select and expand
+   * the row once it is on screen. Resolving happens server-side because a
+   * link only carries the activity id, not which of the project's schedules
+   * holds it. A dead link says so instead of silently doing nothing.
+   */
+  useEffect(() => {
+    if (!pendingTaskId || !projectId) return;
+    let cancelled = false;
+    api
+      .get<{ id: string; scheduleId: string }>(`${base}/schedule-tasks/${pendingTaskId}`)
+      .then((t) => {
+        if (!cancelled) setSelectedId(t.scheduleId);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setPendingTaskId(null);
+        setError(errMessage(err, "That activity is no longer in this project."));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [base, projectId, pendingTaskId]);
+
+  useEffect(() => {
+    if (!pendingTaskId || !tasks.some((t) => t.id === pendingTaskId)) return;
+    setSelectedTaskId(pendingTaskId);
+    setExpandedTaskId(pendingTaskId);
+    setPendingTaskId(null);
+  }, [pendingTaskId, tasks]);
   const predecessorDeps = useMemo(
     () => deps.filter((d) => d.successorId === selectedTaskId),
     [deps, selectedTaskId],
@@ -672,14 +1045,73 @@ export default function SchedulePage() {
       const created = await api.post<ScheduleRow>(`${base}/schedules`, {
         name: schedName.trim(),
         projectStart: schedStart,
+        dataDate: schedDataDate === "" ? null : schedDataDate,
       });
       setCreateOpen(false);
       setSchedName("");
       setSchedStart("");
+      setSchedDataDate("");
       setSelectedId(created.id);
       bump();
     } catch (err) {
       setModalError(errMessage(err, "Failed to create the schedule."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /**
+   * #351 rename / #361 data date / #363-366 default calendar. Nothing in the
+   * product used to reach PATCH /schedules/:id, so a programme built here
+   * (rather than imported) could never be given a data date — which left the
+   * DCMA data-date checks and BEI permanently "could not run", and CPM2's
+   * data-date pinning and remaining-duration forecasting never engaged.
+   * Moving day 0, the data date or the calendar recomputes server-side.
+   */
+  async function onSaveSettings(e: FormEvent) {
+    e.preventDefault();
+    if (!selectedId) return;
+    setModalError(null);
+    setBusy(true);
+    try {
+      await api.patch<ScheduleRow>(`${base}/schedules/${selectedId}`, {
+        name: settingsName.trim(),
+        projectStart: settingsStart,
+        dataDate: settingsDataDate === "" ? null : settingsDataDate,
+        defaultCalendarId: settingsCalendarId === "" ? null : settingsCalendarId,
+      });
+      setSettingsOpen(false);
+      bump();
+      flashRecomputed();
+    } catch (err) {
+      setModalError(errMessage(err, "Failed to save the schedule settings."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /**
+   * Deleting a programme. The API refuses (409) while delay events or risks
+   * still point at it, naming the counts, because a silent delete orphaned
+   * them and left the forensic TIA presenting cached numbers for a programme
+   * that no longer existed. `?detach=true` severs the references explicitly
+   * and ledgers each severance — so the confirmation shows the refusal first
+   * and only then offers the severing delete.
+   */
+  async function onDeleteSchedule(detach: boolean) {
+    if (!selectedId) return;
+    setModalError(null);
+    setBusy(true);
+    try {
+      await api.del(`${base}/schedules/${selectedId}${detach ? "?detach=true" : ""}`);
+      setDeleteBlocked(null);
+      setSettingsOpen(false);
+      setSelectedId(null);
+      bump();
+      toast.success(detach ? "Schedule deleted and references severed" : "Schedule deleted");
+    } catch (err) {
+      if (err instanceof ApiClientError && err.status === 409) setDeleteBlocked(err.message);
+      else setModalError(errMessage(err, "Failed to delete the schedule."));
     } finally {
       setBusy(false);
     }
@@ -805,7 +1237,17 @@ export default function SchedulePage() {
     }
   }
 
-  /** Edit an existing link: delete → recreate; restore the original if the new link is rejected. */
+  /**
+   * Edit an existing link.
+   *
+   * Changing the type or the lag is a PATCH on the link itself — this used to
+   * be delete-then-recreate, which dropped the link outright whenever the
+   * recreate failed and wrote a delete + create pair into the ledger for what
+   * is one edit. Repointing the predecessor still needs a new row (the
+   * endpoints are the link's identity), so the new link is CREATED FIRST and
+   * the old one removed only once the new one exists: a failure leaves the
+   * original in place rather than nothing at all.
+   */
   async function onUpdateDependency(
     dep: DepRow,
     next: { predecessorId: string; depType: string; lagDays: number },
@@ -814,24 +1256,19 @@ export default function SchedulePage() {
     setDepError(null);
     setBusy(true);
     try {
-      await api.del(`${base}/schedule-dependencies/${dep.id}`);
-      try {
+      if (next.predecessorId === dep.predecessorId) {
+        await api.patch(`${base}/schedule-dependencies/${dep.id}`, {
+          depType: next.depType,
+          lagDays: next.lagDays,
+        });
+      } else {
         await api.post(`${base}/schedules/${selectedId}/dependencies`, {
           predecessorId: next.predecessorId,
           successorId: dep.successorId,
           depType: next.depType,
           lagDays: next.lagDays,
         });
-      } catch (err) {
-        await api
-          .post(`${base}/schedules/${selectedId}/dependencies`, {
-            predecessorId: dep.predecessorId,
-            successorId: dep.successorId,
-            depType: dep.depType,
-            lagDays: dep.lagDays,
-          })
-          .catch(() => undefined);
-        throw err;
+        await api.del(`${base}/schedule-dependencies/${dep.id}`);
       }
       flashRecomputed();
     } catch (err) {
@@ -856,8 +1293,17 @@ export default function SchedulePage() {
 
   const panels: { key: Panel; label: string }[] = [
     { key: "compare", label: "Baseline compare" },
+    { key: "revisions", label: "Revisions" },
     { key: "lookahead", label: "Lookahead" },
+    { key: "calendar", label: "Calendar" },
     { key: "health", label: "Schedule health" },
+    { key: "earned-value", label: "Earned value" },
+    { key: "resources", label: "Resources" },
+    { key: "milestones", label: "Milestones" },
+    { key: "constraints", label: "Constraints" },
+    { key: "calendars", label: "Calendars" },
+    { key: "narratives", label: "Narrative" },
+    { key: "import", label: "Import / export" },
   ];
 
   return (
@@ -869,6 +1315,21 @@ export default function SchedulePage() {
           <>
             {selectedId ? (
               <>
+                <Button
+                  variant="secondary"
+                  disabled={busy || !selectedSchedule}
+                  onClick={() => {
+                    if (!selectedSchedule) return;
+                    setModalError(null);
+                    setSettingsName(selectedSchedule.name);
+                    setSettingsStart(selectedSchedule.projectStart);
+                    setSettingsDataDate(selectedSchedule.dataDate ?? "");
+                    setSettingsCalendarId(selectedSchedule.defaultCalendarId ?? "");
+                    setSettingsOpen(true);
+                  }}
+                >
+                  Settings
+                </Button>
                 <Button variant="secondary" disabled={busy} onClick={() => void onRecompute()}>
                   Recompute
                 </Button>
@@ -951,6 +1412,20 @@ export default function SchedulePage() {
                 <span className="rounded-full bg-white px-2.5 py-1 ring-1 ring-ink-200">
                   Finish <strong>{formatDate(detail.computedFinish)}</strong>
                 </span>
+                <span
+                  className={`rounded-full px-2.5 py-1 ring-1 ${
+                    detail.dataDate
+                      ? "bg-white ring-ink-200"
+                      : "bg-amber-50 text-amber-800 ring-amber-200"
+                  }`}
+                  title={
+                    detail.dataDate
+                      ? "Work before the data date is actual, after it is forecast"
+                      : "No data date is set — the DCMA data-date checks and the Baseline Execution Index cannot run, and remaining durations are not forecast from it. Set one in Settings."
+                  }
+                >
+                  Data date <strong>{detail.dataDate ? formatDate(detail.dataDate) : "not set"}</strong>
+                </span>
                 <span className="rounded-full bg-white px-2.5 py-1 ring-1 ring-ink-200">
                   <strong>{detail.computedDurationDays ?? "—"}</strong> days
                 </span>
@@ -1025,6 +1500,7 @@ export default function SchedulePage() {
                             selected={selectedTaskId === t.id}
                             expanded={expandedTaskId === t.id}
                             busy={busy}
+                            options={taskOptions}
                             onSelect={() => setSelectedTaskId(t.id)}
                             onToggleExpand={() =>
                               setExpandedTaskId((cur) => (cur === t.id ? null : t.id))
@@ -1420,9 +1896,14 @@ export default function SchedulePage() {
                       ))}
                     </div>
                     {lookahead ? (
-                      <span className="text-xs text-ink-400">
+                      <span className="text-xs text-ink-400" title={lookahead.constraintsBasis}>
                         {formatDate(lookahead.from)} → {formatDate(lookahead.to)} ·{" "}
-                        {lookahead.total} task{lookahead.total === 1 ? "" : "s"}
+                        {lookahead.total} task{lookahead.total === 1 ? "" : "s"} ·{" "}
+                        {lookahead.constraintsInWindow} of {lookahead.constraintsOpen} open constraint
+                        {lookahead.constraintsOpen === 1 ? "" : "s"} in the window
+                        {lookahead.constraintsOverdue > 0
+                          ? ` · ${lookahead.constraintsOverdue} past need-by`
+                          : ""}
                       </span>
                     ) : null}
                   </div>
@@ -1436,7 +1917,13 @@ export default function SchedulePage() {
                   ) : lookahead.items.length === 0 ? (
                     <EmptyState
                       title="Nothing in the window"
-                      hint="No incomplete task starts or finishes inside the lookahead window."
+                      hint={
+                        lookahead.constraintsOpen > 0
+                          ? `No incomplete activity overlaps the lookahead window, but ${lookahead.constraintsOpen} make-ready constraint${
+                              lookahead.constraintsOpen === 1 ? " is" : "s are"
+                            } still open on this programme.`
+                          : "No incomplete activity overlaps the lookahead window."
+                      }
                     />
                   ) : (
                     <div className="overflow-x-auto rounded-lg bg-white shadow-sm ring-1 ring-ink-100">
@@ -1499,14 +1986,91 @@ export default function SchedulePage() {
 
               {/* ------------------------------ health ------------------------------ */}
               {panel === "health" ? (
-                <QualityPanel
-                  report={quality}
-                  loading={qualityLoading}
-                  tasks={tasks}
-                  deps={deps}
+                <>
+                  {baselines && baselines.length > 1 ? (
+                    <div className="mb-3 flex items-center gap-2">
+                      <label
+                        htmlFor="quality-baseline"
+                        className="text-xs font-medium text-ink-600"
+                      >
+                        Measure BEI and missed tasks against
+                      </label>
+                      <Select
+                        id="quality-baseline"
+                        value={qualityBaselineId}
+                        onChange={(e) => setQualityBaselineId(e.target.value)}
+                        className="w-64 py-1 text-xs"
+                      >
+                        <option value="">Earliest baseline</option>
+                        {baselines.map((b) => (
+                          <option key={b.id} value={b.id}>
+                            {b.name}
+                          </option>
+                        ))}
+                      </Select>
+                    </div>
+                  ) : null}
+                  <QualityPanel
+                    report={quality}
+                    loading={qualityLoading}
+                    tasks={tasks}
+                    deps={deps}
+                    onSelectTask={(id) => {
+                      setSelectedTaskId(id);
+                      setExpandedTaskId(id);
+                    }}
+                  />
+                </>
+              ) : null}
+
+              {panel === "revisions" ? (
+                <RevisionsPanel base={base} schedules={schedules ?? []} scheduleId={selectedId} />
+              ) : null}
+              {panel === "calendar" ? (
+                <CalendarViewPanel base={base} scheduleId={selectedId} />
+              ) : null}
+              {panel === "earned-value" ? (
+                <EarnedValuePanel base={base} scheduleId={selectedId} />
+              ) : null}
+              {panel === "resources" ? (
+                <ResourcesPanel
+                  base={base}
+                  scheduleId={selectedId}
+                  tasks={tasks.map((t) => ({ id: t.id, name: t.name }))}
+                />
+              ) : null}
+              {panel === "milestones" ? (
+                <MilestonesPanel
+                  base={base}
+                  scheduleId={selectedId}
                   onSelectTask={(id) => {
                     setSelectedTaskId(id);
                     setExpandedTaskId(id);
+                  }}
+                />
+              ) : null}
+              {panel === "constraints" ? (
+                <ConstraintsPanel
+                  base={base}
+                  scheduleId={selectedId}
+                  tasks={tasks.map((t) => ({ id: t.id, name: t.name }))}
+                />
+              ) : null}
+              {panel === "calendars" ? (
+                /* a calendar edit moves dates on every programme that uses it,
+                   and the calendar picker on the activity editor must follow */
+                <CalendarsPanel base={base} onChanged={bump} />
+              ) : null}
+              {panel === "narratives" ? (
+                <NarrativesPanel base={base} scheduleId={selectedId} />
+              ) : null}
+              {panel === "import" ? (
+                <ImportPanel
+                  base={base}
+                  schedules={schedules ?? []}
+                  onImported={(id) => {
+                    setSelectedId(id);
+                    bump();
                   }}
                 />
               ) : null}
@@ -1536,6 +2100,16 @@ export default function SchedulePage() {
               onChange={(e) => setSchedStart(e.target.value)}
             />
           </Field>
+          <Field
+            label="Data date (optional)"
+            hint="Progress cut-off: work before it is actual, after it is forecast. Without one the DCMA data-date checks and the Baseline Execution Index cannot run."
+          >
+            <Input
+              type="date"
+              value={schedDataDate}
+              onChange={(e) => setSchedDataDate(e.target.value)}
+            />
+          </Field>
           <div className="flex justify-end gap-2">
             <Button variant="secondary" onClick={() => setCreateOpen(false)}>
               Cancel
@@ -1545,6 +2119,111 @@ export default function SchedulePage() {
             </Button>
           </div>
         </form>
+      </Modal>
+
+      <Modal
+        open={settingsOpen}
+        title="Schedule settings"
+        onClose={() => setSettingsOpen(false)}
+      >
+        <ErrorAlert message={modalError} />
+        <form onSubmit={onSaveSettings} className="space-y-4">
+          <Field label="Schedule name">
+            <Input
+              required
+              value={settingsName}
+              onChange={(e) => setSettingsName(e.target.value)}
+            />
+          </Field>
+          <Field
+            label="Project start (CPM day 0)"
+            hint="Moving day 0 recomputes every date on the programme."
+          >
+            <Input
+              required
+              type="date"
+              value={settingsStart}
+              onChange={(e) => setSettingsStart(e.target.value)}
+            />
+          </Field>
+          <Field
+            label="Data date"
+            hint="Progress cut-off (#361). It pins the forward pass, drives remaining-duration forecasting, and is what the DCMA invalid-dates check and the Baseline Execution Index measure against. Clear it to remove it."
+          >
+            <Input
+              type="date"
+              value={settingsDataDate}
+              onChange={(e) => setSettingsDataDate(e.target.value)}
+            />
+          </Field>
+          <Field
+            label="Default work calendar"
+            hint="Applied to every activity that does not name its own calendar (#363-366)."
+          >
+            <Select
+              value={settingsCalendarId}
+              onChange={(e) => setSettingsCalendarId(e.target.value)}
+              disabled={taskOptions.calendars.loading}
+            >
+              <option value="">
+                {taskOptions.calendars.loading ? "Loading…" : "Platform default (Mon–Fri)"}
+              </option>
+              {taskOptions.calendars.items.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.label}
+                </option>
+              ))}
+            </Select>
+            {taskOptions.calendars.reason ? (
+              <p className="mt-0.5 text-[11px] text-ink-400">{taskOptions.calendars.reason}</p>
+            ) : null}
+          </Field>
+          <div className="flex justify-end gap-2">
+            <Button variant="secondary" onClick={() => setSettingsOpen(false)}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={busy}>
+              {busy ? "Saving…" : "Save settings"}
+            </Button>
+          </div>
+        </form>
+
+        <div className="mt-6 space-y-2 border-t border-ink-100 pt-4">
+          <h4 className="text-xs font-semibold uppercase tracking-wide text-ink-500">
+            Delete this programme
+          </h4>
+          <p className="text-xs text-ink-500">
+            Removes the programme, its activities, logic, baselines, resources, constraints and
+            narratives. Delay events and risks that point at it are refused first.
+          </p>
+          {deleteBlocked ? (
+            <Alert tone="warning" title="Still referenced">
+              <p className="text-xs">{deleteBlocked}</p>
+              <div className="mt-2 flex gap-2">
+                <Button
+                  size="xs"
+                  variant="danger"
+                  disabled={busy}
+                  onClick={() => void onDeleteSchedule(true)}
+                >
+                  Sever the references and delete
+                </Button>
+                <Button size="xs" variant="ghost" onClick={() => setDeleteBlocked(null)}>
+                  Keep the programme
+                </Button>
+              </div>
+            </Alert>
+          ) : (
+            <Button
+              size="sm"
+              variant="danger"
+              disabled={busy || !selectedId}
+              onClick={() => void onDeleteSchedule(false)}
+            >
+              Delete schedule
+            </Button>
+          )}
+        </div>
       </Modal>
 
       <Modal open={baselineOpen} title="Capture baseline" onClose={() => setBaselineOpen(false)}>
@@ -1586,6 +2265,7 @@ function SchedTaskRow({
   selected,
   expanded,
   busy,
+  options,
   onSelect,
   onToggleExpand,
   onPatch,
@@ -1598,6 +2278,7 @@ function SchedTaskRow({
   selected: boolean;
   expanded: boolean;
   busy: boolean;
+  options: TaskOptions;
   onSelect: () => void;
   onToggleExpand: () => void;
   onPatch: (patch: Record<string, unknown>) => Promise<boolean>;
@@ -1746,7 +2427,7 @@ function SchedTaskRow({
       {expanded ? (
         <tr>
           <td colSpan={9} className="p-0">
-            <TaskDetailsEditor task={t} busy={busy} onSave={onPatch} />
+            <TaskDetailsEditor task={t} busy={busy} options={options} onSave={onPatch} />
           </td>
         </tr>
       ) : null}

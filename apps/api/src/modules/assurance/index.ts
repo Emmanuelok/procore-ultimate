@@ -321,6 +321,13 @@ const ledgerListSchema = pageQuerySchema.extend({
  * dominate the row size. The snapshot re-hash is a separate, scheduled deep
  * pass (`anchoring.deep-verify`), because it is the expensive one.
  */
+/**
+ * How many projects per tenant the scheduled project-detector sweep touches on
+ * one tick, most recently updated first. A bound, not a preference: without
+ * it, one tick on a large tenant becomes an unbounded scan.
+ */
+const PROJECT_SWEEP_LIMIT = 50;
+
 const CHAIN_COLUMNS = {
   seq: ledgerEntries.seq,
   companyId: ledgerEntries.companyId,
@@ -696,6 +703,8 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
     created: number;
     refreshed: number;
     superseded: number;
+    /** open again because an auto-closed condition recurred */
+    reopened: number;
     signalIds: string[];
   }
 
@@ -717,7 +726,13 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
     drafts: SignalDraft[],
     runId: string | null,
   ): Promise<RaiseOutcome> {
-    const out: RaiseOutcome = { created: 0, refreshed: 0, superseded: 0, signalIds: [] };
+    const out: RaiseOutcome = {
+      created: 0,
+      refreshed: 0,
+      superseded: 0,
+      reopened: 0,
+      signalIds: [],
+    };
     if (drafts.length === 0) return out;
     const detectors = [...new Set(drafts.map((d) => d.detector))];
     const existing = await app.db
@@ -729,6 +744,8 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
         disposition: signals.disposition,
         projectId: signals.projectId,
         occurrences: signals.occurrences,
+        autoClosedAt: signals.autoClosedAt,
+        reviewerId: signals.reviewerId,
       })
       .from(signals)
       .where(and(eq(signals.companyId, companyId), inArray(signals.detector, detectors)));
@@ -758,9 +775,52 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
         prior !== undefined && (rank[draft.severity] ?? 0) > (rank[prior.severity] ?? 0);
 
       if (prior && !worse) {
-        // Same condition, same or lower severity. Record that it is still
-        // true; do not manufacture a second signal, and do not reopen
-        // something a reviewer has judged.
+        /*
+         * Same condition, same or lower severity: record that it is still
+         * true, do not manufacture a second signal, and do not reopen
+         * something a REVIEWER has judged.
+         *
+         * An AUTO-close is not a reviewer's judgement, though. It is the
+         * machine saying "the condition went away", so the condition coming
+         * back is news and must reach a reviewer: a duplicate payment that is
+         * credited and then re-created would otherwise be closed forever and
+         * appear in no queue, no open count and no dashboard. Reviewer-closed,
+         * confirmed and false_positive rows are left exactly as they are.
+         */
+        const machineClosed = prior.autoClosedAt !== null && prior.reviewerId === null;
+        if (machineClosed) {
+          await app.db
+            .update(signals)
+            .set({
+              disposition: "new",
+              closedAt: null,
+              autoClosedAt: null,
+              lastSeenAt: nowIso,
+              occurrences: (prior.occurrences ?? 1) + 1,
+              reviewerNotes:
+                "Reopened: this condition was auto-closed on an earlier run and has recurred.",
+              ...(runId ? { runId } : {}),
+            })
+            .where(eq(signals.id, prior.id));
+          await appendLedger(app.db, {
+            companyId,
+            actorId,
+            action: "state_change",
+            objectType: "signal",
+            objectId: prior.id,
+            payload: {
+              before: { disposition: prior.disposition, autoClosed: true },
+              after: { disposition: "new" },
+              reopened: true,
+              runId,
+            },
+            projectId,
+          });
+          index.set(k, { ...prior, disposition: "new", autoClosedAt: null });
+          out.reopened += 1;
+          out.signalIds.push(prior.id);
+          continue;
+        }
         await app.db
           .update(signals)
           .set({
@@ -841,6 +901,8 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
         disposition: "new",
         projectId,
         occurrences: 1,
+        autoClosedAt: null,
+        reviewerId: null,
       });
       out.created += 1;
       out.signalIds.push(id);
@@ -1289,7 +1351,10 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
         await raiseSignals(
           req.companyId!,
           req.projectId!,
-          req.user!.id,
+          // The SYSTEM found this, not the reader. Attributing the signal's
+          // ledger entry to whoever happened to click Download would put a
+          // read-only auditor in the record as the author of a state change.
+          null,
           [
             {
               detector: "evidence_content_mismatch",
@@ -1308,6 +1373,9 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
                 expected: ev.contentHash,
                 actual,
                 storageKey: file.storageKey,
+                // Who was reading when the mismatch surfaced is a fact worth
+                // keeping — as data on the finding, not as its author.
+                detectedOnDownloadBy: req.user!.id,
               },
               fingerprint: fingerprintOf(ev.id, ev.contentHash, actual),
               subjectType: "evidence",
@@ -1416,6 +1484,50 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
    * Only an integrity reviewer may knowingly proceed, and the override is
    * recorded on the reconciliation's ledger entry.
    */
+  /**
+   * The same rule, expressed as a FACT about a finished reconciliation rather
+   * than as a veto on a request.
+   *
+   * `separationCheck` can refuse, because a manual reconciliation is one
+   * caller asking for one row. The bulk auto route cannot: it sweeps a whole
+   * project, and refusing the batch because one assertion is self-evidenced
+   * would leave the other forty untested. So the auto route asks THIS instead,
+   * about the rows the reconciler actually used, and downgrades the result.
+   *
+   * The engine does not close this on its own: `effectiveIndependence` scores
+   * claimant-submitted evidence 0, but the rejection test is
+   * `score < policy.minIndependence` and the default minimum is 0, so `0 < 0`
+   * is false and the row is still weighted (floor 0.05). Without this check a
+   * user could file a claim, upload every piece of evidence for it themselves,
+   * POST /reconciliations/auto and have the owner dashboard report the result
+   * as a verified variance.
+   */
+  function selfCertification(
+    assertion: Pick<
+      typeof assertions.$inferSelect,
+      "claimantId" | "claimantKind" | "createdBy"
+    >,
+    used: Array<{ id: string; submittedBy: string }>,
+  ): { selfCertified: boolean; reason: string | null } {
+    if (used.length === 0) return { selfCertified: false, reason: null };
+    const byClaimant =
+      assertion.claimantKind === "user" &&
+      used.every((e) => e.submittedBy === assertion.claimantId);
+    const byAuthor =
+      assertion.createdBy !== null &&
+      assertion.createdBy !== undefined &&
+      used.every((e) => e.submittedBy === assertion.createdBy);
+    if (!byClaimant && !byAuthor) return { selfCertified: false, reason: null };
+    return {
+      selfCertified: true,
+      reason:
+        `every evidence row used (${used.map((e) => e.id).join(", ")}) was submitted by ` +
+        (byClaimant ? "the claimant" : "the author of the assertion") +
+        ". A claim tested only against evidence produced by the person making it has not been " +
+        "tested (Vol III §4).",
+    };
+  }
+
   async function separationCheck(
     req: FastifyRequest,
     assertion: typeof assertions.$inferSelect,
@@ -1540,6 +1652,10 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
         reviewerId: null,
         disposition: null,
         notes: body.notes ?? null,
+        // An integrity reviewer's knowing override does not make the evidence
+        // independent; it only makes the record permissible. The row still
+        // carries the marker so the owner-side variance never quotes it.
+        selfCertified: separation.override,
         createdBy: req.user!.id,
       };
       await app.db.insert(reconciliations).values(row);
@@ -1631,8 +1747,11 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
           .limit(2000)
       ).map(toEvidenceLike);
 
+      const poolById = new Map(pool.map((e) => [e.id, e]));
+
       let created = 0;
       let skipped = 0;
+      let selfCertifiedCount = 0;
       const results: Record<string, number> = {};
       const contradicted: Array<{ assertionId: string; reconciliationId: string; variancePercent: number | null }> = [];
       const drafts: SignalDraft[] = [];
@@ -1648,6 +1767,24 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
           assertion.kind,
         );
         const outcome = autoReconcile(toAssertionLike(assertion), pool, policy);
+
+        /*
+         * THE SEPARATION RULE ON THE BULK PATH.
+         *
+         * The manual route refuses a self-evidenced reconciliation outright.
+         * This one cannot refuse — it sweeps the whole project — so it records
+         * the row and tells the truth about it: the result is downgraded to
+         * `insufficient_evidence`, the row is flagged `selfCertified` so the
+         * owner-side variance never quotes it, and a signal is raised. Without
+         * this, a user could file a claim, upload all of its evidence
+         * themselves, press one button and have the dashboard call it verified.
+         */
+        const usedRows = outcome.usedEvidenceIds
+          .map((eid) => poolById.get(eid))
+          .filter((e): e is (typeof pool)[number] => e !== undefined);
+        const self = selfCertification(assertion, usedRows);
+
+        const effectiveResult = self.selfCertified ? "insufficient_evidence" : outcome.result;
         const id = newId("rec");
         const row = {
           id,
@@ -1656,13 +1793,19 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
           assertionId: assertion.id,
           evidenceIds: outcome.usedEvidenceIds,
           method: outcome.reconciler,
-          result: outcome.result,
-          variance: outcome.variance,
-          variancePercent: outcome.variancePercent,
-          confidence: outcome.confidence,
+          result: effectiveResult,
+          variance: self.selfCertified ? null : outcome.variance,
+          variancePercent: self.selfCertified ? null : outcome.variancePercent,
+          confidence: self.selfCertified ? 0 : outcome.confidence,
           reviewerId: null,
           disposition: null,
-          notes: `${outcome.basis} Tolerance from ${policySource}.`,
+          selfCertified: self.selfCertified,
+          notes: self.selfCertified
+            ? `NOT INDEPENDENTLY TESTED: ${self.reason} The ${outcome.reconciler} reconciler ` +
+              `would have observed ${outcome.observed?.toFixed(3) ?? "—"} against a claim of ` +
+              `${outcome.claimed ?? "—"}, but that comparison is the claimant checking their ` +
+              `own work, so no result is recorded. ${outcome.basis} Tolerance from ${policySource}.`
+            : `${outcome.basis} Tolerance from ${policySource}.`,
           createdBy: req.user!.id,
         };
         await app.db.insert(reconciliations).values(row);
@@ -1672,14 +1815,57 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
           action: "create",
           objectType: "reconciliation",
           objectId: id,
-          payload: { ...row, auto: true, rejected: outcome.rejected.slice(0, 20) },
+          payload: {
+            ...row,
+            auto: true,
+            selfCertified: self.selfCertified,
+            selfCertifiedReason: self.reason,
+            suppressedResult: self.selfCertified ? outcome.result : null,
+            rejected: outcome.rejected.slice(0, 20),
+          },
           storePayload: true,
           projectId: req.projectId!,
         });
         created += 1;
-        results[outcome.result] = (results[outcome.result] ?? 0) + 1;
+        results[effectiveResult] = (results[effectiveResult] ?? 0) + 1;
 
-        if (outcome.result === "contradicted" && outcome.adverse && outcome.confidence > 0) {
+        if (self.selfCertified) {
+          selfCertifiedCount += 1;
+          drafts.push({
+            detector: "self_certified_claim",
+            severity: "high",
+            confidence: 1,
+            title: `Claim ${assertion.id} is evidenced only by the person who made it`,
+            explanation:
+              `Assertion ${assertion.id} (${assertion.kind}) claims ${assertion.value ?? "—"}` +
+              `${assertion.unit ? ` ${assertion.unit}` : ""}. Every evidence row the ` +
+              `${outcome.reconciler} reconciler could use was submitted by ` +
+              `${assertion.claimantKind === "user" ? assertion.claimantId : (assertion.createdBy ?? "the author")}` +
+              `, who is the ${assertion.claimantKind === "user" ? "claimant" : "author of the claim"}. ` +
+              "No reconciliation result is recorded: the claim has not been tested, and the " +
+              "arithmetic that would have been reported is the claimant checking their own work. " +
+              "Obtain evidence from an independent source before certifying.",
+            evidenceRefs: {
+              assertionId: assertion.id,
+              reconciliationId: id,
+              reconciler: outcome.reconciler,
+              claimed: outcome.claimed,
+              wouldHaveObserved: outcome.observed,
+              suppressedResult: outcome.result,
+              evidenceIds: outcome.usedEvidenceIds,
+            },
+            fingerprint: fingerprintOf("self", assertion.id),
+            subjectType: assertion.claimantKind === "entity" ? "entity" : "user",
+            subjectId: assertion.claimantId,
+            links: [
+              { objectType: "assertion", objectId: assertion.id, role: "subject" },
+              { objectType: "reconciliation", objectId: id },
+              ...outcome.usedEvidenceIds.map((e) => ({ objectType: "evidence", objectId: e })),
+            ],
+          });
+        }
+
+        if (!self.selfCertified && outcome.result === "contradicted" && outcome.adverse && outcome.confidence > 0) {
           contradicted.push({
             assertionId: assertion.id,
             reconciliationId: id,
@@ -1727,6 +1913,7 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
         assertions: assertionRows.length,
         created,
         skipped,
+        selfCertified: selfCertifiedCount,
         results,
         contradicted,
         signalsCreated: raised.created,
@@ -2668,7 +2855,21 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
   app.delete("/entities/:entityId", { preHandler: companyGate }, async (req) => {
     await requireEntityWriter(req);
     const { entityId } = req.params as { entityId: string };
-    const body = z.object({ reason: z.string().min(1).max(2000) }).parse(req.body ?? {});
+    // The reason may arrive in the body or as `?reason=` — DELETE with a body
+    // is awkward for a browser client (the web `api.del` helper sends none),
+    // and a mandatory justification the UI cannot supply is a rule nobody can
+    // follow. Either way it is mandatory.
+    const q = z.object({ reason: z.string().min(1).max(2000).optional() }).parse(req.query ?? {});
+    const body = z
+      .object({ reason: z.string().min(1).max(2000).optional() })
+      .parse(req.body ?? {});
+    const reason = body.reason ?? q.reason;
+    if (!reason) {
+      throw badRequest(
+        "A reason is required to remove an entity from the register: the removal is recorded " +
+          "against it, and 'why' is the part an investigator needs. Send { reason } or ?reason=.",
+      );
+    }
     const existing = await loadEntity(req, entityId);
     const relationships = await app.db
       .select()
@@ -2688,7 +2889,7 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
     // on delete is how the register gets cleaned before an investigation.
     await app.db
       .update(entities)
-      .set({ deletedAt: nowIso, deletedBy: req.user!.id, deleteReason: body.reason })
+      .set({ deletedAt: nowIso, deletedBy: req.user!.id, deleteReason: reason })
       .where(eq(entities.id, entityId));
     await appendLedger(app.db, {
       companyId: req.companyId!,
@@ -2706,7 +2907,7 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
           source: r.source,
         })),
         soft: true,
-        reason: body.reason,
+        reason,
       },
       storePayload: true,
     });
@@ -3754,6 +3955,8 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
     created: number;
     refreshed: number;
     superseded: number;
+    /** auto-closed findings whose condition came back on this run */
+    reopened: number;
     autoClosed: number;
     skipped: Array<{ detector: string; reason: string }>;
     perDetector: Record<string, number>;
@@ -3812,7 +4015,13 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
     executed: string[],
     skipped: Array<{ detector: string; reason: string }>,
     perDetector: Record<string, number>,
-    outcome: { created: number; refreshed: number; superseded: number; autoClosed: number },
+    outcome: {
+      created: number;
+      refreshed: number;
+      superseded: number;
+      reopened: number;
+      autoClosed: number;
+    },
     startedAt: Date,
     runId: string,
   ): Promise<void> {
@@ -3829,6 +4038,7 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
       signalsRefreshed: outcome.refreshed,
       signalsAutoClosed: outcome.autoClosed,
       signalsSuperseded: outcome.superseded,
+      signalsReopened: outcome.reopened,
       perDetector,
       durationMs: Date.now() - startedAt.getTime(),
       startedAt: startedAt.toISOString(),
@@ -4076,6 +4286,7 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
       created: raised.created,
       refreshed: raised.refreshed,
       superseded: raised.superseded,
+      reopened: raised.reopened,
       autoClosed,
       skipped,
       perDetector,
@@ -4526,6 +4737,7 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
       created: raised.created,
       refreshed: raised.refreshed,
       superseded: raised.superseded,
+      reopened: raised.reopened,
       autoClosed,
       skipped,
       perDetector,
@@ -4534,13 +4746,29 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
     };
   }
 
-  /** Runs are for assurance-role holders or operational owners/admins. */
+  /**
+   * Runs are for assurance-role holders or operational owners/admins.
+   *
+   * `regulator` is deliberately NOT here. ASSURANCE_ROLES defines it as scoped,
+   * time-boxed READ access, and a detector run writes: signals, detector_runs
+   * and ledger entries, all carrying the runner's actorId. A read-only
+   * oversight role that leaves write traces of its own makes the evidentiary
+   * record show the independent reviewer changing state — the same defect that
+   * was fixed for GET /obligations/upcoming.
+   */
   async function requireDetectorRunner(req: FastifyRequest, projectId: string | null) {
     const privileged =
       req.companyRole === "owner" ||
       req.companyRole === "admin" ||
-      (await holdsAssuranceRole(req, ["integrity_reviewer", "auditor", "regulator"], projectId));
-    if (!privileged) throw forbidden("Requires an assurance role or company owner/admin");
+      (await holdsAssuranceRole(req, ["integrity_reviewer", "auditor"], projectId));
+    if (!privileged) {
+      throw forbidden(
+        "Running detectors requires an integrity_reviewer or auditor grant covering this " +
+          "scope, or company owner/admin. A regulator grant is read-only: a detector run " +
+          "writes signals and ledger entries, and an oversight role must not appear in the " +
+          "record as having changed what it is reviewing.",
+      );
+    }
   }
 
   app.post("/projects/:projectId/detectors/run", { preHandler: readGate }, async (req) => {
@@ -4815,6 +5043,59 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
     );
   }
 
+  /**
+   * Resolve signal ids for attachment to a case, refusing any the caller has
+   * no assurance reach over.
+   *
+   * A case is an investigative surface: attaching a signal reveals its title,
+   * explanation, evidenceRefs and subject in the case drawer, and (for the
+   * write paths) escalates it. Filtering the CASE by project while leaving its
+   * ITEMS filtered by company only would have let an integrity_reviewer scoped
+   * to project A open a case on A, attach project B's signal ids — or a
+   * tenant-level collusion signal — and read and mutate them: exactly the
+   * cross-project leak the grant scoping exists to stop.
+   */
+  async function resolveCaseSignals(
+    req: FastifyRequest,
+    ids: string[],
+    forWrite: boolean,
+  ): Promise<Array<{ id: string; projectId: string | null; disposition: string }>> {
+    const unique = [...new Set(ids)];
+    if (unique.length === 0) return [];
+    const rows = await app.db
+      .select({
+        id: signals.id,
+        projectId: signals.projectId,
+        disposition: signals.disposition,
+      })
+      .from(signals)
+      .where(and(eq(signals.companyId, req.companyId!), inArray(signals.id, unique)));
+    const found = new Set(rows.map((r) => r.id));
+    const missing = unique.filter((id) => !found.has(id));
+    if (missing.length > 0) {
+      throw notFound(`Signal(s) not found in this company: ${missing.join(", ")}`);
+    }
+    const visible = await visibleAssuranceProjectIds(req);
+    if (visible !== "all") {
+      const denied = rows.filter((r) => !r.projectId || !visible.has(r.projectId));
+      if (denied.length > 0) {
+        throw forbidden(
+          `No assurance visibility of signal(s) ${denied.map((d) => d.id).join(", ")}. ` +
+            "A project-scoped grant confers no authority over another project's findings, nor " +
+            "over tenant-level findings.",
+        );
+      }
+    }
+    if (forWrite) {
+      for (const row of rows) {
+        // Escalating a finding is a write on THAT finding's project, not on
+        // the case's — so the authority is re-checked against it.
+        await requireCaseWorker(req, row.projectId);
+      }
+    }
+    return rows;
+  }
+
   app.post("/integrity-cases", { preHandler: companyGate }, async (req, reply) => {
     const body = z
       .object({
@@ -4845,24 +5126,22 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
       assignedTo: body.assignedTo ?? null,
       openedBy: req.user!.id,
     };
+    const attachable =
+      body.signalIds && body.signalIds.length > 0
+        ? await resolveCaseSignals(req, body.signalIds, true)
+        : [];
     await app.db.insert(integrityCases).values(row);
-    if (body.signalIds && body.signalIds.length > 0) {
-      const owned = await app.db
-        .select({ id: signals.id })
-        .from(signals)
-        .where(and(eq(signals.companyId, req.companyId!), inArray(signals.id, body.signalIds)));
-      if (owned.length > 0) {
-        await app.db.insert(integrityCaseItems).values(
-          owned.map((s) => ({
-            id: newId("icit"),
-            companyId: req.companyId!,
-            caseId: id,
-            itemType: "signal",
-            itemId: s.id,
-            addedBy: req.user!.id,
-          })),
-        );
-      }
+    if (attachable.length > 0) {
+      await app.db.insert(integrityCaseItems).values(
+        attachable.map((s) => ({
+          id: newId("icit"),
+          companyId: req.companyId!,
+          caseId: id,
+          itemType: "signal",
+          itemId: s.id,
+          addedBy: req.user!.id,
+        })),
+      );
     }
     await appendLedger(app.db, {
       companyId: req.companyId!,
@@ -4931,19 +5210,29 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
       .orderBy(asc(integrityCaseItems.createdAt))
       .limit(1000);
     const signalIds = items.filter((i) => i.itemType === "signal" && i.itemId).map((i) => i.itemId!);
-    const linkedSignals =
+    const allLinked =
       signalIds.length > 0
         ? await app.db
             .select()
             .from(signals)
             .where(and(eq(signals.companyId, req.companyId!), inArray(signals.id, signalIds)))
         : [];
+    // The case row passing `loadCase` says nothing about the ITEMS hanging off
+    // it. A reviewer scoped to one project reads only that project's findings,
+    // and is told plainly how many were withheld rather than being shown a
+    // silently short list.
+    const visible = await visibleAssuranceProjectIds(req);
+    const linkedSignals =
+      visible === "all"
+        ? allLinked
+        : allLinked.filter((s) => s.projectId !== null && visible.has(s.projectId));
+    const withheldSignals = allLinked.length - linkedSignals.length;
     const packs = await app.db
       .select()
       .from(evidencePacks)
       .where(and(eq(evidencePacks.companyId, req.companyId!), eq(evidencePacks.caseId, caseId)))
       .orderBy(desc(evidencePacks.generatedAt));
-    return { ...record, items, signals: linkedSignals, packs };
+    return { ...record, items, signals: linkedSignals, withheldSignals, packs };
   });
 
   app.patch("/integrity-cases/:caseId", { preHandler: companyGate }, async (req) => {
@@ -5012,6 +5301,11 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
     if (body.itemType !== "ledger_range" && body.itemType !== "note" && !body.itemId) {
       throw badRequest(`A ${body.itemType} item needs an itemId`);
     }
+    // Resolve BEFORE the insert: a refusal must not leave a dangling item.
+    const attached =
+      body.itemType === "signal" && body.itemId
+        ? (await resolveCaseSignals(req, [body.itemId], true))[0]!
+        : null;
     const id = newId("icit");
     const row = {
       id,
@@ -5027,28 +5321,27 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
     await app.db.insert(integrityCaseItems).values(row);
     // A signal attached to a case is escalated by that act: the case IS the
     // escalation, and leaving the signal at "new" would understate it.
-    if (body.itemType === "signal" && body.itemId) {
-      const sig = await app.db
-        .select({ id: signals.id, disposition: signals.disposition })
-        .from(signals)
-        .where(and(eq(signals.id, body.itemId), eq(signals.companyId, req.companyId!)))
-        .limit(1);
-      if (sig[0] && (sig[0].disposition === "new" || sig[0].disposition === "under_review")) {
-        await app.db
-          .update(signals)
-          .set({ disposition: "escalated", reviewerId: req.user!.id })
-          .where(eq(signals.id, body.itemId));
-        await appendLedger(app.db, {
-          companyId: req.companyId!,
-          actorId: req.user!.id,
-          action: "state_change",
-          objectType: "signal",
-          objectId: body.itemId,
-          payload: { before: { disposition: sig[0].disposition }, after: { disposition: "escalated" }, caseId },
-          storePayload: true,
-          projectId: record.projectId,
-        });
-      }
+    if (attached && (attached.disposition === "new" || attached.disposition === "under_review")) {
+      await app.db
+        .update(signals)
+        .set({ disposition: "escalated", reviewerId: req.user!.id })
+        .where(eq(signals.id, attached.id));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "signal",
+        objectId: attached.id,
+        payload: {
+          before: { disposition: attached.disposition },
+          after: { disposition: "escalated" },
+          caseId,
+        },
+        storePayload: true,
+        // The signal's own project, not the case's: a case may group findings
+        // from several projects, and the ledger entry belongs to the finding.
+        projectId: attached.projectId,
+      });
     }
     await appendLedger(app.db, {
       companyId: req.companyId!,
@@ -5372,19 +5665,32 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
       .where(eq(integrityCaseItems.caseId, caseId))
       .limit(1000);
     const signalIds = caseItems.filter((i) => i.itemType === "signal" && i.itemId).map((i) => i.itemId!);
-    const signalRows =
+    const allSignalRows =
       signalIds.length > 0
         ? await app.db
             .select()
             .from(signals)
             .where(and(eq(signals.companyId, req.companyId!), inArray(signals.id, signalIds)))
         : [];
+    // A pack may only contain findings its builder is entitled to read. The
+    // ones withheld are named in the completeness statement rather than
+    // silently dropped: a pack that omits material without saying so is the
+    // failure mode this whole feature exists to avoid.
+    const packVisible = await visibleAssuranceProjectIds(req);
+    const signalRows =
+      packVisible === "all"
+        ? allSignalRows
+        : allSignalRows.filter((s) => s.projectId !== null && packVisible.has(s.projectId));
+    const withheldSignalIds = allSignalRows
+      .filter((s) => !signalRows.some((v) => v.id === s.id))
+      .map((s) => s.id);
+    const readableSignalIds = signalRows.map((s) => s.id);
     const linkRows =
-      signalIds.length > 0
+      readableSignalIds.length > 0
         ? await app.db
             .select()
             .from(signalEvidence)
-            .where(inArray(signalEvidence.signalId, signalIds))
+            .where(inArray(signalEvidence.signalId, readableSignalIds))
             .limit(2000)
         : [];
     const evidenceIds = [
@@ -5438,6 +5744,13 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
 
     const missingEvidence = evidenceIds.filter((id) => !evidenceRows.some((e) => e.id === id));
     const exclusions = [
+      ...withheldSignalIds.map((id) => ({
+        objectType: "signal",
+        objectId: id,
+        reason:
+          "attached to this case but outside the pack builder's assurance reach, so it was not " +
+          "read and could not be committed to the pack",
+      })),
       ...missingEvidence.map((id) => ({
         objectType: "evidence",
         objectId: id,
@@ -5822,7 +6135,13 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
       .filter((o) => o.deadline && Date.parse(o.deadline) >= now)
       .sort((a, b) => Date.parse(a.deadline!) - Date.parse(b.deadline!))[0];
 
-    const withVariance = latestRecon.filter((r) => r.variancePercent !== null);
+    // A self-certified row is the claimant's own arithmetic. It is kept on the
+    // record (and visible on the Reconcile tab, flagged) but it must never be
+    // the number a director reads as "claimed vs verified".
+    const selfCertifiedRecent = latestRecon.filter((r) => r.selfCertified).length;
+    const withVariance = latestRecon.filter(
+      (r) => r.variancePercent !== null && !r.selfCertified,
+    );
     const claimedVsVerified =
       withVariance.length > 0
         ? {
@@ -5836,8 +6155,12 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
         : unknowable(
             latestRecon.length === 0
               ? "no reconciliation has been recorded on this project"
-              : "no reconciliation on this project produced a numeric variance (all were manual " +
-                "or had insufficient evidence)",
+              : selfCertifiedRecent > 0
+                ? `no INDEPENDENT reconciliation on this project produced a numeric variance; ` +
+                  `${selfCertifiedRecent} of the last ${latestRecon.length} were evidenced only ` +
+                  "by the claimant or the author of the claim and are excluded"
+                : "no reconciliation on this project produced a numeric variance (all were manual " +
+                  "or had insufficient evidence)",
           );
 
     const sealAgeHours = seal ? (now - Date.parse(seal.sealedAt)) / 3_600_000 : null;
@@ -5872,6 +6195,7 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
           : null,
       },
       claimedVsVerified,
+      selfCertifiedRecent,
       evidenceSufficiency,
       seal: seal
         ? {
@@ -5940,22 +6264,229 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
     };
   });
 
+  /**
+   * The company roll-up, computed with GROUPED queries rather than by calling
+   * the per-project summary in a loop.
+   *
+   * The loop version issued six queries per project — up to ~600 round trips
+   * and 200,000 obligation rows materialised for one request — for an endpoint
+   * offered to the dashboard and to the intelligence layer as the portfolio
+   * view. Five bounded queries answer the same question for the whole set.
+   *
+   * The per-project route keeps `assuranceSummary`: one project's page can
+   * afford the deeper read, and the two must not drift, so every figure here
+   * is derived the same way and the divergences (the 50-row reconciliation
+   * window, the 2000-row obligation window) are stated as bounds.
+   */
+  async function assuranceRollup(
+    companyId: string,
+    projectRows: Array<{ id: string; name: string }>,
+    seal: Awaited<ReturnType<typeof newestSeal>>,
+    watermark: Awaited<ReturnType<typeof readWatermark>>,
+  ) {
+    const ids = projectRows.map((p) => p.id);
+    if (ids.length === 0) return [];
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    const [sigAgg, oblAgg, oblNext, recRows, scoreRows] = await Promise.all([
+      app.db
+        .select({
+          projectId: signals.projectId,
+          severity: signals.severity,
+          disposition: signals.disposition,
+          n: count(),
+        })
+        .from(signals)
+        .where(and(eq(signals.companyId, companyId), inArray(signals.projectId, ids)))
+        .groupBy(signals.projectId, signals.severity, signals.disposition),
+      app.db
+        .select({ projectId: obligations.projectId, status: obligations.status, n: count() })
+        .from(obligations)
+        .where(and(eq(obligations.companyId, companyId), inArray(obligations.projectId, ids)))
+        .groupBy(obligations.projectId, obligations.status),
+      app.db
+        .select({
+          id: obligations.id,
+          projectId: obligations.projectId,
+          deadline: obligations.deadline,
+          sourceClause: obligations.sourceClause,
+        })
+        .from(obligations)
+        .where(
+          and(
+            eq(obligations.companyId, companyId),
+            inArray(obligations.projectId, ids),
+            eq(obligations.status, "open"),
+            gte(obligations.deadline, nowIso),
+          ),
+        )
+        .orderBy(asc(obligations.deadline))
+        .limit(2000),
+      app.db
+        .select({
+          id: reconciliations.id,
+          projectId: reconciliations.projectId,
+          method: reconciliations.method,
+          result: reconciliations.result,
+          variancePercent: reconciliations.variancePercent,
+          confidence: reconciliations.confidence,
+          selfCertified: reconciliations.selfCertified,
+        })
+        .from(reconciliations)
+        .where(
+          and(eq(reconciliations.companyId, companyId), inArray(reconciliations.projectId, ids)),
+        )
+        .orderBy(desc(reconciliations.createdAt))
+        .limit(2000),
+      app.db
+        .select()
+        .from(integrityScores)
+        .where(
+          and(
+            eq(integrityScores.companyId, companyId),
+            eq(integrityScores.scope, "project"),
+            inArray(integrityScores.subjectId, ids),
+          ),
+        )
+        .orderBy(desc(integrityScores.computedAt))
+        .limit(2000),
+    ]);
+
+    const byProject = <T extends { projectId: string | null }>(rows: T[]) => {
+      const m = new Map<string, T[]>();
+      for (const r of rows) {
+        if (!r.projectId) continue;
+        const list = m.get(r.projectId) ?? [];
+        list.push(r);
+        m.set(r.projectId, list);
+      }
+      return m;
+    };
+    const sigByProject = byProject(sigAgg);
+    const oblByProject = byProject(oblAgg);
+    const nextByProject = new Map<string, (typeof oblNext)[number]>();
+    for (const o of oblNext) if (!nextByProject.has(o.projectId)) nextByProject.set(o.projectId, o);
+    const recByProject = byProject(recRows);
+    const scoreByProject = new Map<string, (typeof scoreRows)[number]>();
+    for (const sc of scoreRows) if (!scoreByProject.has(sc.subjectId)) scoreByProject.set(sc.subjectId, sc);
+
+    const sealAgeHours = seal ? (now - Date.parse(seal.sealedAt)) / 3_600_000 : null;
+    const sealField = seal
+      ? {
+          sequence: seal.sequence,
+          sealedAt: seal.sealedAt,
+          ageHours: sealAgeHours,
+          stale: sealAgeHours !== null && sealAgeHours > 48,
+        }
+      : unknowable(
+          "this tenant's chain has never been sealed, so nothing outside the database " +
+            "commits to its length or content",
+        );
+    const chainField = watermark
+      ? {
+          verdict: watermark.lastVerdict,
+          lastVerifiedSeq: watermark.lastVerifiedSeq,
+          verifiedAt: watermark.verifiedAt,
+          brokenAtSeq: watermark.brokenAtSeq,
+        }
+      : unknowable("the chain has not been verified since this watermark was introduced");
+
+    return projectRows.map((p) => {
+      const sig = sigByProject.get(p.id) ?? [];
+      const open = sig.filter(
+        (r) => r.disposition !== "closed" && r.disposition !== "false_positive",
+      );
+      const obl = oblByProject.get(p.id) ?? [];
+      const countOf = (status: string) =>
+        obl.filter((o) => o.status === status).reduce((a, o) => a + Number(o.n), 0);
+      const next = nextByProject.get(p.id);
+      const recent = (recByProject.get(p.id) ?? []).slice(0, 50);
+      const independent = recent.filter((r) => r.variancePercent !== null && !r.selfCertified);
+      const selfCertifiedRecent = recent.filter((r) => r.selfCertified).length;
+      const score = scoreByProject.get(p.id);
+      return {
+        projectId: p.id,
+        projectName: p.name,
+        openSignals: open.reduce((a, r) => a + Number(r.n), 0),
+        criticalOpen: open
+          .filter((r) => r.severity === "critical" || r.severity === "high")
+          .reduce((a, r) => a + Number(r.n), 0),
+        signalMatrix: sig.map((r) => ({
+          severity: r.severity,
+          disposition: r.disposition,
+          count: Number(r.n),
+        })),
+        obligations: {
+          open: countOf("open"),
+          breached: countOf("breached"),
+          nextDeadline: next
+            ? {
+                obligationId: next.id,
+                deadline: next.deadline,
+                daysAway: Math.ceil((Date.parse(next.deadline!) - now) / 86_400_000),
+                sourceClause: next.sourceClause,
+              }
+            : null,
+        },
+        claimedVsVerified: independent[0]
+          ? {
+              value: independent[0].variancePercent,
+              basis:
+                `Latest independent reconciliation ${independent[0].id} ` +
+                `(${independent[0].method}), result ${independent[0].result}, confidence ` +
+                `${(independent[0].confidence ?? 0).toFixed(2)}.`,
+              reconciliationId: independent[0].id,
+            }
+          : unknowable(
+              recent.length === 0
+                ? "no reconciliation has been recorded on this project"
+                : selfCertifiedRecent > 0
+                  ? `no INDEPENDENT reconciliation on this project produced a numeric variance; ` +
+                    `${selfCertifiedRecent} of the last ${recent.length} were evidenced only by ` +
+                    "the claimant or the author of the claim and are excluded"
+                  : "no reconciliation on this project produced a numeric variance (all were " +
+                    "manual or had insufficient evidence)",
+            ),
+        selfCertifiedRecent,
+        evidenceSufficiency:
+          recent.length > 0
+            ? {
+                value: recent.reduce((a, r) => a + (r.confidence ?? 0), 0) / recent.length,
+                basis: `Mean evidence independence across the last ${recent.length} reconciliation(s).`,
+              }
+            : unknowable("no reconciliations to measure evidence sufficiency from"),
+        seal: sealField,
+        chain: chainField,
+        integrityScore: score
+          ? {
+              value: score.score,
+              band: score.band,
+              computedAt: score.computedAt,
+              basis: `${score.openSignals} open, ${score.confirmedSignals} confirmed.`,
+            }
+          : unknowable("integrity scores have not been computed for this project yet"),
+      };
+    });
+  }
+
   /** Company roll-up: one row per project the caller may actually see. */
   app.get("/assurance/summary", { preHandler: companyGate }, async (req) => {
     const visible = await requireAssuranceReach(req);
+    const q = z
+      .object({ limit: z.coerce.number().int().min(1).max(200).optional() })
+      .parse(req.query ?? {});
     const projectRows = await app.db
       .select({ id: projects.id, name: projects.name })
       .from(projects)
-      .where(eq(projects.companyId, req.companyId!))
+      .where(and(eq(projects.companyId, req.companyId!), isNull(projects.deletedAt)))
+      .orderBy(desc(projects.updatedAt))
       .limit(500);
-    const scoped = projectRows.filter((p) => visible === "all" || visible.has(p.id));
-    const items = [];
-    for (const p of scoped.slice(0, 100)) {
-      const s = await assuranceSummary(req.companyId!, p.id);
-      items.push({ ...s, projectId: p.id, projectName: p.name });
-    }
+    const scoped = projectRows
+      .filter((p) => visible === "all" || visible.has(p.id))
+      .slice(0, q.limit ?? 100);
     const seal = await newestSeal(req.companyId!);
     const watermark = await readWatermark(req.companyId!);
+    const items = await assuranceRollup(req.companyId!, scoped, seal, watermark);
     return {
       generatedAt: new Date().toISOString(),
       projects: items,
@@ -6018,6 +6549,67 @@ export const assuranceModule: FastifyPluginAsync = async (app) => {
         autoClosed += result.autoClosed;
       });
       return { ...summary, created, refreshed, autoClosed };
+    },
+  });
+
+  /**
+   * The other half of the programme.
+   *
+   * The company sweep above covers the payables, approval and entity-network
+   * families. Everything project-scoped — Benford, duplicate claims,
+   * round-number clustering, approval velocity, self-approval, contradicted
+   * claimants, backdated records — used to run ONLY when a human pressed Run
+   * on one project's Signals tab, which made "scheduled detection" true of
+   * half the registry and false of the other half. Both paths dedupe on
+   * fingerprint, so running them on a cadence is safe.
+   *
+   * Bounded deliberately: the most recently touched projects per tenant, not
+   * every project ever created, so a large tenant cannot turn one tick into an
+   * unbounded scan.
+   */
+  app.scheduler.register({
+    name: "assurance.project-detector-sweep",
+    description:
+      "Run the project-scoped detector programme for each tenant's most recently active " +
+      "projects, attributed to the system",
+    everyMs: 6 * 60 * 60_000,
+    runOnBoot: false,
+    run: async ({ db, log }) => {
+      let created = 0;
+      let refreshed = 0;
+      let reopened = 0;
+      let autoClosed = 0;
+      let scanned = 0;
+      const summary = await forEachCompany(db, async (companyId) => {
+        const rows = await db
+          .select({ id: projects.id })
+          .from(projects)
+          .where(and(eq(projects.companyId, companyId), isNull(projects.deletedAt)))
+          .orderBy(desc(projects.updatedAt))
+          .limit(PROJECT_SWEEP_LIMIT);
+        for (const p of rows) {
+          try {
+            const result = await runProjectDetectors({
+              companyId,
+              projectId: p.id,
+              actorId: null,
+              trigger: "scheduled",
+            });
+            scanned += 1;
+            created += result.created;
+            refreshed += result.refreshed;
+            reopened += result.reopened;
+            autoClosed += result.autoClosed;
+          } catch (err) {
+            // One project's bad data must not stop the sweep for the rest.
+            log.warn(
+              { err, companyId, projectId: p.id },
+              "assurance.project-detector-sweep: project run failed",
+            );
+          }
+        }
+      });
+      return { ...summary, projects: scanned, created, refreshed, reopened, autoClosed };
     },
   });
 

@@ -55,10 +55,11 @@ import {
   useRetainage,
   useSov,
   useStoredMaterials,
+  useReason,
   useVendorNames,
   useVendors,
 } from "./shared";
-import type { PrimeContract } from "./types";
+import type { ContractView, PrimeContract, PrimeContractStatus } from "./types";
 
 type TabKey =
   | "summary"
@@ -81,6 +82,72 @@ const TABS: Array<{ value: TabKey; label: string }> = [
   { value: "receivables", label: "Receivables" },
 ];
 
+/**
+ * The contract's own lifecycle, mirroring STATUS_TRANSITIONS in the API. The
+ * page offers only the moves the API would accept, so a refusal is a real
+ * disagreement rather than a button that was never going to work.
+ */
+const STATUS_TRANSITIONS: Record<PrimeContractStatus, readonly PrimeContractStatus[]> = {
+  draft: ["out_for_bid", "out_for_signature", "void"],
+  out_for_bid: ["out_for_signature", "draft", "void"],
+  out_for_signature: ["draft", "void"],
+  approved: ["complete", "terminated", "void"],
+  complete: [],
+  terminated: [],
+  void: [],
+};
+
+const STATUS_ACTIONS: Record<
+  PrimeContractStatus,
+  { label: string; description: string; reasonLabel: string; destructive: boolean }
+> = {
+  draft: {
+    label: "Return to draft",
+    description: "The contract goes back to being editable. Nothing already billed is affected.",
+    reasonLabel: "Why is this contract returning to draft?",
+    destructive: false,
+  },
+  out_for_bid: {
+    label: "Put out for bid",
+    description: "Records that the owner-side agreement is out to market.",
+    reasonLabel: "Note for the record",
+    destructive: false,
+  },
+  out_for_signature: {
+    label: "Send for signature",
+    description: "Records that the agreement is with the parties for signature.",
+    reasonLabel: "Note for the record",
+    destructive: false,
+  },
+  approved: {
+    label: "Approve",
+    description: "Approval carries a segregation-of-duties check and has its own action.",
+    reasonLabel: "Reason",
+    destructive: false,
+  },
+  complete: {
+    label: "Mark complete",
+    description:
+      "Closes the contract out. The API refuses while any payment application is still open — certify, reject or void it first.",
+    reasonLabel: "What closes this contract out?",
+    destructive: false,
+  },
+  terminated: {
+    label: "Terminate",
+    description:
+      "Termination ends a signed instrument that has a billing history. The date is recorded and the transition is ledgered.",
+    reasonLabel: "Why is this contract being terminated?",
+    destructive: true,
+  },
+  void: {
+    label: "Void",
+    description:
+      "Voiding says the contract never took effect. An executed contract carrying applications or executed change orders is terminated instead — the API refuses to void one.",
+    reasonLabel: "Why is this contract void?",
+    destructive: true,
+  },
+};
+
 export default function PrimeContractPage() {
   const { projectId } = useParams<{ projectId: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -94,6 +161,7 @@ export default function PrimeContractPage() {
 
   const [executing, setExecuting] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState(false);
   const [executionDate, setExecutionDate] = useState(() =>
     new Date().toISOString().slice(0, 10),
   );
@@ -102,6 +170,7 @@ export default function PrimeContractPage() {
   const summary = useContractSummary(projectId);
   const vendorName = useVendorNames();
   const { busy, refusal, clear, run } = useAction();
+  const { ask, dialog: reasonDialog } = useReason();
 
   /* Default to the project's own prime once the list lands: the executed one
      if there is exactly one, otherwise the highest-numbered. */
@@ -169,8 +238,54 @@ export default function PrimeContractPage() {
     }
   }
 
+  /**
+   * Move the contract's own status (complete / terminate / void, and the
+   * pre-signature steps). Every one of these is a decision with money behind
+   * it, so the API takes the reason and ledgers the transition; the page
+   * collects it rather than posting an empty body.
+   */
+  async function changeStatus(next: PrimeContractStatus) {
+    if (!contractId || !view) return;
+    const meta = STATUS_ACTIONS[next];
+    const reason = await ask({
+      title: `${meta.label} ${view.reference}?`,
+      description: meta.description,
+      label: meta.reasonLabel,
+      confirmLabel: meta.label,
+      destructive: meta.destructive,
+    });
+    if (!reason) return;
+    const done = await run(`status:${next}`, () =>
+      api.post(`/api/v1/prime-contracts/${contractId}/status`, { status: next, reason }),
+    );
+    if (done !== null) reloadContract();
+  }
+
+  async function deleteContract() {
+    if (!contractId || !view) return;
+    const reason = await ask({
+      title: `Delete ${view.reference}?`,
+      description:
+        "A prime contract that was never executed and has never been billed can be deleted outright, together with its schedule of values. An executed contract is terminated or voided instead — the API refuses to delete one.",
+      label: "Why is this contract being deleted?",
+      confirmLabel: "Delete it",
+      destructive: true,
+    });
+    if (!reason) return;
+    const done = await run("delete", () => api.del(`/api/v1/prime-contracts/${contractId}`));
+    if (done !== null) {
+      setContractId(null);
+      const params = new URLSearchParams(searchParams);
+      params.delete("contract");
+      setSearchParams(params, { replace: true });
+      contracts.reload();
+      summary.reload();
+    }
+  }
+
   const items = contracts.data?.items ?? [];
   const view = contract.data;
+  const allowedTransitions = view ? (STATUS_TRANSITIONS[view.status] ?? []) : [];
 
   const tabItems = useMemo(
     () =>
@@ -237,6 +352,37 @@ export default function PrimeContractPage() {
                 </Field>
               </div>
             ) : null}
+            {view ? (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setEditing(true)}
+                disabled={busy !== null || view.status === "void" || view.status === "terminated"}
+                title={
+                  view.status === "void" || view.status === "terminated"
+                    ? `A ${view.status} prime contract cannot be edited.`
+                    : undefined
+                }
+              >
+                Edit
+              </Button>
+            ) : null}
+            {allowedTransitions.map((next) => (
+              <Button
+                key={next}
+                size="sm"
+                variant={STATUS_ACTIONS[next].destructive ? "danger" : "ghost"}
+                disabled={busy !== null}
+                onClick={() => void changeStatus(next)}
+              >
+                {STATUS_ACTIONS[next].label}
+              </Button>
+            ))}
+            {view && view.executed !== 1 ? (
+              <Button size="sm" variant="ghost" disabled={busy !== null} onClick={() => void deleteContract()}>
+                Delete
+              </Button>
+            ) : null}
             <Button size="sm" variant="secondary" leadingIcon={IconPlus} onClick={() => setCreating(true)}>
               New prime contract
             </Button>
@@ -247,6 +393,7 @@ export default function PrimeContractPage() {
         }
       />
 
+      {reasonDialog}
       <ErrorAlert message={contracts.error} onRetry={contracts.reload} />
       <RefusalPanel refusal={refusal} onDismiss={clear} />
 
@@ -306,6 +453,18 @@ export default function PrimeContractPage() {
             onOpenApplication={() => selectTab("billing")}
           />
         )
+      ) : null}
+
+      {view ? (
+        <EditContractModal
+          open={editing}
+          contract={view}
+          onClose={() => setEditing(false)}
+          onSaved={() => {
+            setEditing(false);
+            reloadContract();
+          }}
+        />
       ) : null}
 
       <NewContractModal
@@ -558,6 +717,191 @@ function NewContractModal({
           </Field>
           <Field label="Substantial completion" optional>
             <Input type="date" value={substantialCompletionDate} onChange={(e) => setSubstantial(e.target.value)} />
+          </Field>
+          <Field label="Scope of work" optional className="sm:col-span-2">
+            <Textarea rows={3} value={scopeOfWork} onChange={(e) => setScope(e.target.value)} />
+          </Field>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/**
+ * Correcting the contract after it exists (#501): title, scope, the dates the
+ * ageing and the retainage step-down are computed from, the paying parties.
+ *
+ * The contract SUM is deliberately not editable here once the contract is
+ * executed — the API refuses it, because a sum that moves without the schedule
+ * of values moving with it is the exact failure this module exists to prevent.
+ * On an unexecuted contract the sum is edited from the schedule-of-values tab,
+ * where the line that absorbs the change can be named.
+ */
+function EditContractModal({
+  open,
+  contract,
+  onClose,
+  onSaved,
+}: {
+  open: boolean;
+  contract: ContractView;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  const vendors = useVendors();
+  const [title, setTitle] = useState(contract.title);
+  const [scopeOfWork, setScope] = useState(contract.scopeOfWork ?? "");
+  const [ownerVendorId, setOwner] = useState(contract.ownerVendorId ?? "");
+  const [architectVendorId, setArchitect] = useState(contract.architectVendorId ?? "");
+  const [contractDate, setContractDate] = useState(contract.contractDate ?? "");
+  const [startDate, setStartDate] = useState(contract.startDate ?? "");
+  const [substantial, setSubstantial] = useState(contract.substantialCompletionDate ?? "");
+  const [actualCompletion, setActualCompletion] = useState(contract.actualCompletionDate ?? "");
+  const [paymentTermsDays, setTerms] = useState(
+    contract.paymentTermsDays === null ? "" : String(contract.paymentTermsDays),
+  );
+  const [retainage, setRetainage] = useState(String(contract.defaultRetainagePercent));
+  const [threshold, setThreshold] = useState(
+    contract.retainageTerms.reductionThresholdPercent === null
+      ? ""
+      : String(contract.retainageTerms.reductionThresholdPercent),
+  );
+  const [reduced, setReduced] = useState(
+    contract.retainageTerms.reducedPercent === null ? "" : String(contract.retainageTerms.reducedPercent),
+  );
+
+  /* Re-seed the form whenever a different contract (or a fresh copy) opens. */
+  useEffect(() => {
+    if (!open) return;
+    setTitle(contract.title);
+    setScope(contract.scopeOfWork ?? "");
+    setOwner(contract.ownerVendorId ?? "");
+    setArchitect(contract.architectVendorId ?? "");
+    setContractDate(contract.contractDate ?? "");
+    setStartDate(contract.startDate ?? "");
+    setSubstantial(contract.substantialCompletionDate ?? "");
+    setActualCompletion(contract.actualCompletionDate ?? "");
+    setTerms(contract.paymentTermsDays === null ? "" : String(contract.paymentTermsDays));
+    setRetainage(String(contract.defaultRetainagePercent));
+    setThreshold(
+      contract.retainageTerms.reductionThresholdPercent === null
+        ? ""
+        : String(contract.retainageTerms.reductionThresholdPercent),
+    );
+    setReduced(
+      contract.retainageTerms.reducedPercent === null
+        ? ""
+        : String(contract.retainageTerms.reducedPercent),
+    );
+  }, [open, contract]);
+
+  const num = (v: string): number | null => {
+    const t = v.trim();
+    if (t === "") return null;
+    const n = Number(t);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  async function submit() {
+    const done = await run("patch", () =>
+      api.patch(`/api/v1/prime-contracts/${contract.id}`, {
+        title: title.trim(),
+        scopeOfWork: scopeOfWork.trim() || null,
+        ownerVendorId: ownerVendorId || null,
+        architectVendorId: architectVendorId || null,
+        contractDate: contractDate || null,
+        startDate: startDate || null,
+        substantialCompletionDate: substantial || null,
+        actualCompletionDate: actualCompletion || null,
+        paymentTermsDays: num(paymentTermsDays),
+        ...(num(retainage) !== null ? { defaultRetainagePercent: num(retainage) } : {}),
+        retainage: {
+          reductionThresholdPercent: num(threshold),
+          reducedPercent: num(reduced),
+        },
+      }),
+    );
+    if (done !== null) onSaved();
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      size="lg"
+      title={`Edit ${contract.reference}`}
+      description="Title, scope, parties, dates and the retainage clause. The contract sum is edited from the schedule of values, and cannot be typed over once the contract is executed."
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button onClick={submit} disabled={title.trim() === "" || busy !== null}>
+            Save changes
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        <RefusalPanel refusal={refusal} onDismiss={clear} />
+        {contract.executed === 1 ? (
+          <Alert tone="info" title="This contract is executed">
+            The sum ({money(contract.originalContractSum, contract.currency)}) and the currency are
+            frozen. Everything below is descriptive and may be corrected.
+          </Alert>
+        ) : null}
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Title" required className="sm:col-span-2">
+            <Input value={title} onChange={(e) => setTitle(e.target.value)} />
+          </Field>
+          <Field label="Owner" optional>
+            <Select value={ownerVendorId} onChange={(e) => setOwner(e.target.value)}>
+              <option value="">Not recorded</option>
+              {(vendors.data?.items ?? []).map((v) => (
+                <option key={v.id} value={v.id}>
+                  {v.name}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="Architect / certifier" optional>
+            <Select value={architectVendorId} onChange={(e) => setArchitect(e.target.value)}>
+              <option value="">Not recorded</option>
+              {(vendors.data?.items ?? []).map((v) => (
+                <option key={v.id} value={v.id}>
+                  {v.name}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="Contract date" optional>
+            <Input type="date" value={contractDate} onChange={(e) => setContractDate(e.target.value)} />
+          </Field>
+          <Field label="Start on site" optional>
+            <Input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+          </Field>
+          <Field label="Substantial completion" optional hint="Drives the retainage step-down proposal.">
+            <Input type="date" value={substantial} onChange={(e) => setSubstantial(e.target.value)} />
+          </Field>
+          <Field label="Actual completion" optional>
+            <Input
+              type="date"
+              value={actualCompletion}
+              onChange={(e) => setActualCompletion(e.target.value)}
+            />
+          </Field>
+          <Field label="Payment terms (days)" optional hint="Drives due dates and the receivables ageing.">
+            <Input value={paymentTermsDays} inputMode="numeric" onChange={(e) => setTerms(e.target.value)} />
+          </Field>
+          <Field label="Retainage on work (%)" optional>
+            <Input value={retainage} inputMode="decimal" onChange={(e) => setRetainage(e.target.value)} />
+          </Field>
+          <Field label="Step-down threshold (% complete)" optional>
+            <Input value={threshold} inputMode="decimal" onChange={(e) => setThreshold(e.target.value)} />
+          </Field>
+          <Field label="Reduced retainage (%)" optional>
+            <Input value={reduced} inputMode="decimal" onChange={(e) => setReduced(e.target.value)} />
           </Field>
           <Field label="Scope of work" optional className="sm:col-span-2">
             <Textarea rows={3} value={scopeOfWork} onChange={(e) => setScope(e.target.value)} />

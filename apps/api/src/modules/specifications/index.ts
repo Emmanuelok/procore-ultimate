@@ -61,6 +61,7 @@ import { nextRevisionLabel } from "../drawings/detectors.js";
 import { extractPdfPages, streamToBuffer } from "../drawings/pdf.js";
 import { sendRanged } from "../drawings/stream.js";
 import { classifyPdfUpload, safeFilename } from "../documents/inbound.js";
+import { assertToolLevel, resolveToolAccess } from "../documents/access.js";
 import { pushNotifications } from "../notifications/service.js";
 import {
   detectSectionHeadings,
@@ -1026,6 +1027,17 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
       : "masterformat_2020";
     const makeCurrent = boolField(mp.fields, "makeCurrent", false);
     const doExtract = boolField(mp.fields, "extractRequirements", true);
+    /*
+     * Putting an issue IN FORCE is an admin act (POST .../set-current is
+     * adminGate): it flips isCurrent, supersedes the previous issue, and
+     * rewrites which text coverage, the register build and every requirement
+     * comparison read from. Uploading is a standard act. `makeCurrent` on the
+     * upload must therefore carry the same admin check the dedicated route
+     * does, or the gate is decorative. Checked before anything is stored.
+     */
+    if (makeCurrent) {
+      await assertToolLevel(app, req, req.projectId!, "specifications", "admin");
+    }
 
     const saved = await app.storage.saveBuffer(req.companyId!, buf);
     const fileId = newId("fil");
@@ -1391,7 +1403,19 @@ export const specificationsModule: FastifyPluginAsync = async (app) => {
       .orderBy(desc(specBooks.number))
       .limit(q.pageSize)
       .offset(pageOffset(q));
-    return paginate(items, Number(totalRow?.n ?? 0), q);
+    /*
+     * The upload form offers "make this the current issue", which only a
+     * specifications admin may do. The tab needs to know that before it draws
+     * the checkbox, so the caller's own level travels with the list.
+     */
+    const access = await resolveToolAccess(app, req, req.projectId!, "specifications");
+    return {
+      ...paginate(items, Number(totalRow?.n ?? 0), q),
+      access: {
+        level: access.bypass ? "admin" : access.level,
+        canSetCurrent: access.bypass || access.level === "admin",
+      },
+    };
   });
 
   app.get("/projects/:projectId/spec-books/:bookId", { preHandler: readGate }, async (req) => {

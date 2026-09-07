@@ -127,6 +127,10 @@ export interface RunResponse extends ExecutionResult {
 
 /** The API's own statement that scheduled delivery is recorded, not sent. */
 export interface DeliveryNotice {
+  /** false when no mail transport is configured, so nothing actually leaves */
+  dispatches?: boolean;
+  provider?: string;
+  job?: string;
   enabled: boolean;
   note: string;
 }
@@ -439,12 +443,20 @@ export function TruncationNotice({ result }: { result: ExecutionResult }) {
   );
 }
 
-/** The API's own delivery disclosure, rendered verbatim. */
+/**
+ * The API's own delivery disclosure, rendered verbatim.
+ *
+ * There are three states and the note distinguishes them, so this component
+ * must too: delivery not running at all, delivery running but no transport
+ * configured (rendered and recorded, nothing sent), and delivery running with
+ * a transport. Only the last is silent.
+ */
 export function DeliveryNote({ delivery }: { delivery: DeliveryNotice }) {
-  if (delivery.enabled) return null;
+  if (delivery.enabled && delivery.dispatches !== false) return null;
   return (
     <Caveat>
-      <strong>Recorded, not dispatched.</strong> {delivery.note}
+      <strong>{delivery.enabled ? "Rendered and recorded, not sent." : "Recorded, not dispatched."}</strong>{" "}
+      {delivery.note}
     </Caveat>
   );
 }

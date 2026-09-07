@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, isNull, lte, ne } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, lte, ne, sql } from "drizzle-orm";
 import {
   invoices,
   obligations,
@@ -333,21 +333,23 @@ async function existingSignal(
   detector: string,
   key: string,
 ): Promise<{ id: string; disposition: string } | null> {
-  const rows = await db
-    .select({ id: signals.id, refs: signals.evidenceRefs, disposition: signals.disposition })
+  // The key is matched in SQL and the read is capped at one row. The sweeps
+  // call this once per vendor, payment, invoice and exposure every hour and
+  // these signals are never deleted, so loading the detector's whole history
+  // and scanning it in JS grew without bound (plan §6.4).
+  const [row] = await db
+    .select({ id: signals.id, disposition: signals.disposition })
     .from(signals)
     .where(
       and(
         eq(signals.companyId, companyId),
         projectId ? eq(signals.projectId, projectId) : isNull(signals.projectId),
         eq(signals.detector, detector),
+        sql`${signals.evidenceRefs}->>'key' = ${key}`,
       ),
-    );
-  for (const r of rows) {
-    const refs = r.refs as { key?: unknown } | null;
-    if (refs && refs.key === key) return { id: r.id, disposition: r.disposition };
-  }
-  return null;
+    )
+    .limit(1);
+  return row ? { id: row.id, disposition: row.disposition } : null;
 }
 
 /** Raise a signal unless one with the same key already exists (any disposition). */

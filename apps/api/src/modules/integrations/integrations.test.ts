@@ -91,7 +91,7 @@ beforeAll(async () => {
   // deliveries in this file are never allowed near a socket
   dispatcher().configure({ autoKick: false, now: () => new Date() });
   dispatcher().setHttpClient(createRecordingWebhookClient(() => ({ status: 200, body: "ok" })));
-});
+}, 300_000);
 
 afterAll(async () => {
   await built.close();

@@ -223,11 +223,10 @@ function ProposalDrawer({
               size="sm"
               variant="secondary"
               icon={IconExternal}
+              loading={action.busy === "print"}
               onClick={() =>
-                window.open(
-                  `/api/v1/projects/${projectId}/estimating/proposals/${proposal.id}/html`,
-                  "_blank",
-                  "noopener",
+                void action.run("print", () =>
+                  estimatingApi.openProposalHtml(projectId, proposal.id),
                 )
               }
             >

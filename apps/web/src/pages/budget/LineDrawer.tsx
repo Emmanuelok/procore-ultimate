@@ -336,7 +336,15 @@ function ExplainTable({ data, currency }: { data: LineTransactions; currency: st
           {data.components.map((c) => (
             <Tr key={c.component} interactive onClick={() => setOpen(open === c.component ? null : c.component)}>
               <Td>{COMPONENT_LABEL[c.component] ?? labelize(c.component)}</Td>
-              <Td numeric>{money(c.stored, currency)}</Td>
+              <Td numeric>
+                {c.stored === null ? (
+                  <span className="text-content-muted" title={c.basis}>
+                    {EM_DASH}
+                  </span>
+                ) : (
+                  money(c.stored, currency)
+                )}
+              </Td>
               <Td numeric>
                 {c.value === null ? (
                   <span className="text-content-muted" title={c.reasons.join(" ")}>

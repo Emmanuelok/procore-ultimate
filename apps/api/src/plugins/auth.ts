@@ -22,7 +22,7 @@ import {
 } from "@constructos/shared";
 import { forbidden, unauthorized } from "../lib/errors.js";
 import { isExpired } from "../lib/time.js";
-import { loadSession } from "../modules/account/sessions.js";
+import { loadSession, touchSession } from "../modules/account/sessions.js";
 // Vol I §0.7 #120 — machine callers. This gate needed four small additions,
 // all marked below: resolve an OAuth2 access token to a machine identity in
 // `authenticate`, branch to the machine equivalents in `requireCompany` and
@@ -33,6 +33,7 @@ import { loadSession } from "../modules/account/sessions.js";
 // plugin-encapsulated, and the integrations module is registered last, so
 // nothing it adds can reach routes registered before it.
 import { machineAuth } from "../modules/integrations/machine-auth.js";
+import { guardCompanyIpAccess } from "../modules/account/login.js";
 
 const authPlugin: FastifyPluginAsync = async (app) => {
   const secret = new TextEncoder().encode(app.appConfig.AUTH_SECRET);
@@ -110,6 +111,20 @@ const authPlugin: FastifyPluginAsync = async (app) => {
         throw unauthorized("Session has expired");
       }
       req.accountSessionId = session.id;
+      /*
+       * Freshness belongs on EVERY authenticated request, not on the handful
+       * that happen to sit behind the account module's own prehandler. Before
+       * this, `last_seen_at` was bumped only by `requireLiveSession`, so the
+       * device list told a user who never opened /account/security that their
+       * session was last seen when they signed in — and the tenant idle
+       * timeout (#23) went unenforced for exactly the same reason.
+       *
+       * `touchSession` is gated on a once-a-minute staleness check, so the
+       * common path costs one comparison and no query. It throws
+       * `unauthorized` when the session has timed out, having revoked it and
+       * written the `session_idle_timeout` record first.
+       */
+      await touchSession(app, req, session, Date.now());
     }
   });
 
@@ -131,6 +146,13 @@ const authPlugin: FastifyPluginAsync = async (app) => {
       )
       .limit(1);
     if (!membership[0]) throw forbidden("Not a member of this company");
+    // The sign-in guard refuses an address only when EVERY company of the
+    // account refuses it, so a strict tenant's own rule has to be applied on
+    // the request that names that tenant - otherwise a session opened from
+    // the office and carried home keeps reading the tenant that excluded the
+    // home address. `monitor` mode records and allows, break-glass users are
+    // exempt, and a policy read failure allows and is logged.
+    await guardCompanyIpAccess(app, req, companyId, req.user.id);
     req.companyId = companyId;
     req.companyRole = membership[0].role as CompanyRole;
   });

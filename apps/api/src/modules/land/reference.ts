@@ -6,7 +6,7 @@
  * grievance redress.
  */
 
-import type { GrievanceSeverity, ParcelStatus } from "@constructos/shared";
+import type { GrievanceSeverity, PapStatus, ParcelStatus } from "@constructos/shared";
 
 /* ------------------------------------------------------------------ */
 /* Grievance redress SLA (#571-572)                                    */
@@ -92,30 +92,70 @@ export const GRIEVANCE_SETTLED_STATUSES = ["resolved", "closed_verified", "rejec
 /**
  * Forward-ish acquisition flow. A parcel may fall into `disputed` from any
  * state (a title challenge can surface at any point, including after
- * acquisition), and a dispute resolves either back into negotiation or, where
- * a compulsory-purchase determination or court order settles it, straight to
- * `acquired`.
+ * acquisition), and a dispute resolves back into negotiation.
  *
- * `compensated` is deliberately NOT reachable from this table: the only way
- * into it is the evidenced /compensate route, so a parcel can never be
- * recorded as compensated without payment evidence on file (#554).
+ * TWO statuses are deliberately NOT reachable from this table, because each
+ * has an evidenced route of its own:
+ *
+ *  - `compensated` — only via /compensate, so a parcel can never be recorded
+ *    as compensated without payment evidence on file (#554).
+ *  - `acquired` — only via /acquire, which records the BASIS on which title
+ *    passed. Before that route existed, a state-owned, donated or
+ *    court-ordered parcel could reach `acquired` only by first being marked
+ *    `disputed`, so a road scheme dominated by state land manufactured a
+ *    dispute for every parcel it acquired, and every dispute statistic,
+ *    RAP dashboard figure and pipeline count was wrong from day one.
  */
 export const PARCEL_TRANSITIONS: Record<ParcelStatus, readonly ParcelStatus[]> = {
   identified: ["surveyed", "disputed"],
   surveyed: ["under_negotiation", "disputed"],
   under_negotiation: ["agreed", "disputed"],
   agreed: ["disputed"],
-  compensated: ["acquired", "disputed"],
+  compensated: ["disputed"],
   acquired: ["disputed"],
-  disputed: ["under_negotiation", "acquired"],
+  disputed: ["under_negotiation"],
 };
 
-/** Statuses from which compensation may be recorded (#553-554). */
+/**
+ * Statuses from which compensation may be recorded (#553-554).
+ *
+ * `compensated` and `acquired` are included because a supplementary payment
+ * is ordinary RAP practice — a valuation is revised on appeal, a crop or
+ * structure missed at the survey is paid for later, a court awards a top-up.
+ * Excluding them left the register permanently stuck on the first figure:
+ * the PATCH route refused the edit (rightly) and pointed at /compensate,
+ * which refused it too, so the only reachable path was
+ * `compensated → disputed → under_negotiation → /compensate` — three
+ * fabricated state changes including a fictitious dispute, which is exactly
+ * the register corruption the /acquire route was introduced to eliminate.
+ * A second payment ADDS to the total (it does not restate it); restating a
+ * mis-keyed figure is the separate, reasoned /compensation-correction act.
+ */
 export const PARCEL_COMPENSABLE_FROM: readonly ParcelStatus[] = [
   "under_negotiation",
   "agreed",
   "disputed",
+  "compensated",
+  "acquired",
 ];
+
+/**
+ * Statuses from which title may pass (#551-552). `disputed` is included
+ * because a court order or a compulsory-purchase determination is exactly
+ * how a disputed parcel is acquired — with the order as the evidence.
+ */
+export const PARCEL_ACQUIRABLE_FROM: readonly ParcelStatus[] = [
+  "agreed",
+  "compensated",
+  "disputed",
+];
+
+/**
+ * Acquisition bases that involve buying the land, and therefore require a
+ * compensation payment before possession (IFC PS5 para 20). Donation, state
+ * allocation and a lease of land the state already holds do not.
+ */
+export const CASH_ACQUISITION_BASES: readonly string[] = ["purchase", "expropriation"];
 
 /** A parcel is only handed to construction once title has actually passed. */
 export const PARCEL_READY_STATUS: ParcelStatus = "acquired";
@@ -154,6 +194,43 @@ export type VulnerabilityFlag = (typeof VULNERABILITY_FLAGS)[number];
 
 /** Displacement types that require a livelihood restoration programme (#561). */
 export const LIVELIHOOD_REQUIRED_DISPLACEMENT: readonly string[] = ["economic", "both"];
+
+/**
+ * Household lifecycle (#555-568), mirroring PARCEL_TRANSITIONS.
+ *
+ * Before this table the status route accepted anything but `compensated`, so
+ * `livelihood_restored → registered` was legal, a household could be marked
+ * `resettled` with no entitlements and no payment, and `grievance_open` could
+ * be set by hand — while the RAP metrics counted livelihood restoration by
+ * status OR date, so the dashboard and the ledger told different stories.
+ *
+ * Two statuses are deliberately unreachable from this table:
+ *  - `compensated` — only via the evidenced /compensate route.
+ *  - `grievance_open` — set by the grievance module (see pap-grievance.ts)
+ *    when a grievance naming the household is opened, and cleared when the
+ *    last such grievance settles. It describes something that happened
+ *    elsewhere; typing it in asserts a grievance exists that does not.
+ *
+ * `grievance_open` is an OVERLAY, not a step: the household's substantive
+ * position is stashed in `statusBeforeGrievance` and restored exactly, and
+ * every rule that reads the column as a lifecycle fact goes through
+ * `effectivePapStatus`. The route therefore evaluates this table from the
+ * effective status, and the `grievance_open` row below only ever applies to
+ * rows flagged before the stash existed.
+ */
+export const PAP_TRANSITIONS: Record<PapStatus, readonly PapStatus[]> = {
+  registered: ["surveyed"],
+  surveyed: ["entitlement_agreed"],
+  entitlement_agreed: [],
+  compensated: ["resettled", "livelihood_restored"],
+  resettled: ["livelihood_restored"],
+  livelihood_restored: [],
+  // a household whose grievance closes returns to where the register had it
+  grievance_open: ["entitlement_agreed", "compensated", "resettled", "livelihood_restored"],
+};
+
+/** `resettled` asserts a physical move actually happened. */
+export const RESETTLEMENT_REQUIRES_PAYMENT = true;
 
 /** Displacement types that count as physical displacement (#565). */
 export const PHYSICAL_DISPLACEMENT: readonly string[] = ["physical", "both"];

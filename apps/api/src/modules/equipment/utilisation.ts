@@ -204,6 +204,16 @@ export interface HireCostInput {
   /** the standing rate — what idle and standby hours cost */
   idleRateAmount: number | null;
   hours: UtilisationHours;
+  /**
+   * OWNED PLANT. `equipment.internalRateAmount` is the internal charge-out
+   * rate, and without it every owned machine costs nothing on the utilisation
+   * report, in the summary and in the value-at-risk of the telematics
+   * reconciliation — which is how a fleet that is 60% owned shows a labour-only
+   * cost report. Read per hour, and the basis says so, because an internal
+   * rate is a management convention rather than an invoice.
+   */
+  internalRateAmount?: number | null;
+  ownership?: string | null;
 }
 
 export interface CostComponent {
@@ -228,11 +238,43 @@ export interface CostComponent {
  */
 export function computeHireCost(input: HireCostInput): CostComponent {
   const reasons: string[] = [];
+  if (
+    (input.hireRateAmount === null || input.hireRateAmount < 0) &&
+    input.internalRateAmount != null &&
+    input.internalRateAmount >= 0
+  ) {
+    // Owned plant charged out internally (#714). Priced per hour on the same
+    // ladder as a per-hour hire, with downtime excluded for the same reason.
+    const h = input.hours;
+    const workedRateHours = (h.workingHours || 0) + (h.travelHours || 0);
+    const standingHours = (h.idleHours || 0) + (h.standbyHours || 0);
+    const standingRate = input.idleRateAmount ?? input.internalRateAmount;
+    return {
+      amount: round2(
+        workedRateHours * input.internalRateAmount + standingHours * standingRate,
+      ),
+      basis:
+        `${round2(workedRateHours)}h at the internal charge-out rate of ` +
+        `${input.internalRateAmount}/hour` +
+        (standingHours > 0 ? ` + ${round2(standingHours)}h standing at ${standingRate}/hour` : ""),
+      reasons: [
+        "this machine is " +
+          `${input.ownership ?? "owned"} and carries no hire rate, so it is costed at the internal ` +
+          "charge-out rate. That is a management convention, not an invoice: it is the right number " +
+          "for comparing owned against hired plant and the wrong one for a claim.",
+      ],
+    };
+  }
   if (input.hireRateAmount === null || input.hireRateAmount < 0) {
     reasons.push(
       "no hire rate is recorded on this machine — its standing cost cannot be stated, " +
         "which is exactly how idle plant stays invisible",
     );
+    if (input.internalRateAmount == null) {
+      reasons.push(
+        "nor an internal charge-out rate: owned plant costs nothing on this report until one is set",
+      );
+    }
     return { amount: null, basis: null, reasons };
   }
   const unit = input.hireRateUnit;
@@ -413,6 +455,8 @@ export interface IdlePlantInput {
   hireRateAmount: number | null;
   hireRateUnit: HireRateUnit | null;
   idleRateAmount: number | null;
+  /** internal charge-out rate, so owned plant standing still costs (#714) */
+  internalRateAmount?: number | null;
   operatorRateAmount: number | null;
   /** set once somebody has asked for the machine to go back */
   offHireRequestedAt: string | null;
@@ -510,6 +554,8 @@ export function assessIdlePlant(
       hireRateAmount: input.hireRateAmount,
       hireRateUnit: input.hireRateUnit,
       idleRateAmount: input.idleRateAmount,
+      internalRateAmount: input.internalRateAmount ?? null,
+      ownership: input.ownership,
       hours: d.hours,
     }),
   }));

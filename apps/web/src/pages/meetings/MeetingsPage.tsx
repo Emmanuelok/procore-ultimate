@@ -11,6 +11,10 @@
  *                 carried three times has stopped being an agenda item.
  *   Actions       owners, dates, slippage kept as evidence, and promotion to
  *                 an obligation explained before it is offered.
+ *   Templates     the company agenda library: the standing headings every job
+ *                 carries, held once and COPIED onto a series — never
+ *                 referenced, so editing the library cannot rewrite minutes
+ *                 that were issued last March.
  *
  * A meeting opens in a drawer over whichever tab you are on.
  */
@@ -24,6 +28,7 @@ import CarryForwardTab from "./CarryForwardTab";
 import MeetingDrawer from "./MeetingDrawer";
 import OccurrencesTab from "./OccurrencesTab";
 import SeriesTab from "./SeriesTab";
+import TemplatesTab from "./TemplatesTab";
 import {
   CARRY_THRESHOLD,
   EMPTY_ACTION_FILTERS,
@@ -43,13 +48,14 @@ import {
   type MeetingSeries,
 } from "./meetingsShared";
 
-type TabKey = "series" | "occurrences" | "carry" | "actions";
+type TabKey = "series" | "occurrences" | "carry" | "actions" | "templates";
 
 const TABS: Array<{ value: TabKey; label: string }> = [
   { value: "series", label: "Series" },
   { value: "occurrences", label: "Occurrences" },
   { value: "carry", label: "Carry-forward" },
   { value: "actions", label: "Action items" },
+  { value: "templates", label: "Agenda templates" },
 ];
 
 const isTabKey = (value: string | null): value is TabKey =>
@@ -191,7 +197,7 @@ export default function MeetingsPage() {
           onSeriesId={setCarrySeriesId}
           onOpenMeeting={openMeeting}
         />
-      ) : (
+      ) : tab === "actions" ? (
         <ActionsTab
           projectId={projectId}
           actions={actions}
@@ -202,6 +208,8 @@ export default function MeetingsPage() {
           onMutated={refresh}
           onOpenMeeting={openMeeting}
         />
+      ) : (
+        <TemplatesTab projectId={projectId} />
       )}
 
       <MeetingDrawer

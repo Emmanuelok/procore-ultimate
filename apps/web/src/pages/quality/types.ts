@@ -111,6 +111,13 @@ export interface ItpActivity {
   parsedVerifyingParties: VerifyingParty[];
   notice: NoticeStatus;
   mayProceed: Decision;
+  /**
+   * The sequential sign-off chain, when one is configured on this point.
+   * `null` means no chain exists and the single-release rule governs — the API
+   * refuses the activity-level release outright while a chain is incomplete,
+   * so the UI must not offer it.
+   */
+  signOffChain: ChainSummary | null;
 }
 
 export interface HoldPointSummary {
@@ -876,6 +883,28 @@ export interface ReleaseChain {
   activityReleased?: boolean;
 }
 
+/** GET /projects/:projectId/surveillance — the legs held by somebody outside. */
+export interface SurveillanceRegister {
+  items: Array<
+    ReleaseLeg & {
+      activity: {
+        id: string;
+        activity: string;
+        activityCode: string | null;
+        interventionPoint: string;
+        plannedDate: string | null;
+        status: string;
+        itpId: string;
+      } | null;
+    }
+  >;
+  total: number;
+  page: number;
+  pageSize: number;
+  awaitingAttendance: number;
+  notifiedAwaitingSignature: number;
+}
+
 /* ================================================================== */
 /* Concessions (#1091)                                                 */
 /* ================================================================== */
@@ -1224,6 +1253,18 @@ export interface CertificateCheck {
   independentlyWitnessed: boolean;
 }
 
+/**
+ * The company-wide heat trace. `scope` is part of the answer, not decoration:
+ * an empty result on a filtered scope means "not on the projects you can see",
+ * which is a different statement from "this cast was never certified".
+ */
+export interface HeatTraceResult {
+  items: MaterialCertificate[];
+  total: number;
+  scope: { projectCount: number | null; allProjects: boolean };
+  reasons: string[];
+}
+
 export interface MaterialCertificate {
   id: string;
   reference: string;
@@ -1327,6 +1368,11 @@ export interface CalibrationRecord {
   calibratedByOrganisation: string | null;
   technicianName: string | null;
   notes: string | null;
+}
+
+/** GET /projects/:projectId/instruments/:id — the row plus its certificates. */
+export interface InstrumentDetail extends Instrument {
+  history: CalibrationRecord[];
 }
 
 export interface InstrumentSummary {

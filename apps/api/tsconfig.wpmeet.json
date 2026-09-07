@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "src",
+    "types": ["node"],
+    "declaration": false,
+    "declarationMap": false
+  },
+  "include": [
+    "src/modules/meetings/**/*.ts",
+    "src/modules/learning/**/*.ts",
+    "src/modules/insurance/**/*.ts"
+  ]
+}

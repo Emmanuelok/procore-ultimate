@@ -29,7 +29,8 @@ import {
   Td,
   Th,
 } from "../../ui";
-import { RefusalPanel, isoDate, money, titleCase, useAction } from "./shared";
+import { FindingList, RefusalPanel, isoDate, money, titleCase, useAction } from "./shared";
+import type { ComplianceFinding } from "./types";
 
 interface Candidate {
   id: string;
@@ -67,6 +68,17 @@ interface RunRow {
     commitmentReference: string | null;
     vendorName: string | null;
   }>;
+  /** every warning the API would record as acknowledged if this run were issued */
+  complianceWarnings?: RunFinding[];
+  complianceBlocking?: RunFinding[];
+}
+
+interface RunFinding {
+  paymentId: string;
+  paymentReference: string;
+  commitmentReference: string | null;
+  vendorName: string | null;
+  finding: ComplianceFinding;
 }
 
 interface Remittance {
@@ -413,6 +425,7 @@ function RunDrawer({
   const [data, setData] = useState<RunRow | null>(null);
   const [remittances, setRemittances] = useState<Remittance[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [issuing, setIssuing] = useState(false);
 
   const load = useCallback(async () => {
     if (!runId) return;
@@ -528,19 +541,7 @@ function RunDrawer({
                 </Button>
               ) : null}
               {data.status === "approved" ? (
-                <Button
-                  size="sm"
-                  disabled={busy !== null}
-                  onClick={() => {
-                    if (
-                      window.confirm(
-                        `Issue ${data.paymentCount} payment(s) totalling ${money(data.totalAmount, data.currency)}? Each is re-checked against the vendor's cover as it goes out.`,
-                      )
-                    ) {
-                      void act("issue", { acknowledgeWarnings: true });
-                    }
-                  }}
-                >
+                <Button size="sm" disabled={busy !== null} onClick={() => setIssuing(true)}>
                   Issue the run
                 </Button>
               ) : null}
@@ -564,6 +565,17 @@ function RunDrawer({
               ) : null}
             </div>
 
+            <IssueRun
+              open={issuing}
+              run={data}
+              busy={busy !== null}
+              onClose={() => setIssuing(false)}
+              onIssue={async (acknowledgeWarnings) => {
+                setIssuing(false);
+                await act("issue", { acknowledgeWarnings });
+              }}
+            />
+
             {remittances ? (
               <div className="space-y-2">
                 {remittances.map((r) => (
@@ -581,6 +593,135 @@ function RunDrawer({
               </div>
             ) : null}
           </>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+/**
+ * ISSUING A RUN — the warnings first, the tick second.
+ *
+ * The API stamps `acknowledgedWarnings` on every payment the run issues and
+ * writes it to the ledger. Sending that flag for warnings the issuer was never
+ * shown would make "we knew and paid anyway" an audited fact about something
+ * that never happened — and a run does it for every vendor in the batch at
+ * once. So the dialog fetches nothing extra: the run detail already carries
+ * each member's compliance position, and every warning is rendered verbatim,
+ * named to its payment and vendor, before the checkbox can be ticked. With no
+ * warnings on file the flag is sent as false.
+ */
+function IssueRun({
+  open,
+  run,
+  busy,
+  onClose,
+  onIssue,
+}: {
+  open: boolean;
+  run: RunRow;
+  busy: boolean;
+  onClose: () => void;
+  onIssue: (acknowledgeWarnings: boolean) => void | Promise<void>;
+}) {
+  const [acknowledged, setAcknowledged] = useState(false);
+  const warnings = run.complianceWarnings ?? [];
+  const blocking = run.complianceBlocking ?? [];
+  const needsAck = warnings.length > 0;
+
+  useEffect(() => {
+    if (!open) setAcknowledged(false);
+  }, [open]);
+
+  const byPayment = new Map<string, { label: string; findings: ComplianceFinding[] }>();
+  for (const w of warnings) {
+    const label = `${w.paymentReference}${w.vendorName ? ` — ${w.vendorName}` : ""}${
+      w.commitmentReference ? ` (${w.commitmentReference})` : ""
+    }`;
+    const bucket = byPayment.get(w.paymentId) ?? { label, findings: [] };
+    bucket.findings.push(w.finding);
+    byPayment.set(w.paymentId, bucket);
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={`Issue ${run.reference}?`}
+      size="lg"
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button
+            disabled={busy || (needsAck && !acknowledged)}
+            onClick={() => void onIssue(needsAck ? acknowledged : false)}
+          >
+            {busy ? "Issuing…" : `Issue ${run.paymentCount} payment(s)`}
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        <p className="text-meta text-content-muted">
+          {run.paymentCount} payment(s) totalling {money(run.totalAmount, run.currency)}. Each is
+          re-checked against the vendor&rsquo;s cover as it goes out, and the run stops at the first
+          refusal — the payments already issued stay issued.
+        </p>
+        {blocking.length > 0 ? (
+          <Alert
+            tone="danger"
+            title={`${blocking.length} blocking finding${blocking.length === 1 ? "" : "s"} stand against this run`}
+          >
+            <p>
+              These are not acknowledgeable. The run will stop at the first payment they cover;
+              clear them or take that vendor out of the run.
+            </p>
+            {blocking.map((b) => (
+              <div key={`${b.paymentId}-${b.finding.code}`} className="mt-2">
+                <p className="text-meta font-semibold">
+                  {b.paymentReference}
+                  {b.vendorName ? ` — ${b.vendorName}` : ""}
+                </p>
+                <FindingList findings={[b.finding]} />
+              </div>
+            ))}
+          </Alert>
+        ) : null}
+        {needsAck ? (
+          <Alert
+            tone="warning"
+            title={`${warnings.length} compliance warning${warnings.length === 1 ? "" : "s"} across ${byPayment.size} payment(s)`}
+          >
+            <p>
+              These do not block the run, but issuing records on every payment below, and in the
+              ledger, that they were known at the moment the money moved.
+            </p>
+            {[...byPayment.entries()].map(([paymentId, bucket]) => (
+              <div key={paymentId} className="mt-2">
+                <p className="text-meta font-semibold">{bucket.label}</p>
+                <FindingList findings={bucket.findings} />
+              </div>
+            ))}
+            <label className="mt-3 flex items-start gap-2 text-meta">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={acknowledged}
+                onChange={(e) => setAcknowledged(e.target.checked)}
+              />
+              <span>
+                I have read every warning above and am issuing this run anyway. Record my
+                acknowledgement against each payment.
+              </span>
+            </label>
+          </Alert>
+        ) : (
+          <p className="text-meta text-content-subtle">
+            No compliance warnings are on file for the vendors in this run, so nothing is
+            acknowledged on your behalf.
+          </p>
         )}
       </div>
     </Modal>

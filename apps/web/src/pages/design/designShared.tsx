@@ -13,7 +13,9 @@
  *     authorisation, readiness) is shown next to the basis the engine used.
  */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { Alert, Badge, Card, CardBody, Tooltip } from "../../ui";
+import { toast } from "sonner";
+import { Alert, Badge, Button, Card, CardBody, Field, Input, Select, Textarea, Tooltip } from "../../ui";
+import { IconEdit } from "../../ui/icons";
 import { cx } from "../../ui/cx";
 import type { Tone } from "../../ui/tokens";
 import { api } from "../../lib/api";
@@ -498,6 +500,10 @@ export interface ChangeNoticeDetail extends ChangeNoticeRow {
   authorisation: AuthorisationVerdict;
   entitlement: Entitlement;
   thresholds: { projectManagerAbove: number; clientAbove: number; boardAbove: number; clientTimeDaysAbove: number };
+  /** the currency the project's change register is kept in (change_events has none of its own) */
+  projectCurrency: string | null;
+  /** the level the READER may sign at, checked server-side against what they hold */
+  heldAuthorisation: { level: string; basis: string };
 }
 
 export interface ReadinessDimension {
@@ -540,6 +546,8 @@ export interface SignalRow {
 
 export interface Summary {
   asOf: string;
+  /** caveats about the roll-up itself, e.g. a row cap that bit on a huge register */
+  notes?: string[];
   packages: { total: number; byStatus: Record<string, number>; byDiscipline: Record<string, number>; frozen: number; approved: number };
   stages: { planned: number; open: number; signedOff: number; current: { stageKey: string; label: string | null } | null };
   reviews: { open: number; overdue: number; total: number; averageTurnaroundDays: Figure; byCode: Record<string, number> };
@@ -655,6 +663,17 @@ export interface SheetOption {
 
 export const EM_DASH = "—";
 export const NOT_AVAILABLE = "Not available";
+
+/**
+ * The DCN authorisation ladder, mirrored from the engine so the workspace can
+ * offer only the levels the reader actually holds. Unknown values sort to the
+ * bottom rather than the top: never assume authority the server did not name.
+ */
+const AUTHORISATION_ORDER = ["design_lead", "project_manager", "client", "board"] as const;
+export function authorisationRank(level: string | null | undefined): number {
+  const index = AUTHORISATION_ORDER.indexOf((level ?? "") as (typeof AUTHORISATION_ORDER)[number]);
+  return index === -1 ? -1 : index;
+}
 
 export function labelize(value: string | null | undefined): string {
   if (!value) return EM_DASH;
@@ -1120,6 +1139,363 @@ export function KeyValue({ items }: { items: Array<{ label: string; value: React
 
 export function optionList<T extends { id: string }>(items: T[], label: (item: T) => string, emptyLabel = "— none —") {
   return [{ value: "", label: emptyLabel }, ...items.map((i) => ({ value: i.id, label: label(i) }))];
+}
+
+/* ========================================================================== */
+/* Correcting a record in place                                                */
+/* ========================================================================== */
+
+export type EditFieldKind = "text" | "textarea" | "date" | "number" | "select";
+
+export interface EditFieldSpec {
+  /** the JSON key the API PATCH expects */
+  key: string;
+  label: string;
+  kind: EditFieldKind;
+  options?: Array<{ value: string; label: string }>;
+  maxLength?: number;
+  rows?: number;
+  placeholder?: string;
+  hint?: string;
+  /** an empty box sends null rather than "" (default true for nullable columns) */
+  nullable?: boolean;
+  /** full width inside the two-column grid */
+  wide?: boolean;
+}
+
+/**
+ * The correction path every register needs and none of them had: a drawer
+ * section that PATCHes the record while it is still editable. The API refuses
+ * once a record is approved, closed, verified or accepted, so this surfaces
+ * that refusal rather than trying to predict it — except where `disabled`
+ * says up front that the record is past editing, which saves a round trip.
+ *
+ * Only fields the user actually changed are sent: a PATCH is what the caller
+ * touched, never a whole-record overwrite.
+ */
+export function EditPanel({
+  title = "Correct this record",
+  hint,
+  path,
+  fields,
+  initial,
+  disabled = false,
+  disabledReason,
+  onSaved,
+}: {
+  title?: string;
+  hint?: string;
+  path: string;
+  fields: readonly EditFieldSpec[];
+  initial: Record<string, unknown>;
+  disabled?: boolean;
+  disabledReason?: string;
+  onSaved: () => void;
+}) {
+  const action = useAction();
+  const [open, setOpen] = useState(false);
+  const toText = useCallback(
+    (value: unknown): string => {
+      if (value === null || value === undefined) return "";
+      if (typeof value === "number") return String(value);
+      if (typeof value === "string") return value.length > 10 && /^\d{4}-\d{2}-\d{2}T/.test(value) ? value.slice(0, 10) : value;
+      return "";
+    },
+    [],
+  );
+  const seed = useCallback(() => {
+    const out: Record<string, string> = {};
+    for (const field of fields) out[field.key] = toText(initial[field.key]);
+    return out;
+  }, [fields, initial, toText]);
+  const [draft, setDraft] = useState<Record<string, string>>(seed);
+
+  useEffect(() => {
+    if (!open) setDraft(seed());
+  }, [open, seed]);
+
+  if (disabled) {
+    return disabledReason ? (
+      <p className="text-2xs italic text-content-subtle">{disabledReason}</p>
+    ) : null;
+  }
+
+  const changed = fields.filter((f) => draft[f.key] !== toText(initial[f.key]));
+
+  async function save() {
+    const payload: Record<string, unknown> = {};
+    for (const field of changed) {
+      const raw = (draft[field.key] ?? "").trim();
+      if (raw === "") payload[field.key] = field.nullable === false ? "" : null;
+      else if (field.kind === "number") {
+        const n = Number(raw);
+        if (!Number.isFinite(n)) continue;
+        payload[field.key] = n;
+      } else payload[field.key] = raw;
+    }
+    if (Object.keys(payload).length === 0) return;
+    const count = Object.keys(payload).length;
+    const r = await action.run("save", () => api.patch(path, payload));
+    if (r) {
+      toast.success(`${count} field${count === 1 ? "" : "s"} corrected`);
+      setOpen(false);
+      onSaved();
+    }
+  }
+
+  return (
+    <div className="rounded-md border border-border-subtle p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-meta font-semibold text-content">{title}</h3>
+          {hint ? <p className="text-2xs text-content-muted">{hint}</p> : null}
+        </div>
+        <Button size="xs" variant="secondary" leadingIcon={IconEdit} onClick={() => setOpen((v) => !v)}>
+          {open ? "Close" : "Edit"}
+        </Button>
+      </div>
+      {open ? (
+        <form
+          className="mt-3 space-y-3"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void save();
+          }}
+        >
+          {action.refusal ? <RefusalNotice refusal={action.refusal} onDismiss={action.clear} /> : null}
+          <div className="grid gap-3 sm:grid-cols-2">
+            {fields.map((field) => (
+              <div key={field.key} className={field.wide || field.kind === "textarea" ? "sm:col-span-2" : undefined}>
+                <Field label={field.label} hint={field.hint}>
+                  {field.kind === "textarea" ? (
+                    <Textarea
+                      rows={field.rows ?? 3}
+                      maxLength={field.maxLength}
+                      value={draft[field.key] ?? ""}
+                      onChange={(e) => setDraft((d) => ({ ...d, [field.key]: e.target.value }))}
+                    />
+                  ) : field.kind === "select" ? (
+                    <Select
+                      value={draft[field.key] ?? ""}
+                      onChange={(e) => setDraft((d) => ({ ...d, [field.key]: e.target.value }))}
+                    >
+                      {(field.options ?? []).map((o) => (
+                        <option key={o.value} value={o.value}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </Select>
+                  ) : (
+                    <Input
+                      type={field.kind === "date" ? "date" : field.kind === "number" ? "number" : "text"}
+                      maxLength={field.maxLength}
+                      placeholder={field.placeholder}
+                      value={draft[field.key] ?? ""}
+                      onChange={(e) => setDraft((d) => ({ ...d, [field.key]: e.target.value }))}
+                    />
+                  )}
+                </Field>
+              </div>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <Button
+              type="submit"
+              size="sm"
+              loading={action.busy === "save"}
+              disabled={changed.length === 0}
+            >
+              {changed.length === 0 ? "Nothing changed" : `Save ${changed.length} change${changed.length === 1 ? "" : "s"}`}
+            </Button>
+            <Button type="button" size="sm" variant="ghost" onClick={() => setOpen(false)}>
+              Cancel
+            </Button>
+          </div>
+        </form>
+      ) : null}
+    </div>
+  );
+}
+
+/* ========================================================================== */
+/* Cross-tool links                                                            */
+/* ========================================================================== */
+
+export interface RecordLinkRow {
+  id: string;
+  fromType: string;
+  fromId: string;
+  toType: string;
+  toId: string;
+  linkKind: string;
+  createdAt: string;
+}
+
+const LINK_TARGET_LABEL: Record<string, string> = {
+  drawing_sheet: "Drawing sheet",
+  bim_model: "BIM model",
+  spec_section: "Specification section",
+  document: "Document",
+  change_event: "Change event",
+  schedule_task: "Schedule task",
+  rfi: "RFI",
+  submittal: "Submittal",
+};
+
+/**
+ * The design record's ties to the rest of the platform, held in `record_links`:
+ * a package to the sheets that carry it, a change notice to the task it moves,
+ * an issue to the model it was found in. The API checks that the target exists
+ * in this project, so a link here points at something real; where the target's
+ * register has not been loaded the panel shows the id rather than inventing a
+ * name for it.
+ */
+export function LinkPanel({
+  base,
+  fromType,
+  fromId,
+  sheets,
+  tasks,
+}: {
+  base: string;
+  fromType: string;
+  fromId: string;
+  sheets: readonly SheetOption[];
+  tasks: readonly TaskOption[];
+}) {
+  const links = useResource<{ items: RecordLinkRow[]; targetTypes: readonly string[] }>(
+    `${base}/links?fromType=${fromType}&fromId=${fromId}`,
+  );
+  const action = useAction();
+  const [open, setOpen] = useState(false);
+  const [toType, setToType] = useState("drawing_sheet");
+  const [toId, setToId] = useState("");
+
+  const targetTypes = links.data?.targetTypes ?? ["drawing_sheet", "schedule_task"];
+
+  function nameFor(link: RecordLinkRow): string {
+    if (link.toType === "drawing_sheet") {
+      const sheet = sheets.find((s) => s.id === link.toId);
+      return sheet ? `${sheet.number} — ${sheet.title}` : link.toId;
+    }
+    if (link.toType === "schedule_task") {
+      const task = tasks.find((t) => t.id === link.toId);
+      return task ? task.name : link.toId;
+    }
+    return link.toId;
+  }
+
+  async function add() {
+    if (!toId.trim()) return;
+    const r = await action.run("link", () =>
+      api.post<{ created?: boolean; reason?: string }>(`${base}/links`, {
+        fromType,
+        fromId,
+        toType,
+        toId: toId.trim(),
+        linkKind: "reference",
+      }),
+    );
+    if (r) {
+      toast.success(r.created === false ? (r.reason ?? "That link already exists.") : "Linked");
+      setToId("");
+      links.reload();
+    }
+  }
+
+  async function remove(linkId: string) {
+    const r = await action.run(`unlink-${linkId}`, () => api.del<{ deleted: string }>(`${base}/links/${linkId}`));
+    if (r) {
+      toast.success("Link removed");
+      links.reload();
+    }
+  }
+
+  const options: Array<{ value: string; label: string }> =
+    toType === "drawing_sheet"
+      ? [{ value: "", label: "— pick a sheet —" }, ...sheets.map((s) => ({ value: s.id, label: `${s.number} — ${s.title}` }))]
+      : toType === "schedule_task"
+        ? [{ value: "", label: "— pick a task —" }, ...tasks.map((t) => ({ value: t.id, label: t.name }))]
+        : [];
+
+  return (
+    <div className="rounded-md border border-border-subtle p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-meta font-semibold text-content">Linked records</h3>
+          <p className="text-2xs text-content-muted">
+            Drawings, models, specifications, tasks and change events this record is tied to.
+          </p>
+        </div>
+        <Button size="xs" variant="secondary" onClick={() => setOpen((v) => !v)}>
+          {open ? "Close" : "Link a record"}
+        </Button>
+      </div>
+
+      {links.error ? <LoadError message={links.error} onRetry={links.reload} /> : null}
+      {action.refusal ? <RefusalNotice refusal={action.refusal} onDismiss={action.clear} /> : null}
+
+      {open ? (
+        <div className="mt-3 grid gap-2 sm:grid-cols-[10rem_1fr_auto]">
+          <Field label="Type">
+            <Select
+              value={toType}
+              onChange={(e) => {
+                setToType(e.target.value);
+                setToId("");
+              }}
+            >
+              {targetTypes.map((t) => (
+                <option key={t} value={t}>
+                  {LINK_TARGET_LABEL[t] ?? labelize(t)}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="Record" hint={options.length === 0 ? "No picker for this type yet — paste the record id." : undefined}>
+            {options.length > 0 ? (
+              <Select value={toId} onChange={(e) => setToId(e.target.value)}>
+                {options.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </Select>
+            ) : (
+              <Input value={toId} onChange={(e) => setToId(e.target.value)} placeholder="record id" />
+            )}
+          </Field>
+          <div className="flex items-end">
+            <Button size="sm" loading={action.busy === "link"} disabled={!toId.trim()} onClick={() => void add()}>
+              Link
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
+      {links.loading && !links.data ? (
+        <p className="mt-2 text-2xs italic text-content-subtle">Loading links…</p>
+      ) : (links.data?.items ?? []).length === 0 ? (
+        <p className="mt-2 text-2xs italic text-content-subtle">Nothing is linked to this record yet.</p>
+      ) : (
+        <ul className="mt-2 divide-y divide-border-subtle">
+          {(links.data?.items ?? []).map((link) => (
+            <li key={link.id} className="flex items-center justify-between gap-3 py-1.5">
+              <div className="min-w-0">
+                <span className="text-2xs uppercase tracking-wide text-content-subtle">
+                  {LINK_TARGET_LABEL[link.toType] ?? labelize(link.toType)}
+                </span>
+                <div className="truncate text-meta text-content">{nameFor(link)}</div>
+              </div>
+              <Button size="xs" variant="ghost" loading={action.busy === `unlink-${link.id}`} onClick={() => void remove(link.id)}>
+                Remove
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 /** The engine's verdict with its basis underneath — never a bare colour. */

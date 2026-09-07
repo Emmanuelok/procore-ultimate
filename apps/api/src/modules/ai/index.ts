@@ -23,14 +23,26 @@
  *   · detector implementations (modules/assurance) — the integrity agents
  *     read what the detectors produced, they do not re-detect.
  *
- * AUTHORISATION NOTE. Company-wide lists (/ai/runs, /ai/review, /agents/*)
- * are filtered to the projects the caller can actually read — see
- * visibility.ts — and never return prompts or model output in a list. The
- * text is available only from the per-run detail route, behind that run's
- * project gate.
+ * AUTHORISATION NOTE. Two rules, applied everywhere:
+ *
+ *  1. Company-wide lists (/ai/runs, /ai/review, /agents/*) are filtered to
+ *     the projects the caller can actually read (visibility.ts) and never
+ *     return prompts, model output, proposals or before/after images in a
+ *     list. Content comes only from a detail route. A company-scoped row
+ *     belongs to a run only an owner/admin could have started, so it is
+ *     listed and shown only to an owner/admin (or, for a run, its requester).
+ *
+ *  2. `ai:standard` is never a gate on OTHER modules' data. Every agent
+ *     declares the tools that own the tables it reads (`requiredTools`), and
+ *     they are enforced at "read" on the run's project before it gathers;
+ *     a legacy single-shot route that reads several modules gates on its
+ *     primary record's tool and DROPS a secondary source the caller may not
+ *     read, reporting the omission instead of quietly including it. Reading a
+ *     run back is gated by the tools its recorded inputRefs belong to, and a
+ *     queue proposal by the tool that owns the data its body quotes.
  */
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
-import { and, count, desc, eq, gte, ilike, inArray, isNull, lt, lte, ne, or } from "drizzle-orm";
+import { and, count, desc, eq, gte, ilike, inArray, isNull, lt, lte, ne, or, sql } from "drizzle-orm";
 import type Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import {
@@ -57,6 +69,7 @@ import {
 import {
   AGENT_AUTHORISATIONS,
   AGENT_REPORT_KINDS,
+  COMPANY_ROLES,
   DRAWING_DISCIPLINES,
   SIGNAL_SEVERITIES,
   SUBMITTAL_RESPONSES,
@@ -69,6 +82,7 @@ import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import {
   claimReviewItem,
+  recordAgentAction,
   revertAction,
   type ActionRow,
   type ReviewRow,
@@ -111,6 +125,7 @@ import {
   type InputRef,
   type SearchCandidate,
 } from "./service.js";
+import { targetTool, toolsForRefs } from "./tools.js";
 import { canSeeProject, visibleProjectIds } from "./visibility.js";
 
 /* ------------------------------------------------------------------ */
@@ -171,7 +186,9 @@ const policyBodySchema = z.object({
   autoApplyMinConfidence: z.number().min(0).max(1).nullable().optional(),
   minConfidence: z.number().min(0).max(1).nullable().optional(),
   allowedTargetTypes: z.array(z.string().max(64)).max(40).optional(),
-  allowedRoles: z.array(z.string().max(32)).max(10).optional(),
+  // A real company role, not free text: a policy naming a role that cannot
+  // exist would silently lock every caller out of the agent.
+  allowedRoles: z.array(z.enum(COMPANY_ROLES)).max(COMPANY_ROLES.length).optional(),
   maxRunsPerDay: z.number().int().min(0).max(100_000).nullable().optional(),
   maxInputTokensPerDay: z.number().int().min(0).max(1_000_000_000).nullable().optional(),
   maxOutputTokensPerDay: z.number().int().min(0).max(1_000_000_000).nullable().optional(),
@@ -372,23 +389,8 @@ export function interleave<T>(groups: T[][], limit: number): T[] {
   return out;
 }
 
-/** Which operational tool must the reviewer hold to apply a proposal? */
-export function targetTool(targetType: string): ToolKey | null {
-  switch (targetType) {
-    case "daily_log":
-      return "daily_logs";
-    case "rfi_response":
-      return "rfis";
-    case "drawing_sheet":
-      return "drawings";
-    case "submittal_review":
-      return "submittals";
-    case "signal_explanation":
-      return "assurance";
-    default:
-      return null;
-  }
-}
+/** Re-exported so the module's public surface is unchanged. */
+export { refTool, targetTool, toolsForRefs } from "./tools.js";
 
 /** List projections: a list never carries prompts, outputs or proposals. */
 function runListView(row: typeof aiRuns.$inferSelect) {
@@ -406,6 +408,42 @@ function runListView(row: typeof aiRuns.$inferSelect) {
     error: row.error ? row.error.slice(0, 300) : null,
     inputRefCount: (row.inputRefs ?? []).length,
     citationCount: (row.citations ?? []).length,
+    createdAt: row.createdAt,
+  };
+}
+
+/**
+ * Action projections: an action's before/after image IS the operational
+ * record content it moved — an RFI's official response, a daily log's
+ * sections, a photo's tags, a budget-quoting comment. A list gated at
+ * `ai:read` must not carry it; the detail route below re-resolves the tool
+ * that owns the target and only then hands the images over.
+ */
+function actionListView(row: ActionRow) {
+  return {
+    id: row.id,
+    companyId: row.companyId,
+    projectId: row.projectId,
+    agentKind: row.agentKind,
+    runId: row.runId,
+    reviewId: row.reviewId,
+    actionType: row.actionType,
+    targetType: row.targetType,
+    targetId: row.targetId,
+    status: row.status,
+    reversible: row.reversible,
+    irreversibleReason: row.irreversibleReason,
+    authorisation: row.authorisation,
+    policyId: row.policyId,
+    confidence: row.confidence,
+    summary: row.summary,
+    appliedBy: row.appliedBy,
+    appliedAt: row.appliedAt,
+    rolledBackBy: row.rolledBackBy,
+    rolledBackAt: row.rolledBackAt,
+    rollbackReason: row.rollbackReason,
+    hasBeforeImage: row.beforeImage !== null && row.beforeImage !== undefined,
+    hasAfterImage: row.afterImage !== null && row.afterImage !== undefined,
     createdAt: row.createdAt,
   };
 }
@@ -455,6 +493,46 @@ export const aiModule: FastifyPluginAsync = async (app) => {
   ): Promise<void> {
     (req.params as Record<string, string>).projectId = projectId;
     await app.requireTool(tool, level)(req, reply);
+  }
+
+  /**
+   * Non-throwing form of the same check.
+   *
+   * A grounded agent reads SEVERAL tables. Refusing the whole run because the
+   * caller lacks one of them would be worse than useless (a superintendent
+   * with no `punch` access would lose the daily-log drafter entirely), and
+   * quietly putting the rows in the prompt anyway is the leak this wave
+   * closed everywhere else. So the secondary sources are dropped per source
+   * and the omission is REPORTED — the reader is told what the agent was not
+   * allowed to look at, rather than being handed a confident answer over a
+   * silently narrower evidence base.
+   */
+  async function holdsProjectTool(
+    req: FastifyRequest,
+    reply: FastifyReply,
+    projectId: string,
+    tool: ToolKey,
+    level: PermissionLevel = "read",
+  ): Promise<boolean> {
+    try {
+      await requireProjectTool(req, reply, projectId, tool, level);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function heldTools(
+    req: FastifyRequest,
+    reply: FastifyReply,
+    projectId: string,
+    tools: ToolKey[],
+  ): Promise<Set<ToolKey>> {
+    const held = new Set<ToolKey>();
+    for (const tool of tools) {
+      if (await holdsProjectTool(req, reply, projectId, tool)) held.add(tool);
+    }
+    return held;
   }
 
   /** Guests never act on AI proposals, whatever the target. */
@@ -560,11 +638,19 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     companyId: string,
     projectId: string,
     query: string,
+    /**
+     * The tools the caller actually holds on this project. Every source the
+     * search reads is owned by one of them, and the answer quotes the rows
+     * verbatim, so a source the caller may not read is not scanned and the
+     * omission is reported in `skipped` rather than silently included.
+     */
+    allowed: Set<ToolKey>,
   ): Promise<{ candidates: SearchCandidate[]; coverage: string[]; skipped: string[] }> {
     const pattern = `%${escapeLike(query)}%`;
+    const empty = Promise.resolve([] as never[]);
 
     const [fileRows, rfiRows, submittalRows] = await Promise.all([
-      app.db
+      !allowed.has("documents") ? empty : app.db
         .select({ id: files.id, name: files.name })
         .from(files)
         .where(
@@ -575,7 +661,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
           ),
         )
         .limit(10),
-      app.db
+      !allowed.has("rfis") ? empty : app.db
         .select({
           id: rfis.id,
           number: rfis.number,
@@ -596,7 +682,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
           ),
         )
         .limit(10),
-      app.db
+      !allowed.has("submittals") ? empty : app.db
         .select({
           id: submittals.id,
           number: submittals.number,
@@ -615,15 +701,27 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     ]);
 
     const cheapCount = fileRows.length + rfiRows.length + submittalRows.length;
-    const coverage = ["rfi", "submittal", "file"];
+    const coverage: string[] = [];
     const skipped: string[] = [];
+    for (const [type, tool] of [
+      ["rfi", "rfis"],
+      ["submittal", "submittals"],
+      ["file", "documents"],
+    ] as Array<[string, ToolKey]>) {
+      if (allowed.has(tool)) coverage.push(type);
+      else skipped.push(`${type} records (you do not have read access to ${tool} on this project)`);
+    }
     let drawingRows: Array<{
       sheetId: string;
       number: string;
       title: string;
       text: string | null;
     }> = [];
-    if (query.length < OCR_MIN_QUERY) {
+    if (!allowed.has("drawings")) {
+      skipped.push(
+        "drawing OCR text (you do not have read access to drawings on this project)",
+      );
+    } else if (query.length < OCR_MIN_QUERY) {
       skipped.push(
         `drawing OCR text (a query shorter than ${OCR_MIN_QUERY} characters is not selective enough to scan it)`,
       );
@@ -688,14 +786,26 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     return { candidates, coverage, skipped };
   }
 
-  app.post("/projects/:projectId/ai/search", { preHandler: aiStandard }, async (req) => {
+  app.post("/projects/:projectId/ai/search", { preHandler: aiStandard }, async (req, reply) => {
     requireAi();
     const body = searchBodySchema.parse(req.body);
     const projectId = req.projectId!;
+    const allowed = await heldTools(req, reply, projectId, [
+      "documents",
+      "rfis",
+      "submittals",
+      "drawings",
+    ]);
+    if (allowed.size === 0) {
+      throw forbidden(
+        "Grounded search reads drawings, documents, RFIs and submittals; you hold none of them on this project",
+      );
+    }
     const { candidates, coverage, skipped } = await collectSearchCandidates(
       req.companyId!,
       projectId,
       body.query,
+      allowed,
     );
 
     if (candidates.length === 0) {
@@ -754,7 +864,9 @@ export const aiModule: FastifyPluginAsync = async (app) => {
 
   app.post(
     "/projects/:projectId/ai/daily-log-draft",
-    { preHandler: aiStandard },
+    // `daily_logs` at read: the prompt carries the previous log's sections
+    // verbatim and the proposal becomes a daily log.
+    { preHandler: [...aiStandard, app.requireTool("daily_logs", "read")] },
     async (req, reply) => {
       requireAi();
       const body = dailyLogBodySchema.parse(req.body);
@@ -763,7 +875,20 @@ export const aiModule: FastifyPluginAsync = async (app) => {
       const offset = await projectOffset(companyId, projectId);
       const { start, end } = dayRange(body.date, offset);
 
-      const dayPhotos = await app.db
+      // The day's activity comes from three other modules. A source the
+      // caller may not read is dropped and reported rather than quietly
+      // summarised into a log they can then read.
+      const may = await heldTools(req, reply, projectId, ["photos", "punch", "rfis"]);
+      const omitted: string[] = [];
+      for (const [label, tool] of [
+        ["photos taken that day", "photos"],
+        ["punch items updated that day", "punch"],
+        ["RFIs created or answered that day", "rfis"],
+      ] as Array<[string, ToolKey]>) {
+        if (!may.has(tool)) omitted.push(`${label} (you do not have read access to ${tool})`);
+      }
+
+      const dayPhotos = !may.has("photos") ? [] : await app.db
         .select({ id: photos.id, caption: photos.caption, aiTags: photos.aiTags })
         .from(photos)
         .where(
@@ -778,7 +903,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
         )
         .limit(50);
 
-      const dayPunch = await app.db
+      const dayPunch = !may.has("punch") ? [] : await app.db
         .select({
           id: punchItems.id,
           number: punchItems.number,
@@ -796,7 +921,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
         )
         .limit(50);
 
-      const dayRfis = await app.db
+      const dayRfis = !may.has("rfis") ? [] : await app.db
         .select({
           id: rfis.id,
           number: rfis.number,
@@ -864,6 +989,9 @@ export const aiModule: FastifyPluginAsync = async (app) => {
       ].join("\n");
       const user = [
         `Log date: ${body.date} (project-local day; window ${start} .. ${end})`,
+        omitted.length
+          ? `These sources were NOT supplied and must not be described: ${omitted.join("; ")}.`
+          : "",
         `Photos captured that day (captions + AI tags):\n${
           dayPhotos.length
             ? dayPhotos
@@ -912,7 +1040,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
         evidenceScore: result.grounding.evidenceScore,
         droppedCitations: result.grounding.dropped,
       });
-      return reply.status(201).send({ runId: result.runId, review });
+      return reply.status(201).send({ runId: result.runId, review, omittedSources: omitted });
     },
   );
 
@@ -922,7 +1050,9 @@ export const aiModule: FastifyPluginAsync = async (app) => {
 
   app.post(
     "/projects/:projectId/ai/rfi-evaluate",
-    { preHandler: aiStandard },
+    // `rfis` at read as well as `ai`: the prompt is the RFI's own question
+    // and answer text, and the proposal it queues answers that RFI.
+    { preHandler: [...aiStandard, app.requireTool("rfis", "read")] },
     async (req, reply) => {
       requireAi();
       const body = rfiEvalBodySchema.parse(req.body);
@@ -951,7 +1081,17 @@ export const aiModule: FastifyPluginAsync = async (app) => {
         );
       }
 
-      const pins = await app.db
+      // The pinned sheets' OCR is drawing content. A caller with rfis:read and
+      // drawings:none gets the evaluation without it, and is told so, rather
+      // than getting the drawing text laundered through the AI route.
+      const omitted: string[] = [];
+      const mayReadDrawings = await holdsProjectTool(req, reply, projectId, "drawings");
+      if (!mayReadDrawings) {
+        omitted.push("pinned drawing sheet OCR (you do not have read access to drawings)");
+      }
+      const pins = !mayReadDrawings
+        ? []
+        : await app.db
         .select({
           sheetId: drawingSheets.id,
           number: drawingSheets.number,
@@ -1023,7 +1163,11 @@ export const aiModule: FastifyPluginAsync = async (app) => {
         `RFI (type=rfi id=${rfi.id}) #${rfi.number}: ${rfi.subject}`,
         `Question:\n${rfi.question}`,
         rfi.proposedSolution ? `Proposed solution by submitter:\n${rfi.proposedSolution}` : "",
-        sheetContext ? `Pinned drawing sheet text (OCR):${sheetContext}` : "No pinned drawing context.",
+        sheetContext
+          ? `Pinned drawing sheet text (OCR):${sheetContext}`
+          : mayReadDrawings
+            ? "No pinned drawing context."
+            : "Pinned drawing context was NOT supplied: the requester does not have drawing access. Say so if the answer would depend on it.",
         linked.length
           ? `Linked records: ${linked.map((l) => `${l.type}:${l.id}`).join(", ")}`
           : "No linked records.",
@@ -1060,7 +1204,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
         evidenceScore: result.grounding.evidenceScore,
         droppedCitations: result.grounding.dropped,
       });
-      return reply.status(201).send({ runId: result.runId, review });
+      return reply.status(201).send({ runId: result.runId, review, omittedSources: omitted });
     },
   );
 
@@ -1070,12 +1214,28 @@ export const aiModule: FastifyPluginAsync = async (app) => {
 
   app.post(
     "/projects/:projectId/ai/submittal-review",
-    { preHandler: aiStandard },
+    // `submittals` at read: the prompt is the submittal, and approval writes
+    // an advisory review comment on it.
+    { preHandler: [...aiStandard, app.requireTool("submittals", "read")] },
     async (req, reply) => {
       requireAi();
       const body = submittalBodySchema.parse(req.body);
       const projectId = req.projectId!;
       const companyId = req.companyId!;
+      // The two secondary sources are owned by other tools: the governing
+      // clause text by `specifications`, the attached documents by
+      // `documents`. Each is omitted rather than laundered, and the omission
+      // is reported and put in front of the model so it cannot claim a
+      // review it could not perform.
+      const omitted: string[] = [];
+      const maySpecs = await holdsProjectTool(req, reply, projectId, "specifications");
+      const mayDocs = await holdsProjectTool(req, reply, projectId, "documents");
+      if (!maySpecs) {
+        omitted.push("the governing specification clause text (you do not have read access to specifications)");
+      }
+      if (!mayDocs) {
+        omitted.push("the attached documents (you do not have read access to documents)");
+      }
 
       const submittal = (
         await app.db
@@ -1095,7 +1255,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
       const attachedIds = (submittal.fileIds ?? []).filter(
         (id): id is string => typeof id === "string",
       );
-      const attached = attachedIds.length
+      const attached = attachedIds.length && mayDocs
         ? await app.db
             .select()
             .from(files)
@@ -1106,7 +1266,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
       // extracted clause text. Without this the agent was reviewing a
       // submittal against a list of file NAMES, which is why its findings
       // could not be grounded.
-      const specRows = submittal.specSection
+      const specRows = submittal.specSection && maySpecs
         ? await app.db
             .select({
               sectionId: specSections.id,
@@ -1146,7 +1306,11 @@ export const aiModule: FastifyPluginAsync = async (app) => {
       }
       blocks.push({
         type: "text",
-        text: specText || "No specification clause text is available for this submittal.",
+        text:
+          specText ||
+          (maySpecs
+            ? "No specification clause text is available for this submittal."
+            : "The governing specification clause text was NOT supplied: the requester does not have specification access."),
       });
 
       let documentsAttached = 0;
@@ -1206,6 +1370,12 @@ export const aiModule: FastifyPluginAsync = async (app) => {
         });
       }
 
+      if (!mayDocs && attachedIds.length > 0) {
+        blocks.push({
+          type: "text",
+          text: `This submittal has ${attachedIds.length} attachment(s) that were NOT supplied to you: the requester does not have document access. Do not claim to have reviewed them.`,
+        });
+      }
       const haveContent = documentsAttached > 0 || specRows.some((s) => Boolean(s.text));
       const system = [
         "You are the ConstructOS submittal review agent. Review the submittal against its specification section using ONLY the supplied context.",
@@ -1245,9 +1415,13 @@ export const aiModule: FastifyPluginAsync = async (app) => {
         evidenceScore: result.grounding.evidenceScore,
         droppedCitations: result.grounding.dropped,
       });
-      return reply
-        .status(201)
-        .send({ runId: result.runId, review, contentReviewed: haveContent, documentsAttached });
+      return reply.status(201).send({
+        runId: result.runId,
+        review,
+        contentReviewed: haveContent,
+        documentsAttached,
+        omittedSources: omitted,
+      });
     },
   );
 
@@ -1257,7 +1431,9 @@ export const aiModule: FastifyPluginAsync = async (app) => {
 
   app.post(
     "/projects/:projectId/ai/sheet-name",
-    { preHandler: aiStandard },
+    // The only source is the drawing revision's title-block OCR, and the
+    // proposal renames a sheet.
+    { preHandler: [...aiStandard, app.requireTool("drawings", "read")] },
     async (req, reply) => {
       requireAi();
       const body = sheetNameBodySchema.parse(req.body);
@@ -1329,7 +1505,13 @@ export const aiModule: FastifyPluginAsync = async (app) => {
   /* /photo-intel (#770, #771)                                         */
   /* ================================================================ */
 
-  app.post("/projects/:projectId/ai/photo-intel", { preHandler: aiStandard }, async (req) => {
+  app.post(
+    "/projects/:projectId/ai/photo-intel",
+    // `photos` at standard as well as `ai`: this route WRITES photos.aiTags /
+    // aiSummary and raises safety signals. Gating it on ai:standard alone let
+    // a member with photos:none overwrite the field team's tags.
+    { preHandler: [...aiStandard, app.requireTool("photos", "standard")] },
+    async (req) => {
     requireAi();
     const body = photoIntelBodySchema.parse(req.body);
     const projectId = req.projectId!;
@@ -1408,6 +1590,13 @@ export const aiModule: FastifyPluginAsync = async (app) => {
       result.grounding.dropped,
     );
 
+    // The write is recorded as an agent action with a before-image, so it
+    // appears in /agents/actions and can be rolled back like every other
+    // operational change an agent causes (#1023). It used to be the one
+    // agent-caused write on the platform with no inverse.
+    const beforeImage = { aiTags: photo.aiTags ?? [], aiSummary: photo.aiSummary };
+    const nowIso = new Date().toISOString();
+    const policy = await loadEffectivePolicy(app, companyId, "photo_intelligence");
     await app.db
       .update(photos)
       .set({
@@ -1415,13 +1604,40 @@ export const aiModule: FastifyPluginAsync = async (app) => {
         aiSummary: parsed.progressSummary ?? photo.aiSummary,
       })
       .where(eq(photos.id, photo.id));
+    const actionId = await recordAgentAction(app.db, {
+      companyId,
+      projectId,
+      agentKind: "photo_intelligence",
+      runId: result.runId,
+      reviewId: null,
+      draft: {
+        actionType: "tag_photo",
+        targetType: "photo",
+        targetId: photo.id,
+        beforeImage,
+        afterImage: { aiTags: parsed.tags, aiSummary: parsed.progressSummary ?? photo.aiSummary },
+        reversible: true,
+        irreversibleReason: null,
+      },
+      appliedBy: req.user!.id,
+      now: nowIso,
+      authorisation: "direct",
+      policyId: policy.policyId,
+      confidence: recorded,
+      summary: `Tagged photo ${photo.id} with ${parsed.tags.length} tag(s)`,
+    });
     await appendLedger(app.db, {
       companyId,
       actorId: req.user!.id,
       action: "update",
       objectType: "photo",
       objectId: photo.id,
-      payload: { aiTags: parsed.tags, aiSummary: parsed.progressSummary, runId: result.runId },
+      payload: {
+        aiTags: parsed.tags,
+        aiSummary: parsed.progressSummary,
+        runId: result.runId,
+        actionId,
+      },
       projectId,
     });
 
@@ -1462,8 +1678,10 @@ export const aiModule: FastifyPluginAsync = async (app) => {
       confidence: recorded,
       modelConfidence: parsed.confidence ?? null,
       signalsCreated,
+      actionId,
     };
-  });
+    },
+  );
 
   /* ================================================================ */
   /* /assist — grounded conversational assistant (#759, #760)          */
@@ -1576,12 +1794,15 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     if (visible !== null && q.projectId && !visible.has(q.projectId)) {
       throw forbidden("You do not have AI access to that project");
     }
+    // Company-scoped proposals come from company-wide runs that gathered
+    // across every project; `gateReviewer` hands one to an owner/admin only,
+    // so the list must not carry their summaries to anyone else.
     const scope =
       visible === null
         ? undefined
         : visible.size === 0
-          ? isNull(aiReviewQueue.projectId)
-          : or(isNull(aiReviewQueue.projectId), inArray(aiReviewQueue.projectId, [...visible]));
+          ? sql`false`
+          : inArray(aiReviewQueue.projectId, [...visible]);
     const where = and(
       eq(aiReviewQueue.companyId, req.companyId!),
       scope,
@@ -1665,7 +1886,16 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     level: PermissionLevel,
   ): Promise<void> {
     refuseGuest(req);
-    if (!row.projectId) return;
+    if (!row.projectId) {
+      // A company-scoped proposal has no project ACL to consult, and the run
+      // behind it gathered records from EVERY project in the tenant (only an
+      // owner/admin can start a company-wide run or schedule one). Company
+      // membership alone is therefore not a gate for reading or approving it.
+      if (req.companyRole !== "owner" && req.companyRole !== "admin") {
+        throw forbidden("A company-wide AI proposal is an owner/admin surface");
+      }
+      return;
+    }
     const tool = targetTool(row.targetType) ?? "ai";
     await requireProjectTool(req, reply, row.projectId, tool, level);
   }
@@ -1946,15 +2176,47 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     return { restored: outcome.restored };
   }
 
+  /**
+   * The gate on ONE agent action, at the level the caller needs.
+   *
+   * Same shape as `gateReviewer`, for the same reason: the before/after image
+   * is the operational record content the agent moved, so the tool that owns
+   * the target owns the action too. A company-scoped action (no project ACL to
+   * consult) belongs to a company-wide run, which only an owner/admin can
+   * start — so only an owner/admin may read it back or reverse it.
+   */
+  async function gateAction(
+    req: FastifyRequest,
+    reply: FastifyReply,
+    action: ActionRow,
+    level: PermissionLevel,
+  ): Promise<void> {
+    refuseGuest(req);
+    if (!action.projectId) {
+      if (req.companyRole !== "owner" && req.companyRole !== "admin") {
+        throw forbidden("A company-wide agent action is an owner/admin surface");
+      }
+      return;
+    }
+    const tool = targetTool(action.targetType) ?? "ai";
+    await requireProjectTool(req, reply, action.projectId, tool, level);
+  }
+
   app.get("/agents/actions", { preHandler: companyGate }, async (req) => {
     const q = actionsQuerySchema.parse(req.query);
     const visible = await visibleProjectIds(app, req);
+    if (visible !== null && q.projectId && !visible.has(q.projectId)) {
+      throw forbidden("You do not have AI access to that project");
+    }
+    // A company-scoped action carries a company-wide run's output; the detail
+    // route hands it only to an owner/admin, so the list must not advertise
+    // it to everyone else either.
     const scope =
       visible === null
         ? undefined
         : visible.size === 0
-          ? isNull(agentActions.projectId)
-          : or(isNull(agentActions.projectId), inArray(agentActions.projectId, [...visible]));
+          ? sql`false`
+          : inArray(agentActions.projectId, [...visible]);
     const where = and(
       eq(agentActions.companyId, req.companyId!),
       scope,
@@ -1972,7 +2234,26 @@ export const aiModule: FastifyPluginAsync = async (app) => {
         .offset(pageOffset(q)),
       app.db.select({ n: count() }).from(agentActions).where(where),
     ]);
-    return paginate(items, Number(totalRow[0]?.n ?? 0), q);
+    return paginate(items.map(actionListView), Number(totalRow[0]?.n ?? 0), q);
+  });
+
+  /** One action WITH its before/after image, behind the owning tool's gate. */
+  app.get("/agents/actions/:id", { preHandler: companyGate }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const [action] = await app.db
+      .select()
+      .from(agentActions)
+      .where(and(eq(agentActions.id, id), eq(agentActions.companyId, req.companyId!)))
+      .limit(1);
+    if (!action) throw notFound("Agent action not found");
+    await gateAction(req, reply, action, "read");
+    return {
+      action: {
+        ...actionListView(action),
+        beforeImage: action.beforeImage ?? null,
+        afterImage: action.afterImage ?? null,
+      },
+    };
   });
 
   app.post("/agents/actions/:id/rollback", { preHandler: companyGate }, async (req, reply) => {
@@ -1984,11 +2265,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
       .where(and(eq(agentActions.id, id), eq(agentActions.companyId, req.companyId!)))
       .limit(1);
     if (!action) throw notFound("Agent action not found");
-    refuseGuest(req);
-    if (action.projectId) {
-      const tool = targetTool(action.targetType) ?? "ai";
-      await requireProjectTool(req, reply, action.projectId, tool, "standard");
-    }
+    await gateAction(req, reply, action, "standard");
     const result = await rollbackAction(req, action, body.reason ?? null, action.reviewId);
     return { id: action.id, status: "rolled_back", restored: result.restored };
   });
@@ -2003,12 +2280,17 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     if (visible !== null && q.projectId && !visible.has(q.projectId)) {
       throw forbidden("You do not have AI access to that project");
     }
+    // A company-scoped run's prompt can hold records from every project, and
+    // GET /ai/runs/:id hands it back only to its requester or an owner/admin.
+    // The list follows the same rule rather than listing rows whose detail is
+    // a 403.
+    const ownCompanyScoped = and(isNull(aiRuns.projectId), eq(aiRuns.requestedBy, req.user!.id));
     const scope =
       visible === null
         ? undefined
         : visible.size === 0
-          ? isNull(aiRuns.projectId)
-          : or(isNull(aiRuns.projectId), inArray(aiRuns.projectId, [...visible]));
+          ? ownCompanyScoped
+          : or(ownCompanyScoped, inArray(aiRuns.projectId, [...visible]));
     const where = and(
       eq(aiRuns.companyId, req.companyId!),
       scope,
@@ -2056,11 +2338,34 @@ export const aiModule: FastifyPluginAsync = async (app) => {
       .where(and(eq(aiRuns.id, id), eq(aiRuns.companyId, req.companyId!)))
       .limit(1);
     if (!run) throw notFound("Run not found");
-    // Prompts carry record content: the gate is the run's own project.
+    // Prompts carry record content: the gate is the run's own project AND the
+    // tools that own the tables the agent read. `ai:read` alone is not a gate
+    // for a cost_forecaster prompt full of budget lines — a field engineer
+    // with budget:none would read every figure their template denies. The
+    // same list that decides who may START the run decides who may read it
+    // back (agents/types.ts `requiredTools`).
     if (run.projectId) {
       await requireProjectTool(req, reply, run.projectId, "ai", "read");
+      const refs = run.inputRefs ?? [];
+      const entry = AGENT_INVENTORY.find((a) => a.kind === run.agentKind);
+      // What this run actually read, when it recorded anything; the agent's
+      // declared tools otherwise (a refused or failed run has no refs).
+      const tools = refs.length > 0 ? toolsForRefs(refs) : (entry?.requiredTools ?? []);
+      for (const tool of tools) {
+        await requireProjectTool(req, reply, run.projectId, tool, "read");
+      }
     } else {
+      // A company-scoped run's prompt can carry records from EVERY project (a
+      // company-wide fleet run gathers across the tenant), and there is no
+      // project ACL to consult. It is readable by the person who asked for it
+      // and by company owners/admins — not by every company member.
       refuseGuest(req);
+      const admin = req.companyRole === "owner" || req.companyRole === "admin";
+      if (!admin && run.requestedBy !== req.user!.id) {
+        throw forbidden(
+          "This company-wide AI run is visible to its requester and to company owners/admins",
+        );
+      }
     }
     const meta = await loadRunMeta(app.db, req.companyId!, run.id);
     const reviews = await app.db
@@ -2189,6 +2494,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
           inputs: a.inputs,
           outputs: a.outputs,
           dataCategories: a.dataCategories,
+          requiredTools: a.requiredTools,
           targetTypes: a.targetTypes,
           consequential: a.consequential,
           runnable: a.runnable,
@@ -2244,8 +2550,48 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     return { policy };
   });
 
+  /**
+   * The two authorisation checks that must happen BEFORE an agent gathers.
+   *
+   *  1. The tenant's policy may restrict a kind to certain company roles
+   *     (#1022). That field was stored, ledgered and rendered but never read,
+   *     which told an administrator a limit was in force when it was not.
+   *  2. The caller must hold every tool that owns the tables the agent reads
+   *     (agents/types.ts `requiredTools`) at level "read" on the run's
+   *     project. The gathered rows land verbatim in `ai_runs.prompt`, which
+   *     anyone with `ai:read` on that project can read back, so gating the
+   *     run on `ai:standard` alone laundered budget, safety and bid data
+   *     around the tool that denies it.
+   */
+  async function authoriseAgentRun(
+    req: FastifyRequest,
+    reply: FastifyReply,
+    def: { kind: string; requiredTools: readonly ToolKey[] },
+    projectId: string | null,
+  ): Promise<void> {
+    const policy = await loadEffectivePolicy(app, req.companyId!, def.kind);
+    if (
+      policy.allowedRoles.length > 0 &&
+      !policy.allowedRoles.includes(req.companyRole ?? "")
+    ) {
+      throw forbidden(
+        `Company policy restricts the "${def.kind}" agent to: ${policy.allowedRoles.join(", ")}`,
+      );
+    }
+    if (!projectId) {
+      // A company-wide run is owner/admin only (see the route gates), and
+      // owners and admins bypass tool levels by design, so there is nothing
+      // narrower to enforce here.
+      return;
+    }
+    for (const tool of def.requiredTools) {
+      await requireProjectTool(req, reply, projectId, tool, "read");
+    }
+  }
+
   async function runFleetAgent(
     req: FastifyRequest,
+    reply: FastifyReply,
     kind: string,
     projectId: string | null,
     params: Record<string, unknown>,
@@ -2263,6 +2609,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     if (def.scope === "project" && !projectId) {
       throw badRequest(`The "${kind}" agent needs a projectId`);
     }
+    await authoriseAgentRun(req, reply, def, projectId);
     const result = await executeAgent({
       app,
       req,
@@ -2303,7 +2650,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
       // run is an owner/admin action.
       await app.requireCompanyRole(["owner", "admin"])(req, reply);
     }
-    const result = await runFleetAgent(req, kind, body.projectId ?? null, body.params);
+    const result = await runFleetAgent(req, reply, kind, body.projectId ?? null, body.params);
     return reply.status(result.skipped ? 200 : 201).send(result);
   });
 
@@ -2313,7 +2660,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     async (req, reply) => {
       const { kind } = req.params as { kind: string };
       const body = projectRunAgentBodySchema.parse(req.body ?? {});
-      const result = await runFleetAgent(req, kind, req.projectId!, body.params);
+      const result = await runFleetAgent(req, reply, kind, req.projectId!, body.params);
       return reply.status(result.skipped ? 200 : 201).send(result);
     },
   );
@@ -2322,12 +2669,17 @@ export const aiModule: FastifyPluginAsync = async (app) => {
   app.get("/agents/runs", { preHandler: companyGate }, async (req) => {
     const q = runsQuerySchema.parse(req.query);
     const visible = await visibleProjectIds(app, req);
+    // A company-scoped run's prompt can hold records from every project, and
+    // GET /ai/runs/:id hands it back only to its requester or an owner/admin.
+    // The list follows the same rule rather than listing rows whose detail is
+    // a 403.
+    const ownCompanyScoped = and(isNull(aiRuns.projectId), eq(aiRuns.requestedBy, req.user!.id));
     const scope =
       visible === null
         ? undefined
         : visible.size === 0
-          ? isNull(aiRuns.projectId)
-          : or(isNull(aiRuns.projectId), inArray(aiRuns.projectId, [...visible]));
+          ? ownCompanyScoped
+          : or(ownCompanyScoped, inArray(aiRuns.projectId, [...visible]));
     const where = and(
       eq(aiRuns.companyId, req.companyId!),
       scope,
@@ -2393,6 +2745,9 @@ export const aiModule: FastifyPluginAsync = async (app) => {
         throw badRequest(`The "${body.agentKind}" agent needs a projectId`);
       }
     }
+    // Scheduled runs have no human actor, so the authorisation moment is HERE:
+    // whoever puts an agent on a clock must be allowed to run it by hand.
+    await authoriseAgentRun(req, reply, def, body.projectId ?? null);
     const row = await createSchedule(app.db, {
       companyId: req.companyId!,
       projectId: body.projectId ?? null,
@@ -2488,7 +2843,16 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     if (!row) throw notFound("Schedule not found");
     if (row.projectId) await requireProjectTool(req, reply, row.projectId, "ai", "standard");
     else await app.requireCompanyRole(["owner", "admin"])(req, reply);
-    return runSchedule(app, row, new Date());
+    const def = getAgentDefinition(row.agentKind);
+    if (def) await authoriseAgentRun(req, reply, def, row.projectId);
+    // runSchedule claims the row first (conditional UPDATE on next_run_at), so
+    // "Run now" and a tick that has just picked the same schedule up cannot
+    // both call the model.
+    const outcome = await runSchedule(app, row, new Date(), { force: true });
+    if (outcome.status === "skipped" && outcome.detail.startsWith("Already running")) {
+      throw conflict(outcome.detail);
+    }
+    return outcome;
   });
 
   /** Manual scheduler cycle for this company (plan §3.2). */
@@ -2501,7 +2865,12 @@ export const aiModule: FastifyPluginAsync = async (app) => {
   /* Governance reports (#1024–#1027)                                  */
   /* ================================================================ */
 
-  app.get("/agents/reports", { preHandler: companyGate }, async (req) => {
+  // Reading is gated exactly like generating (adminGate). A bias report names
+  // the vendors the fleet flags adversely and how often; a validation report
+  // aggregates every project's runs in the tenant. Neither is project-scoped,
+  // so there is no ACL to filter them by — the only honest gate is the one
+  // that already governs who may create them.
+  app.get("/agents/reports", { preHandler: adminGate }, async (req) => {
     const rows = await app.db
       .select()
       .from(agentReports)
@@ -2511,7 +2880,7 @@ export const aiModule: FastifyPluginAsync = async (app) => {
     return { items: rows, kinds: AGENT_REPORT_KINDS };
   });
 
-  app.get("/agents/reports/:id", { preHandler: companyGate }, async (req) => {
+  app.get("/agents/reports/:id", { preHandler: adminGate }, async (req) => {
     const { id } = req.params as { id: string };
     const [row] = await app.db
       .select()
@@ -2548,7 +2917,9 @@ export const aiModule: FastifyPluginAsync = async (app) => {
       const report = await buildValidationReport(app.db, req.companyId!, windowFrom, now);
       data = report as unknown as Record<string, unknown>;
       title = `Model validation report (${q.days} days)`;
-      summary = `${report.totals.runs} run(s) across ${report.agents.length} agent(s); ${report.totals.approved} proposal(s) approved, ${report.totals.rejected} rejected`;
+      summary = `${report.totals.runs} run(s) across ${report.agents.length} agent(s); ${report.totals.approved} proposal(s) approved, ${report.totals.rejected} rejected${
+        report.truncated ? " — PARTIAL: the window was truncated, so no rates are stated" : ""
+      }`;
     }
 
     const id = newId("arep");

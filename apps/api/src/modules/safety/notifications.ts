@@ -72,6 +72,12 @@ export interface NotificationState {
   /** regimes whose deadline has passed with no notification, or a late one */
   missed: string[];
   notified: string[];
+  /**
+   * Regimes that owe a notification but whose deadline cannot be established
+   * from the record. Not a live clock, and not discharged: a reassessment is
+   * what settles them.
+   */
+  needsReview: string[];
   /** every notifiable regime has a recorded notification */
   allDischarged: boolean;
   /** at least one deadline has been passed (whether or not later notified) */
@@ -225,10 +231,17 @@ export function notificationState(input: NotificationStateInput): NotificationSt
         hoursRemaining: null,
       };
     }
+    /* A duty with no establishable deadline. This only happens on a fallback
+     * duty — `regimeDuties` never produces one, because a met rule with no
+     * deadline is a recording duty and owes nothing to an authority. Calling
+     * it `outstanding` gave it a clock that could never expire and could never
+     * be discharged, so the incident could never be closed: an unanswerable
+     * refusal on any row written before the rules engine existed. It is a
+     * request for a human to reassess instead. */
     if (due == null || !Number.isFinite(due)) {
       return {
         ...duty,
-        state: "outstanding",
+        state: "deadline_unknown",
         notifiedAt: null,
         reference: null,
         method: null,
@@ -249,6 +262,16 @@ export function notificationState(input: NotificationStateInput): NotificationSt
   });
 
   const outstanding = states.filter((d) => d.state === "outstanding").map((d) => d.regime);
+  const needsReview = states.filter((d) => d.state === "deadline_unknown").map((d) => d.regime);
+  if (needsReview.length > 0) {
+    reasons.push(
+      `No statutory deadline can be established for ${needsReview.join(", ")}: the incident carries ` +
+        `the regime but no \`reportDueAt\`, which is what a row written before the rules engine ` +
+        `looks like. The duty is real; the clock is not knowable from the record. Reassess the ` +
+        `incident to get the deadline and the rule behind it — the alternative is closing it with ` +
+        `an explicit, recorded override.`,
+    );
+  }
   const missed = states.filter((d) => d.state === "missed" || d.state === "notified_late").map((d) => d.regime);
   const notified = states
     .filter((d) => d.state === "notified" || d.state === "notified_late")
@@ -275,7 +298,14 @@ export function notificationState(input: NotificationStateInput): NotificationSt
     outstanding,
     missed: [...new Set(missed)],
     notified,
-    allDischarged: states.length > 0 && outstanding.length === 0,
+    needsReview,
+    /* Discharged means EVERY duty has a recorded notification. A duty whose
+     * deadline has passed with nothing filed is `missed`, not `outstanding`,
+     * and treating the absence of an outstanding clock as discharge is how the
+     * missed duty would have vanished from the close gate a second time. */
+    allDischarged:
+      states.length > 0 &&
+      states.every((d) => d.state === "notified" || d.state === "notified_late"),
     anyMissed: states.some((d) => d.state === "missed" || d.state === "notified_late"),
     earliestDueAt: live[0]?.dueAt ?? null,
     required: states.length > 0,

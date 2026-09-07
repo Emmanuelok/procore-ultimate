@@ -19,6 +19,7 @@ import {
   Spinner,
 } from "../../ui";
 import { formatDate, formatDateTime } from "../format";
+import AuthenticityPanel from "./AuthenticityPanel";
 import {
   CERTIFICATE_STATUSES,
   Caveat,
@@ -466,6 +467,14 @@ export default function CertificateDrawer({
               {cert.fileId ? "Replace file" : "Upload file"}
             </Button>
           </div>
+
+          {/* ----------------------------- authenticity ----------------------------- */}
+          <AuthenticityPanel
+            projectId={projectId}
+            certificateId={cert.id}
+            hasFile={Boolean(cert.fileId)}
+            onChanged={() => void load()}
+          />
 
           {/* --------------------------------- edit --------------------------------- */}
           <SectionTitle>Amend</SectionTitle>

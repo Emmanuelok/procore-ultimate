@@ -36,6 +36,17 @@ export const isoDateSchema = z
   .refine((s) => !Number.isNaN(Date.parse(s)), "not a real calendar date");
 
 export const timeOfDaySchema = z.string().regex(/^\d{2}:\d{2}$/, "expected HH:MM");
+
+/**
+ * A boolean query flag that means what it says. `z.coerce.boolean()` runs JS
+ * truthiness over the raw query string, so `?inline=false` arrives as `true`
+ * and the caller is answered with the opposite of what they asked for. The
+ * rest of this module compares the string (`q.exceptions === "true"`); this
+ * is the same decision, parsed once.
+ */
+export const boolQuerySchema = z
+  .union([z.boolean(), z.enum(["true", "false", "1", "0", "yes", "no"])])
+  .transform((v) => (typeof v === "boolean" ? v : v === "true" || v === "1" || v === "yes"));
 export const idSchema = z.string().min(1).max(64);
 export const detailSchema = z.record(z.string(), z.unknown());
 export const hoursSchema = z.number().min(0).max(24);

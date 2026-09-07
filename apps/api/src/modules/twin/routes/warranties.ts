@@ -229,13 +229,19 @@ export const warrantyRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  /** Operators and tests can run the expiry sweep on demand. */
+  /**
+   * Operators and tests can run the expiry sweep on demand — for THIS
+   * project only. The route is authorised against :projectId, so running a
+   * company-wide sweep from it would write obligations and fire
+   * notifications on projects the caller has no access to. The company-wide
+   * pass belongs to the scheduler job (twin.warranty-expiry).
+   */
   app.post(
     "/projects/:projectId/warranties/sweep",
     { preHandler: gates.adminGate },
     async (req) => {
-      const result = await sweepWarrantyExpiry(app, req.companyId!, todayISO());
-      return { ...result, ranAt: nowISO() };
+      const result = await sweepWarrantyExpiry(app, req.companyId!, todayISO(), req.projectId!);
+      return { ...result, ranAt: nowISO(), scope: "project", projectId: req.projectId! };
     },
   );
 

@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, gte, ilike, inArray, lte } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, ilike, inArray, lte, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   boqItems,
@@ -48,6 +48,8 @@ import {
   unitsMatch,
   wasteDiversion,
 } from "./carbon.js";
+import { registerEsgJobs, runEsgDetectors } from "./detectors.js";
+import { registerEnvironmentRoutes } from "./routes-environment.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -144,6 +146,13 @@ const entryListQuery = pageQuerySchema.extend({
 const fromBoqSchema = z.object({
   boqId: z.string().min(1),
   budgetId: z.string().min(1).nullable().optional(),
+  /**
+   * "append" (the default) skips bill items that already carry an entry in
+   * this project — a re-run is then a no-op rather than a doubling of the
+   * reported footprint. "replace" is the deliberate re-import: prior entries
+   * for this bill's items are removed inside the same transaction first.
+   */
+  mode: z.enum(["append", "replace"]).optional(),
   mappings: z
     .array(
       z
@@ -218,6 +227,21 @@ type EntryRow = typeof carbonEntries.$inferSelect;
  * waste by stream with diversion-from-landfill (#513-514), and UK Social
  * Value Model commitments reconciled tender-promise against delivery, with
  * proxy financial valuation and a shortfall signal (#527-540).
+ *
+ * `routes-environment.ts` adds the environmental half: consent-limit
+ * monitoring points and readings, environmental incidents with the statutory
+ * notification clock, biodiversity net gain, design-option carbon and
+ * marginal abatement cost (#502-504), transport carbon (A4/A5), the ISO
+ * 14001 evidence register, the GIA writer behind the RICS intensity unit
+ * (#491) and period disclosure assembly for CSRD/ESRS, IFRS S2, TCFD, the
+ * GHG Protocol and modern slavery (#541-546).
+ *
+ * WHAT THIS MODULE DELIBERATELY DOES NOT DO: raise findings on a read, or
+ * report an unevidenced figure as zero. Findings come from the scheduled
+ * `esg.detectors` job as the SYSTEM actor — advisory-locked and
+ * fingerprinted, and re-armed rather than silenced when a carbon target is
+ * revised. A datapoint the platform cannot evidence is reported as
+ * unavailable with the reason.
  */
 export const esgModule: FastifyPluginAsync = async (app) => {
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("esg", "read")];
@@ -383,134 +407,37 @@ export const esgModule: FastifyPluginAsync = async (app) => {
     return out;
   }
 
-  /* ---------------------------- Sweeps ------------------------------ */
+  /* ---------------------------------------------------------------- */
+  /* Detectors                                                         */
+  /* ---------------------------------------------------------------- */
 
-  /**
-   * Lazy carbon-budget exceedance sweep (#495). A budget has no status
-   * column — its state is derived from the entries booked against it — so
-   * the once-only guard is a lookup of the existing signal by budget id in
-   * `evidenceRefs` rather than a status flip. Runs on every budget read and
-   * after every entry mutation, exactly like the finance overdue sweep.
+  /*
+   * The carbon-budget, social-value and environmental detectors used to run
+   * lazily on reads: read the existing signals, compute, insert. With no lock
+   * and no unique key, the two requests this workspace fires in parallel
+   * (summary + list) both saw "no signal yet" and both inserted one, plus two
+   * ledger rows — and a read-only assurance grant became the ledger actor for
+   * a finding it did not make. Signals are the product's integrity feed, so a
+   * duplicate is not cosmetic: it inflates every downstream count.
+   *
+   * They now run as a scheduled job (system actor, advisory-locked,
+   * fingerprinted, self-reconciling when the condition clears — including a
+   * budget target revision, which re-arms the exceedance finding). Reads are
+   * pure; `POST .../esg/detectors/run` triggers a cycle.
    */
-  async function sweepBudgets(companyId: string, projectId: string, actorId: string) {
-    const budgets = await app.db
-      .select()
-      .from(carbonBudgets)
-      .where(and(eq(carbonBudgets.companyId, companyId), eq(carbonBudgets.projectId, projectId)));
-    if (budgets.length === 0) return;
-    const actuals = await budgetActuals(companyId, projectId);
-    const exceeded = budgets.filter(
-      (b) => budgetDrawdown(actuals.get(b.id) ?? 0, b.targetTco2e).status === "exceeded",
-    );
-    if (exceeded.length === 0) return;
-    const raised = await app.db
-      .select({ evidenceRefs: signals.evidenceRefs })
-      .from(signals)
-      .where(
-        and(
-          eq(signals.companyId, companyId),
-          eq(signals.projectId, projectId),
-          eq(signals.detector, "carbon_budget_exceeded"),
-        ),
-      );
-    const already = new Set(
-      raised
-        .map((r) => (r.evidenceRefs as { budgetId?: string } | null)?.budgetId)
-        .filter((v): v is string => !!v),
-    );
-    for (const b of exceeded) {
-      if (already.has(b.id)) continue;
-      const actual = actuals.get(b.id) ?? 0;
-      const { drawdownPercent, remaining } = budgetDrawdown(actual, b.targetTco2e);
-      await app.db.insert(signals).values({
-        id: newId("sig"),
-        companyId,
-        projectId,
-        detector: "carbon_budget_exceeded",
-        severity: "medium",
-        confidence: 1,
-        title: `Carbon budget exceeded — ${b.name} (${drawdownPercent}% of target)`,
-        explanation:
-          `Entries booked against carbon budget "${b.name}"${b.element ? ` (${b.element})` : ""} ` +
-          `total ${round6(actual)} tCO2e against a target of ${b.targetTco2e} tCO2e — an overrun ` +
-          `of ${round6(-remaining)} tCO2e (${drawdownPercent}% drawdown). The baseline for this ` +
-          `element was ${b.baselineTco2e} tCO2e. Reduction against the target is no longer ` +
-          `achievable by omission alone; a design or specification change is required, or the ` +
-          `target must be formally revised and the revision recorded.`,
-        evidenceRefs: { budgetId: b.id, targetTco2e: b.targetTco2e, actualTco2e: round6(actual) },
-      });
-      await appendLedger(app.db, {
-        companyId,
-        actorId,
-        action: "state_change",
-        objectType: "carbon_budget",
-        objectId: b.id,
-        payload: { status: "exceeded", actualTco2e: round6(actual), targetTco2e: b.targetTco2e },
-      });
-    }
-  }
+  registerEsgJobs(app);
 
-  /**
-   * Lazy social-value status sweep (#539-540). Commitment status is partly a
-   * function of the calendar, so it cannot only be recomputed on delivery:
-   * a commitment nobody ever delivered against must still fall into
-   * `at_risk` and then `shortfall` on its own. The shortfall signal is
-   * guarded on the status flip itself, so it fires exactly once.
-   */
-  async function sweepCommitments(companyId: string, projectId: string, actorId: string) {
-    const rows = await app.db
-      .select()
-      .from(socialValueCommitments)
-      .where(
-        and(
-          eq(socialValueCommitments.companyId, companyId),
-          eq(socialValueCommitments.projectId, projectId),
-        ),
-      );
-    const today = todayISO();
-    for (const c of rows) {
-      const next = commitmentStatus(c.deliveredValue, c.targetValue, c.dueDate, today);
-      if (next === c.status) continue;
-      await app.db
-        .update(socialValueCommitments)
-        .set({ status: next, updatedAt: new Date().toISOString() })
-        .where(
-          and(eq(socialValueCommitments.id, c.id), eq(socialValueCommitments.status, c.status)),
-        );
-      if (next === "shortfall") {
-        const shortfall = round2(c.targetValue - c.deliveredValue);
-        const proxyGap =
-          c.proxyValuePerUnit != null ? round2(shortfall * c.proxyValuePerUnit) : null;
-        await app.db.insert(signals).values({
-          id: newId("sig"),
-          companyId,
-          projectId,
-          detector: "social_value_shortfall",
-          severity: "medium",
-          confidence: 1,
-          title: `Social value shortfall — SV-${String(c.number).padStart(4, "0")}: ${c.description.slice(0, 90)}`,
-          explanation:
-            `Commitment SV-${String(c.number).padStart(4, "0")} ("${c.description}") promised ` +
-            `${c.targetValue} ${c.unit} by ${c.dueDate}. ${c.deliveredValue} ${c.unit} have been ` +
-            `evidenced — a shortfall of ${shortfall} ${c.unit} ` +
-            `(${percent(c.deliveredValue, c.targetValue)}% delivered), now more than 30 days past ` +
-            `the due date.` +
-            (proxyGap != null ? ` Proxy financial value not delivered: ${proxyGap}.` : "") +
-            ` Tender commitments are scored obligations: an unremediated shortfall is a ` +
-            `contract-performance issue and, on UK public work, a disclosable one.`,
-          evidenceRefs: { commitmentId: c.id, shortfall, dueDate: c.dueDate },
-        });
-      }
-      await appendLedger(app.db, {
-        companyId,
-        actorId,
-        action: "state_change",
-        objectType: "social_value_commitment",
-        objectId: c.id,
-        payload: { from: c.status, to: next, deliveredValue: c.deliveredValue },
-      });
-    }
-  }
+  /* Environment, biodiversity, options/MACC, transport, EMS, disclosure. */
+  registerEnvironmentRoutes(app);
+
+  app.post(
+    "/projects/:projectId/esg/detectors/run",
+    { preHandler: standardGate },
+    async (req) => {
+      const result = await runEsgDetectors(app.db, req.companyId!, req.projectId!);
+      return { projectId: req.projectId!, ...result };
+    },
+  );
 
   function commitmentView(c: typeof socialValueCommitments.$inferSelect) {
     const progressPercent = percent(c.deliveredValue, c.targetValue);
@@ -655,7 +582,7 @@ export const esgModule: FastifyPluginAsync = async (app) => {
   app.patch("/carbon-factors/:factorId", { preHandler: companyWrite }, async (req) => {
     const { factorId } = req.params as { factorId: string };
     const body = factorPatchSchema.parse(req.body);
-    await fetchFactor(factorId, req.companyId!);
+    const current = await fetchFactor(factorId, req.companyId!);
     // Editing a factor already used would silently restate published tCO2e
     // figures. Supersede it with a new factor instead.
     const used = await factorUsage(factorId);
@@ -680,13 +607,23 @@ export const esgModule: FastifyPluginAsync = async (app) => {
     if (Object.keys(set).length > 0) {
       await app.db.update(carbonFactors).set(set).where(eq(carbonFactors.id, factorId));
     }
+    // the values, not the key names: an emission factor is the multiplier
+    // every tCO2e figure in the project is built on, so a change to it has to
+    // be readable from the ledger without the record beside it
+    const before: Record<string, unknown> = {};
+    const after: Record<string, unknown> = {};
+    for (const key of Object.keys(set)) {
+      before[key] = (current as unknown as Record<string, unknown>)[key];
+      after[key] = set[key];
+    }
     await appendLedger(app.db, {
       companyId: req.companyId!,
       actorId: req.user!.id,
       action: "update",
       objectType: "carbon_factor",
       objectId: factorId,
-      payload: { changed: Object.keys(body) },
+      payload: { before, after },
+      storePayload: true,
     });
     return fetchFactor(factorId, req.companyId!);
   });
@@ -756,7 +693,6 @@ export const esgModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/carbon-budgets", { preHandler: readGate }, async (req) => {
     const q = pageQuerySchema.parse(req.query);
-    await sweepBudgets(req.companyId!, req.projectId!, req.user!.id);
     const where = and(
       eq(carbonBudgets.companyId, req.companyId!),
       eq(carbonBudgets.projectId, req.projectId!),
@@ -788,7 +724,6 @@ export const esgModule: FastifyPluginAsync = async (app) => {
     async (req) => {
       const { budgetId } = req.params as { budgetId: string };
       const budget = await fetchBudget(budgetId, req.companyId!, req.projectId!);
-      await sweepBudgets(req.companyId!, req.projectId!, req.user!.id);
       const actuals = await budgetActuals(req.companyId!, req.projectId!);
       const actualTco2e = actuals.get(budgetId) ?? 0;
       const entries = await app.db
@@ -836,7 +771,6 @@ export const esgModule: FastifyPluginAsync = async (app) => {
         },
         storePayload: true,
       });
-      await sweepBudgets(req.companyId!, req.projectId!, req.user!.id);
       const updated = await fetchBudget(budgetId, req.companyId!, req.projectId!);
       const actuals = await budgetActuals(req.companyId!, req.projectId!);
       const actualTco2e = actuals.get(budgetId) ?? 0;
@@ -959,7 +893,6 @@ export const esgModule: FastifyPluginAsync = async (app) => {
         },
         storePayload: true,
       });
-      await sweepBudgets(req.companyId!, req.projectId!, req.user!.id);
       const created = await fetchEntry(id, req.companyId!, req.projectId!);
       return reply.status(201).send(entryView(created, await factorMapFor([created])));
     },
@@ -1015,91 +948,167 @@ export const esgModule: FastifyPluginAsync = async (app) => {
         .where(eq(boqItems.boqId, boq.id))
         .orderBy(asc(boqItems.path), asc(boqItems.sortOrder));
 
+      /*
+       * A bill item that already has a carbon entry in this project has
+       * already been imported. Without this check, re-running the import —
+       * which the workspace explicitly invites with "Run another import" —
+       * inserted a SECOND entry per item and doubled the reported footprint:
+       * budgets flipped to exceeded, signals were raised against a phantom
+       * overrun and the disclosure CSV double-counted, with nothing anywhere
+       * reconciling or warning. `mode: "replace"` is the deliberate re-run:
+       * it removes this bill's prior entries inside the same transaction.
+       */
+      const itemIds = items.map((i) => i.id);
+      const replace = body.mode === "replace";
+
       const created: string[] = [];
       const skipped: { boqItemId: string; code: string; reason: string; detail: string }[] = [];
       let totalTco2e = 0;
 
-      for (const item of items) {
-        const mapping =
-          body.mappings.find((m) => m.boqItemId === item.id) ??
-          body.mappings.find(
-            (m) => m.boqItemCodePrefix != null && item.code.startsWith(m.boqItemCodePrefix),
-          );
-        if (!mapping) continue; // out of scope for this run — not a skip
-        const factor = factorById.get(mapping.factorId)!;
-        if (item.quantity == null || item.quantity <= 0) {
-          skipped.push({
-            boqItemId: item.id,
-            code: item.code,
-            reason: "no_quantity",
-            detail: "The BoQ item carries no measured quantity",
-          });
-          continue;
-        }
-        if (item.unit == null) {
-          skipped.push({
-            boqItemId: item.id,
-            code: item.code,
-            reason: "no_unit",
-            detail: "The BoQ item carries no unit of measurement",
-          });
-          continue;
-        }
-        if (!unitsMatch(item.unit, factor.unit)) {
-          skipped.push({
-            boqItemId: item.id,
-            code: item.code,
-            reason: "unit_mismatch",
-            detail: `BoQ item is measured in "${item.unit}" but factor "${factor.name}" is published per "${factor.unit}"`,
-          });
-          continue;
-        }
-        const tco2e = computeTco2e(item.quantity, factor.factorKgCo2ePerUnit);
-        const id = newId("cen");
-        await app.db.insert(carbonEntries).values({
-          id,
-          companyId: req.companyId!,
-          projectId: req.projectId!,
-          budgetId: body.budgetId ?? null,
-          description: item.description,
-          // Material quantities taken off the bill are cradle-to-gate product
-          // stage, and purchased goods and services in GHG-Protocol terms.
-          lifecycleModule: "A1-A3",
-          scope: "scope_3",
-          factorId: factor.id,
-          quantity: item.quantity,
-          unit: item.unit,
-          tco2e,
-          boqItemId: item.id,
-          sourceNote: `BoQ ${boq.name} item ${item.code}`,
-          entryDate: todayISO(),
-          createdBy: req.user!.id,
-        });
-        created.push(id);
-        totalTco2e += tco2e;
-      }
+      /*
+       * ONE transaction, holding a per-(company, bill) advisory lock, and the
+       * "what is already imported?" read happens INSIDE it. Two parallel
+       * imports of the same bill — a double-submit, a retry, two engineers —
+       * would otherwise both read "nothing imported yet" and both insert,
+       * doubling the reported footprint: budgets flip to exceeded, the
+       * detector raises a phantom overrun and the disclosure CSV
+       * double-counts, with nothing anywhere reconciling or warning. The lock
+       * serialises them; the prior-entry check then makes the second one a
+       * no-op that reports `already_imported` per item rather than a silent
+       * duplication. `mode: "replace"` is the deliberate re-run: it removes
+       * this bill's prior entries in the same transaction.
+       */
+      const removed = await app.db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtext(${`carbon-import:${req.companyId!}:${boq.id}`}))`,
+        );
+        const priorRows = itemIds.length
+          ? await tx
+              .select({ id: carbonEntries.id, boqItemId: carbonEntries.boqItemId })
+              .from(carbonEntries)
+              .where(
+                and(
+                  eq(carbonEntries.companyId, req.companyId!),
+                  eq(carbonEntries.projectId, req.projectId!),
+                  inArray(carbonEntries.boqItemId, itemIds),
+                ),
+              )
+          : [];
+        const alreadyImported = new Set(
+          replace ? [] : priorRows.map((r) => r.boqItemId).filter((v): v is string => Boolean(v)),
+        );
+        const inserts: (typeof carbonEntries.$inferInsert)[] = [];
 
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "create",
-        objectType: "carbon_entry_bulk",
-        objectId: boq.id,
-        payload: {
-          boqId: boq.id,
-          budgetId: body.budgetId ?? null,
-          created: created.length,
-          skipped: skipped.map((s) => ({ code: s.code, reason: s.reason })),
-          totalTco2e: round6(totalTco2e),
-        },
-        storePayload: true,
+        for (const item of items) {
+          const mapping =
+            body.mappings.find((m) => m.boqItemId === item.id) ??
+            body.mappings.find(
+              (m) => m.boqItemCodePrefix != null && item.code.startsWith(m.boqItemCodePrefix),
+            );
+          if (!mapping) continue; // out of scope for this run — not a skip
+          if (alreadyImported.has(item.id)) {
+            skipped.push({
+              boqItemId: item.id,
+              code: item.code,
+              reason: "already_imported",
+              detail:
+                "This bill item already carries a carbon entry in this project. Re-running would " +
+                'double its footprint; pass mode:"replace" to re-import the bill from scratch.',
+            });
+            continue;
+          }
+          const factor = factorById.get(mapping.factorId)!;
+          if (item.quantity == null || item.quantity <= 0) {
+            skipped.push({
+              boqItemId: item.id,
+              code: item.code,
+              reason: "no_quantity",
+              detail: "The BoQ item carries no measured quantity",
+            });
+            continue;
+          }
+          if (item.unit == null) {
+            skipped.push({
+              boqItemId: item.id,
+              code: item.code,
+              reason: "no_unit",
+              detail: "The BoQ item carries no unit of measurement",
+            });
+            continue;
+          }
+          if (!unitsMatch(item.unit, factor.unit)) {
+            skipped.push({
+              boqItemId: item.id,
+              code: item.code,
+              reason: "unit_mismatch",
+              detail: `BoQ item is measured in "${item.unit}" but factor "${factor.name}" is published per "${factor.unit}"`,
+            });
+            continue;
+          }
+          const tco2e = computeTco2e(item.quantity, factor.factorKgCo2ePerUnit);
+          const id = newId("cen");
+          inserts.push({
+            id,
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            budgetId: body.budgetId ?? null,
+            description: item.description,
+            // Material quantities taken off the bill are cradle-to-gate product
+            // stage, and purchased goods and services in GHG-Protocol terms.
+            lifecycleModule: "A1-A3",
+            scope: "scope_3",
+            factorId: factor.id,
+            quantity: item.quantity,
+            unit: item.unit,
+            tco2e,
+            boqItemId: item.id,
+            sourceNote: `BoQ ${boq.name} item ${item.code}`,
+            entryDate: todayISO(),
+            createdBy: req.user!.id,
+          });
+          created.push(id);
+          totalTco2e += tco2e;
+        }
+
+        let removed = 0;
+        if (replace && priorRows.length > 0) {
+          await tx.delete(carbonEntries).where(
+            inArray(
+              carbonEntries.id,
+              priorRows.map((r) => r.id),
+            ),
+          );
+          removed = priorRows.length;
+        }
+        if (inserts.length > 0) await tx.insert(carbonEntries).values(inserts);
+        await appendLedger(tx, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "create",
+          objectType: "carbon_entry_bulk",
+          objectId: boq.id,
+          projectId: req.projectId!,
+          payload: {
+            boqId: boq.id,
+            budgetId: body.budgetId ?? null,
+            mode: replace ? "replace" : "append",
+            replaced: removed,
+            created: created.length,
+            skipped: skipped.map((s) => ({ code: s.code, reason: s.reason })),
+            totalTco2e: round6(totalTco2e),
+          },
+          storePayload: true,
+        });
+        return removed;
       });
-      await sweepBudgets(req.companyId!, req.projectId!, req.user!.id);
       return reply.status(201).send({
         boqId: boq.id,
+        mode: replace ? "replace" : "append",
+        replaced: removed,
         created: created.length,
         createdIds: created,
         skipped,
+        alreadyImported: skipped.filter((s) => s.reason === "already_imported").length,
         totalTco2e: round6(totalTco2e),
       });
     },
@@ -1189,7 +1198,6 @@ export const esgModule: FastifyPluginAsync = async (app) => {
         },
         storePayload: true,
       });
-      await sweepBudgets(req.companyId!, req.projectId!, req.user!.id);
       const updated = await fetchEntry(entryId, req.companyId!, req.projectId!);
       return entryView(updated, await factorMapFor([updated]));
     },
@@ -1255,7 +1263,6 @@ export const esgModule: FastifyPluginAsync = async (app) => {
   }
 
   app.get("/projects/:projectId/carbon/summary", { preHandler: readGate }, async (req) => {
-    await sweepBudgets(req.companyId!, req.projectId!, req.user!.id);
     const roll = await carbonRollup(req.companyId!, req.projectId!);
     const budgets = await app.db
       .select()
@@ -1515,7 +1522,6 @@ export const esgModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/social-value", { preHandler: readGate }, async (req) => {
     const q = commitmentListQuery.parse(req.query);
-    await sweepCommitments(req.companyId!, req.projectId!, req.user!.id);
     const conds = [
       eq(socialValueCommitments.companyId, req.companyId!),
       eq(socialValueCommitments.projectId, req.projectId!),
@@ -1537,7 +1543,6 @@ export const esgModule: FastifyPluginAsync = async (app) => {
   });
 
   app.get("/projects/:projectId/social-value/summary", { preHandler: readGate }, async (req) => {
-    await sweepCommitments(req.companyId!, req.projectId!, req.user!.id);
     const rows = await app.db
       .select()
       .from(socialValueCommitments)
@@ -1643,8 +1648,6 @@ export const esgModule: FastifyPluginAsync = async (app) => {
     { preHandler: readGate },
     async (req) => {
       const { commitmentId } = req.params as { commitmentId: string };
-      await fetchCommitment(commitmentId, req.companyId!, req.projectId!);
-      await sweepCommitments(req.companyId!, req.projectId!, req.user!.id);
       const commitment = await fetchCommitment(commitmentId, req.companyId!, req.projectId!);
       const deliveries = await app.db
         .select()
@@ -1661,24 +1664,41 @@ export const esgModule: FastifyPluginAsync = async (app) => {
     async (req, reply) => {
       const { commitmentId } = req.params as { commitmentId: string };
       const body = deliveryCreateSchema.parse(req.body);
-      const commitment = await fetchCommitment(commitmentId, req.companyId!, req.projectId!);
+      await fetchCommitment(commitmentId, req.companyId!, req.projectId!);
       await validateEvidence(req.companyId!, req.projectId!, body.evidenceIds ?? []);
       const id = newId("svd");
-      await app.db.insert(socialValueDeliveries).values({
-        id,
-        commitmentId,
-        companyId: req.companyId!,
-        deliveryDate: body.deliveryDate,
-        value: body.value,
-        note: body.note ?? null,
-        evidenceIds: body.evidenceIds ?? [],
-        recordedBy: req.user!.id,
+      /*
+       * `deliveredValue` used to be a read-modify-write: read 40, compute
+       * 40 + x, write it back. Two concurrent deliveries (a double-submit, a
+       * retry, two officers) both read 40 and one increment vanished — and
+       * nothing ever recomputed the field, so the commitment's delivered
+       * total permanently disagreed with the sum of its own deliveries, and
+       * with it the status, the progress percent, the proxy value and the
+       * shortfall signal. It is now DERIVED inside one transaction from
+       * SUM(deliveries), which is the only definition that cannot drift.
+       */
+      const deliveredValue = await app.db.transaction(async (tx) => {
+        await tx.insert(socialValueDeliveries).values({
+          id,
+          commitmentId,
+          companyId: req.companyId!,
+          deliveryDate: body.deliveryDate,
+          value: body.value,
+          note: body.note ?? null,
+          evidenceIds: body.evidenceIds ?? [],
+          recordedBy: req.user!.id,
+        });
+        const [sumRow] = await tx
+          .select({ total: sql<number>`coalesce(sum(${socialValueDeliveries.value}), 0)` })
+          .from(socialValueDeliveries)
+          .where(eq(socialValueDeliveries.commitmentId, commitmentId));
+        const total = round2(Number(sumRow?.total ?? 0));
+        await tx
+          .update(socialValueCommitments)
+          .set({ deliveredValue: total, updatedAt: new Date().toISOString() })
+          .where(eq(socialValueCommitments.id, commitmentId));
+        return total;
       });
-      const deliveredValue = round2(commitment.deliveredValue + body.value);
-      await app.db
-        .update(socialValueCommitments)
-        .set({ deliveredValue, updatedAt: new Date().toISOString() })
-        .where(eq(socialValueCommitments.id, commitmentId));
       await appendLedger(app.db, {
         companyId: req.companyId!,
         actorId: req.user!.id,
@@ -1694,9 +1714,26 @@ export const esgModule: FastifyPluginAsync = async (app) => {
         },
         storePayload: true,
       });
-      // Recompute status (and raise the shortfall signal) through the same
-      // sweep that the read paths use, so there is exactly one status rule.
-      await sweepCommitments(req.companyId!, req.projectId!, req.user!.id);
+      // Status is a pure function of (delivered, target, dueDate, today), so
+      // recompute it here rather than waiting for the next detector cycle.
+      const current = await fetchCommitment(commitmentId, req.companyId!, req.projectId!);
+      const nextStatus = commitmentStatus(
+        current.deliveredValue,
+        current.targetValue,
+        current.dueDate,
+        todayISO(),
+      );
+      if (nextStatus !== current.status) {
+        await app.db
+          .update(socialValueCommitments)
+          .set({ status: nextStatus, updatedAt: new Date().toISOString() })
+          .where(
+            and(
+              eq(socialValueCommitments.id, commitmentId),
+              eq(socialValueCommitments.status, current.status),
+            ),
+          );
+      }
       const updated = await fetchCommitment(commitmentId, req.companyId!, req.projectId!);
       const delivery = await app.db
         .select()

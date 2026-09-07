@@ -425,6 +425,28 @@ export default function PoliciesTab({
                     </Td>
                     <Td className="whitespace-nowrap">
                       <DeadlineChip days={p.daysToExpiry} />
+                      {/*
+                        Renewal is measured against a LEAD TIME, not the expiry
+                        date: a renewal not started with three weeks left has
+                        already failed even though nothing has expired yet.
+                      */}
+                      {p.renewalStatus && p.renewalStatus !== "bound" &&
+                      p.renewalStatus !== "not_renewing" &&
+                      p.daysToExpiry <= 120 ? (
+                        <div
+                          className={`mt-0.5 text-[10px] font-medium ${
+                            p.renewalStatus === "not_started" && p.daysToExpiry <= 30
+                              ? "text-red-700"
+                              : "text-amber-700"
+                          }`}
+                          title="Renewal pipeline stage. Manage it from the Lines & requirements tab."
+                        >
+                          renewal: {p.renewalStatus.replace(/_/g, " ")}
+                        </div>
+                      ) : null}
+                      {p.renewalStatus === "bound" && p.renewedByPolicyId ? (
+                        <div className="mt-0.5 text-[10px] text-emerald-700">renewal bound</div>
+                      ) : null}
                     </Td>
                     <Td className="whitespace-nowrap text-xs">
                       {p.notificationDays === null ? (

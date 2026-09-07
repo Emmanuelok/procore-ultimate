@@ -95,6 +95,16 @@ export const automationRules = pgTable(
     lastRunAt: timestamp("last_run_at", { withTimezone: true, mode: "string" }),
     /** schedule triggers: when the scan last ran for this rule */
     lastScanAt: timestamp("last_scan_at", { withTimezone: true, mode: "string" }),
+    /** how many records the last scan looked at */
+    lastScanCandidates: integer("last_scan_candidates").default(0).notNull(),
+    /**
+     * 1 = the last scan hit the row cap, so live records were NOT looked at.
+     * A capped scan is a partial answer and must be visible: the engine tab
+     * and the rule drawer surface it rather than reporting a silent 0 match.
+     */
+    lastScanTruncated: integer("last_scan_truncated").default(0).notNull(),
+    /** the ordering the last scan used (e.g. "dueDate asc") */
+    lastScanOrderedBy: text("last_scan_ordered_by"),
     lastError: text("last_error"),
     createdBy: text("created_by").notNull(),
     createdAt: createdAt(),

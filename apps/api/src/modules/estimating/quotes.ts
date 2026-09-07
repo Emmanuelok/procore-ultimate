@@ -10,6 +10,13 @@
  *   spread     how far apart the people who did price it are
  *   outliers   whose number is a long way from the pack, in either direction
  *
+ * A row carrying NO price — nothing in the rate column and nothing in the
+ * amount column — is unpriced, not priced at nil. It is kept out of the
+ * median, out of the outlier test and out of the coverage count, and it is
+ * gap-filled at the pack median exactly like a row the bidder never
+ * mentioned. Treating a blank as a zero is how the bidder who priced the
+ * least ends up looking cheapest.
+ *
  * Outliers are flagged by MEDIAN ABSOLUTE DEVIATION rather than by standard
  * deviation, because with three or four bidders one wild number drags a mean
  * and its own standard deviation far enough to hide itself. A row with fewer
@@ -53,6 +60,8 @@ export interface ScopeRowEntry {
   amount: number;
   unitRate: number | null;
   excluded: boolean;
+  /** no rate and no amount: the bidder left this row blank, they did not price it at nil */
+  unpriced: boolean;
   /** |amount − median| ÷ MAD; null when the row has too few prices to judge */
   deviation: number | null;
   outlier: boolean;
@@ -66,6 +75,8 @@ export interface ScopeRow {
   entries: ScopeRowEntry[];
   pricedCount: number;
   excludedCount: number;
+  /** rows a bidder listed but left blank */
+  unpricedCount: number;
   /** quotes that never mentioned this row at all — the real scope gap */
   missingVendors: string[];
   low: number | null;
@@ -89,6 +100,8 @@ export interface QuoteTotal {
   coverage: number;
   pricedRows: number;
   excludedRows: number;
+  /** rows this bidder listed but left blank */
+  unpricedRows: number;
   missingRows: number;
   /** levelledTotal + the pack median for every row this bidder did not price */
   comparableTotal: number | null;
@@ -102,7 +115,14 @@ export interface LevellingResult {
   currency: string | null;
   rows: ScopeRow[];
   totals: QuoteTotal[];
-  scopeGaps: Array<{ scopeKey: string; description: string; missingVendors: string[] }>;
+  scopeGaps: Array<{
+    scopeKey: string;
+    description: string;
+    /** never mentioned the row at all */
+    missingVendors: string[];
+    /** listed the row and left it blank */
+    unpricedVendors: string[];
+  }>;
   outliers: Array<{
     scopeKey: string;
     description: string;
@@ -215,19 +235,26 @@ export function levelQuotes(
         missingVendors.push(q.vendorName);
         continue;
       }
+      const amount = round2(line.amount);
+      const unitRate =
+        line.unitRate === null || line.unitRate === undefined ? null : round4(line.unitRate);
       entries.push({
         quoteId: q.id,
         vendorName: q.vendorName,
         lineId: line.lineId,
-        amount: round2(line.amount),
-        unitRate: line.unitRate === null || line.unitRate === undefined ? null : round4(line.unitRate),
+        amount,
+        unitRate,
         excluded: line.excluded === true,
+        // Nothing in the rate column AND nothing in the amount column is a
+        // row the bidder left blank. A bidder who really means nil records a
+        // rate of 0, and that is still a price.
+        unpriced: line.excluded !== true && amount === 0 && unitRate === null,
         deviation: null,
         outlier: false,
       });
     }
 
-    const priced = entries.filter((e) => !e.excluded);
+    const priced = entries.filter((e) => !e.excluded && !e.unpriced);
     const amounts = priced.map((e) => e.amount);
     const med = median(amounts);
     const mad = medianAbsoluteDeviation(amounts);
@@ -261,9 +288,14 @@ export function levelQuotes(
         ? round4((high - low) / Math.abs(med))
         : null;
 
+    const unpricedCount = entries.filter((e) => e.unpriced).length;
+
     let verdict: string;
     if (priced.length === 0) {
-      verdict = "Nobody priced this row.";
+      verdict =
+        unpricedCount > 0
+          ? `Nobody priced this row; ${unpricedCount} bidder${unpricedCount === 1 ? "" : "s"} listed it and left it blank.`
+          : "Nobody priced this row.";
     } else if (priced.length < minEntries) {
       verdict = `Only ${priced.length} price${priced.length === 1 ? "" : "s"} — too few to call an outlier.`;
     } else if (mad === null || mad === 0) {
@@ -282,6 +314,7 @@ export function levelQuotes(
       entries,
       pricedCount: priced.length,
       excludedCount: entries.filter((e) => e.excluded).length,
+      unpricedCount,
       missingVendors,
       low: low === null ? null : round2(low),
       high: high === null ? null : round2(high),
@@ -300,6 +333,7 @@ export function levelQuotes(
     const levelled = round2(q.quotedTotal + adjustment);
     let priced = 0;
     let excluded = 0;
+    let unpriced = 0;
     let missing = 0;
     let gapFill = 0;
     let gapFillable = true;
@@ -311,6 +345,12 @@ export function levelQuotes(
         else gapFill += row.median;
       } else if (entry.excluded) {
         excluded += 1;
+        if (row.median === null) gapFillable = false;
+        else gapFill += row.median;
+      } else if (entry.unpriced) {
+        // Listed and left blank: worth the same as never mentioning it, so
+        // it is filled from the pack rather than counted as coverage.
+        unpriced += 1;
         if (row.median === null) gapFillable = false;
         else gapFill += row.median;
       } else {
@@ -329,21 +369,29 @@ export function levelQuotes(
       coverage: rows.length === 0 ? 0 : round4(priced / rows.length),
       pricedRows: priced,
       excludedRows: excluded,
+      unpricedRows: unpriced,
       missingRows: missing,
       comparableTotal: comparable,
       comparableBasis:
-        missing + excluded === 0
+        missing + excluded + unpriced === 0
           ? "The bidder priced every scope row; the levelled total is directly comparable."
           : gapFillable
-            ? `${missing + excluded} unpriced or excluded row${missing + excluded === 1 ? "" : "s"} filled at the pack median.`
+            ? `${missing + excluded + unpriced} unpriced, blank or excluded row${missing + excluded + unpriced === 1 ? "" : "s"} filled at the pack median.`
             : "One or more unpriced rows have no pack median to fill from, so no comparable total can be stated.",
     };
   });
   totals.sort((a, b) => (a.comparableTotal ?? a.levelledTotal) - (b.comparableTotal ?? b.levelledTotal));
 
+  // A gap is a row somebody did not price — whether they never mentioned it
+  // or listed it and left it blank. Both cost the same at settlement.
   const scopeGaps = rows
-    .filter((r) => r.missingVendors.length > 0)
-    .map((r) => ({ scopeKey: r.scopeKey, description: r.description, missingVendors: r.missingVendors }));
+    .filter((r) => r.missingVendors.length > 0 || r.unpricedCount > 0)
+    .map((r) => ({
+      scopeKey: r.scopeKey,
+      description: r.description,
+      missingVendors: r.missingVendors,
+      unpricedVendors: r.entries.filter((e) => e.unpriced).map((e) => e.vendorName),
+    }));
 
   return {
     tradePackage: packages.length === 1 ? (packages[0] ?? null) : null,

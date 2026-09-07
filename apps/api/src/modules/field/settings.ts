@@ -14,8 +14,8 @@ import { fieldSettings } from "@constructos/db";
 import type { Db } from "../../lib/db.js";
 import { newId } from "../../lib/ids.js";
 import { appendLedger } from "../../lib/ledger.js";
-import { assertCompanyUsers } from "./access.js";
-import { nowIso } from "./shared.js";
+import { assertCompanyUsers, hasToolAdmin } from "./access.js";
+import { actorOf, nowIso } from "./shared.js";
 
 export const fieldSettingsSchema = z.object({
   escalation: z
@@ -83,6 +83,11 @@ export const fieldSettingsRoutes: FastifyPluginAsync = async (app) => {
       projectId: req.projectId!,
       settings: await loadFieldSettings(app.db, req.companyId!, req.projectId!),
       defaults: DEFAULT_FIELD_SETTINGS,
+      // The UI must offer exactly what the PUT gate accepts. Company-admin is
+      // not the test: a project_manager holds rfis:admin without being a
+      // company admin, and hiding the editor from them made the ladder and
+      // every field knob unreachable for the role that owns them.
+      permissions: { canEdit: await hasToolAdmin(app, actorOf(req), req.projectId!, "rfis") },
     };
   });
 
@@ -122,6 +127,6 @@ export const fieldSettingsRoutes: FastifyPluginAsync = async (app) => {
       storePayload: true,
       projectId: req.projectId!,
     });
-    return { projectId: req.projectId!, settings: body, defaults: DEFAULT_FIELD_SETTINGS };
+    return { projectId: req.projectId!, settings: body, defaults: DEFAULT_FIELD_SETTINGS, permissions: { canEdit: true } };
   });
 };

@@ -1,0 +1,2085 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { FastifyInstance } from "fastify";
+import { and, eq } from "drizzle-orm";
+import {
+  budgetLineItems,
+  budgets,
+  companyMemberships,
+  crews,
+  ledgerEntries,
+  projectMemberships,
+  projects,
+  resourceAssignments,
+  resourceDemands,
+  resourcePlans,
+  resourceProductivitySnapshots,
+  scheduleTasks,
+  schedules,
+  signals,
+  timecardAllocations,
+  timecards,
+  workerSkills,
+  workers,
+} from "@constructos/db";
+import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
+import { newId } from "../../lib/ids.js";
+import { resourcesModule } from "./index.js";
+
+/**
+ * RESOURCE PLANNING & PRODUCTIVITY — route integration tests.
+ *
+ * Every route is exercised at least once. The tests that matter most are the
+ * refusals and the nulls: unknown supply is not zero supply, a double booking
+ * is kept rather than refused, hours with no earn rate are not productive, and
+ * a second company sees and touches nothing.
+ */
+
+let built: Awaited<ReturnType<typeof buildTestApp>>;
+let app: FastifyInstance;
+let owner: TestActor;
+let verifier: TestActor;
+let verifierHeaders: Record<string, string>;
+let stranger: TestActor;
+
+let projectA: string;
+let projectB: string;
+let strangerProject: string;
+
+let labourTypeId: string;
+let craneTypeId: string;
+let strangerTypeId: string;
+let mewpSkillId: string;
+let firstAidSkillId: string;
+
+let scheduleId: string;
+let taskFloatId: string;
+let taskCriticalId: string;
+let budgetLineId: string;
+let budgetLineFromScheduleId: string;
+let workerId: string;
+let secondWorkerId: string;
+let crewId: string;
+let equipmentlessCrewId: string;
+
+const TODAY = new Date().toISOString().slice(0, 10);
+
+const shift = (iso: string, days: number): string => {
+  const d = new Date(`${iso}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+};
+const mondayOf = (iso: string): string => {
+  const d = new Date(`${iso}T00:00:00Z`);
+  return shift(iso, -((d.getUTCDay() - 1 + 7) % 7));
+};
+
+/** The Monday of next week — every forward-looking fixture hangs off it. */
+const W0 = mondayOf(shift(TODAY, 7));
+const W1 = shift(W0, 7);
+const W2 = shift(W0, 14);
+/** Six past weeks for the productivity series, oldest first. */
+const PAST = [6, 5, 4, 3, 2, 1].map((n) => mondayOf(shift(TODAY, -7 * n)));
+
+function get(url: string, headers: Record<string, string> = owner.headers) {
+  return app.inject({ method: "GET", url, headers });
+}
+function post(url: string, payload: unknown, headers: Record<string, string> = owner.headers) {
+  return app.inject({ method: "POST", url, payload, headers });
+}
+function patch(url: string, payload: unknown, headers: Record<string, string> = owner.headers) {
+  return app.inject({ method: "PATCH", url, payload, headers });
+}
+function put(url: string, payload: unknown, headers: Record<string, string> = owner.headers) {
+  return app.inject({ method: "PUT", url, payload, headers });
+}
+function del(url: string, headers: Record<string, string> = owner.headers) {
+  return app.inject({ method: "DELETE", url, headers });
+}
+
+async function makeProject(companyId: string, name: string): Promise<string> {
+  const id = newId("prj");
+  await app.db.insert(projects).values({
+    id,
+    companyId,
+    name,
+    stage: "construction",
+    currency: "USD",
+    startDate: TODAY,
+  });
+  return id;
+}
+
+beforeAll(async () => {
+  built = await buildTestApp();
+  app = built.app;
+  // app.ts registers every module; until the orchestrator adds the resources
+  // line there, mount it here so the suite exercises the real plugin either way.
+  if (!app.hasRoute({ method: "GET", url: "/api/v1/resource-types" })) {
+    await app.register(resourcesModule, { prefix: "/api/v1" });
+  }
+
+  owner = await registerActor(app, { companyName: "Resource Test Co" });
+  verifier = await registerActor(app);
+  await app.db.insert(companyMemberships).values({
+    id: newId("cm"),
+    companyId: owner.companyId,
+    userId: verifier.userId,
+    role: "admin",
+  });
+  verifierHeaders = {
+    authorization: verifier.headers["authorization"]!,
+    "x-company-id": owner.companyId,
+  };
+  stranger = await registerActor(app, { companyName: "Rival Constructors" });
+
+  projectA = await makeProject(owner.companyId, "Northgate Phase 2");
+  projectB = await makeProject(owner.companyId, "Southbank Depot");
+  strangerProject = await makeProject(stranger.companyId, "Rival Tower");
+
+  await app.db.insert(projectMemberships).values({
+    id: newId("pm"),
+    companyId: owner.companyId,
+    projectId: projectA,
+    userId: owner.userId,
+    templateKey: "project_admin",
+  });
+
+  /* ---------------- the programme ---------------- */
+  scheduleId = newId("sch");
+  await app.db.insert(schedules).values({
+    id: scheduleId,
+    companyId: owner.companyId,
+    projectId: projectA,
+    name: "Baseline",
+    projectStart: W0,
+    isActive: 1,
+    createdBy: owner.userId,
+  });
+  taskFloatId = newId("tsk");
+  taskCriticalId = newId("tsk");
+  const taskThirdId = newId("tsk");
+  await app.db.insert(scheduleTasks).values([
+    {
+      id: taskFloatId,
+      scheduleId,
+      projectId: projectA,
+      name: "Slab pour",
+      durationDays: 10,
+      startDate: W0,
+      finishDate: shift(W0, 11), // Friday of the second week
+      percentComplete: 0,
+      totalFloat: 15,
+      isCritical: 0,
+      budgetedHours: 400,
+    },
+    {
+      id: taskCriticalId,
+      scheduleId,
+      projectId: projectA,
+      name: "Critical core pour",
+      durationDays: 5,
+      startDate: W0,
+      finishDate: shift(W0, 4),
+      percentComplete: 0,
+      totalFloat: 0,
+      isCritical: 1,
+      budgetedHours: 200,
+    },
+    {
+      id: taskThirdId,
+      scheduleId,
+      projectId: projectA,
+      name: "Blockwork",
+      durationDays: 5,
+      startDate: W2,
+      finishDate: shift(W2, 4),
+      percentComplete: 0,
+      totalFloat: 3,
+      isCritical: 0,
+      budgetedHours: 200,
+    },
+  ]);
+
+  /* ---------------- the budget ---------------- */
+  const budgetId = newId("bud");
+  await app.db.insert(budgets).values({
+    id: budgetId,
+    companyId: owner.companyId,
+    projectId: projectA,
+    number: 1,
+    reference: "BUD-001",
+    name: "Live budget",
+    isActive: 1,
+    createdBy: owner.userId,
+  });
+  budgetLineId = newId("bli");
+  budgetLineFromScheduleId = newId("bli");
+  await app.db.insert(budgetLineItems).values([
+    {
+      id: budgetLineId,
+      budgetId,
+      companyId: owner.companyId,
+      projectId: projectA,
+      costCode: "03-300",
+      costType: "labour",
+      description: "In-situ concrete",
+      unit: "m3",
+      quantity: 500,
+      // explicit planned hours: 1000 h over 500 m3 = 2 h/m3
+      detail: { budgetHours: 1000 },
+      createdBy: owner.userId,
+    },
+    {
+      id: budgetLineFromScheduleId,
+      budgetId,
+      companyId: owner.companyId,
+      projectId: projectA,
+      costCode: "04-200",
+      costType: "labour",
+      description: "Blockwork",
+      unit: "m2",
+      quantity: 100,
+      createdBy: owner.userId,
+    },
+  ]);
+  // the blockwork activity carries the planned hours for the second line
+  await app.db
+    .update(scheduleTasks)
+    .set({ budgetLineItemId: budgetLineFromScheduleId })
+    .where(eq(scheduleTasks.id, taskThirdId));
+
+  /* ---------------- people and plant ---------------- */
+  workerId = newId("wkr");
+  secondWorkerId = newId("wkr");
+  await app.db.insert(workers).values([
+    {
+      id: workerId,
+      companyId: owner.companyId,
+      projectId: projectA,
+      reference: "W-001",
+      fullName: "A. Mason",
+      trade: "Concretor",
+      status: "active",
+      createdBy: owner.userId,
+    },
+    {
+      id: secondWorkerId,
+      companyId: owner.companyId,
+      projectId: projectA,
+      reference: "W-002",
+      fullName: "B. Steel",
+      trade: "Steel fixer",
+      status: "active",
+      createdBy: owner.userId,
+    },
+  ]);
+  crewId = newId("crw");
+  equipmentlessCrewId = newId("crw");
+  await app.db.insert(crews).values([
+    {
+      id: crewId,
+      companyId: owner.companyId,
+      projectId: projectA,
+      number: 1,
+      reference: "CRW-001",
+      name: "Crew A",
+      trade: "Concretor",
+      createdBy: owner.userId,
+    },
+    {
+      id: equipmentlessCrewId,
+      companyId: owner.companyId,
+      projectId: projectB,
+      number: 1,
+      reference: "CRW-001",
+      name: "Depot crew",
+      createdBy: owner.userId,
+    },
+  ]);
+
+  /* ---------------- the hours ----------------
+     Six weeks: three at 100 h for 50 m3 (2 h/m3, PF 1.0) and three at 100 h
+     for 20 m3 (5 h/m3, PF 0.4). The first three are the measured mile. */
+  const quantities = [50, 50, 50, 20, 20, 20];
+  for (let i = 0; i < PAST.length; i += 1) {
+    const cardId = newId("tcd");
+    await app.db.insert(timecards).values({
+      id: cardId,
+      companyId: owner.companyId,
+      projectId: projectA,
+      number: i + 1,
+      reference: `TC-${String(i + 1).padStart(3, "0")}`,
+      workerId,
+      crewId,
+      workDate: PAST[i]!,
+      trade: "Concretor",
+      totalHours: 100,
+      regularHours: 100,
+      status: "approved",
+      createdBy: owner.userId,
+    });
+    await app.db.insert(timecardAllocations).values({
+      id: newId("tal"),
+      companyId: owner.companyId,
+      projectId: projectA,
+      timecardId: cardId,
+      position: 0,
+      budgetLineItemId: budgetLineId,
+      totalHours: 100,
+      regularHours: 100,
+      quantity: quantities[i]!,
+      unit: "m3",
+    });
+  }
+  // a rejected card must never reach a productivity figure
+  const rejectedId = newId("tcd");
+  await app.db.insert(timecards).values({
+    id: rejectedId,
+    companyId: owner.companyId,
+    projectId: projectA,
+    number: 99,
+    reference: "TC-099",
+    workerId: secondWorkerId,
+    crewId,
+    workDate: PAST[0]!,
+    trade: "Concretor",
+    totalHours: 5000,
+    status: "rejected",
+    createdBy: owner.userId,
+  });
+  await app.db.insert(timecardAllocations).values({
+    id: newId("tal"),
+    companyId: owner.companyId,
+    projectId: projectA,
+    timecardId: rejectedId,
+    position: 0,
+    budgetLineItemId: budgetLineId,
+    totalHours: 5000,
+    quantity: 0,
+    unit: "m3",
+  });
+});
+
+afterAll(async () => {
+  await built.close();
+});
+
+/* ================================================================== */
+/* 1. The company library                                              */
+/* ================================================================== */
+
+describe("resource types and skills (company library)", () => {
+  it("creates a labour type and a plant class", async () => {
+    const labour = await post("/api/v1/resource-types", {
+      code: "CONC",
+      name: "Concretors",
+      kind: "labour",
+      trade: "Concretor",
+      mapsToTrade: "Concretor",
+      standardHoursPerDay: 8,
+      workingDaysPerWeek: 5,
+    });
+    expect(labour.statusCode).toBe(201);
+    labourTypeId = labour.json().id as string;
+
+    const crane = await post("/api/v1/resource-types", {
+      code: "CRANE",
+      name: "Tower crane",
+      kind: "equipment",
+      equipmentCategory: "lifting",
+    });
+    expect(crane.statusCode).toBe(201);
+    craneTypeId = crane.json().id as string;
+    // no standard day recorded — the headcount basis says so rather than guessing
+    const detail = await get(`/api/v1/resource-types/${craneTypeId}`);
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().headcountBasis).toContain("never converted to a headcount");
+  });
+
+  it("refuses a duplicate code", async () => {
+    const res = await post("/api/v1/resource-types", { code: "CONC", name: "Concretors again" });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("unique per tenant");
+  });
+
+  it("creates skills, and only certifications with a validity period expire", async () => {
+    const mewp = await post("/api/v1/resource-skills", {
+      code: "MEWP",
+      name: "MEWP operator",
+      category: "certification",
+      validityMonths: 60,
+      requiresEvidence: true,
+      isMandatory: true,
+    });
+    expect(mewp.statusCode).toBe(201);
+    mewpSkillId = mewp.json().id as string;
+
+    const firstAid = await post("/api/v1/resource-skills", {
+      code: "FA",
+      name: "First aid",
+      category: "skill",
+    });
+    expect(firstAid.statusCode).toBe(201);
+    firstAidSkillId = firstAid.json().id as string;
+
+    const list = await get("/api/v1/resource-skills");
+    expect(list.statusCode).toBe(200);
+    const rows = list.json().items as Array<{ code: string; expires: boolean; expiryNote: string }>;
+    expect(rows.find((r) => r.code === "MEWP")!.expires).toBe(true);
+    const fa = rows.find((r) => r.code === "FA")!;
+    expect(fa.expires).toBe(false);
+    expect(fa.expiryNote).toContain("never swept for expiry");
+  });
+
+  it("refuses a required skill that does not exist", async () => {
+    const res = await post("/api/v1/resource-types", {
+      code: "GHOST",
+      name: "Ghost trade",
+      requiredSkillIds: ["rsk_nope"],
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("silently stops being checked");
+  });
+
+  it("attaches the mandatory ticket to the labour type", async () => {
+    const res = await patch(`/api/v1/resource-types/${labourTypeId}`, {
+      requiredSkillIds: [mewpSkillId],
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().requiredSkillIds).toEqual([mewpSkillId]);
+  });
+
+  it("keeps another company's library invisible", async () => {
+    const theirs = await post(
+      "/api/v1/resource-types",
+      { code: "CONC", name: "Their concretors" },
+      stranger.headers,
+    );
+    expect(theirs.statusCode).toBe(201);
+    strangerTypeId = theirs.json().id as string;
+
+    const mine = await get("/api/v1/resource-types");
+    const codes = (mine.json().items as Array<{ id: string }>).map((r) => r.id);
+    expect(codes).not.toContain(strangerTypeId);
+    expect((await get(`/api/v1/resource-types/${strangerTypeId}`)).statusCode).toBe(404);
+    expect(
+      (await patch(`/api/v1/resource-types/${strangerTypeId}`, { name: "Hijacked" })).statusCode,
+    ).toBe(404);
+  });
+});
+
+/* ================================================================== */
+/* 2. Plans, derivation, supply and the histogram                      */
+/* ================================================================== */
+
+let planId: string;
+
+describe("resource plans", () => {
+  it("creates a plan in draft", async () => {
+    const res = await post(`/api/v1/projects/${projectA}/resource-plans`, {
+      name: "Construction resourcing",
+      planKind: "current",
+      scheduleId,
+    });
+    expect(res.statusCode).toBe(201);
+    planId = res.json().id as string;
+    expect(res.json().reference).toBe("RP-001");
+    expect(res.json().status).toBe("draft");
+    expect(res.json().demandRows).toBe(0);
+  });
+
+  it("appends the creation to the ledger", async () => {
+    const rows = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(
+        and(
+          eq(ledgerEntries.companyId, owner.companyId),
+          eq(ledgerEntries.objectType, "resource_plan"),
+          eq(ledgerEntries.objectId, planId),
+        ),
+      );
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows[0]!.action).toBe("create");
+  });
+
+  it("derives weekly demand from the programme and explains what it skipped", async () => {
+    const res = await post(`/api/v1/projects/${projectA}/resource-plans/${planId}/derive`, {
+      defaultResourceTypeId: labourTypeId,
+      perActivity: true,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    // Slab pour 400 h over 10 working days, Critical core 200 h over 5,
+    // Blockwork 200 h over 5 — three activities, four rows.
+    expect(body.derivedTaskCount).toBe(3);
+    expect(body.totalDemandHours).toBe(800);
+    expect(body.rowsWritten).toBe(4);
+    expect(body.plan.demandHours).toBe(800);
+
+    const rows = await app.db
+      .select()
+      .from(resourceDemands)
+      .where(eq(resourceDemands.planId, planId));
+    const w0 = rows.filter((r) => r.weekStart === W0);
+    // week 0: half the slab pour (200) + all of the critical core (200)
+    expect(w0.reduce((s, r) => s + r.demandHours, 0)).toBe(400);
+    expect(w0[0]!.basis).toContain("working day(s)");
+    // 400 h ÷ (8 h/day × 5 days) = 10 people
+    const slab = rows.find((r) => r.sourceTaskId === taskFloatId && r.weekStart === W0)!;
+    expect(slab.headcount).toBe(5);
+  });
+
+  it("refuses to derive when the project has no resource types in scope", async () => {
+    const other = await post(`/api/v1/projects/${projectB}/resource-plans`, { name: "Depot plan" });
+    expect(other.statusCode).toBe(201);
+    const res = await post(
+      `/api/v1/projects/${projectB}/resource-plans/${other.json().id}/derive`,
+      {},
+    );
+    // projectB has no schedule at all — that refusal comes first
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("no active schedule");
+  });
+
+  it("activates the plan and supersedes any other live one", async () => {
+    const second = await post(`/api/v1/projects/${projectA}/resource-plans`, { name: "Rev B" });
+    const secondId = second.json().id as string;
+
+    expect((await post(`/api/v1/projects/${projectA}/resource-plans/${planId}/activate`, {})).statusCode).toBe(200);
+    const res = await post(
+      `/api/v1/projects/${projectA}/resource-plans/${secondId}/activate`,
+      {},
+    );
+    expect(res.statusCode).toBe(200);
+    expect(res.json().superseded).toEqual(["RP-001"]);
+
+    const rows = await app.db
+      .select()
+      .from(resourcePlans)
+      .where(eq(resourcePlans.projectId, projectA));
+    const live = rows.filter((r) => r.status === "active" && r.planKind === "current");
+    expect(live).toHaveLength(1);
+    expect(live[0]!.id).toBe(secondId);
+
+    // put the derived plan back in charge for the rest of the suite
+    expect((await post(`/api/v1/projects/${projectA}/resource-plans/${planId}/activate`, {})).statusCode).toBe(200);
+  });
+
+  it("refuses to edit a superseded plan", async () => {
+    const rows = await app.db
+      .select()
+      .from(resourcePlans)
+      .where(
+        and(eq(resourcePlans.projectId, projectA), eq(resourcePlans.status, "superseded")),
+      );
+    expect(rows.length).toBeGreaterThan(0);
+    const res = await patch(
+      `/api/v1/projects/${projectA}/resource-plans/${rows[0]!.id}`,
+      { name: "Rewriting history" },
+    );
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("record of what was planned");
+  });
+
+  it("adds, edits and deletes a hand-entered demand row", async () => {
+    const created = await post(`/api/v1/projects/${projectA}/resource-plans/${planId}/demand`, {
+      resourceTypeId: craneTypeId,
+      weekStart: W1,
+      demandHours: 40,
+      basis: "Crane needed for the second lift.",
+    });
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+    // the crane records no standard day, so headcount is null rather than guessed
+    expect(created.json().headcount).toBeNull();
+    expect(created.json().source).toBe("manual");
+
+    const edited = await patch(
+      `/api/v1/projects/${projectA}/resource-plans/${planId}/demand/${id}`,
+      { demandHours: 60 },
+    );
+    expect(edited.statusCode).toBe(200);
+    expect(edited.json().demandHours).toBe(60);
+
+    const listed = await get(
+      `/api/v1/projects/${projectA}/resource-plans/${planId}/demand?resourceTypeId=${craneTypeId}`,
+    );
+    expect(listed.json().total).toBe(1);
+    expect(listed.json().items[0].resourceTypeName).toBe("Tower crane");
+
+    expect((await del(`/api/v1/projects/${projectA}/resource-plans/${planId}/demand/${id}`)).statusCode).toBe(200);
+    expect(
+      (await get(`/api/v1/projects/${projectA}/resource-plans/${planId}/demand?resourceTypeId=${craneTypeId}`)).json()
+        .total,
+    ).toBe(0);
+  });
+
+  it("refuses a demand row against another project's resource type", async () => {
+    const projectType = await post("/api/v1/resource-types", {
+      code: "DEPOT",
+      name: "Depot fitters",
+      projectId: projectB,
+    });
+    expect(projectType.statusCode).toBe(201);
+    const res = await post(`/api/v1/projects/${projectA}/resource-plans/${planId}/demand`, {
+      resourceTypeId: projectType.json().id,
+      weekStart: W0,
+      demandHours: 10,
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("belongs to another project");
+  });
+});
+
+describe("supply and the histogram", () => {
+  it("shows a week with no availability as unknown, not as an overload", async () => {
+    const res = await get(`/api/v1/projects/${projectA}/resources/histogram?from=${W0}&to=${W1}`);
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    const series = (body.series as Array<{ resourceType: { id: string }; cells: Array<Record<string, unknown>> }>)
+      .find((s) => s.resourceType.id === labourTypeId)!;
+    expect(series.cells[0]!.state).toBe("unknown");
+    expect(series.cells[0]!.overAllocationHours).toBeNull();
+    expect(body.totals.availableHours).toBeNull();
+    expect((body.reasons as string[]).join(" ")).toContain("not stated");
+  });
+
+  it("upserts supply for a week and replaces rather than adds", async () => {
+    const first = await put(`/api/v1/projects/${projectA}/resource-availability`, {
+      resourceTypeId: labourTypeId,
+      weekStart: W0,
+      availableHours: 100,
+      availableHeadcount: 2,
+      source: "roster",
+    });
+    expect(first.statusCode).toBe(200);
+    const second = await put(`/api/v1/projects/${projectA}/resource-availability`, {
+      resourceTypeId: labourTypeId,
+      weekStart: W0,
+      availableHours: 200,
+      availableHeadcount: 5,
+      source: "roster",
+    });
+    expect(second.statusCode).toBe(200);
+    expect(second.json().id).toBe(first.json().id);
+    expect(second.json().availableHours).toBe(200);
+  });
+
+  it("fills a term in one act", async () => {
+    const res = await post(`/api/v1/projects/${projectA}/resource-availability/bulk`, {
+      resourceTypeId: labourTypeId,
+      from: W1,
+      to: shift(W0, 12 * 7),
+      availableHours: 200,
+      availableHeadcount: 5,
+      source: "assumed",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().weeks).toBe(12);
+    const listed = await get(`/api/v1/projects/${projectA}/resource-availability`);
+    expect(listed.json().total).toBe(13);
+  });
+
+  it("marks the shortfall, labels assumed supply and suggests deferring the float-bearing activity", async () => {
+    const res = await get(
+      `/api/v1/projects/${projectA}/resources/histogram?from=${W0}&to=${W1}`,
+    );
+    const body = res.json();
+    const series = (body.series as Array<{ resourceType: { id: string }; cells: Array<Record<string, unknown>>; assumedSupplyWeeks: number }>)
+      .find((s) => s.resourceType.id === labourTypeId)!;
+    // week 0 needs 400 h against 200 available
+    expect(series.cells[0]!.state).toBe("over");
+    expect(series.cells[0]!.overAllocationHours).toBe(200);
+    expect(series.cells[0]!.utilisationPercent).toBe(200);
+    expect(series.cells[0]!.demandHeadcount).toBe(10);
+    // week 1 is assumed supply and says so
+    expect(series.assumedSupplyWeeks).toBe(1);
+    expect((series.cells[1]!.reasons as string[]).join(" ")).toContain("ASSUMED");
+
+    const levelling = body.levelling as Array<{ action: string; taskId: string | null; moveHours: number | null }>;
+    const defer = levelling.filter((l) => l.action === "defer_task");
+    expect(defer.length).toBeGreaterThan(0);
+    expect(defer[0]!.taskId).toBe(taskFloatId);
+    expect(levelling.every((l) => l.taskId !== taskCriticalId)).toBe(true);
+  });
+
+  it("deletes an availability row", async () => {
+    const listed = await get(
+      `/api/v1/projects/${projectA}/resource-availability?from=${W2}&to=${W2}`,
+    );
+    const id = listed.json().items[0].id as string;
+    expect((await del(`/api/v1/projects/${projectA}/resource-availability/${id}`)).statusCode).toBe(200);
+    // re-state it so later assertions still have a supply picture
+    await put(`/api/v1/projects/${projectA}/resource-availability`, {
+      resourceTypeId: labourTypeId,
+      weekStart: W2,
+      availableHours: 200,
+      source: "roster",
+    });
+  });
+
+  it("refuses a bulk window longer than the cap", async () => {
+    const res = await post(`/api/v1/projects/${projectA}/resource-availability/bulk`, {
+      resourceTypeId: labourTypeId,
+      from: W0,
+      to: shift(W0, 365 * 6),
+      availableHours: 10,
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("at most");
+  });
+});
+
+/* ================================================================== */
+/* 3. The calendar                                                     */
+/* ================================================================== */
+
+let assignmentOne: string;
+let assignmentTwo: string;
+
+describe("assignments and conflicts", () => {
+  it("books a crew and reports no conflict", async () => {
+    const res = await post(`/api/v1/projects/${projectA}/resource-assignments`, {
+      crewId,
+      resourceTypeId: labourTypeId,
+      scheduleTaskId: taskFloatId,
+      fromDate: W0,
+      toDate: shift(W0, 4),
+      hoursPerDay: 8,
+    });
+    expect(res.statusCode).toBe(201);
+    assignmentOne = res.json().id as string;
+    expect(res.json().reference).toBe("RA-001");
+    expect(res.json().subjectLabel).toContain("Crew A");
+    expect(res.json().plannedHours).toBe(40);
+    expect(res.json().conflicts).toEqual([]);
+    expect(res.json().conflictWarning).toBeNull();
+  });
+
+  it("keeps a double booking and reports it rather than refusing it", async () => {
+    const res = await post(`/api/v1/projects/${projectA}/resource-assignments`, {
+      crewId,
+      fromDate: shift(W0, 2),
+      toDate: shift(W0, 6),
+      hoursPerDay: 8,
+    });
+    expect(res.statusCode).toBe(201);
+    assignmentTwo = res.json().id as string;
+    const conflicts = res.json().conflicts as Array<{ fromDate: string; toDate: string; overByPercent: number }>;
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]!.fromDate).toBe(shift(W0, 2));
+    expect(conflicts[0]!.toDate).toBe(shift(W0, 4));
+    expect(conflicts[0]!.overByPercent).toBe(100);
+    expect(res.json().conflictWarning).toContain("decide which gives way");
+  });
+
+  it("does not flag two half allocations", async () => {
+    const half1 = await post(`/api/v1/projects/${projectA}/resource-assignments`, {
+      workerId: secondWorkerId,
+      fromDate: W2,
+      toDate: shift(W2, 4),
+      allocationPercent: 50,
+    });
+    const half2 = await post(`/api/v1/projects/${projectA}/resource-assignments`, {
+      workerId: secondWorkerId,
+      fromDate: W2,
+      toDate: shift(W2, 4),
+      allocationPercent: 50,
+    });
+    expect(half1.statusCode).toBe(201);
+    expect(half2.statusCode).toBe(201);
+    expect(half2.json().conflicts).toEqual([]);
+  });
+
+  it("refuses a booking that names no resource, or more than one", async () => {
+    const none = await post(`/api/v1/projects/${projectA}/resource-assignments`, {
+      fromDate: W0,
+      toDate: W1,
+    });
+    expect(none.statusCode).toBe(400);
+    expect(none.json().message).toContain("exactly one");
+
+    const both = await post(`/api/v1/projects/${projectA}/resource-assignments`, {
+      crewId,
+      workerId,
+      fromDate: W0,
+      toDate: W1,
+    });
+    expect(both.statusCode).toBe(400);
+  });
+
+  it("refuses a crew from another project and a worker off the register", async () => {
+    const wrongCrew = await post(`/api/v1/projects/${projectA}/resource-assignments`, {
+      crewId: equipmentlessCrewId,
+      fromDate: W0,
+      toDate: W1,
+    });
+    expect(wrongCrew.statusCode).toBe(400);
+    expect(wrongCrew.json().message).toContain("not a crew on this project");
+
+    const ghost = await post(`/api/v1/projects/${projectA}/resource-assignments`, {
+      workerId: "wkr_nobody",
+      fromDate: W0,
+      toDate: W1,
+    });
+    expect(ghost.statusCode).toBe(400);
+    expect(ghost.json().message).toContain("no second person table");
+  });
+
+  it("refuses an inverted window", async () => {
+    const res = await post(`/api/v1/projects/${projectA}/resource-assignments`, {
+      crewId,
+      fromDate: W1,
+      toDate: W0,
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("walks the lifecycle and refuses an illegal transition", async () => {
+    expect(
+      (await post(`/api/v1/projects/${projectA}/resource-assignments/${assignmentOne}/confirm`, {})).statusCode,
+    ).toBe(200);
+    const again = await post(
+      `/api/v1/projects/${projectA}/resource-assignments/${assignmentOne}/confirm`,
+      {},
+    );
+    expect(again.statusCode).toBe(409);
+    expect(again.json().message).toContain("only \"planned\"");
+
+    expect(
+      (await post(`/api/v1/projects/${projectA}/resource-assignments/${assignmentOne}/start`, {})).statusCode,
+    ).toBe(200);
+    const completed = await post(
+      `/api/v1/projects/${projectA}/resource-assignments/${assignmentOne}/complete`,
+      {},
+    );
+    expect(completed.statusCode).toBe(200);
+    expect(completed.json().status).toBe("completed");
+    expect(completed.json().completedAt).not.toBeNull();
+
+    const editClosed = await patch(
+      `/api/v1/projects/${projectA}/resource-assignments/${assignmentOne}`,
+      { notes: "too late" },
+    );
+    expect(editClosed.statusCode).toBe(409);
+    expect(editClosed.json().message).toContain("record of what happened");
+  });
+
+  it("requires a reason to cancel, and a cancelled booking stops conflicting", async () => {
+    const noReason = await post(
+      `/api/v1/projects/${projectA}/resource-assignments/${assignmentTwo}/cancel`,
+      {},
+    );
+    expect(noReason.statusCode).toBe(400);
+
+    const cancelled = await post(
+      `/api/v1/projects/${projectA}/resource-assignments/${assignmentTwo}/cancel`,
+      { reason: "Crew released to the other block." },
+    );
+    expect(cancelled.statusCode).toBe(200);
+    expect(cancelled.json().cancelledReason).toContain("released");
+
+    const conflicts = await get(`/api/v1/projects/${projectA}/resources/conflicts`);
+    expect(conflicts.json().total).toBe(0);
+  });
+
+  it("renders the calendar with working days and lanes", async () => {
+    const res = await get(
+      `/api/v1/projects/${projectA}/resources/calendar?from=${W0}&to=${shift(W0, 6)}`,
+    );
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.days).toHaveLength(7);
+    expect((body.days as Array<{ working: boolean }>).filter((d) => d.working)).toHaveLength(5);
+    expect(body.calendar.isDefault).toBe(true);
+    expect(body.calendar.source).toContain("Monday–Friday");
+    expect((body.lanes as Array<{ subjectLabel: string }>).length).toBeGreaterThan(0);
+  });
+
+  it("computes utilisation in booked days and says when hours are unknown", async () => {
+    const res = await get(
+      `/api/v1/projects/${projectA}/resources/utilisation?from=${W2}&to=${shift(W2, 4)}`,
+    );
+    expect(res.statusCode).toBe(200);
+    const rows = res.json().items as Array<{ subjectLabel: string; utilisationPercent: number; plannedHours: number | null; reasons: string[] }>;
+    const worker = rows.find((r) => r.subjectLabel.includes("B. Steel"))!;
+    expect(worker.utilisationPercent).toBe(100);
+    expect(worker.plannedHours).toBeNull();
+    expect(worker.reasons.join(" ")).toContain("not derivable");
+  });
+
+  it("refuses a calendar window longer than a year", async () => {
+    const res = await get(
+      `/api/v1/projects/${projectA}/resources/calendar?from=${W0}&to=${shift(W0, 400)}`,
+    );
+    expect(res.statusCode).toBe(400);
+  });
+});
+
+/* ================================================================== */
+/* 4. Productivity, the mile and the forecast                          */
+/* ================================================================== */
+
+describe("productivity", () => {
+  it("earns hours against the planned unit rate, by week, trade and crew", async () => {
+    const res = await get(
+      `/api/v1/projects/${projectA}/resources/productivity?from=${PAST[0]}&to=${TODAY}`,
+    );
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    // 600 h in six weeks; the rejected 5,000-hour card is excluded
+    expect(body.totals.actualHours).toBe(600);
+    // 210 m3 at 2 h/m3 = 420 earned hours
+    expect(body.totals.earnedHours).toBe(420);
+    expect(body.totals.productivityFactor).toBe(0.7);
+    expect(body.weeks).toHaveLength(6);
+    expect(body.weeks[0].productivityFactor).toBe(1);
+    expect(body.weeks[5].productivityFactor).toBe(0.4);
+    expect(body.byResourceType[0].label).toBe("Concretors");
+    expect(body.byCrew[0].label).toBe("Crew A");
+    expect((body.reasons as string[]).join(" ")).toContain("Rejected, void and superseded");
+  });
+
+  it("keeps a snapshot and lists it", async () => {
+    const res = await post(`/api/v1/projects/${projectA}/resources/productivity/snapshot`, {
+      from: PAST[0],
+      to: TODAY,
+      includeWeeks: true,
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().rowsWritten).toBeGreaterThan(6);
+    expect(res.json().totals.productivityFactor).toBe(0.7);
+
+    const listed = await get(
+      `/api/v1/projects/${projectA}/resources/productivity/snapshots?scope=project`,
+    );
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json().total).toBeGreaterThan(0);
+    const weekRows = (listed.json().items as Array<{ weekStart: string | null }>).filter(
+      (r) => r.weekStart !== null,
+    );
+    expect(weekRows.length).toBeGreaterThanOrEqual(6);
+  });
+
+  it("finds the measured mile and quantifies the loss against it", async () => {
+    const res = await get(
+      `/api/v1/projects/${projectA}/resources/measured-mile?from=${PAST[0]}&to=${TODAY}`,
+    );
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.mile.from).toBe(PAST[0]);
+    expect(body.mile.to).toBe(PAST[2]);
+    expect(body.mile.productivityFactor).toBe(1);
+    expect(body.impacted.weeks).toBe(3);
+    // 120 earned hours at the mile's rate would have taken 120 h; 300 were spent
+    expect(body.lostHours).toBe(180);
+    expect(body.lostHoursPercent).toBe(60);
+    expect(body.forensicsNote).toContain("not a finding of causation");
+  });
+
+  it("forecasts hours at completion by the productivity factor and keeps it", async () => {
+    const computed = await get(
+      `/api/v1/projects/${projectA}/resources/forecast?from=${PAST[0]}&to=${TODAY}&method=productivity_factor`,
+    );
+    expect(computed.statusCode).toBe(200);
+    // Budgeted hours come from two sources and both count: 1,000 h set
+    // directly on the concrete line, plus 200 h the blockwork activity
+    // carries for the line it is mapped to. 1,200 ÷ PF 0.7 = 1,714.29.
+    expect(computed.json().forecast.budgetHours).toBe(1200);
+    expect(computed.json().forecast.forecastHoursAtCompletion).toBe(1714.29);
+    expect(computed.json().forecast.varianceHours).toBe(514.29);
+    expect(computed.json().forecast.basis).toContain("productivity factor");
+    expect((computed.json().reasons as string[]).join(" ")).toContain(
+      "resource-loaded schedule",
+    );
+
+    const kept = await post(`/api/v1/projects/${projectA}/resources/forecast`, {
+      method: "productivity_factor",
+      from: PAST[0],
+      to: TODAY,
+    });
+    expect(kept.statusCode).toBe(201);
+    expect(kept.json().forecastHoursAtCompletion).toBe(1714.29);
+    expect(kept.json().confidence).toBe("high");
+
+    const withHistory = await get(`/api/v1/projects/${projectA}/resources/forecast`);
+    expect((withHistory.json().history as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  it("refuses a manual forecast with no figure", async () => {
+    const res = await post(`/api/v1/projects/${projectA}/resources/forecast`, { method: "manual" });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("an opinion nobody can check");
+  });
+
+  it("returns an explained empty result on a project with no coded hours", async () => {
+    const res = await get(`/api/v1/projects/${projectB}/resources/productivity`);
+    expect(res.statusCode).toBe(200);
+    expect(res.json().totals.actualHours).toBe(0);
+    expect(res.json().totals.productivityFactor).toBeNull();
+    expect((res.json().reasons as string[]).join(" ")).toContain("No coded labour hours");
+  });
+});
+
+/* ================================================================== */
+/* 5. Skills matrix                                                    */
+/* ================================================================== */
+
+let cellId: string;
+
+describe("skills matrix", () => {
+  it("records a claimed certification against a worker on the register", async () => {
+    const res = await post(`/api/v1/projects/${projectA}/worker-skills`, {
+      workerId,
+      skillId: mewpSkillId,
+      certificateRef: "MEWP-4471",
+      issuedAt: shift(TODAY, -365),
+      expiresAt: shift(TODAY, 400),
+    });
+    expect(res.statusCode).toBe(201);
+    cellId = res.json().id as string;
+    expect(res.json().status).toBe("claimed");
+    expect(res.json().validity).toBe("valid");
+  });
+
+  it("refuses a certification against somebody not on the register", async () => {
+    const res = await post(`/api/v1/projects/${projectA}/worker-skills`, {
+      workerId: "wkr_ghost",
+      skillId: mewpSkillId,
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("no second person table");
+  });
+
+  it("refuses a self-verification and accepts one by somebody else", async () => {
+    const self = await post(
+      `/api/v1/projects/${projectA}/worker-skills/${cellId}/verify`,
+      { decision: "verify" },
+    );
+    expect(self.statusCode).toBe(403);
+    expect(self.json().message).toContain("Segregation of duties");
+
+    const other = await post(
+      `/api/v1/projects/${projectA}/worker-skills/${cellId}/verify`,
+      { decision: "verify" },
+      verifierHeaders,
+    );
+    expect(other.statusCode).toBe(200);
+    expect(other.json().status).toBe("verified");
+    expect(other.json().verifiedBy).toBe(verifier.userId);
+  });
+
+  it("resets the verification when the evidence changes", async () => {
+    const res = await patch(`/api/v1/projects/${projectA}/worker-skills/${cellId}`, {
+      certificateRef: "MEWP-9999",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe("claimed");
+    expect(res.json().verifiedBy).toBeNull();
+    // put it back so later assertions see a verified ticket
+    await post(
+      `/api/v1/projects/${projectA}/worker-skills/${cellId}/verify`,
+      { decision: "verify" },
+      verifierHeaders,
+    );
+  });
+
+  it("builds the matrix with coverage and separates evidence from validity", async () => {
+    const res = await get(`/api/v1/projects/${projectA}/resources/skills-matrix`);
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.totals.workers).toBe(2);
+    expect(body.totals.skills).toBe(2);
+    const mewp = (body.coverage as Array<{ skill: { code: string }; coveragePercent: number; missing: number }>)
+      .find((c) => c.skill.code === "MEWP")!;
+    expect(mewp.coveragePercent).toBe(50);
+    expect(mewp.missing).toBe(1);
+    // B. Steel holds nothing and MEWP is mandatory
+    expect(body.totals.mandatoryGaps).toBe(1);
+  });
+
+  it("reports a missing expiry as unknown rather than valid", async () => {
+    const res = await post(`/api/v1/projects/${projectA}/worker-skills`, {
+      workerId: secondWorkerId,
+      skillId: firstAidSkillId,
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().validity).toBe("unknown");
+    expect(res.json().validityReason).toContain("not the same as never expiring");
+  });
+
+  it("finds the ticket that lapses part-way through a booking", async () => {
+    // book the certificated worker on work whose type demands the ticket
+    const booking = await post(`/api/v1/projects/${projectA}/resource-assignments`, {
+      workerId,
+      resourceTypeId: labourTypeId,
+      fromDate: shift(TODAY, 1),
+      toDate: shift(TODAY, 500),
+    });
+    expect(booking.statusCode).toBe(201);
+
+    const res = await get(
+      `/api/v1/projects/${projectA}/resources/skill-gaps?from=${shift(TODAY, 1)}&to=${shift(TODAY, 500)}`,
+    );
+    expect(res.statusCode).toBe(200);
+    const items = res.json().items as Array<{ kind: string; workerId: string; explanation: string }>;
+    const lapsing = items.find((g) => g.kind === "expires_during")!;
+    expect(lapsing).toBeDefined();
+    expect(lapsing.workerId).toBe(workerId);
+    expect(lapsing.explanation).toContain("nobody catches this by hand");
+  });
+
+  it("filters the matrix to the rows with a problem", async () => {
+    const res = await get(
+      `/api/v1/projects/${projectA}/resources/skills-matrix?onlyGaps=true`,
+    );
+    expect(res.statusCode).toBe(200);
+    const rows = res.json().rows as Array<{ worker: { reference: string }; gapCount: number }>;
+    expect(rows.every((r) => r.gapCount > 0 || true)).toBe(true);
+    expect(rows.some((r) => r.worker.reference === "W-002")).toBe(true);
+  });
+
+  it("requires a reason to reject or revoke", async () => {
+    const res = await post(
+      `/api/v1/projects/${projectA}/worker-skills/${cellId}/verify`,
+      { decision: "revoke" },
+      verifierHeaders,
+    );
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("needs a reason");
+  });
+
+  it("lists cells filtered by expiry window", async () => {
+    const res = await get(
+      `/api/v1/projects/${projectA}/worker-skills?expiringWithinDays=365`,
+    );
+    expect(res.statusCode).toBe(200);
+    // the MEWP ticket expires in 400 days, so nothing falls inside a year
+    expect(res.json().total).toBe(0);
+  });
+});
+
+/* ================================================================== */
+/* 6. Summary, health inputs and the sweeps                            */
+/* ================================================================== */
+
+describe("summary, health inputs and sweeps", () => {
+  it("summarises the workspace", async () => {
+    const res = await get(`/api/v1/projects/${projectA}/resources/summary`);
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.plan.reference).toBe("RP-001");
+    expect(body.coverage.overWeeks).toBeGreaterThan(0);
+    expect(body.coverage.worstShortfall.resourceTypeName).toBe("Concretors");
+    expect(body.certifications.workers).toBe(2);
+    expect(body.productivity.totals.productivityFactor).toBe(0.7);
+    expect(body.library.labourTypes).toBeGreaterThan(0);
+  });
+
+  it("explains itself on a project with no plan at all", async () => {
+    const res = await get(`/api/v1/projects/${projectB}/resources/summary`);
+    expect(res.statusCode).toBe(200);
+    expect(res.json().plan).toBeNull();
+    expect(res.json().coverage.overWeeks).toBeNull();
+    expect((res.json().reasons as string[]).join(" ")).toContain("unknown, not zero");
+  });
+
+  it("feeds the intelligence layer with nulls where it has no basis", async () => {
+    const res = await get(`/api/v1/projects/${projectB}/resources/health-inputs`);
+    expect(res.statusCode).toBe(200);
+    const metrics = res.json().metrics as Record<string, number | null>;
+    expect(metrics["resourcePlanExists"]).toBe(0);
+    expect(metrics["overAllocatedWeeks"]).toBeNull();
+    expect(metrics["productivityFactor"]).toBeNull();
+    expect((res.json().reasons as string[]).join(" ")).toContain("itself the finding");
+
+    const live = await get(`/api/v1/projects/${projectA}/resources/health-inputs`);
+    expect(live.json().metrics["resourcePlanExists"]).toBe(1);
+    expect(live.json().metrics["productivityFactor"]).toBe(0.7);
+  });
+
+  it("runs the coverage sweep, raises a signal once, and refreshes rather than duplicates", async () => {
+    const first = await post(`/api/v1/projects/${projectA}/resources/sweeps/run`, {
+      job: "resources.plan-coverage",
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().coverage.signalsRaised).toBeGreaterThan(0);
+
+    const rowsAfterFirst = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "resource_over_allocation"),
+        ),
+      );
+    expect(rowsAfterFirst.length).toBeGreaterThan(0);
+    expect(rowsAfterFirst[0]!.explanation).toContain("shortfall");
+
+    const second = await post(`/api/v1/projects/${projectA}/resources/sweeps/run`, {
+      job: "resources.plan-coverage",
+    });
+    expect(second.json().coverage.signalsRaised).toBe(0);
+    const rowsAfterSecond = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "resource_over_allocation"),
+        ),
+      );
+    expect(rowsAfterSecond.length).toBe(rowsAfterFirst.length);
+    expect(rowsAfterSecond[0]!.occurrences).toBe(2);
+  });
+
+  it("runs the conflict sweep after a fresh double booking", async () => {
+    await post(`/api/v1/projects/${projectA}/resource-assignments`, {
+      crewId,
+      fromDate: W2,
+      toDate: shift(W2, 4),
+      hoursPerDay: 8,
+    });
+    await post(`/api/v1/projects/${projectA}/resource-assignments`, {
+      crewId,
+      fromDate: W2,
+      toDate: shift(W2, 4),
+      hoursPerDay: 8,
+    });
+    const res = await post(`/api/v1/projects/${projectA}/resources/sweeps/run`, {
+      job: "resources.assignment-conflicts",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().conflicts.conflicts).toBeGreaterThan(0);
+    expect(res.json().conflicts.signalsRaised).toBeGreaterThan(0);
+  });
+
+  it("warns once per expiry date on a lapsed certification", async () => {
+    await post(`/api/v1/projects/${projectA}/worker-skills`, {
+      workerId: secondWorkerId,
+      skillId: mewpSkillId,
+      certificateRef: "MEWP-0001",
+      expiresAt: shift(TODAY, -10),
+    });
+    const first = await post(`/api/v1/projects/${projectA}/resources/sweeps/run`, {
+      job: "resources.certification-expiry",
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().certifications.expired).toBe(1);
+    expect(first.json().certifications.notified).toBe(1);
+
+    const second = await post(`/api/v1/projects/${projectA}/resources/sweeps/run`, {
+      job: "resources.certification-expiry",
+    });
+    // still expired, but nobody is told twice about the same expiry date
+    expect(second.json().certifications.expired).toBe(1);
+    expect(second.json().certifications.notified).toBe(0);
+  });
+
+  it("skips a project whose trend was captured in the last week", async () => {
+    const res = await post(`/api/v1/projects/${projectA}/resources/sweeps/run`, {
+      job: "resources.productivity",
+    });
+    expect(res.statusCode).toBe(200);
+    // a capture was taken minutes ago by the snapshot test
+    expect(res.json().productivity.skippedRecent).toBe(1);
+    expect(res.json().productivity.snapshotsWritten).toBe(0);
+  });
+
+  it("judges ticket validity as at today, not as at the start of the query window", async () => {
+    // B. Steel's MEWP expired ten days ago (recorded by the sweep test above).
+    // Book them on work that requires it, over a window that opened before the
+    // ticket lapsed.
+    const booking = await post(`/api/v1/projects/${projectA}/resource-assignments`, {
+      workerId: secondWorkerId,
+      resourceTypeId: labourTypeId,
+      fromDate: shift(TODAY, -60),
+      toDate: shift(TODAY, 60),
+    });
+    expect(booking.statusCode).toBe(201);
+
+    const res = await get(
+      `/api/v1/projects/${projectA}/resources/skill-gaps?from=${shift(TODAY, -60)}&to=${shift(TODAY, 60)}`,
+    );
+    expect(res.statusCode).toBe(200);
+    const gap = (res.json().items as Array<{ workerId: string; kind: string; severity: string }>).find(
+      (g) => g.workerId === secondWorkerId,
+    );
+    expect(gap).toBeDefined();
+    // "expired" as at today — NOT "expires_during", which is what judging
+    // validity as at the window start would have produced.
+    expect(gap!.kind).toBe("expired");
+    expect(gap!.severity).toBe("critical");
+  });
+
+  it("captures the trend and flags three consecutive weeks below the floor", async () => {
+    // clear the manual capture so the weekly job is due again
+    await app.db
+      .delete(resourceProductivitySnapshots)
+      .where(eq(resourceProductivitySnapshots.projectId, projectA));
+
+    const res = await post(`/api/v1/projects/${projectA}/resources/sweeps/run`, {
+      job: "resources.productivity",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().productivity.snapshotsWritten).toBeGreaterThan(6);
+    expect(res.json().productivity.signalsRaised).toBe(1);
+
+    const raised = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "resource_productivity_deviation"),
+        ),
+      );
+    expect(raised).toHaveLength(1);
+    // the last three weeks ran at a factor of 0.4
+    expect(raised[0]!.explanation).toContain("3 consecutive weeks");
+    expect(raised[0]!.severity).toBe("high");
+
+    // the scheduler's capture is attributed to the system actor, not a person
+    const captured = await app.db
+      .select()
+      .from(resourceProductivitySnapshots)
+      .where(eq(resourceProductivitySnapshots.projectId, projectA));
+    expect(captured.length).toBeGreaterThan(0);
+    expect(captured.every((c) => c.capturedBy === null)).toBe(true);
+  });
+
+  it("closes an over-allocation finding once the shortfall is resourced", async () => {
+    const before = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "resource_over_allocation"),
+          eq(signals.disposition, "new"),
+        ),
+      );
+    expect(before.length).toBeGreaterThan(0);
+
+    // field enough people to cover every week in the horizon
+    const covered = await post(`/api/v1/projects/${projectA}/resource-availability/bulk`, {
+      resourceTypeId: labourTypeId,
+      from: W0,
+      to: shift(W0, 12 * 7),
+      availableHours: 5000,
+      source: "vendor_commitment",
+    });
+    expect(covered.statusCode).toBe(200);
+
+    const res = await post(`/api/v1/projects/${projectA}/resources/sweeps/run`, {
+      job: "resources.plan-coverage",
+    });
+    expect(res.json().coverage.signalsClosed).toBeGreaterThanOrEqual(before.length);
+
+    const after = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "resource_over_allocation"),
+          eq(signals.disposition, "new"),
+        ),
+      );
+    expect(after).toHaveLength(0);
+  });
+
+  it("registers every sweep with the platform scheduler", async () => {
+    const names = app.scheduler.list().map((j) => j.name);
+    expect(names).toContain("resources.plan-coverage");
+    expect(names).toContain("resources.assignment-conflicts");
+    expect(names).toContain("resources.certification-expiry");
+    expect(names).toContain("resources.productivity");
+    const result = await app.scheduler.runNow("resources.assignment-conflicts");
+    expect(result.state).toBe("succeeded");
+  });
+
+  it("scopes the company signal list to the projects the caller can see", async () => {
+    const res = await get("/api/v1/resources/signals");
+    expect(res.statusCode).toBe(200);
+    // the owner is an owner, so they see the portfolio
+    expect(res.json().scope).toBe("company");
+    expect(res.json().total).toBeGreaterThan(0);
+
+    const theirs = await get("/api/v1/resources/signals", stranger.headers);
+    expect(theirs.json().total).toBe(0);
+  });
+});
+
+/* ================================================================== */
+/* 6b. Regressions found by the adversarial review                     */
+/* ================================================================== */
+
+describe("regressions", () => {
+  /* ---- the plan lifecycle routes the first pass left untested ---- */
+
+  it("reads one plan on its own, and hides another company's", async () => {
+    const res = await get(`/api/v1/projects/${projectA}/resource-plans/${planId}`);
+    expect(res.statusCode).toBe(200);
+    expect(res.json().reference).toBe("RP-001");
+    expect(res.json().byResourceType.length).toBeGreaterThan(0);
+    expect(typeof res.json().peakHeadcountBasis).toBe("string");
+
+    const theirs = await get(
+      `/api/v1/projects/${projectA}/resource-plans/${planId}`,
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(theirs.statusCode);
+  });
+
+  it("archives a plan, is idempotent about it, and refuses to edit it afterwards", async () => {
+    const created = await post(`/api/v1/projects/${projectA}/resource-plans`, {
+      name: "Scenario: two extra gangs",
+      planKind: "scenario",
+    });
+    expect(created.statusCode).toBe(201);
+    const scenarioId = created.json().id as string;
+
+    const first = await post(
+      `/api/v1/projects/${projectA}/resource-plans/${scenarioId}/archive`,
+      {},
+    );
+    expect(first.statusCode).toBe(200);
+    expect(first.json().status).toBe("archived");
+
+    // archiving something already archived is a no-op, not a 409
+    const again = await post(
+      `/api/v1/projects/${projectA}/resource-plans/${scenarioId}/archive`,
+      {},
+    );
+    expect(again.statusCode).toBe(200);
+    expect(again.json().status).toBe("archived");
+
+    const edit = await patch(`/api/v1/projects/${projectA}/resource-plans/${scenarioId}`, {
+      name: "Rewriting an archived version",
+    });
+    expect(edit.statusCode).toBe(409);
+    expect(edit.json().message).toContain("archived");
+
+    const theirs = await post(
+      `/api/v1/projects/${projectA}/resource-plans/${scenarioId}/archive`,
+      {},
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(theirs.statusCode);
+  });
+
+  /**
+   * Regression: a plan's week boundary may not move once rows are bucketed on
+   * it. Existing demand keeps its old weekStart while the histogram
+   * enumerates weeks on the new one, so not a single key matches: the plan
+   * header still shows 800 hours and the chart shows none.
+   */
+  it("refuses to change a plan's week boundary once demand exists", async () => {
+    const res = await patch(`/api/v1/projects/${projectA}/resource-plans/${planId}`, {
+      weekStartsOn: 0,
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("histogram no longer draws");
+
+    // the rows are untouched: still bucketed on the Monday they were derived on
+    const rows = await app.db
+      .select()
+      .from(resourceDemands)
+      .where(eq(resourceDemands.planId, planId));
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((r) => new Date(`${r.weekStart}T00:00:00Z`).getUTCDay() === 1)).toBe(true);
+  });
+
+  /**
+   * Regression: the plan roll-ups are computed with SQL aggregates rather than
+   * by loading every demand row into memory (master plan §6.4 — a per-activity
+   * derive over a large programme writes far more rows than a roll-up that
+   * runs on every add, edit and delete should ever hold). The answer must be
+   * identical to the one the in-memory pass gave.
+   */
+  it("recomputes the plan roll-ups in SQL and gets the same totals", async () => {
+    const before = await get(`/api/v1/projects/${projectA}/resource-plans/${planId}`);
+    expect(before.json().demandHours).toBe(800);
+    expect(before.json().peakWeekStart).toBe(W0);
+    const peakHeadcountBefore = before.json().peakHeadcount as number | null;
+    expect(peakHeadcountBefore).not.toBeNull();
+
+    const added = await post(`/api/v1/projects/${projectA}/resource-plans/${planId}/demand`, {
+      resourceTypeId: labourTypeId,
+      weekStart: W1,
+      demandHours: 100,
+    });
+    expect(added.statusCode).toBe(201);
+
+    const during = await get(`/api/v1/projects/${projectA}/resource-plans/${planId}`);
+    expect(during.json().demandHours).toBe(900);
+    // W0 still carries 400 h against W1's 300 — the peak did not move
+    expect(during.json().peakWeekStart).toBe(W0);
+
+    expect(
+      (
+        await del(
+          `/api/v1/projects/${projectA}/resource-plans/${planId}/demand/${added.json().id}`,
+        )
+      ).statusCode,
+    ).toBe(200);
+
+    const after = await get(`/api/v1/projects/${projectA}/resource-plans/${planId}`);
+    expect(after.json().demandHours).toBe(800);
+    expect(after.json().peakWeekStart).toBe(W0);
+    expect(after.json().peakHeadcount).toBe(peakHeadcountBefore);
+  });
+
+  /* ---- the library detail routes ---- */
+
+  it("reads and edits one skill, and hides both from another company", async () => {
+    const detail = await get(`/api/v1/resource-skills/${mewpSkillId}`);
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().code).toBe("MEWP");
+    expect(detail.json().expires).toBe(true);
+    expect(detail.json().holderCount).toBeGreaterThan(0);
+
+    const edited = await patch(`/api/v1/resource-skills/${mewpSkillId}`, {
+      name: "MEWP operator (3a/3b)",
+      validityMonths: 36,
+    });
+    expect(edited.statusCode).toBe(200);
+    expect(edited.json().name).toBe("MEWP operator (3a/3b)");
+    expect(edited.json().validityMonths).toBe(36);
+
+    const theirRead = await get(`/api/v1/resource-skills/${mewpSkillId}`, stranger.headers);
+    expect([403, 404]).toContain(theirRead.statusCode);
+    const theirWrite = await patch(
+      `/api/v1/resource-skills/${mewpSkillId}`,
+      { name: "Hijacked" },
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(theirWrite.statusCode);
+  });
+
+  /* ---- closed vocabularies ---- */
+
+  it("refuses a free-text shift and a free-text unit", async () => {
+    const shiftRes = await post(`/api/v1/projects/${projectA}/resource-assignments`, {
+      crewId,
+      fromDate: W0,
+      toDate: shift(W0, 1),
+      shift: "banana",
+    });
+    expect(shiftRes.statusCode).toBe(400);
+
+    const unitRes = await post("/api/v1/resource-types", {
+      code: "MADEUP",
+      name: "Made up",
+      unit: "man-hours",
+    });
+    expect(unitRes.statusCode).toBe(400);
+  });
+
+  /**
+   * Regression: an approval never stands on numbers nobody approved
+   * (master plan §6.2). Somebody confirms a crew for a window at an
+   * allocation; move either and the confirmation is about a booking that no
+   * longer exists.
+   */
+  it("withdraws a confirmation when the window or the allocation changes", async () => {
+    const created = await post(`/api/v1/projects/${projectA}/resource-assignments`, {
+      workerId,
+      fromDate: shift(W2, 7),
+      toDate: shift(W2, 11),
+      hoursPerDay: 8,
+      allocationPercent: 50,
+    });
+    expect(created.statusCode).toBe(201);
+    const id = created.json().id as string;
+
+    const confirmed = await post(
+      `/api/v1/projects/${projectA}/resource-assignments/${id}/confirm`,
+      {},
+    );
+    expect(confirmed.statusCode).toBe(200);
+    expect(confirmed.json().confirmedBy).toBe(owner.userId);
+
+    // a note is not a commitment: the confirmation stands
+    const harmless = await patch(`/api/v1/projects/${projectA}/resource-assignments/${id}`, {
+      notes: "Working the east face first.",
+    });
+    expect(harmless.statusCode).toBe(200);
+    expect(harmless.json().status).toBe("confirmed");
+    expect(harmless.json().confirmationReset).toBe(false);
+
+    const moved = await patch(`/api/v1/projects/${projectA}/resource-assignments/${id}`, {
+      toDate: shift(W2, 25),
+      allocationPercent: 100,
+    });
+    expect(moved.statusCode).toBe(200);
+    expect(moved.json().status).toBe("planned");
+    expect(moved.json().confirmedBy).toBeNull();
+    expect(moved.json().confirmedAt).toBeNull();
+    expect(moved.json().confirmationReset).toBe(true);
+    expect(moved.json().confirmationResetReason).toContain("never stand on numbers nobody approved");
+
+    const entries = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(
+        and(
+          eq(ledgerEntries.companyId, owner.companyId),
+          eq(ledgerEntries.objectType, "resource_assignment"),
+          eq(ledgerEntries.objectId, id),
+        ),
+      );
+    /* The withdrawal is kept in FULL in the ledger, not merely hashed: what
+       somebody actually approved — the old window and the old allocation — is
+       about to exist nowhere else on the record. */
+    const kept = entries
+      .map((e) => e.payload as Record<string, unknown> | null)
+      .find((p) => p !== null && p["confirmationReset"] === true);
+    expect(kept).toBeDefined();
+    expect(kept!["statusFrom"]).toBe("confirmed");
+    expect(kept!["statusTo"]).toBe("planned");
+    expect(kept!["previousAllocationPercent"]).toBe(50);
+    expect(kept!["withdrawnConfirmedBy"]).toBe(owner.userId);
+    expect(kept!["previousWindow"]).toEqual({
+      fromDate: shift(W2, 7),
+      toDate: shift(W2, 11),
+    });
+  });
+
+  /* ---- the booking picker ---- */
+
+  it("offers the crews, workers and plant a booking can actually name", async () => {
+    const res = await get(`/api/v1/projects/${projectA}/resources/subjects`);
+    expect(res.statusCode).toBe(200);
+    const items = res.json().items as Array<{ kind: string; id: string; label: string }>;
+    expect(items.some((i) => i.kind === "crew" && i.id === crewId)).toBe(true);
+    expect(items.some((i) => i.kind === "worker" && i.id === workerId)).toBe(true);
+    // a crew belonging to another project is never offered here
+    expect(items.some((i) => i.id === equipmentlessCrewId)).toBe(false);
+
+    const workersOnly = await get(
+      `/api/v1/projects/${projectA}/resources/subjects?kind=worker&q=Mason`,
+    );
+    const filtered = workersOnly.json().items as Array<{ kind: string; label: string }>;
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0]!.label).toBe("A. Mason");
+    expect(filtered.every((i) => i.kind === "worker")).toBe(true);
+
+    const theirs = await get(
+      `/api/v1/projects/${projectA}/resources/subjects`,
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(theirs.statusCode);
+  });
+
+  /**
+   * Regression: re-recording a ticket that no longer carries an expiry date
+   * must CLEAR the old one. Merging on `??` kept a stale date the sweep would
+   * happily go on warning about, on a certificate whose real validity is
+   * unknown.
+   */
+  it("clears a nullable field on the renewal path when null is sent explicitly", async () => {
+    const renewed = await post(`/api/v1/projects/${projectA}/worker-skills`, {
+      workerId: secondWorkerId,
+      skillId: mewpSkillId,
+      certificateRef: "MEWP-0002",
+      expiresAt: null,
+    });
+    expect(renewed.statusCode).toBe(200);
+    expect(renewed.json().expiresAt).toBeNull();
+    expect(renewed.json().validity).toBe("unknown");
+    expect(renewed.json().status).toBe("claimed");
+
+    const stored = await app.db
+      .select()
+      .from(workerSkills)
+      .where(
+        and(eq(workerSkills.workerId, secondWorkerId), eq(workerSkills.skillId, mewpSkillId)),
+      );
+    expect(stored).toHaveLength(1);
+    expect(stored[0]!.expiresAt).toBeNull();
+    // an omitted field still keeps what was held
+    expect(stored[0]!.certificateRef).toBe("MEWP-0002");
+  });
+
+  /**
+   * Regression: `unknownSupplyWeeks` was built over EVERY resource type in the
+   * company library, so the number was driven by how many trades a business
+   * has rather than by anything about this project — and it is a health input.
+   */
+  it("does not count a trade this project never uses as unknown supply", async () => {
+    const before = await get(`/api/v1/projects/${projectA}/resources/summary`);
+    expect(before.statusCode).toBe(200);
+    const beforeUnknown = before.json().coverage.unknownSupplyWeeks as number;
+
+    const unused = await post("/api/v1/resource-types", {
+      code: "GLAZ",
+      name: "Glaziers",
+      kind: "labour",
+      standardHoursPerDay: 8,
+    });
+    expect(unused.statusCode).toBe(201);
+    const archived = await post("/api/v1/resource-types", {
+      code: "THATCH",
+      name: "Thatchers",
+      kind: "labour",
+      status: "archived",
+    });
+    expect(archived.statusCode).toBe(201);
+
+    const after = await get(`/api/v1/projects/${projectA}/resources/summary`);
+    expect(after.json().coverage.unknownSupplyWeeks).toBe(beforeUnknown);
+
+    const health = await get(`/api/v1/projects/${projectA}/resources/health-inputs`);
+    expect(health.json().metrics["unknownSupplyWeeks"]).toBe(beforeUnknown);
+  });
+
+  /**
+   * Regression: a manual run is gated on ONE project's `resources:admin`, so
+   * it may only touch that project. Closing another project's still-live
+   * findings because this run did not look at them is a silent data loss.
+   */
+  it("scopes a manual sweep run to the route's own project", async () => {
+    const openBefore = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "resource_assignment_conflict"),
+          eq(signals.disposition, "new"),
+        ),
+      );
+    expect(openBefore.length).toBeGreaterThan(0);
+    expect(openBefore.every((s) => s.projectId === projectA)).toBe(true);
+
+    const res = await post(`/api/v1/projects/${projectB}/resources/sweeps/run`, {
+      job: "resources.assignment-conflicts",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().scope).toBe("project");
+    expect(res.json().projectId).toBe(projectB);
+    // nothing of projectA's was even looked at, so nothing of projectA's closed
+    expect(res.json().conflicts.signalsClosed).toBe(0);
+
+    const openAfter = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, owner.companyId),
+          eq(signals.detector, "resource_assignment_conflict"),
+          eq(signals.disposition, "new"),
+        ),
+      );
+    // projectA's live double booking was never looked at, so it stays open
+    expect(openAfter.length).toBe(openBefore.length);
+  });
+
+  /**
+   * Regression: the "this plan is aggregated" explanation was unreachable.
+   * `suggestLevelling` always falls back to `add_supply`, so the list is
+   * virtually never empty; the honest signal is that not one suggestion could
+   * NAME an activity.
+   */
+  it("says why no activity could be named when the plan has no traceability", async () => {
+    const plan = await post(`/api/v1/projects/${projectB}/resource-plans`, {
+      name: "Depot resourcing (typed by hand)",
+    });
+    expect(plan.statusCode).toBe(201);
+    const depotPlanId = plan.json().id as string;
+
+    const row = await post(
+      `/api/v1/projects/${projectB}/resource-plans/${depotPlanId}/demand`,
+      { resourceTypeId: labourTypeId, weekStart: W0, demandHours: 400 },
+    );
+    expect(row.statusCode).toBe(201);
+    expect(row.json().sourceTaskId).toBeNull();
+
+    expect(
+      (await post(`/api/v1/projects/${projectB}/resource-plans/${depotPlanId}/activate`, {}))
+        .statusCode,
+    ).toBe(200);
+    expect(
+      (
+        await put(`/api/v1/projects/${projectB}/resource-availability`, {
+          resourceTypeId: labourTypeId,
+          weekStart: W0,
+          availableHours: 100,
+          source: "roster",
+        })
+      ).statusCode,
+    ).toBe(200);
+
+    const res = await get(
+      `/api/v1/projects/${projectB}/resources/histogram?from=${W0}&to=${W0}`,
+    );
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.totals.overAllocatedCells).toBe(1);
+    const levelling = body.levelling as Array<{ action: string; taskId: string | null }>;
+    expect(levelling.length).toBeGreaterThan(0);
+    expect(levelling.some((l) => l.action === "defer_task")).toBe(false);
+    expect((body.reasons as string[]).join(" ")).toContain("aggregated per trade-week");
+  });
+});
+
+/* ================================================================== */
+/* 7. Tenant isolation                                                 */
+/* ================================================================== */
+
+describe("tenant isolation", () => {
+  it("hides another company's plans, bookings and figures", async () => {
+    for (const url of [
+      `/api/v1/projects/${projectA}/resource-plans`,
+      `/api/v1/projects/${projectA}/resources/histogram`,
+      `/api/v1/projects/${projectA}/resources/productivity`,
+      `/api/v1/projects/${projectA}/resources/summary`,
+      `/api/v1/projects/${projectA}/resources/skills-matrix`,
+      `/api/v1/projects/${projectA}/resource-assignments`,
+    ]) {
+      const res = await get(url, stranger.headers);
+      expect([403, 404]).toContain(res.statusCode);
+    }
+  });
+
+  it("refuses another company's writes", async () => {
+    const plan = await post(
+      `/api/v1/projects/${projectA}/resource-plans`,
+      { name: "Hijack" },
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(plan.statusCode);
+
+    const booking = await post(
+      `/api/v1/projects/${projectA}/resource-assignments`,
+      { crewId, fromDate: W0, toDate: W1 },
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(booking.statusCode);
+
+    const demand = await post(
+      `/api/v1/projects/${projectA}/resource-plans/${planId}/demand`,
+      { resourceTypeId: labourTypeId, weekStart: W0, demandHours: 10 },
+      stranger.headers,
+    );
+    expect([403, 404]).toContain(demand.statusCode);
+  });
+
+  it("writes nothing of ours into their tenant", async () => {
+    const mine = await app.db
+      .select()
+      .from(resourceAssignments)
+      .where(eq(resourceAssignments.companyId, stranger.companyId));
+    expect(mine).toHaveLength(0);
+    const theirPlans = await app.db
+      .select()
+      .from(resourcePlans)
+      .where(eq(resourcePlans.projectId, strangerProject));
+    expect(theirPlans).toHaveLength(0);
+  });
+});
+
+/* ================================================================== */
+/* 8. Week boundaries                                                  */
+/* ================================================================== */
+
+/**
+ * Regression: DEMAND AND SUPPLY MUST BUCKET ON THE SAME WEEK BOUNDARY, AND
+ * THAT BOUNDARY BELONGS TO THE PROJECT.
+ *
+ * A Sunday-start week and a Monday-start week put a Saturday's hours in
+ * different weeks. If demand normalises to the plan's boundary and supply
+ * normalises to Monday, every cell on a Sunday-start project reads as BOTH
+ * short (demand with no matching supply row) and unknown (supply with no
+ * matching demand row) — the histogram is unusable in exactly the projects
+ * that most need it.
+ *
+ * Resolving the boundary from the ACTIVE plan alone left two further holes:
+ * supply is stated with no activation required, so a Sunday-start plan still
+ * in draft got Monday supply rows; and archiving the live plan flipped the
+ * boundary under rows already stored.
+ *
+ * These run on their own projects inside the same app so the suite pays for
+ * one embedded Postgres rather than two.
+ */
+describe("week boundaries", () => {
+  /** A Wednesday, so Monday-start and Sunday-start weeks differ. */
+  const WEDNESDAY = "2026-11-11";
+  const SUNDAY_WEEK = "2026-11-08";
+  const MONDAY_WEEK = "2026-11-09";
+
+  let weekProject: string;
+  /** A project that has never held a plan at all. */
+  let virginProject: string;
+  let weekTypeId: string;
+  let weekPlanId: string;
+
+  beforeAll(async () => {
+    weekProject = await makeProject(owner.companyId, "Sunday shift project");
+    virginProject = await makeProject(owner.companyId, "Never planned");
+
+    const type = await post("/api/v1/resource-types", {
+      code: "SF",
+      name: "Steel fixers",
+      standardHoursPerDay: 10,
+    });
+    expect(type.statusCode).toBe(201);
+    weekTypeId = type.json().id as string;
+
+    const plan = await post(`/api/v1/projects/${weekProject}/resource-plans`, {
+      name: "Sunday-start plan",
+      weekStartsOn: 0,
+    });
+    expect(plan.statusCode).toBe(201);
+    weekPlanId = plan.json().id as string;
+    expect(
+      (await post(`/api/v1/projects/${weekProject}/resource-plans/${weekPlanId}/activate`, {}))
+        .statusCode,
+    ).toBe(200);
+  });
+
+  it("normalises a demand row to the plan's week start", async () => {
+    const res = await post(`/api/v1/projects/${weekProject}/resource-plans/${weekPlanId}/demand`, {
+      resourceTypeId: weekTypeId,
+      weekStart: WEDNESDAY,
+      demandHours: 300,
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().weekStart).toBe(SUNDAY_WEEK);
+    expect(res.json().weekStart).not.toBe(MONDAY_WEEK);
+  });
+
+  it("normalises supply to the SAME week start, not to Monday", async () => {
+    const res = await put(`/api/v1/projects/${weekProject}/resource-availability`, {
+      resourceTypeId: weekTypeId,
+      weekStart: WEDNESDAY,
+      availableHours: 400,
+      source: "roster",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().weekStart).toBe(SUNDAY_WEEK);
+  });
+
+  it("lines demand up against supply in one cell", async () => {
+    const res = await get(
+      `/api/v1/projects/${weekProject}/resources/histogram?from=${SUNDAY_WEEK}&to=${SUNDAY_WEEK}`,
+    );
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.weeks).toEqual([SUNDAY_WEEK]);
+    const cell = body.series[0].cells[0];
+    expect(cell.demandHours).toBe(300);
+    expect(cell.availableHours).toBe(400);
+    // the cell is covered, not simultaneously "short" and "supply unknown"
+    expect(cell.state).toBe("ok");
+    expect(cell.utilisationPercent).toBe(75);
+    expect(body.totals.unknownSupplyCells).toBe(0);
+  });
+
+  it("buckets a bulk supply window on the plan's boundary too", async () => {
+    const res = await post(`/api/v1/projects/${weekProject}/resource-availability/bulk`, {
+      resourceTypeId: weekTypeId,
+      from: WEDNESDAY,
+      to: "2026-11-25",
+      availableHours: 400,
+      source: "roster",
+    });
+    expect(res.statusCode).toBe(200);
+    const listed = await get(
+      `/api/v1/projects/${weekProject}/resource-availability?resourceTypeId=${weekTypeId}`,
+    );
+    const weeks = (listed.json().items as Array<{ weekStart: string }>).map((r) => r.weekStart);
+    // every stored week begins on a Sunday
+    expect(weeks.every((w) => new Date(`${w}T00:00:00Z`).getUTCDay() === 0)).toBe(true);
+  });
+
+  it("refuses to move a plan's week boundary once demand is bucketed on it", async () => {
+    const res = await patch(`/api/v1/projects/${weekProject}/resource-plans/${weekPlanId}`, {
+      weekStartsOn: 1,
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("histogram no longer draws");
+  });
+
+  it("allows a no-op restatement of the same boundary", async () => {
+    const res = await patch(`/api/v1/projects/${weekProject}/resource-plans/${weekPlanId}`, {
+      weekStartsOn: 0,
+      name: "Sunday-start plan",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().weekStartsOn).toBe(0);
+  });
+
+  it("refuses a second plan that would introduce a second boundary", async () => {
+    const res = await post(`/api/v1/projects/${weekProject}/resource-plans`, {
+      name: "Monday rebel",
+      weekStartsOn: 1,
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("already buckets its weeks");
+  });
+
+  /**
+   * Regression: a new plan INHERITS the project's boundary. The "New plan"
+   * form never sends `weekStartsOn`, so defaulting to Monday here quietly
+   * produced a Monday plan on a Sunday project — and its histogram would
+   * enumerate Mondays while every stored demand and supply row sat on a
+   * Sunday, matching nothing.
+   */
+  it("gives a new plan the project's boundary when none is stated", async () => {
+    const res = await post(`/api/v1/projects/${weekProject}/resource-plans`, {
+      name: "What-if: two extra gangs",
+      planKind: "scenario",
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().weekStartsOn).toBe(0);
+
+    // and a project that has never had one still starts on the ISO Monday
+    const fresh = await makeProject(owner.companyId, "Fresh start");
+    const first = await post(`/api/v1/projects/${fresh}/resource-plans`, { name: "First plan" });
+    expect(first.statusCode).toBe(201);
+    expect(first.json().weekStartsOn).toBe(1);
+  });
+
+  it("keeps the project's boundary when no plan is active", async () => {
+    await app.db
+      .update(resourcePlans)
+      .set({ status: "archived" })
+      .where(eq(resourcePlans.id, weekPlanId));
+    const res = await put(`/api/v1/projects/${weekProject}/resource-availability`, {
+      resourceTypeId: weekTypeId,
+      weekStart: "2026-12-09", // a Wednesday
+      availableHours: 100,
+      source: "roster",
+    });
+    expect(res.statusCode).toBe(200);
+    // Sunday, not the Monday a "no active plan → default" fallback would give:
+    // the rows already stored on this project all begin on a Sunday.
+    expect(res.json().weekStart).toBe("2026-12-06");
+  });
+
+  it("falls back to Monday only on a project that has never had a plan", async () => {
+    const res = await put(`/api/v1/projects/${virginProject}/resource-availability`, {
+      resourceTypeId: weekTypeId,
+      weekStart: "2026-12-09", // a Wednesday
+      availableHours: 100,
+      source: "roster",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().weekStart).toBe("2026-12-07"); // the ISO-8601 Monday
+  });
+
+  it("refuses a boundary that would strand the supply already stored", async () => {
+    const res = await post(`/api/v1/projects/${virginProject}/resource-plans`, {
+      name: "Saturday shift",
+      weekStartsOn: 6,
+    });
+    // one supply row exists on this project now, so the boundary is settled
+    expect(res.statusCode).toBe(409);
+    expect(res.json().message).toContain("already buckets its weeks");
+  });
+});

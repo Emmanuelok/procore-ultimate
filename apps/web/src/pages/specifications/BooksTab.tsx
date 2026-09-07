@@ -51,8 +51,8 @@ import {
   useAction,
   type BuildRegisterResult,
   type Loadable,
-  type Paginated,
   type SpecBook,
+  type SpecBooksResponse,
   type SpecBookUploadResult,
 } from "./specShared";
 
@@ -93,7 +93,7 @@ export default function BooksTab({
   onOpenSections,
 }: {
   projectId: string;
-  books: Loadable<Paginated<SpecBook>>;
+  books: Loadable<SpecBooksResponse>;
   onChanged: () => void;
   onOpenSections: (bookId: string) => void;
 }) {
@@ -108,6 +108,14 @@ export default function BooksTab({
   const [built, setBuilt] = useState<BuildRegisterResult | null>(null);
 
   const rows = books.data?.items ?? [];
+  /*
+   * Putting an issue in force supersedes the book the whole register, the
+   * coverage report and every requirement comparison read from — the API
+   * gates it on specifications admin, on the dedicated route AND on the
+   * upload. The affordance follows the gate rather than 403-ing after the
+   * upload has already been stored.
+   */
+  const canSetCurrent = books.data?.access.canSetCurrent ?? false;
 
   async function submitUpload() {
     if (!file) return;
@@ -121,7 +129,7 @@ export default function BooksTab({
     }
     if (form.description.trim()) body.append("description", form.description.trim());
     body.append("classificationSystem", form.classificationSystem);
-    body.append("makeCurrent", form.makeCurrent ? "1" : "0");
+    body.append("makeCurrent", canSetCurrent && form.makeCurrent ? "1" : "0");
     body.append("extractRequirements", form.extractRequirements ? "1" : "0");
 
     setUploading(true);
@@ -398,8 +406,10 @@ export default function BooksTab({
             },
             {
               id: "current",
-              label: "Make this the current issue",
-              disabled: row.isCurrent === 1 || row.processing !== "ready",
+              label: canSetCurrent
+                ? "Make this the current issue"
+                : "Make current (specifications admin only)",
+              disabled: !canSetCurrent || row.isCurrent === 1 || row.processing !== "ready",
               onSelect: () => void setCurrent(row),
             },
             {
@@ -520,12 +530,20 @@ export default function BooksTab({
               label="Extract submittal requirements while splitting"
               description="Reads Part 1.3 of each section and proposes the submittals it demands. Every row lands as identified — a machine reading, unconfirmed, not registrable."
             />
-            <Checkbox
-              checked={form.makeCurrent}
-              onChange={(e) => setForm({ ...form, makeCurrent: e.target.checked })}
-              label="Make this the current issue once it has split"
-              description="Supersedes whichever book is current today, in both directions. The superseded book stays readable."
-            />
+            {canSetCurrent ? (
+              <Checkbox
+                checked={form.makeCurrent}
+                onChange={(e) => setForm({ ...form, makeCurrent: e.target.checked })}
+                label="Make this the current issue once it has split"
+                description="Supersedes whichever book is current today, in both directions. The superseded book stays readable."
+              />
+            ) : (
+              <p className="text-meta">
+                Putting an issue in force is a specifications-admin act, and you have{" "}
+                {books.data?.access.level ?? "no"} access. This upload lands as a draft; ask an
+                administrator to make it current once a second person has accepted it.
+              </p>
+            )}
           </div>
         </div>
       </Modal>

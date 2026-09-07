@@ -7,7 +7,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
-import { changeEvents, companyMemberships, projects, signals } from "@constructos/db";
+import { changeEvents, companyMemberships, ledgerEntries, projectMemberships, projects, signals } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
 import { newId } from "../../lib/ids.js";
 import { designModule } from "./index.js";
@@ -16,6 +16,7 @@ let built: Awaited<ReturnType<typeof buildTestApp>>;
 let app: FastifyInstance;
 let owner: TestActor;
 let approver: TestActor;
+let standardUser: TestActor;
 let stranger: TestActor;
 let projectId: string;
 
@@ -37,6 +38,16 @@ const base = () => `/projects/${projectId}/design`;
 async function makePackage(name: string) {
   const res = await post(`${base()}/packages`, { name, discipline: "multi_discipline", stageKey: "stage_4" });
   return res.json() as { id: string; reference: string };
+}
+
+/** A freeze fixes what has been approved, so freezing needs an approved package. */
+async function makeApprovedPackage(name: string) {
+  const pkg = await makePackage(name);
+  await post(`${base()}/packages/${pkg.id}/transition`, { to: "in_progress" });
+  await post(`${base()}/packages/${pkg.id}/transition`, { to: "in_review" });
+  const approved = await post(`${base()}/packages/${pkg.id}/transition`, { to: "approved" }, approver.headers);
+  expect(approved.statusCode).toBe(200);
+  return pkg;
 }
 
 async function makeNotice(over: Record<string, unknown> = {}) {
@@ -66,12 +77,34 @@ beforeAll(async () => {
     headers: { authorization: second.headers["authorization"]!, "x-company-id": owner.companyId },
   };
 
+  // A plain member with design:standard on the project and NO company admin
+  // role: the ceiling of what they may sign at is design_lead.
+  const plain = await registerActor(app);
+  await app.db
+    .insert(companyMemberships)
+    .values({ id: newId("cm"), companyId: owner.companyId, userId: plain.userId, role: "member" });
+  standardUser = {
+    ...plain,
+    companyId: owner.companyId,
+    headers: { authorization: plain.headers["authorization"]!, "x-company-id": owner.companyId },
+  };
+
   stranger = await registerActor(app);
 
   projectId = newId("prj");
+  // The change register carries no currency of its own — its money IS the
+  // project's currency — so this project is kept in GBP, the currency every
+  // impact below is assessed in.
   await app.db
     .insert(projects)
-    .values({ id: projectId, companyId: owner.companyId, name: "Design — change control", stage: "design" });
+    .values({ id: projectId, companyId: owner.companyId, name: "Design — change control", stage: "design", currency: "GBP" });
+  await app.db.insert(projectMemberships).values({
+    id: newId("pm"),
+    companyId: owner.companyId,
+    projectId,
+    userId: plain.userId,
+    templateKey: "project_manager",
+  });
 });
 
 afterAll(async () => {
@@ -193,7 +226,7 @@ describe("currency honesty", () => {
 
 describe("freeze position and post-freeze signal", () => {
   it("stamps the freeze position at submission and raises one signal", async () => {
-    const pkg = await makePackage("Frozen for change control");
+    const pkg = await makeApprovedPackage("Frozen for change control");
     await post(`${base()}/freezes`, {
       scope: "package",
       packageId: pkg.id,
@@ -306,6 +339,70 @@ describe("approval", () => {
     expect(body.approvedBy).toBe(approver.userId);
   });
 
+  it("refuses an authorisation level the approver does not hold", async () => {
+    // The ladder used to be self-declared: any project member with
+    // design:standard could sign a board-level change by typing "board".
+    const notice = await makeNotice({ title: "Board-level self-declaration" });
+    await post(`${base()}/change-notices/${notice.id}/impacts`, {
+      discipline: "structural",
+      summary: "Major re-frame",
+      costImpact: 2_000_000,
+      currency: "GBP",
+      timeImpactDays: 40,
+    });
+    await post(`${base()}/change-notices/${notice.id}/submit`, {});
+    const detail = (await get(`${base()}/change-notices/${notice.id}`)).json() as {
+      requiredAuthorisation: string;
+      heldAuthorisation: { level: string; basis: string };
+    };
+    expect(detail.requiredAuthorisation).toBe("board");
+
+    const claimed = await post(
+      `${base()}/change-notices/${notice.id}/approve`,
+      { authorisationLevel: "board" },
+      standardUser.headers,
+    );
+    expect(claimed.statusCode).toBe(403);
+    expect(claimed.json().message).toContain("you hold design lead");
+
+    // Unchanged: the notice is still waiting for someone who does hold it.
+    const after = (await get(`${base()}/change-notices/${notice.id}`)).json() as { status: string };
+    expect(after.status).toBe("submitted");
+
+    // And the endpoint tells the caller what they may sign at.
+    const held = (await get(`${base()}/change-notices/${notice.id}`, standardUser.headers)).json() as {
+      heldAuthorisation: { level: string };
+    };
+    expect(held.heldAuthorisation.level).toBe("design_lead");
+
+    const proper = await post(
+      `${base()}/change-notices/${notice.id}/approve`,
+      { authorisationLevel: "board" },
+      approver.headers,
+    );
+    expect(proper.statusCode).toBe(200);
+  });
+
+  it("lets a standard user sign a change that only needs design lead authority", async () => {
+    const notice = await makeNotice({ title: "Small design lead change", classification: "design_development" });
+    await post(`${base()}/change-notices/${notice.id}/impacts`, {
+      discipline: "architectural",
+      summary: "Setting-out tweak",
+      costImpact: 250,
+      currency: "GBP",
+    });
+    await post(`${base()}/change-notices/${notice.id}/submit`, {});
+    const detail = (await get(`${base()}/change-notices/${notice.id}`)).json() as { requiredAuthorisation: string };
+    expect(detail.requiredAuthorisation).toBe("design_lead");
+    const res = await post(
+      `${base()}/change-notices/${notice.id}/approve`,
+      { authorisationLevel: "design_lead" },
+      standardUser.headers,
+    );
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as { approvedBy: string }).approvedBy).toBe(standardUser.userId);
+  });
+
   it("refuses to approve a change nobody has assessed", async () => {
     const notice = await makeNotice({ title: "Unassessed" });
     await post(`${base()}/change-notices/${notice.id}/submit`, {});
@@ -386,6 +483,16 @@ describe("implementation and entitlement", () => {
     expect(event?.eventType).toBe("design_change");
     expect(event?.reason).toBe("client_request");
     expect(event?.originId).toBe(notice.id);
+
+    // The chain must file the raised record as what it is: searching the
+    // ledger for a change event id may not answer "design change notice".
+    const chain = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(and(eq(ledgerEntries.companyId, owner.companyId), eq(ledgerEntries.objectId, body.changeEventId!)));
+    expect(chain).toHaveLength(1);
+    expect(chain[0]?.objectType).toBe("change_event");
+    expect(chain[0]?.action).toBe("create");
   });
 
   it("refuses to turn a designer's own change into an owner change event", async () => {
@@ -408,6 +515,59 @@ describe("implementation and entitlement", () => {
     const res = await post(`${base()}/change-notices/${notice.id}/implement`, { raiseChangeEvent: true });
     expect(res.statusCode).toBe(400);
     expect(res.json().message).toContain("currencies");
+  });
+
+  it("refuses to raise a change event in a currency the project does not keep", async () => {
+    // change_events has no currency column: its money IS the project's
+    // currency. A EUR assessment landing in a GBP register would silently
+    // restate the number.
+    const notice = await approvedNotice({ title: "Assessed in euros", originator: "client" }, [
+      { discipline: "mechanical", summary: "Imported plant", costImpact: 30_000, currency: "EUR", timeImpactDays: 3 },
+    ]);
+    const res = await post(`${base()}/change-notices/${notice.id}/implement`, { raiseChangeEvent: true });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("EUR");
+    expect(res.json().message).toContain("GBP");
+    const events = await app.db.select().from(changeEvents).where(eq(changeEvents.originId, notice.id));
+    expect(events).toHaveLength(0);
+
+    // It can still be implemented without pretending to price it in GBP.
+    const without = await post(`${base()}/change-notices/${notice.id}/implement`, { raiseChangeEvent: false });
+    expect(without.statusCode).toBe(200);
+    expect((without.json() as { changeEventId: string | null }).changeEventId).toBeNull();
+  });
+
+  it("refuses to put an unpriced change into the register as zero exposure", async () => {
+    const notice = await approvedNotice({ title: "Deliberately unpriced", originator: "client" }, [
+      { discipline: "civil", summary: "Scope to be priced", timeImpactDays: 4 },
+    ]);
+    const res = await post(`${base()}/change-notices/${notice.id}/implement`, { raiseChangeEvent: true });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("No cost has been assessed");
+    const events = await app.db.select().from(changeEvents).where(eq(changeEvents.originId, notice.id));
+    expect(events).toHaveLength(0);
+  });
+
+  it("raises exactly one change event when implementation is fired twice", async () => {
+    const notice = await approvedNotice({ title: "Double implementation", originator: "client" }, [
+      { discipline: "architectural", summary: "Extra glazing", costImpact: 45_000, currency: "GBP", timeImpactDays: 4 },
+    ]);
+    const [a, b] = await Promise.all([
+      post(`${base()}/change-notices/${notice.id}/implement`, { raiseChangeEvent: true }),
+      post(`${base()}/change-notices/${notice.id}/implement`, { raiseChangeEvent: true }),
+    ]);
+    const codes = [a.statusCode, b.statusCode].sort();
+    expect(codes[0]).toBe(200);
+    expect(codes[1]).toBe(409);
+    const events = await app.db.select().from(changeEvents).where(eq(changeEvents.originId, notice.id));
+    expect(events).toHaveLength(1);
+    expect(events[0]?.estimatedCost).toBe(45_000);
+    const detail = (await get(`${base()}/change-notices/${notice.id}`)).json() as {
+      status: string;
+      changeEventId: string | null;
+    };
+    expect(detail.status).toBe("implemented");
+    expect(detail.changeEventId).toBe(events[0]?.id);
   });
 
   it("refuses implementation of an unapproved notice", async () => {

@@ -22,7 +22,7 @@
  */
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { api } from "../../lib/api";
-import { Badge, Card, CardBody } from "../../ui";
+import { Badge, Card, CardBody, formatCurrency } from "../../ui";
 
 /* ---------------------------------- Types ---------------------------------- */
 
@@ -90,6 +90,29 @@ export interface LessonListRow extends Lesson {
   applicationCount: number;
 }
 
+/**
+ * What actually happened after a lesson was applied (#979, #981-984).
+ *
+ * `unknown` is a real answer and the default: an application whose outcome
+ * nobody measured must not be counted as a success, which is precisely how
+ * lessons registers come to report impact they never had.
+ */
+export const LESSON_OUTCOMES = [
+  "unknown",
+  "avoided",
+  "partially_avoided",
+  "no_effect",
+  "counterproductive",
+] as const;
+
+export const LESSON_OUTCOME_LABELS: Record<string, string> = {
+  unknown: "Not yet measured",
+  avoided: "The problem was avoided",
+  partially_avoided: "Partly avoided",
+  no_effect: "No effect",
+  counterproductive: "Made it worse",
+};
+
 export interface LessonApplication {
   id: string;
   companyId: string;
@@ -97,12 +120,66 @@ export interface LessonApplication {
   projectId: string;
   appliedTo: { tool?: string; recordId?: string; label?: string | null } | null;
   action: string;
+  outcome: string | null;
   outcomeNote: string | null;
+  outcomeValue: number | null;
+  outcomeCurrency: string | null;
+  outcomeDays: number | null;
+  measuredAt: string | null;
+  measuredBy: string | null;
   appliedBy: string;
   appliedAt: string;
   /** present on the impact report only */
   projectName?: string | null;
   crossedProjectBoundary?: boolean;
+}
+
+/**
+ * An AI PROPOSAL for a lesson, from the record that obliged its capture.
+ *
+ * `created` is always false and the trigger stays open: a lesson nobody chose
+ * to write is a lesson nobody stands behind, and the validation step that
+ * follows would then be checking a machine's work against nothing.
+ */
+export interface LessonDraft {
+  triggerId: string;
+  runId: string | null;
+  aiAvailable: boolean;
+  created: false;
+  proposal: {
+    title: string | null;
+    whatHappened: string | null;
+    rootCause: string | null;
+    recommendation: string | null;
+    category: string | null;
+    tags: string[];
+  } | null;
+  confidence: number | null;
+  citations: { recordId: string; excerpt: string | null }[];
+  evidenceRefs: { tool: string; recordId: string; label: string }[];
+  note: string;
+}
+
+/**
+ * Applied-lesson outcome measurement (#979, #981-984).
+ *
+ * `effectiveness` is computed over MEASURED applications only, with the
+ * denominator stated: an unmeasured application is not a successful one, and a
+ * register that reads it as one reports impact it never had.
+ */
+export interface LessonOutcomes {
+  lessonId: string;
+  number: string;
+  applications: number;
+  measured: number;
+  unmeasured: number;
+  byOutcome: Record<string, number>;
+  effectiveness: { value: number | null; denominator: number; reasons: string[] };
+  valueByCurrency: { currency: string; value: number; applications: number }[];
+  daysAvoided: number | null;
+  daysMeasuredOn: number;
+  reasons: string[];
+  items: LessonApplication[];
 }
 
 export interface LessonDetail extends Lesson {
@@ -202,7 +279,8 @@ export interface RelevanceReason {
     | "tag_overlap"
     | "impact_magnitude"
     | "recency"
-    | "previously_applied";
+    | "previously_applied"
+    | "semantic_similarity";
   points: number;
   detail: string;
 }
@@ -212,6 +290,8 @@ export interface RelevantItem {
   applicationCount: number;
   score: number;
   reasons: RelevanceReason[];
+  /** tf-idf cosine against the record's own words, when text was supplied */
+  similarity?: number | null;
 }
 
 export interface RelevantResponse {
@@ -220,7 +300,10 @@ export interface RelevantResponse {
     category: string | null;
     phase: string | null;
     tags: string[];
+    text?: string | null;
     toolImpliesCategories: string[];
+    semanticMatches?: number;
+    semanticTerms?: string[];
   };
   registerSize: number;
   matched: number;
@@ -512,6 +595,7 @@ export const REASON_LABEL: Record<RelevanceReason["code"], string> = {
   impact_magnitude: "Impact magnitude",
   recency: "Recency",
   previously_applied: "Previously applied",
+  semantic_similarity: "Semantic similarity",
 };
 
 /** csv text field ("delay, design") → normalized tag list. */
@@ -761,4 +845,356 @@ export function KV({ k, v }: { k: string; v: ReactNode }) {
 export function Prose({ text }: { text: string | null | undefined }) {
   if (!text || !text.trim()) return <p className="text-xs text-ink-300">—</p>;
   return <p className="whitespace-pre-wrap text-sm leading-relaxed text-ink-700">{text}</p>;
+}
+
+/* ------------------ Cross-project supplier performance -------------------- */
+
+export interface SupplierDimension {
+  /** null when there is nothing to score — never 0 */
+  score: number | null;
+  observations: number;
+  basis: string;
+  counts: Record<string, number>;
+}
+
+export interface SupplierScore {
+  vendorId: string;
+  vendorName: string;
+  certificateDiscipline: SupplierDimension;
+  commitmentSlippage: SupplierDimension;
+  quality: SupplierDimension;
+  composite: number | null;
+  observations: number;
+  reasons: string[];
+}
+
+export interface SupplierPerformanceResponse {
+  asOf: string;
+  items: SupplierScore[];
+  total: number;
+  scope: "company" | "restricted";
+  sources?: string[];
+  note?: string;
+}
+
+export const SUPPLIER_DIMENSIONS = [
+  { key: "certificateDiscipline", label: "Certificate discipline" },
+  { key: "commitmentSlippage", label: "Commitment slippage" },
+  { key: "quality", label: "Quality" },
+] as const;
+
+/** A colour for a 0-100 score. Null is grey — an unknown is not a good score. */
+export function scoreTone(score: number | null): string {
+  if (score === null) return "text-ink-400";
+  if (score >= 80) return "text-emerald-700";
+  if (score >= 55) return "text-amber-700";
+  return "text-red-700";
+}
+
+/* ------------------------- Knowledge graph (#992) ------------------------- */
+
+export type LessonEdgeKind = "record" | "person" | "tag" | "lesson";
+
+export interface LessonEdge {
+  id: string;
+  lessonId: string;
+  edgeKind: LessonEdgeKind;
+  targetType: string;
+  targetId: string;
+  targetLabel: string | null;
+  targetProjectId: string | null;
+  role: string;
+  /** 1 when the target row was actually found at write time */
+  verified: number;
+  recordLinkId: string | null;
+  createdAt: string;
+}
+
+export interface LessonGraph {
+  lesson: { id: string; number: string; title: string; status: LessonStatus };
+  edges: LessonEdge[];
+  byKind: Record<LessonEdgeKind, LessonEdge[]>;
+  counts: {
+    total: number;
+    record: number;
+    person: number;
+    tag: number;
+    lesson: number;
+    unverified: number;
+  };
+  resolvableTypes: string[];
+  /** the server's own account of what the edges do and do not establish */
+  reason: string;
+}
+
+export const EDGE_ROLE_LABEL: Record<string, string> = {
+  origin: "Came out of",
+  evidence: "Evidence",
+  applied_to: "Applied to",
+  author: "Author",
+  validator: "Validator",
+  applier: "Applied by",
+  tag: "Tag",
+  supersedes: "Supersedes",
+  superseded_by: "Superseded by",
+  see_also: "See also",
+};
+
+/* ---------------------- Onboarding packs (#994) --------------------------- */
+
+export interface PackItem {
+  lesson: Lesson;
+  score: number;
+  reasons: string[];
+}
+
+export interface OnboardingPack {
+  project: {
+    id: string;
+    name: string;
+    type: string | null;
+    stage: string;
+    value: number | null;
+    currency: string;
+  };
+  registerSize: number;
+  items: PackItem[];
+  selection: string;
+  reason: string | null;
+  /** present only on the narrated (POST) response */
+  narrative?: string | null;
+  narrativeReason?: string | null;
+  runId?: string | null;
+}
+
+/* ------------------- Rate & duration libraries (#981-984) ----------------- */
+
+export type LibraryEntryStatus = "proposed" | "accepted" | "rejected" | "superseded";
+
+export interface RateLibraryEntry {
+  id: string;
+  elementCode: string;
+  description: string | null;
+  unit: string;
+  currency: string;
+  sampleSize: number;
+  medianRate: number | null;
+  p80Rate: number | null;
+  meanRate: number | null;
+  minRate: number | null;
+  maxRate: number | null;
+  estimatedRate: number | null;
+  /** median outturn ÷ estimate − 1; null when no estimate was recorded */
+  accuracyRatio: number | null;
+  sourceProjectIds: string[];
+  samples: unknown[];
+  status: LibraryEntryStatus;
+  note: string | null;
+  supersedesId: string | null;
+  acceptedBy: string | null;
+  acceptedAt: string | null;
+  computedAt: string;
+}
+
+export interface DurationLibraryEntry {
+  id: string;
+  activityCode: string;
+  description: string | null;
+  unit: string;
+  sampleSize: number;
+  medianDays: number | null;
+  p80Days: number | null;
+  meanDays: number | null;
+  minDays: number | null;
+  maxDays: number | null;
+  plannedDays: number | null;
+  accuracyRatio: number | null;
+  sourceProjectIds: string[];
+  samples: unknown[];
+  status: LibraryEntryStatus;
+  note: string | null;
+  supersedesId: string | null;
+  acceptedBy: string | null;
+  acceptedAt: string | null;
+  computedAt: string;
+}
+
+export interface AccuracyMetric {
+  scope: "rates" | "durations";
+  comparable: number;
+  /** entries with no estimate to compare against — counted, never assumed right */
+  notComparable: number;
+  medianBias: number | null;
+  p80Bias: number | null;
+  optimisticShare: number | null;
+  reason: string;
+}
+
+export interface RealisationStat {
+  category: string;
+  realised: number;
+  meanPredictedProbability: number | null;
+  impactByCurrency: Array<{
+    currency: string;
+    n: number;
+    medianRealised: number;
+    medianPredicted: number | null;
+    bias: number | null;
+  }>;
+  reason: string;
+}
+
+export interface LibraryAccuracy {
+  rates: AccuracyMetric;
+  durations: AccuracyMetric;
+  riskRealisation: RealisationStat[];
+  basis: string;
+}
+
+export interface LibraryRebuildResult {
+  rates: { proposals: number; inserted: number; superseded: number; skipped: number };
+  durations: { proposals: number; inserted: number; superseded: number; skipped: number };
+  reasons: string[];
+}
+
+export interface RiskRealisation {
+  id: string;
+  projectId: string;
+  riskId: string;
+  riskReference: string | null;
+  category: string | null;
+  title: string | null;
+  predictedProbability: number | null;
+  predictedImpact: number | null;
+  predictedCurrency: string | null;
+  realisedAt: string | null;
+  realisedImpact: number | null;
+  realisedCurrency: string | null;
+  realisedDays: number | null;
+  sourceType: string | null;
+  sourceId: string | null;
+  note: string | null;
+  createdAt: string;
+}
+
+export interface RiskRealisationResponse extends ListResponse<RiskRealisation> {
+  stats: RealisationStat[];
+}
+
+/** A signed percentage: +30% means the estimate was 30% optimistic. */
+export function biasLabel(ratio: number | null | undefined): string {
+  if (ratio === null || ratio === undefined || !Number.isFinite(ratio)) return "—";
+  const pct = ratio * 100;
+  const sign = pct > 0 ? "+" : "";
+  return `${sign}${pct.toFixed(0)}%`;
+}
+
+export function biasTone(ratio: number | null | undefined): string {
+  if (ratio === null || ratio === undefined || !Number.isFinite(ratio)) return "text-ink-400";
+  if (Math.abs(ratio) < 0.05) return "text-emerald-700";
+  if (Math.abs(ratio) < 0.2) return "text-amber-700";
+  return "text-red-700";
+}
+
+export function libraryStatusTone(status: string): "gray" | "blue" | "green" | "red" {
+  if (status === "accepted") return "green";
+  if (status === "rejected") return "red";
+  if (status === "superseded") return "gray";
+  return "blue";
+}
+
+/* ---------- Contract clause & procurement route analytics (#987-988) ------- */
+
+/** Money is never one number: every amount arrives keyed by its currency. */
+export type MoneyByCurrency = Record<string, number>;
+
+export interface ClauseRow {
+  key: string;
+  contractFamily: string;
+  clause: string;
+  projects: number;
+  disputes: number;
+  disputesResolved: number;
+  disputeOutcomes: Record<string, number>;
+  disputeRootCauses: Record<string, number>;
+  amountClaimed: MoneyByCurrency;
+  amountAwarded: MoneyByCurrency;
+  /** awarded ÷ claimed where both were recorded; null when unknowable */
+  recoveryRatio: number | null;
+  recoveryObservations: number;
+  variations: number;
+  variationValue: MoneyByCurrency;
+  variationTimeImpactDays: number | null;
+  forensicClaims: number;
+  obligations: number;
+  obligationsBreached: number;
+  breachRate: number | null;
+  weight: number;
+  basis: string;
+  reasons: string[];
+}
+
+export interface ClausePerformanceResponse {
+  asOf: string;
+  items: ClauseRow[];
+  total: number;
+  unattributed: {
+    disputes: number;
+    variations: number;
+    forensicClaims: number;
+    obligations: number;
+  };
+  scope: "company" | "restricted";
+  truncated?: boolean;
+  sources?: string[];
+  reasons: string[];
+}
+
+export interface RouteRow {
+  route: string;
+  projects: number;
+  projectIds: string[];
+  contractSum: MoneyByCurrency;
+  agreedVariationValue: MoneyByCurrency;
+  outturnVariancePercent: number | null;
+  outturnObservations: number;
+  variationsPerProject: number | null;
+  variations: number;
+  disputeRate: number | null;
+  disputedProjects: number;
+  disputes: number;
+  reliable: boolean;
+  basis: string;
+  reasons: string[];
+}
+
+export interface ProcurementRouteResponse {
+  asOf: string;
+  items: RouteRow[];
+  total: number;
+  minProjects: number;
+  scope: "company" | "restricted";
+  sources?: string[];
+  reasons: string[];
+}
+
+/**
+ * Money bucketed by currency, rendered as the several figures it is. Summing
+ * across currencies would produce one confident wrong number, so the component
+ * lists them instead — and says "—" when there is nothing at all.
+ */
+export function moneyBuckets(bucket: MoneyByCurrency | undefined): string {
+  if (!bucket) return "—";
+  const entries = Object.entries(bucket).filter(([, v]) => Number.isFinite(v));
+  if (entries.length === 0) return "—";
+  return entries
+    .sort((a, b) => b[1] - a[1])
+    .map(([ccy, value]) => formatCurrency(value, { currency: ccy, compact: true }))
+    .join("  ·  ");
+}
+
+/** A ratio 0..1 as a percentage, or "—" when it was not knowable. */
+export function ratioPercent(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  return `${(value * 100).toFixed(0)}%`;
 }

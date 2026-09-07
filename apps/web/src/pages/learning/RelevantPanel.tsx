@@ -12,7 +12,7 @@
 import { useCallback, useState } from "react";
 import { LESSON_CATEGORIES, TOOLS } from "@constructos/shared";
 import { api } from "../../lib/api";
-import { Badge, Button, Card, CardBody, Field, Input, Select, Spinner } from "../../ui";
+import { Badge, Button, Card, CardBody, Field, Input, Select, Spinner, Textarea } from "../../ui";
 import { formatDate } from "../format";
 import ApplyModal from "./ApplyModal";
 import type { ApplyOutcome } from "./ApplyModal";
@@ -44,6 +44,12 @@ export default function RelevantPanel({
   const [category, setCategory] = useState("");
   const [phase, setPhase] = useState("");
   const [tags, setTags] = useState("");
+  /**
+   * The record's OWN WORDS (#993). The structured filters only find lessons
+   * whose metadata somebody remembered to set; this finds the one that
+   * describes exactly this problem and was filed under something else.
+   */
+  const [text, setText] = useState("");
   const [limit, setLimit] = useState("10");
 
   const [result, setResult] = useState<RelevantResponse | null>(null);
@@ -63,6 +69,7 @@ export default function RelevantPanel({
       if (phase.trim()) params.set("phase", phase.trim());
       const t = parseTags(tags);
       if (t.length > 0) params.set("tags", t.join(","));
+      if (text.trim().length >= 3) params.set("text", text.trim());
       params.set("limit", limit);
       setResult(
         await api.get<RelevantResponse>(
@@ -75,7 +82,7 @@ export default function RelevantPanel({
     } finally {
       setLoading(false);
     }
-  }, [projectId, tool, category, phase, tags, limit]);
+  }, [projectId, tool, category, phase, tags, text, limit]);
 
   function applied(outcome: ApplyOutcome) {
     setApplyFor(null);
@@ -143,12 +150,26 @@ export default function RelevantPanel({
           </Field>
         </div>
 
+        <Field
+          label="The record's own words"
+          hint="Paste the subject or description of the RFI, variation or risk you are raising. Matched by tf-idf cosine against the register — still no model, and the similarity is shown as a number."
+        >
+          <Textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            rows={2}
+            maxLength={4000}
+            placeholder="e.g. Piling rig sank in made ground that was never probed"
+          />
+        </Field>
+
         <div className="flex items-center gap-3">
           <Button onClick={() => void run()} disabled={loading}>
             {loading ? "Retrieving…" : "Retrieve lessons"}
           </Button>
           <span className="text-xs text-ink-400">
-            No model is involved — this is integer arithmetic over the inputs above.
+            No model is involved — this is integer arithmetic over the inputs above, plus a
+            tf-idf cosine when the record's words are supplied.
           </span>
         </div>
 
@@ -177,6 +198,27 @@ export default function RelevantPanel({
                 {result.query.tags.length > 0 ? result.query.tags.join(", ") : "none"}
               </span>
             </div>
+
+            {result.query.text ? (
+              <p className="text-xs text-ink-500">
+                Matched the record's words against the register:{" "}
+                <span className="font-semibold tabular-nums text-ink-900">
+                  {fmtInt(result.query.semanticMatches ?? 0)}
+                </span>{" "}
+                lesson{(result.query.semanticMatches ?? 0) === 1 ? "" : "s"} share vocabulary with
+                it
+                {(result.query.semanticTerms ?? []).length > 0 ? (
+                  <>
+                    {" "}
+                    — strongest terms{" "}
+                    <span className="font-mono text-[11px] text-ink-700">
+                      {(result.query.semanticTerms ?? []).join(", ")}
+                    </span>
+                  </>
+                ) : null}
+                .
+              </p>
+            ) : null}
 
             {result.query.toolImpliesCategories.length > 0 ? (
               <p className="text-xs text-ink-500">
@@ -222,6 +264,14 @@ export default function RelevantPanel({
                         </div>
                       </div>
                       <div className="flex items-center gap-2">
+                        {typeof item.similarity === "number" ? (
+                          <span
+                            className="inline-flex items-center rounded-full bg-violet-100 px-2 py-1 text-[11px] font-semibold tabular-nums text-violet-800"
+                            title="tf-idf cosine similarity between the lesson's words and the record's"
+                          >
+                            sim {item.similarity.toFixed(2)}
+                          </span>
+                        ) : null}
                         <span
                           className="inline-flex items-center rounded-full bg-brand-600 px-2.5 py-1 text-xs font-bold tabular-nums text-white"
                           title="Total relevance score"

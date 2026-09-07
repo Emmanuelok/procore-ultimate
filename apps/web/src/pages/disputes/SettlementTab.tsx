@@ -37,6 +37,7 @@ import {
   type OfferRow,
   type SettlementAnalysisResult,
 } from "./disputesShared";
+import DecisionTreePanel from "./DecisionTreePanel";
 
 const BRAND = "#1d60f1";
 const GRID = "#ebedf1";
@@ -467,6 +468,11 @@ export default function SettlementTab({
           ) : null}
         </CardBody>
       </Card>
+
+      {/* ------------------- decision tree modelling (#351-355) ------------------- */}
+      <div className="mt-6 border-t border-ink-100 pt-4">
+        <DecisionTreePanel projectId={projectId} dispute={dispute} onChanged={onChanged} />
+      </div>
 
       {/* ------------------------------- record modal ------------------------------- */}
       <Modal open={recordOpen} title="Record a settlement offer" onClose={() => setRecordOpen(false)} wide>

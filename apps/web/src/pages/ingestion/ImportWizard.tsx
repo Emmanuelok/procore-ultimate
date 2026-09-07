@@ -9,7 +9,8 @@
  *   · The commit step names what will be created, where, and shows the
  *     retained file hash that every committed record traces back to.
  */
-import { useMemo, useState, type ChangeEvent } from "react";
+import { useCallback, useEffect, useMemo, useState, type ChangeEvent } from "react";
+import { toast } from "sonner";
 import { api } from "../../lib/api";
 import {
   Badge,
@@ -19,6 +20,7 @@ import {
   ErrorAlert,
   Field,
   Input,
+  SegmentedControl,
   Select,
   Spinner,
 } from "../../ui";
@@ -29,11 +31,13 @@ import {
   ReportTable,
   RowSplitBar,
   fmtInt,
+  asList,
   guessColumnMap,
   normalizeCreateRunResponse,
   shortSha,
   type CreateRunResult,
   type DatasetInfo,
+  type MappingTemplate,
   type ProjectPick,
   type RunRow,
   type SourceRow,
@@ -107,6 +111,15 @@ export default function ImportWizard({
   const [projectId, setProjectId] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [newSourceName, setNewSourceName] = useState("");
+  /**
+   * insert  — a row whose externalId was already committed is a DUPLICATE and
+   *           is rejected. Right for a first migration.
+   * reconcile — that row is a RESTATEMENT: it is matched to the committed
+   *           record, the difference is computed field by field, and an
+   *           operator decides per row whether to apply it. Right for the
+   *           monthly re-export every operator actually has.
+   */
+  const [mode, setMode] = useState<"insert" | "reconcile">("insert");
 
   const dataset = useMemo(
     () => (datasets ?? []).find((d) => d.dataset === datasetCode) ?? null,
@@ -154,11 +167,23 @@ export default function ImportWizard({
     setBusy(true);
     setError(null);
     try {
+      /*
+       * FIELDS BEFORE THE FILE — not a style choice.
+       *
+       * @fastify/multipart only exposes a field once its bytes have been
+       * parsed, and busybody emits the file's end when it sees the terminating
+       * boundary. With the file first, the trailing field parts can land in a
+       * later TCP chunk, so on a multi-megabyte CSV the server read sourceId as
+       * undefined and answered "Request validation failed" — intermittently,
+       * and only on large files, which is the worst kind of bug to chase. Every
+       * other upload in this app puts its fields first; this one now does too.
+       */
       const form = new FormData();
-      form.append("file", file);
       form.append("sourceId", effectiveSourceId);
       form.append("dataset", dataset.dataset);
       if (projectId) form.append("projectId", projectId);
+      if (mode === "reconcile") form.append("mode", "reconcile");
+      form.append("file", file);
       const res = await api.upload<unknown>("/api/v1/ingestion/runs", form);
       const norm = normalizeCreateRunResponse(res);
       if (!norm) {
@@ -172,6 +197,87 @@ export default function ImportWizard({
       setStep(2);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Upload failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /* ------------------------- step 2: saved templates ----------------------- */
+
+  /**
+   * Saved column maps (#1045-1047). The API has had POST/DELETE
+   * /ingestion/mapping-templates and a templateId branch on /map since the
+   * capability landed, and nothing in the app called any of them — the
+   * Programme tab even instructed the user to "adopt one on the New import
+   * tab", which did not exist. This is that tab.
+   */
+  const [templates, setTemplates] = useState<MappingTemplate[] | null>(null);
+  const [templateId, setTemplateId] = useState("");
+  const [templateName, setTemplateName] = useState("");
+  const [templateNote, setTemplateNote] = useState<string | null>(null);
+
+  const loadTemplates = useCallback(async (ds: string) => {
+    if (!ds) {
+      setTemplates([]);
+      return;
+    }
+    try {
+      const res = await api.get<unknown>(
+        `/api/v1/ingestion/mapping-templates?dataset=${encodeURIComponent(ds)}&pageSize=100`,
+      );
+      setTemplates(asList<MappingTemplate>(res).items);
+    } catch {
+      // A template list that will not load must not block an import.
+      setTemplates([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (step === 2 && dataset) void loadTemplates(dataset.dataset);
+  }, [step, dataset, loadTemplates]);
+
+  function adoptTemplate(id: string) {
+    setTemplateId(id);
+    setTemplateNote(null);
+    const tpl = (templates ?? []).find((t) => t.id === id);
+    if (!tpl) return;
+    // Adopting fills the picker so the operator SEES what will be applied and
+    // can change it; the map is still sent as a templateId so the adoption is
+    // counted and ledgered on the run.
+    setColumnMap({ ...tpl.columnMap });
+    const unknown = Object.values(tpl.columnMap).filter(
+      (col) => created !== null && !created.columns.includes(col),
+    );
+    setTemplateNote(
+      unknown.length > 0
+        ? `Template "${tpl.name}" maps ${unknown.length} column(s) this file does not have (${unknown.join(", ")}). Fix them below — the run will be mapped from what is on screen.`
+        : `Template "${tpl.name}" applied.`,
+    );
+    if (unknown.length > 0) setTemplateId("");
+  }
+
+  async function onSaveTemplate() {
+    if (!dataset || !templateName.trim()) return;
+    const cleaned: Record<string, string> = {};
+    for (const [k, v] of Object.entries(columnMap)) if (v) cleaned[k] = v;
+    if (Object.keys(cleaned).length === 0) {
+      setTemplateNote("Map at least one field before saving a template.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await api.post<unknown>("/api/v1/ingestion/mapping-templates", {
+        name: templateName.trim(),
+        dataset: dataset.dataset,
+        ...(effectiveSourceId ? { sourceId: effectiveSourceId } : {}),
+        columnMap: cleaned,
+      });
+      toast.success(`Mapping template "${templateName.trim()}" saved`);
+      setTemplateName("");
+      await loadTemplates(dataset.dataset);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save the mapping template");
     } finally {
       setBusy(false);
     }
@@ -191,9 +297,18 @@ export default function ImportWizard({
     try {
       const cleaned: Record<string, string> = {};
       for (const [k, v] of Object.entries(columnMap)) if (v) cleaned[k] = v;
-      const res = await api.post<unknown>(`/api/v1/ingestion/runs/${run.id}/map`, {
-        columnMap: cleaned,
-      });
+      // An unmodified adoption is sent as {templateId} so the server records
+      // which template was used and counts the adoption; an edited map is sent
+      // verbatim, because it is no longer that template.
+      const tpl = (templates ?? []).find((t) => t.id === templateId);
+      const unchanged =
+        !!tpl &&
+        JSON.stringify(Object.entries(tpl.columnMap).sort()) ===
+          JSON.stringify(Object.entries(cleaned).sort());
+      const res = await api.post<unknown>(
+        `/api/v1/ingestion/runs/${run.id}/map`,
+        unchanged ? { templateId } : { columnMap: cleaned },
+      );
       const next = extractRun(res);
       if (next) setRun(next);
       setMapped(true);
@@ -382,6 +497,25 @@ export default function ImportWizard({
               </Field>
             ) : null}
 
+            <Field
+              label="Duplicate handling"
+              hint={
+                mode === "insert"
+                  ? "A row whose external id was already committed is rejected as a duplicate."
+                  : "A row whose external id was already committed is matched to it, and the difference is shown for a per-row decision at commit time."
+              }
+            >
+              <SegmentedControl<"insert" | "reconcile">
+                value={mode}
+                onChange={setMode}
+                aria-label="Duplicate handling"
+                options={[
+                  { value: "insert", label: "Reject duplicates" },
+                  { value: "reconcile", label: "Reconcile restatements" },
+                ]}
+              />
+            </Field>
+
             <Field label="CSV file" hint="Comma-separated with a header row. Quoted fields, escaped quotes and CRLF are handled; up to 20,000 data rows per run.">
               <input
                 type="file"
@@ -429,6 +563,60 @@ export default function ImportWizard({
                   the file has a header row.
                 </Caveat>
               ) : null}
+
+              {/* Saved mapping templates (#1045-1047) */}
+              <div className="rounded-md bg-ink-50 p-3">
+                <h3 className="text-sm font-semibold text-ink-900">Saved mapping templates</h3>
+                <p className="mt-0.5 text-xs text-ink-500">
+                  The mapping step is identical every month. Adopt a saved map to fill the table
+                  below, or save the map you build here and the next import of the same export is
+                  two clicks. Adopting an unedited template records WHICH template a run was mapped
+                  from; editing it after adopting sends the map you can see instead.
+                </p>
+                <div className="mt-2 flex flex-wrap items-end gap-2">
+                  <Field label="Adopt a template">
+                    <Select
+                      value={templateId}
+                      onChange={(e) => adoptTemplate(e.target.value)}
+                      className="w-64"
+                      disabled={busy || (templates?.length ?? 0) === 0}
+                    >
+                      <option value="">
+                        {templates === null
+                          ? "Loading…"
+                          : templates.length === 0
+                            ? "No saved template for this dataset"
+                            : "— choose a template —"}
+                      </option>
+                      {(templates ?? []).map((t) => (
+                        <option key={t.id} value={t.id}>
+                          {t.name} ({Object.keys(t.columnMap).length} fields · adopted {t.useCount}x)
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                  <Field label="Save this mapping as">
+                    <Input
+                      value={templateName}
+                      onChange={(e) => setTemplateName(e.target.value)}
+                      maxLength={200}
+                      placeholder="e.g. Sage vendor export"
+                      className="w-56"
+                    />
+                  </Field>
+                  <Button
+                    variant="secondary"
+                    className="mb-5"
+                    onClick={() => void onSaveTemplate()}
+                    disabled={busy || !templateName.trim()}
+                  >
+                    Save template
+                  </Button>
+                </div>
+                {templateNote ? (
+                  <p className="mt-1 text-xs text-ink-600">{templateNote}</p>
+                ) : null}
+              </div>
 
               <div>
                 <h3 className="mb-2 text-sm font-semibold text-ink-900">

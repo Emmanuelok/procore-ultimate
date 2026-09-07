@@ -19,12 +19,16 @@
  *
  * GATES. Every project route is `/projects/:projectId/...` so `requireTool`
  * resolves the project and enforces the `estimating` tool level. The rate
- * library is a COMPANY asset and sits behind the company gate, because an
- * estimator without a project still has to be able to maintain it.
+ * library is a COMPANY asset with no project for `requireTool` to resolve, so
+ * it is gated on company role instead: owner/admin/member read and maintain
+ * it, only owner/admin retire from it or import over it, and a `guest`
+ * membership reaches none of it — the library is the company's margin
+ * structure, not reference data.
  */
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { and, asc, count, desc, eq, ilike, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import {
+  assuranceGrants,
   bidSubmissionLines,
   bidSubmissions,
   budgetLineItems,
@@ -42,6 +46,7 @@ import {
   estimates,
   estimatingCrews,
   estimatingProductionRates,
+  projectMemberships,
   projects,
   signals,
   takeoffItems,
@@ -54,6 +59,7 @@ import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, paginate } from "../../lib/pagination.js";
+import { isExpired } from "../../lib/time.js";
 import { pushNotifications } from "../notifications/service.js";
 import { planBudgetLines } from "./budgetize.js";
 import { compareEstimates, type ComparableLine } from "./compare.js";
@@ -75,6 +81,7 @@ import {
 import { buildProposalDocument, renderProposalHtml, type ProposalDetailLevel } from "./proposal.js";
 import { levelQuotes, normaliseScopeKey, type QuoteInput } from "./quotes.js";
 import * as S from "./schemas.js";
+import { registerEstimatingSearch } from "./search.js";
 import {
   addDays,
   assertEditable,
@@ -134,9 +141,28 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     app.requireTool("estimating", "standard"),
   ];
   const adminGate = [app.authenticate, app.requireCompany, app.requireTool("estimating", "admin")];
-  const companyGate = [app.authenticate, app.requireCompany];
+  // The rate library is a company asset with no :projectId for `requireTool`
+  // to resolve, so it is gated on company ROLE instead (plan §1), in two
+  // tiers. A `guest` membership reaches none of it: the library carries the
+  // company's labour, plant and material build-ups — its margin structure —
+  // and a guest is by definition somebody from outside. A member maintains
+  // it; retiring a rate an estimate cites, or importing over the whole list,
+  // is an owner's or administrator's act.
+  const companyGate = [
+    app.authenticate,
+    app.requireCompany,
+    app.requireCompanyRole(["owner", "admin", "member"]),
+  ];
+  /** Same roles as reading today; named separately so the two can diverge. */
+  const companyWriteGate = companyGate;
+  const companyAdminGate = [
+    app.authenticate,
+    app.requireCompany,
+    app.requireCompanyRole(["owner", "admin"]),
+  ];
 
   registerEstimatingJobs(app);
+  registerEstimatingSearch();
 
   async function ledger(
     req: FastifyRequest,
@@ -180,6 +206,41 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     const row = rows[0];
     if (!row) throw notFound("Crew not found");
     return row;
+  }
+
+  /**
+   * Plan §6.3: a read that ranges over project data is limited to the
+   * projects the caller can actually see. `null` means every project in the
+   * company — an owner, an admin, or a company-wide assurance grant.
+   */
+  async function visibleProjectIds(req: FastifyRequest): Promise<string[] | null> {
+    if (req.companyRole === "owner" || req.companyRole === "admin") return null;
+    const nowMs = Date.now();
+    const grants = await app.db
+      .select({ projectId: assuranceGrants.projectId, expiresAt: assuranceGrants.expiresAt })
+      .from(assuranceGrants)
+      .where(
+        and(
+          eq(assuranceGrants.companyId, req.companyId!),
+          eq(assuranceGrants.userId, req.user!.id),
+        ),
+      );
+    const live = grants.filter((g) => !isExpired(g.expiresAt, nowMs));
+    if (live.some((g) => g.projectId === null)) return null;
+    const ids = new Set<string>(
+      live.map((g) => g.projectId).filter((p): p is string => typeof p === "string"),
+    );
+    const memberships = await app.db
+      .select({ projectId: projectMemberships.projectId })
+      .from(projectMemberships)
+      .where(
+        and(
+          eq(projectMemberships.companyId, req.companyId!),
+          eq(projectMemberships.userId, req.user!.id),
+        ),
+      );
+    for (const m of memberships) ids.add(m.projectId);
+    return [...ids];
   }
 
   /** A project id the caller named on a company-library route must be ours. */
@@ -270,7 +331,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     return paginate(items, Number(totalRow?.n ?? 0), q);
   });
 
-  app.post("/estimating/catalogue", { preHandler: companyGate }, async (req, reply) => {
+  app.post("/estimating/catalogue", { preHandler: companyWriteGate }, async (req, reply) => {
     const body = S.catalogueCreateSchema.parse(req.body);
     if (body.projectId) await assertProjectInCompany(body.projectId, req.companyId!);
     if (body.crewId) await fetchCrew(body.crewId, req.companyId!);
@@ -300,7 +361,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     return reply.status(201).send(await fetchCatalogueItem(id, req.companyId!));
   });
 
-  app.post("/estimating/catalogue/bulk", { preHandler: companyGate }, async (req, reply) => {
+  app.post("/estimating/catalogue/bulk", { preHandler: companyAdminGate }, async (req, reply) => {
     const body = S.catalogueBulkSchema.parse(req.body);
     const created: string[] = [];
     const updated: string[] = [];
@@ -367,10 +428,13 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     };
   });
 
-  app.patch("/estimating/catalogue/:itemId", { preHandler: companyGate }, async (req) => {
+  app.patch("/estimating/catalogue/:itemId", { preHandler: companyWriteGate }, async (req) => {
     const { itemId } = req.params as { itemId: string };
     const body = S.cataloguePatchSchema.parse(req.body);
     const item = await fetchCatalogueItem(itemId, req.companyId!);
+    // Same check the create path makes: a crew named here has to be ours, or
+    // the rate's labour build-up cites a crew nobody in this company can see.
+    if (body.crewId) await fetchCrew(body.crewId, req.companyId!);
     const patch: Record<string, unknown> = { updatedAt: nowIso() };
     if (body.rates !== undefined) {
       const rates = makeSplit({ ...ratesOf(item), ...body.rates });
@@ -420,7 +484,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     return fetchCatalogueItem(itemId, req.companyId!);
   });
 
-  app.delete("/estimating/catalogue/:itemId", { preHandler: companyGate }, async (req) => {
+  app.delete("/estimating/catalogue/:itemId", { preHandler: companyAdminGate }, async (req) => {
     const { itemId } = req.params as { itemId: string };
     const item = await fetchCatalogueItem(itemId, req.companyId!);
     // Retired, never deleted: estimate lines cite the item, and an estimate
@@ -587,7 +651,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     return paginate(items, Number(totalRow?.n ?? 0), q);
   });
 
-  app.post("/estimating/assemblies", { preHandler: companyGate }, async (req, reply) => {
+  app.post("/estimating/assemblies", { preHandler: companyWriteGate }, async (req, reply) => {
     const body = S.assemblyCreateSchema.parse(req.body);
     if (body.projectId) await assertProjectInCompany(body.projectId, req.companyId!);
     const existing = await app.db
@@ -642,7 +706,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     return { ...assembly, components: await componentsOf(assemblyId) };
   });
 
-  app.patch("/estimating/assemblies/:assemblyId", { preHandler: companyGate }, async (req) => {
+  app.patch("/estimating/assemblies/:assemblyId", { preHandler: companyWriteGate }, async (req) => {
     const { assemblyId } = req.params as { assemblyId: string };
     const body = S.assemblyPatchSchema.parse(req.body);
     const assembly = await fetchAssembly(assemblyId, req.companyId!);
@@ -670,7 +734,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     return { ...(await fetchAssembly(assemblyId, req.companyId!)), components: await componentsOf(assemblyId) };
   });
 
-  app.put("/estimating/assemblies/:assemblyId/components", { preHandler: companyGate }, async (req) => {
+  app.put("/estimating/assemblies/:assemblyId/components", { preHandler: companyWriteGate }, async (req) => {
     const { assemblyId } = req.params as { assemblyId: string };
     const body = S.assemblyComponentsSchema.parse(req.body);
     const assembly = await fetchAssembly(assemblyId, req.companyId!);
@@ -685,7 +749,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
 
   app.post(
     "/estimating/assemblies/:assemblyId/refresh-rates",
-    { preHandler: companyGate },
+    { preHandler: companyWriteGate },
     async (req) => {
       const { assemblyId } = req.params as { assemblyId: string };
       const assembly = await fetchAssembly(assemblyId, req.companyId!);
@@ -744,7 +808,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     },
   );
 
-  app.delete("/estimating/assemblies/:assemblyId", { preHandler: companyGate }, async (req) => {
+  app.delete("/estimating/assemblies/:assemblyId", { preHandler: companyAdminGate }, async (req) => {
     const { assemblyId } = req.params as { assemblyId: string };
     const assembly = await fetchAssembly(assemblyId, req.companyId!);
     await app.db
@@ -792,7 +856,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     return paginate(items, Number(totalRow?.n ?? 0), q);
   });
 
-  app.post("/estimating/crews", { preHandler: companyGate }, async (req, reply) => {
+  app.post("/estimating/crews", { preHandler: companyWriteGate }, async (req, reply) => {
     const body = S.crewCreateSchema.parse(req.body);
     if (body.projectId) await assertProjectInCompany(body.projectId, req.companyId!);
     const existing = await app.db
@@ -844,7 +908,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     return fetchCrew(crewId, req.companyId!);
   });
 
-  app.patch("/estimating/crews/:crewId", { preHandler: companyGate }, async (req) => {
+  app.patch("/estimating/crews/:crewId", { preHandler: companyWriteGate }, async (req) => {
     const { crewId } = req.params as { crewId: string };
     const body = S.crewPatchSchema.parse(req.body);
     const crew = await fetchCrew(crewId, req.companyId!);
@@ -873,7 +937,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     return fetchCrew(crewId, req.companyId!);
   });
 
-  app.delete("/estimating/crews/:crewId", { preHandler: companyGate }, async (req) => {
+  app.delete("/estimating/crews/:crewId", { preHandler: companyAdminGate }, async (req) => {
     const { crewId } = req.params as { crewId: string };
     const crew = await fetchCrew(crewId, req.companyId!);
     await app.db
@@ -925,7 +989,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     return paginate(items, Number(totalRow?.n ?? 0), q);
   });
 
-  app.post("/estimating/production-rates", { preHandler: companyGate }, async (req, reply) => {
+  app.post("/estimating/production-rates", { preHandler: companyWriteGate }, async (req, reply) => {
     const body = S.productionRateCreateSchema.parse(req.body);
     if (body.projectId) await assertProjectInCompany(body.projectId, req.companyId!);
     if (body.crewId) await fetchCrew(body.crewId, req.companyId!);
@@ -976,7 +1040,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     return reply.status(201).send(rows[0]);
   });
 
-  app.patch("/estimating/production-rates/:rateId", { preHandler: companyGate }, async (req) => {
+  app.patch("/estimating/production-rates/:rateId", { preHandler: companyWriteGate }, async (req) => {
     const { rateId } = req.params as { rateId: string };
     const body = S.productionRatePatchSchema.parse(req.body);
     const rows = await app.db
@@ -991,6 +1055,9 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
       .limit(1);
     const rate = rows[0];
     if (!rate) throw notFound("Production rate not found");
+    // Same check the create path makes — a crew from another company must not
+    // end up on one of our production rates.
+    if (body.crewId) await fetchCrew(body.crewId, req.companyId!);
     const patch: Record<string, unknown> = { updatedAt: nowIso() };
     for (const key of [
       "description",
@@ -1026,7 +1093,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     return after[0];
   });
 
-  app.delete("/estimating/production-rates/:rateId", { preHandler: companyGate }, async (req) => {
+  app.delete("/estimating/production-rates/:rateId", { preHandler: companyAdminGate }, async (req) => {
     const { rateId } = req.params as { rateId: string };
     const rows = await app.db
       .select()
@@ -1110,6 +1177,26 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     let takeoffQuantity = existing?.takeoffQuantity ?? null;
     let description = body.description ?? existing?.description ?? "";
     const basis: string[] = [];
+
+    // Every reference on a line is resolved tenant-scoped. A line pointed at
+    // a section on somebody else's estimate still counts in the header total
+    // but its subtotal is written nowhere, so the sections quietly stop
+    // adding up to the estimate.
+    if (body.sectionId) await assertSectionOnEstimate(body.sectionId, estimate.id);
+    if (body.subQuoteLineId) {
+      const rows = await app.db
+        .select({ id: estimateSubQuoteLines.id })
+        .from(estimateSubQuoteLines)
+        .where(
+          and(
+            eq(estimateSubQuoteLines.id, body.subQuoteLineId),
+            eq(estimateSubQuoteLines.companyId, companyId),
+            eq(estimateSubQuoteLines.projectId, estimate.projectId),
+          ),
+        )
+        .limit(1);
+      if (!rows[0]) throw notFound("Sub-quote line not found on this project");
+    }
 
     const catalogueItemId = body.catalogueItemId ?? existing?.catalogueItemId ?? null;
     if (body.catalogueItemId) {
@@ -1662,6 +1749,26 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     for (const s of sections) sectionMap.set(s.id, newId("esec"));
 
     await app.db.transaction(async (tx) => {
+      // Re-assert the head guard on a locked row (plan §6.2). Exactly one
+      // member of a version chain may be un-superseded; two concurrent
+      // "new version" clicks would otherwise both pass the read above and
+      // leave two live heads carrying the same version number.
+      const locked = (
+        await tx
+          .select({ id: estimates.id, supersededById: estimates.supersededById, status: estimates.status })
+          .from(estimates)
+          .where(and(eq(estimates.id, parent.id), eq(estimates.companyId, companyId)))
+          .for("update")
+      )[0];
+      if (!locked) throw notFound("Estimate not found");
+      if (locked.supersededById) {
+        throw conflict(
+          `Estimate ${parent.reference} has already been superseded by a later version; branch from the head instead.`,
+        );
+      }
+      if (locked.status === "void") {
+        throw conflict(`Estimate ${parent.reference} is void; there is nothing to carry forward.`);
+      }
       await tx.insert(estimates).values({
         id: newEstimateId,
         companyId,
@@ -1815,6 +1922,16 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
 
   /* ---------------- sections ------------------------------------------ */
 
+  /** A section named as a parent (or on a line) must be on THIS estimate. */
+  async function assertSectionOnEstimate(sectionId: string, estimateId: string): Promise<void> {
+    const rows = await app.db
+      .select({ id: estimateSections.id })
+      .from(estimateSections)
+      .where(and(eq(estimateSections.id, sectionId), eq(estimateSections.estimateId, estimateId)))
+      .limit(1);
+    if (!rows[0]) throw notFound("Section not found on this estimate");
+  }
+
   app.get("/projects/:projectId/estimates/:estimateId/sections", { preHandler: readGate }, async (req) => {
     const { estimateId } = req.params as { estimateId: string };
     const estimate = await fetchEstimate(app.db, estimateId, req.companyId!, req.projectId!);
@@ -1827,6 +1944,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     const body = S.sectionCreateSchema.parse(req.body);
     const estimate = await fetchEstimate(app.db, estimateId, req.companyId!, req.projectId!);
     await guardEditable(req, estimate);
+    if (body.parentId) await assertSectionOnEstimate(body.parentId, estimate.id);
     const id = newId("esec");
     await app.db.insert(estimateSections).values({
       id,
@@ -1863,6 +1981,12 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
         .where(and(eq(estimateSections.id, sectionId), eq(estimateSections.estimateId, estimate.id)))
         .limit(1);
       if (!rows[0]) throw notFound("Section not found on this estimate");
+      if (body.parentId) {
+        if (body.parentId === sectionId) {
+          throw badRequest("A section cannot be its own parent.");
+        }
+        await assertSectionOnEstimate(body.parentId, estimate.id);
+      }
       const patch: Record<string, unknown> = { updatedAt: nowIso() };
       for (const key of ["name", "code", "description", "parentId", "sortOrder", "detail"] as const) {
         const value = (body as Record<string, unknown>)[key];
@@ -2159,6 +2283,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
       const body = S.fromAssemblySchema.parse(req.body);
       const estimate = await fetchEstimate(app.db, estimateId, req.companyId!, req.projectId!);
       await guardEditable(req, estimate);
+      if (body.sectionId) await assertSectionOnEstimate(body.sectionId, estimate.id);
       const assembly = await fetchAssembly(body.assemblyId, req.companyId!);
       const components = await componentsOf(assembly.id);
       if (components.length === 0) {
@@ -2314,6 +2439,11 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     const body = S.markupCreateSchema.parse(req.body);
     const estimate = await fetchEstimate(app.db, estimateId, req.companyId!, req.projectId!);
     await guardEditable(req, estimate);
+    // A markup scoped to a section on another estimate would apply to nothing
+    // and say nothing about it, so the sections are resolved here.
+    for (const sectionId of body.sectionIds ?? []) {
+      await assertSectionOnEstimate(sectionId, estimate.id);
+    }
     const existing = await markupsOfEstimate(app.db, estimate.id);
     const id = newId("emk");
     await app.db.insert(estimateMarkups).values({
@@ -2362,6 +2492,9 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
         .limit(1);
       const markup = rows[0];
       if (!markup) throw notFound("Markup not found on this estimate");
+      for (const sectionId of body.sectionIds ?? []) {
+        await assertSectionOnEstimate(sectionId, estimate.id);
+      }
       const patch: Record<string, unknown> = { updatedAt: nowIso() };
       for (const key of [
         "kind",
@@ -2825,15 +2958,15 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
       .limit(1);
     const item = rows[0];
     if (!item) throw notFound("Takeoff item not found on this project");
-    const [{ n } = { n: 0 }] = await app.db
-      .select({ n: count() })
+    const cited = await app.db
+      .select({ id: estimateLineItems.id, estimateId: estimateLineItems.estimateId })
       .from(estimateLineItems)
       .where(eq(estimateLineItems.takeoffItemId, itemId));
-    if (Number(n) > 0) {
-      throw conflict(
-        `This measurement is priced on ${n} estimate line${Number(n) === 1 ? "" : "s"}. Void it instead of deleting it, so the provenance of those lines survives.`,
-      );
-    }
+    // This is a soft void, never a delete: the row, its geometry and its
+    // scale stay exactly where they are, and the estimate lines that cite it
+    // keep citing it. That is why a cited measurement may be voided — the
+    // provenance of those lines survives the void, and refusing would leave
+    // an abandoned measurement no route could ever retire.
     await app.db
       .update(takeoffItems)
       .set({ status: "void", updatedAt: nowIso() })
@@ -2843,8 +2976,19 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
       name: item.name,
       from: item.status,
       to: "void",
+      citedByLines: cited.length,
     });
-    return { id: itemId, status: "void" };
+    return {
+      id: itemId,
+      status: "void",
+      pricedOn: cited,
+      warnings:
+        cited.length > 0
+          ? [
+              `This measurement is priced on ${cited.length} estimate line${cited.length === 1 ? "" : "s"}. Voiding it does NOT change those lines — they keep the quantity they were priced at and still cite this measurement, so the estimate stays defensible. Amend the lines deliberately if the quantity was wrong.`,
+            ]
+          : [],
+    };
   });
 
   /* ================================================================== */
@@ -3035,6 +3179,20 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
       const { quoteId } = req.params as { quoteId: string };
       const body = S.subQuotePatchSchema.parse(req.body);
       const quote = await fetchSubQuote(quoteId, req.companyId!, req.projectId!);
+      // An accepted quote is cited by estimate lines. Its descriptive fields
+      // may still be corrected, but its MONEY may not: moving the quoted
+      // total under lines priced from it makes the levelled total and the
+      // estimate disagree, with nothing on screen to say why.
+      if (quote.status === "accepted") {
+        const moved = (["quotedTotal", "adjustmentAmount", "currency"] as const).filter(
+          (k) => body[k] !== undefined && body[k] !== quote[k],
+        );
+        if (moved.length > 0) {
+          throw conflict(
+            `Sub-quote ${quote.reference} has been accepted into an estimate; ${moved.join(", ")} can no longer be changed. Take a fresh quote from ${quote.vendorName} and accept that instead, so the estimate lines still cite the price they were built from.`,
+          );
+        }
+      }
       const patch: Record<string, unknown> = { updatedAt: nowIso() };
       for (const key of [
         "vendorId",
@@ -3050,7 +3208,6 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
         "qualifications",
         "notes",
         "documentIds",
-        "status",
         "estimateId",
         "detail",
       ] as const) {
@@ -3061,27 +3218,96 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
       const adjustment = body.adjustmentAmount ?? quote.adjustmentAmount;
       patch["levelledTotal"] = round2(quoted + adjustment);
       await app.db.update(estimateSubQuotes).set(patch).where(eq(estimateSubQuotes.id, quoteId));
-      // A re-dated or withdrawn quote clears the validity findings it raised.
-      if (body.validUntil !== undefined || body.status !== undefined) {
+      // A re-dated quote clears the validity findings it raised.
+      if (body.validUntil !== undefined) {
         await closeSignalByKey(
           app.db,
           req.companyId!,
           "sub_quote_expiring",
           quoteId,
-          "The quote was re-dated or its status changed.",
+          "The quote was re-dated.",
         );
         await closeSignalByKey(
           app.db,
           req.companyId!,
           "sub_quote_expired",
           quoteId,
-          "The quote was re-dated or its status changed.",
+          "The quote was re-dated.",
         );
       }
       await ledger(req, "update", "estimate_sub_quote", quoteId, {
         projectId: req.projectId!,
         reference: quote.reference,
         changed: Object.keys(patch).filter((k) => k !== "updatedAt"),
+      });
+      return {
+        ...(await fetchSubQuote(quoteId, req.companyId!, req.projectId!)),
+        lines: await quoteLinesOf(quoteId),
+      };
+    },
+  );
+
+  /**
+   * The hand-driven half of a quote's lifecycle (#202). Acceptance has its
+   * own route because it writes estimate lines; withdrawal is the DELETE;
+   * expiry belongs to the validity sweep. What is left — reviewing, levelling
+   * and rejecting a price, and re-dating one that lapsed — is here, with the
+   * one transition that must never happen refused explicitly.
+   */
+  app.post(
+    "/projects/:projectId/estimating/sub-quotes/:quoteId/status",
+    { preHandler: standardGate },
+    async (req) => {
+      const { quoteId } = req.params as { quoteId: string };
+      const body = S.subQuoteStatusSchema.parse(req.body);
+      const quote = await fetchSubQuote(quoteId, req.companyId!, req.projectId!);
+      if (quote.status === "accepted") {
+        const [{ n } = { n: 0 }] = await app.db
+          .select({ n: count() })
+          .from(estimateLineItems)
+          .where(eq(estimateLineItems.subQuoteId, quoteId));
+        throw conflict(
+          `Sub-quote ${quote.reference} has been accepted into an estimate and ${n} estimate line${Number(n) === 1 ? "" : "s"} cite its prices. Its status cannot be walked back underneath them — delete those lines, or cut a new version of the estimate.`,
+        );
+      }
+      if (quote.status === "withdrawn" && body.status !== "received") {
+        throw conflict(
+          `Sub-quote ${quote.reference} was withdrawn. Re-open it as "received" first if the price is live again.`,
+        );
+      }
+      const validUntil = body.validUntil !== undefined ? body.validUntil : quote.validUntil;
+      const reviving = quote.status === "expired" || quote.status === "withdrawn";
+      if (reviving && validUntil !== null && validUntil < todayIso()) {
+        throw badRequest(
+          `Sub-quote ${quote.reference} lapsed on ${quote.validUntil}. Re-confirm the price with ${quote.vendorName} and give it a validity date in the future; a lapsed number is not a price.`,
+        );
+      }
+      if (quote.status === body.status && body.validUntil === undefined) {
+        throw conflict(`Sub-quote ${quote.reference} is already ${body.status}.`);
+      }
+      const note = body.note
+        ? `${quote.notes ? `${quote.notes}\n` : ""}${body.note}`
+        : quote.notes;
+      await app.db
+        .update(estimateSubQuotes)
+        .set({ status: body.status, validUntil, notes: note, updatedAt: nowIso() })
+        .where(eq(estimateSubQuotes.id, quoteId));
+      // Re-dated, rejected or re-opened: whichever it is, the validity
+      // findings raised against the old date no longer describe the quote.
+      if (body.validUntil !== undefined || body.status === "rejected" || reviving) {
+        const why = `The quote moved to ${body.status}${
+          body.validUntil !== undefined ? ` and was re-dated to ${validUntil ?? "no expiry"}` : ""
+        }.`;
+        await closeSignalByKey(app.db, req.companyId!, "sub_quote_expiring", quoteId, why);
+        await closeSignalByKey(app.db, req.companyId!, "sub_quote_expired", quoteId, why);
+      }
+      await ledger(req, "state_change", "estimate_sub_quote", quoteId, {
+        projectId: req.projectId!,
+        reference: quote.reference,
+        from: quote.status,
+        to: body.status,
+        validUntil,
+        note: body.note ?? null,
       });
       return {
         ...(await fetchSubQuote(quoteId, req.companyId!, req.projectId!)),
@@ -3351,6 +3577,7 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
       const quote = await fetchSubQuote(quoteId, companyId, projectId);
       const estimate = await fetchEstimate(app.db, body.estimateId, companyId, projectId);
       await guardEditable(req, estimate);
+      if (body.sectionId) await assertSectionOnEstimate(body.sectionId, estimate.id);
       if (quote.status === "expired") {
         throw conflict(
           `Sub-quote ${quote.reference} is out of validity (${quote.validUntil}). Re-confirm the price with ${quote.vendorName} and re-date it before pricing it into an estimate.`,
@@ -3372,10 +3599,17 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
       }
       let position = estimate.lineCount;
       const values = lines.map((l) => {
+        // A lump sum is a quote line with no quantity — and a quantity of
+        // ZERO is the same statement as no quantity at all. Taking a literal
+        // 0 would extend the line to nothing and quietly drop the money,
+        // which is exactly what a bid import produces when the bidder priced
+        // a package rather than a rate.
+        const q = l.quantity;
+        const lump = q === null || q === undefined || q === 0;
+        const rate = lump ? l.amount : (l.unitRate ?? round4(l.amount / q));
         const priced = priceLine({
-          baseQuantity: l.quantity ?? 1,
-          rates: { [l.costType === "subcontract" ? "subcontract" : "other"]:
-            l.unitRate ?? (l.quantity && l.quantity !== 0 ? round4(l.amount / l.quantity) : l.amount) },
+          baseQuantity: lump ? 1 : q,
+          rates: { [l.costType === "subcontract" ? "subcontract" : "other"]: rate },
         });
         const row: typeof estimateLineItems.$inferInsert = {
           id: newId("eli"),
@@ -3414,6 +3648,37 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
         };
         return row;
       });
+      // Reconcile what landed on the estimate against what the quote says.
+      // A silent difference here is the whole failure mode this route has:
+      // the tender goes out at one number and the subcontractor holds
+      // another.
+      const quotedForAccepted = round2(lines.reduce((sum, l) => sum + l.amount, 0));
+      const createdTotal = round2(values.reduce((sum, v) => sum + (v.amount ?? 0), 0));
+      if (Math.abs(createdTotal - quotedForAccepted) > 0.5) {
+        warnings.push(
+          `The ${values.length} line${values.length === 1 ? "" : "s"} written onto the estimate total ${createdTotal} ${quote.currency} against the ${quotedForAccepted} priced on the quote (difference ${round2(quotedForAccepted - createdTotal)}). Check the quantities and rates on the quote before relying on the estimate.`,
+        );
+      }
+      // A quote row with nothing in the rate column and nothing in the amount
+      // column was left BLANK by the bidder. It lands on the estimate as a
+      // zero line, which is a real thing to want (the scope is in the grid,
+      // waiting for a price) but never a thing to let pass silently.
+      const blank = lines.filter(
+        (l) => l.amount === 0 && (l.unitRate === null || l.unitRate === undefined),
+      );
+      if (blank.length > 0) {
+        warnings.push(
+          `${blank.length} row${blank.length === 1 ? "" : "s"} on this quote carry no price at all (${blank
+            .slice(0, 3)
+            .map((l) => `"${l.description}"`)
+            .join(", ")}${blank.length > 3 ? ", …" : ""}). They were written onto the estimate at nil so the scope is visible in the grid — price them before the estimate goes out, and do not read the quote's total as covering them.`,
+        );
+      }
+      if (quote.adjustmentAmount !== 0) {
+        warnings.push(
+          `The quote carries a levelling adjustment of ${quote.adjustmentAmount} ${quote.currency}, which is NOT carried onto the estimate lines — it belongs to the comparison, not to the price. Add it as a line if it is part of the number.`,
+        );
+      }
       await app.db.insert(estimateLineItems).values(values);
       for (const [i, l] of lines.entries()) {
         await app.db
@@ -3553,7 +3818,29 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
       const budgetReference = `BUD-${pad3(number)}`;
       // The whole conversion is one transaction: a budget with half its lines
       // is worse than no budget, because every rollup would quietly be wrong.
+      // The guards above ran on a read outside it, so they are re-asserted
+      // here on a locked row (plan §6.2): two clicks arriving together would
+      // otherwise both pass, write two budgets with identical lines, and
+      // leave one of them orphaned with nothing pointing at it.
       await app.db.transaction(async (tx) => {
+        const locked = (
+          await tx
+            .select()
+            .from(estimates)
+            .where(and(eq(estimates.id, estimate.id), eq(estimates.companyId, companyId)))
+            .for("update")
+        )[0];
+        if (!locked) throw notFound("Estimate not found");
+        if (locked.convertedBudgetId) {
+          throw conflict(
+            `Estimate ${locked.reference} has already been converted into budget ${locked.convertedBudgetId}. Cut a new version and convert that instead.`,
+          );
+        }
+        if (locked.status !== "approved") {
+          throw conflict(
+            `Estimate ${locked.reference} is ${locked.status}. Only an APPROVED estimate becomes a budget — the budget is what the project is then measured against, and it may not rest on a number nobody signed.`,
+          );
+        }
         if (body.makeActive) {
           await tx
             .update(budgets)
@@ -3709,6 +3996,24 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
       if (!event) throw notFound("Change event not found on this project");
       if (estimate.lineCount === 0) {
         throw badRequest(`Estimate ${estimate.reference} has no priced lines to push.`);
+      }
+      // change_events.estimatedCost/latestCost carry no currency of their own:
+      // they are read as the PROJECT's currency by every cost report
+      // downstream. Writing an estimate denominated in something else into
+      // them would put a number in the cost report that means a different
+      // amount of money, with nothing on the record to say so.
+      const projectRow = (
+        await app.db
+          .select({ currency: projects.currency })
+          .from(projects)
+          .where(eq(projects.id, projectId))
+          .limit(1)
+      )[0];
+      const projectCurrency = projectRow?.currency ?? null;
+      if (projectCurrency !== null && projectCurrency !== estimate.currency) {
+        throw conflict(
+          `Estimate ${estimate.reference} is in ${estimate.currency} and this project's costs are reported in ${projectCurrency}. The change event's cost fields carry no currency of their own, so pushing would put a ${estimate.currency} figure into a ${projectCurrency} cost report. Re-price the estimate in ${projectCurrency}, or record the change event's value by hand with the rate you used.`,
+        );
       }
       const totals = await recomputeEstimate(app.db, estimate.id);
       const field = body.field ?? "both";
@@ -4043,11 +4348,33 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     if (!q.costCode && !q.search) {
       throw badRequest("Give a cost code or a search term to look up a historical rate.");
     }
+    // The history ranges over projects, so it is narrowed to the ones this
+    // caller can see (plan §6.3). An owner or admin — or a company-wide
+    // assurance grant — reads the whole tenant; anybody else reads the
+    // projects they are on, and the response says which basis it used rather
+    // than quietly returning a smaller number.
+    const visible = await visibleProjectIds(req);
     const clauses = [
       eq(estimateLineItems.companyId, req.companyId!),
       inArray(estimates.status, ["approved", "converted", "superseded"]),
       ne(estimateLineItems.quantity, 0),
     ];
+    if (visible !== null) {
+      if (visible.length === 0) {
+        return {
+          costCode: q.costCode ?? null,
+          search: q.search ?? null,
+          distributions: [],
+          samples: [],
+          scope: "visible_projects" as const,
+          reasons: [
+            "You are not a member of any project in this company, so there is no rate history you may read. A company owner or administrator sees the whole tenant's history.",
+          ],
+          generatedAt: nowIso(),
+        };
+      }
+      clauses.push(inArray(estimateLineItems.projectId, visible));
+    }
     if (q.costCode) clauses.push(eq(estimateLineItems.costCode, q.costCode));
     if (q.search) clauses.push(ilike(estimateLineItems.description, `%${q.search}%`));
     if (q.unit) clauses.push(eq(estimateLineItems.unit, q.unit));
@@ -4117,8 +4444,14 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
       };
     });
 
+    const scopeReason =
+      visible === null
+        ? "Drawn from every approved, converted or superseded estimate in this company — you hold company-wide visibility."
+        : `Drawn from the ${visible.length} project${visible.length === 1 ? "" : "s"} you are a member of. A company owner or administrator sees the whole tenant's history, so their figures may differ from these.`;
+
     return {
       query: { costCode: q.costCode ?? null, search: q.search ?? null, unit: q.unit ?? null },
+      scope: visible === null ? ("company" as const) : ("visible_projects" as const),
       distributions,
       samples: rows.map((r) => ({
         description: r.description,
@@ -4133,9 +4466,10 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
       reasons:
         rows.length === 0
           ? [
-              "No approved or converted estimate in this company carries a line matching that filter, so there is no historical rate to show. This is a gap in our records, not a rate of zero.",
+              "No approved or converted estimate in the projects you can see carries a line matching that filter, so there is no historical rate to show. This is a gap in our records, not a rate of zero.",
+              scopeReason,
             ]
-          : [],
+          : [scopeReason],
     };
   });
 
@@ -4399,13 +4733,23 @@ export const estimatingModule: FastifyPluginAsync = async (app) => {
     return paginate(items, Number(totalRow?.n ?? 0), q);
   });
 
-  /** Run both sweeps for this tenant now — the operator/test entry point. */
-  app.post("/projects/:projectId/estimating/sweep", { preHandler: standardGate }, async (req) => {
-    const result = await runEstimatingSweeps(app.db, req.companyId!, new Date());
+  /**
+   * Run the sweeps for THIS PROJECT now — the operator/test entry point.
+   *
+   * Narrowed to `req.projectId` on purpose: the scheduler owns the
+   * company-wide run (and an operator can trigger that at
+   * POST /api/v1/platform/scheduler), because standard access to one project
+   * is not authority to expire quotes and re-flag rates on projects the
+   * caller cannot even see. Admin on the tool, because it writes.
+   */
+  app.post("/projects/:projectId/estimating/sweep", { preHandler: adminGate }, async (req) => {
+    const result = await runEstimatingSweeps(app.db, req.companyId!, new Date(), req.projectId!);
     await ledger(req, "update", "estimating_sweep", newId("swp"), {
       projectId: req.projectId!,
+      scope: "project",
       quotes: result.quotes,
       hygiene: result.hygiene,
+      outliers: result.outliers,
     });
     return result;
   });

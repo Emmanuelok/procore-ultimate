@@ -1,27 +1,119 @@
+/**
+ * Project finance and lender discipline (spec Vol II Domains N/O #732-751,
+ * #769).
+ *
+ * WHAT IT IS
+ * The DFI/PPP financing side of a project: facilities with conditions
+ * precedent, disbursements running draft → submitted → approved →
+ * certified → disbursed, expenditure eligibility and ineligible-expenditure
+ * recoveries, designated-account ledgers and reconciliation (accounts.ts),
+ * covenants computed from period cashflows rather than typed in
+ * (covenants.ts), interest-during-construction and commitment-fee accrual
+ * (interest.ts), PPP availability payments with deduction mechanics
+ * (availability.ts), and the IFI withdrawal application (withdrawal.ts).
+ *
+ * THE THREE RULES THIS MODULE EXISTS TO ENFORCE
+ *  1. Money never crosses a currency boundary: every total is bucketed by
+ *     currency and a mixed-currency headline returns an Unknowable with
+ *     reasons (money.ts).
+ *  2. Headroom is checked inside the transaction that consumes it, with the
+ *     facility row locked FOR UPDATE, at submit AND again at approve — and
+ *     the pipeline, not just cash paid, consumes it.
+ *  3. Separation of duties across the whole chain: requester/submitter ≠
+ *     approver ≠ certifier ≠ payer, and certification is performed by an
+ *     independent engineer, not the delivery team.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO
+ * It does not write a PDF — this runtime has no PDF writer, so the
+ * withdrawal application is served as the print-ready form plus a
+ * statement-of-expenditure CSV rather than a file that claims to be the
+ * lender's. It does not move cash; it records the decisions that authorise
+ * someone else to.
+ */
 import type { FastifyPluginAsync } from "fastify";
 import { and, asc, count, desc, eq, inArray, isNotNull, lt } from "drizzle-orm";
 import { z } from "zod";
 import {
+  assertions,
+  availabilityPaymentModels,
+  availabilityPeriods,
   covenantReadings,
+  covenantWaivers,
   covenants,
+  designatedAccountEntries,
+  designatedAccountReconciliations,
+  designatedAccounts,
+  disbursementForecasts,
   disbursements,
   evidence,
+  facilityCashflows,
   facilityConditions,
   fundingFacilities,
+  ineligibleRecoveries,
   obligations,
-  signals,
+  projects,
+  reconciliations,
+  scheduleTasks,
 } from "@constructos/db";
 import {
+  AVAILABILITY_PERIOD_STATUSES,
+  COVENANT_FORMULAS,
   COVENANT_OPERATORS,
+  DAY_COUNT_CONVENTIONS,
+  DESIGNATED_ACCOUNT_ENTRY_KINDS,
+  DESIGNATED_ACCOUNT_STATUSES,
+  EXPENDITURE_ELIGIBILITY,
   FACILITY_CONDITION_KINDS,
   FACILITY_INSTRUMENTS,
+  FACILITY_CASHFLOW_INPUTS,
+  INELIGIBILITY_REASONS,
+  INELIGIBLE_RECOVERY_STATUSES,
+  type DayCountConvention,
 } from "@constructos/shared";
+import type { Db } from "../../lib/db.js";
 import { newId } from "../../lib/ids.js";
 import { nextRecordNumber } from "../../lib/numbering.js";
 import { appendLedger } from "../../lib/ledger.js";
 import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { isoDateSchema, todayISO } from "../field/dates.js";
+import {
+  companyToolGate,
+  isIndependentReviewer,
+  visibleProjectIds,
+} from "../governance/gates.js";
+import {
+  COVENANT_FORMULA_LIBRARY,
+  computeCovenantReading,
+  evaluateDrawStop,
+  formulaSpec,
+} from "./covenants.js";
+import { buildAccrualSchedule, quarterEnds } from "./interest.js";
+import { computeAccountPosition, reconcileAccount, type AccountEntryInput } from "./accounts.js";
+import {
+  renderWithdrawalApplicationHtml,
+  withdrawalApplicationCsv,
+  type WithdrawalApplicationDocument,
+} from "./withdrawal.js";
+import {
+  computeAvailabilityPayment,
+  type UnavailabilityEvent,
+} from "./availability.js";
+import {
+  assessEligibility,
+  bucketByCurrency,
+  compareForecast,
+  singleCurrencyTotal,
+  type EligibilityEntry,
+  type ForecastPeriod,
+} from "./money.js";
+import {
+  covenantStanding,
+  registerFinanceJobs,
+  sweepDisbursementForecast,
+  sweepOverdueConditions as sweepConditionsShared,
+} from "./jobs.js";
+import { closeSignalByKey, raiseSignalOnce } from "../governance/signals.js";
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                             */
@@ -48,6 +140,11 @@ const facilityCreateSchema = z.object({
   committedAmount: z.number().positive(),
   availabilityEndDate: isoDateSchema.nullable().optional(),
   categories: z.array(categoryInputSchema).max(100).optional(),
+  baseRatePercent: z.number().min(0).max(100).nullable().optional(),
+  marginPercent: z.number().min(0).max(100).nullable().optional(),
+  commitmentFeePercent: z.number().min(0).max(100).nullable().optional(),
+  dayCountConvention: z.enum(DAY_COUNT_CONVENTIONS).optional(),
+  capitaliseInterest: z.boolean().optional(),
   notes: z.string().max(20000).nullable().optional(),
 });
 
@@ -56,6 +153,11 @@ const facilityPatchSchema = z.object({
   lender: z.string().min(1).max(300).optional(),
   availabilityEndDate: isoDateSchema.nullable().optional(),
   categories: z.array(categoryInputSchema).max(100).optional(),
+  baseRatePercent: z.number().min(0).max(100).nullable().optional(),
+  marginPercent: z.number().min(0).max(100).nullable().optional(),
+  commitmentFeePercent: z.number().min(0).max(100).nullable().optional(),
+  dayCountConvention: z.enum(DAY_COUNT_CONVENTIONS).optional(),
+  capitaliseInterest: z.boolean().optional(),
   notes: z.string().max(20000).nullable().optional(),
 });
 
@@ -82,7 +184,155 @@ const disbursementCreateSchema = z.object({
 
 const disburseSchema = z.object({ disbursedAt: isoTimestamp.optional() });
 
+const certifySchema = z.object({
+  note: z.string().max(10000).nullable().optional(),
+  evidenceIds: z.array(z.string().min(1)).max(100).optional(),
+});
+
+/** Per-item eligibility classification on a withdrawal application (#736-737). */
+const eligibilityPutSchema = z.object({
+  entries: z
+    .array(
+      z.object({
+        evidenceId: z.string().min(1),
+        eligibility: z.enum(EXPENDITURE_ELIGIBILITY),
+        reason: z.enum(INELIGIBILITY_REASONS).nullable().optional(),
+        amount: z.number().nonnegative().nullable().optional(),
+        note: z.string().max(5000).nullable().optional(),
+      }),
+    )
+    .max(200),
+});
+
+const forecastCreateSchema = z.object({
+  periodStart: isoDateSchema,
+  periodEnd: isoDateSchema,
+  plannedAmount: z.number().positive(),
+  categoryId: z.string().min(1).nullable().optional(),
+  milestoneTaskId: z.string().min(1).nullable().optional(),
+  note: z.string().max(5000).nullable().optional(),
+});
+
+const CASHFLOW_INPUT_SET = new Set<string>(FACILITY_CASHFLOW_INPUTS);
+
+const cashflowPutSchema = z.object({
+  periodEnd: isoDateSchema,
+  /*
+   * A PARTIAL map, not an exhaustive one. `z.record(z.enum(...), ...)` in
+   * zod v4 demands every key of the enum, which would force a treasury team
+   * to send all twelve named inputs to record a DSCR. Keys are validated
+   * against the enum below instead, so an unknown key is still refused.
+   */
+  inputs: z
+    .record(z.string().max(60), z.number().finite())
+    .refine(
+      (map) => Object.keys(map).every((k) => CASHFLOW_INPUT_SET.has(k)),
+      `inputs may only name the recognised cashflow inputs: ${FACILITY_CASHFLOW_INPUTS.join(", ")}`,
+    )
+    .refine((map) => Object.keys(map).length > 0, "at least one input is required"),
+  note: z.string().max(5000).nullable().optional(),
+});
+
+const covenantWaiveSchema = z.object({
+  reason: z.string().min(1).max(10000),
+  lenderReference: z.string().max(200).nullable().optional(),
+  effectiveFrom: isoDateSchema,
+  effectiveTo: isoDateSchema.nullable().optional(),
+  evidenceIds: z.array(z.string().min(1)).max(50).optional(),
+});
+
+const recoveryCreateSchema = z.object({
+  disbursementId: z.string().min(1).nullable().optional(),
+  evidenceId: z.string().min(1).nullable().optional(),
+  amount: z.number().positive(),
+  currency: z.string().length(3).optional(),
+  reason: z.enum(INELIGIBILITY_REASONS),
+  detail: z.string().max(10000).nullable().optional(),
+});
+
+const recoveryResolveSchema = z.object({
+  status: z.enum(INELIGIBLE_RECOVERY_STATUSES).exclude(["open"]),
+  note: z.string().max(5000).nullable().optional(),
+});
+
+const costOfFinanceQuery = z.object({
+  from: isoDateSchema.optional(),
+  to: isoDateSchema.optional(),
+});
+
 const rejectSchema = z.object({ reason: z.string().min(1).max(10000) });
+
+/* ---- Designated (special) accounts (#735, #745) ---- */
+
+const accountCreateSchema = z.object({
+  name: z.string().min(1).max(300),
+  bankName: z.string().max(300).nullable().optional(),
+  /** last four digits / IBAN tail only — never the full number */
+  accountRef: z.string().max(60).nullable().optional(),
+  currency: z.string().length(3).optional(),
+  authorisedCeiling: z.number().positive(),
+  openingBalance: z.number().nonnegative().optional(),
+  openedOn: isoDateSchema.nullable().optional(),
+  status: z.enum(DESIGNATED_ACCOUNT_STATUSES).optional(),
+});
+
+const accountEntrySchema = z.object({
+  entryDate: isoDateSchema,
+  kind: z.enum(DESIGNATED_ACCOUNT_ENTRY_KINDS),
+  /** always positive — the kind decides the direction */
+  amount: z.number().positive(),
+  description: z.string().min(1).max(2000),
+  reference: z.string().max(200).nullable().optional(),
+  disbursementId: z.string().min(1).nullable().optional(),
+  evidenceId: z.string().min(1).nullable().optional(),
+});
+
+const accountReconcileSchema = z.object({
+  periodEnd: isoDateSchema,
+  statementBalance: z.number().finite(),
+  /** absolute tolerance for rounding and cross-border charges */
+  tolerance: z.number().nonnegative().max(10000).optional(),
+  explanation: z.string().max(10000).nullable().optional(),
+  evidenceIds: z.array(z.string().min(1)).max(50).optional(),
+});
+
+const accountViewQuery = z.object({ asAt: isoDateSchema.optional() });
+
+/* ---- PPP / availability payment mechanism ---- */
+
+const availabilityModelSchema = z.object({
+  name: z.string().min(1).max(300),
+  facilityId: z.string().min(1).nullable().optional(),
+  currency: z.string().length(3).optional(),
+  unitaryCharge: z.number().positive(),
+  periodMonths: z.number().int().min(1).max(12).default(1),
+  availabilityWeightPercent: z.number().min(0).max(100).default(70),
+  performanceWeightPercent: z.number().min(0).max(100).default(30),
+  performancePointValuePercent: z.number().min(0).max(100).default(0.1),
+  deductionCapPercent: z.number().min(0).max(100).nullable().optional(),
+  persistentBreachPoints: z.number().nonnegative().nullable().optional(),
+  notes: z.string().max(20000).nullable().optional(),
+});
+
+const availabilityPeriodSchema = z.object({
+  periodStart: isoDateSchema,
+  periodEnd: isoDateSchema,
+  requiredHours: z.number().nonnegative(),
+  unavailabilityEvents: z
+    .array(
+      z.object({
+        area: z.string().min(1).max(300),
+        hours: z.number().nonnegative(),
+        /** share of the asset the area represents; an event cannot cost more than the asset */
+        weight: z.number().min(0).max(1),
+        note: z.string().max(2000).nullable().optional(),
+      }),
+    )
+    .max(500)
+    .default([]),
+  performancePoints: z.number().nonnegative().default(0),
+  status: z.enum(AVAILABILITY_PERIOD_STATUSES).optional(),
+});
 
 const covenantCreateSchema = z.object({
   name: z.string().min(1).max(300),
@@ -90,6 +340,9 @@ const covenantCreateSchema = z.object({
   operator: z.enum(COVENANT_OPERATORS),
   threshold: z.number().finite(),
   unit: z.string().max(50).nullable().optional(),
+  /** a named ratio computed from the period cashflows, or custom for manual entry (#743) */
+  formula: z.enum(COVENANT_FORMULAS).default("custom"),
+  testFrequencyMonths: z.number().int().min(1).max(24).nullable().optional(),
 });
 
 const readingCreateSchema = z.object({
@@ -120,6 +373,13 @@ function daysUntil(isoDate: string): number {
 
 /** Statuses that consume facility headroom (draft/rejected do not). */
 const PIPELINE_STATUSES = ["submitted", "approved", "disbursed"] as const;
+
+/**
+ * Instruments on which an independent engineer must certify before money
+ * moves (#738). Loans and blended packages are the IFI case; a grant or an
+ * equity injection does not carry the same requirement.
+ */
+const CERTIFICATION_REQUIRED_INSTRUMENTS: readonly string[] = ["loan", "blended"];
 
 /**
  * Covenant headroom, signed toward compliance (#743): positive headroom is
@@ -158,6 +418,11 @@ export const financeModule: FastifyPluginAsync = async (app) => {
     app.requireTool("finance", "standard"),
   ];
   const adminGate = [app.authenticate, app.requireCompany, app.requireTool("finance", "admin")];
+  const companyReadGate = [
+    app.authenticate,
+    app.requireCompany,
+    companyToolGate(app, "finance", "read"),
+  ];
 
   async function fetchFacility(facilityId: string, companyId: string, projectId: string) {
     const rows = await app.db
@@ -247,81 +512,37 @@ export const financeModule: FastifyPluginAsync = async (app) => {
   }
 
   /**
-   * Lazy overdue-condition sweep (#730-731, same pattern as the payments
-   * deemed-liability sweep): an OPEN condition whose due date has passed
-   * flips to `breached`, its backing obligation is breached and a high
-   * signal is raised — exactly once, guarded on the status flip itself (a
-   * breached condition never re-enters the sweep). Runs on facility reads
-   * and before every conditionality verification.
+   * Refresh overdue condition state before a read.
+   *
+   * This used to write signals and ledger `state_change` rows with
+   * `actorId = req.user.id`, on routes gated at READ. An auditor or
+   * regulator with read-only access became the recorded actor of
+   * "facility condition breached" transitions they did not perform — a
+   * false entry in the one record the platform sells as trustworthy. The
+   * sweep now lives in jobs.ts, runs on a schedule, and attributes every
+   * transition to the system principal (`actorId: null`). The read path
+   * still calls it so a page opened between cycles is current, but the
+   * reader is not blamed for what it finds.
    */
-  async function sweepOverdueConditions(
-    companyId: string,
-    projectId: string,
-    actorId: string,
-  ): Promise<void> {
-    const today = todayISO();
-    const overdue = await app.db
-      .select()
-      .from(facilityConditions)
-      .where(
-        and(
-          eq(facilityConditions.companyId, companyId),
-          eq(facilityConditions.projectId, projectId),
-          eq(facilityConditions.status, "open"),
-          isNotNull(facilityConditions.dueDate),
-          lt(facilityConditions.dueDate, today),
-        ),
-      );
-    if (overdue.length === 0) return;
-    const facilityIds = [...new Set(overdue.map((c) => c.facilityId))];
-    const facs = await app.db
-      .select({ id: fundingFacilities.id, name: fundingFacilities.name })
-      .from(fundingFacilities)
-      .where(inArray(fundingFacilities.id, facilityIds));
-    const facilityName = new Map(facs.map((f) => [f.id, f.name]));
-    for (const cond of overdue) {
-      await app.db
-        .update(facilityConditions)
-        .set({ status: "breached", updatedAt: new Date().toISOString() })
-        .where(and(eq(facilityConditions.id, cond.id), eq(facilityConditions.status, "open")));
-      if (cond.obligationId) {
-        await app.db
-          .update(obligations)
-          .set({ status: "breached" })
-          .where(and(eq(obligations.id, cond.obligationId), eq(obligations.status, "open")));
-      }
-      const fname = facilityName.get(cond.facilityId) ?? "funding facility";
-      await app.db.insert(signals).values({
-        id: newId("sig"),
-        companyId,
-        projectId,
-        detector: "facility_condition_overdue",
-        severity: "high",
-        confidence: 1,
-        title: `Facility condition overdue — ${fname}${cond.reference ? ` (${cond.reference})` : ""}`,
-        explanation:
-          `Condition ${cond.kind} on facility "${fname}" fell due on ${cond.dueDate} and remains ` +
-          `unsatisfied: ${cond.description}. ` +
-          (cond.kind === "precedent"
-            ? "While it stands, disbursement requests against this facility cannot be submitted."
-            : "An unsatisfied condition subsequent is an event of default risk under the facility agreement."),
-      });
-      await appendLedger(app.db, {
-        companyId,
-        actorId,
-        action: "state_change",
-        objectType: "facility_condition",
-        objectId: cond.id,
-        payload: { from: "open", to: "breached", dueDate: cond.dueDate },
-      });
-    }
+  async function sweepOverdueConditions(companyId: string, projectId: string): Promise<void> {
+    await sweepConditionsShared(app.db, companyId, todayISO(), projectId);
   }
-
   function parseCategories(facility: { categories: unknown[] }): FacilityCategory[] {
     return facility.categories as FacilityCategory[];
   }
 
-  /** Aggregate view-model fields for one facility (#739-741). */
+  /**
+   * Aggregate view-model fields for one facility (#739-741).
+   *
+   * `remaining` and `undisbursed` used to count only DISBURSED requests,
+   * while the submit gate counted submitted + approved + disbursed. The
+   * category picker offered "Civil works — 500,000 remaining" and then
+   * refused a 400,000 request because 300,000 was already approved but
+   * unpaid: two contradictory numbers on the same screen. Both figures
+   * are now returned — `disbursed` (money that has moved) and `pipeline`
+   * (money committed to move) — plus `available`, which is what the
+   * picker must show because it is what the gate enforces.
+   */
   function facilityAggregates(
     facility: typeof fundingFacilities.$inferSelect,
     rows: (typeof disbursements.$inferSelect)[],
@@ -330,22 +551,34 @@ export const financeModule: FastifyPluginAsync = async (app) => {
     const disbursed = round2(
       rows.filter((d) => d.status === "disbursed").reduce((s, d) => s + d.amount, 0),
     );
+    const inPipeline = rows.filter((d) =>
+      (PIPELINE_STATUSES as readonly string[]).includes(d.status),
+    );
+    const pipeline = round2(inPipeline.reduce((s, d) => s + d.amount, 0));
     const cats = parseCategories(facility).map((c) => {
       const catDisbursed = round2(
         rows
           .filter((d) => d.status === "disbursed" && d.categoryId === c.id)
           .reduce((s, d) => s + d.amount, 0),
       );
+      const catPipeline = round2(
+        inPipeline.filter((d) => d.categoryId === c.id).reduce((s, d) => s + d.amount, 0),
+      );
       return {
         id: c.id,
         name: c.name,
         limit: c.limit,
         disbursed: catDisbursed,
+        pipeline: catPipeline,
+        /** limit less everything disbursed or in flight — what the gate allows */
+        available: round2(c.limit - catPipeline),
         remaining: round2(c.limit - catDisbursed),
       };
     });
     return {
       disbursed,
+      pipeline,
+      available: round2(facility.committedAmount - pipeline),
       undisbursed: round2(facility.committedAmount - disbursed),
       // "open" in the lender's sense: not yet satisfied or waived — an
       // overdue (breached) condition is still outstanding.
@@ -356,6 +589,52 @@ export const financeModule: FastifyPluginAsync = async (app) => {
       categories: cats,
     };
   }
+
+  /**
+   * The headroom invariant (#739-741): the PIPELINE — submitted, approved
+   * and disbursed together — may never exceed the committed amount or a
+   * category limit. Draft and rejected requests consume nothing.
+   *
+   * Called inside the transaction that holds the facility row lock, from
+   * both submit and approve. One definition, so the two stages can never
+   * enforce different arithmetic — which is exactly how 12M got paid
+   * against 10M committed before.
+   */
+  function checkHeadroom(
+    facility: typeof fundingFacilities.$inferSelect,
+    siblings: (typeof disbursements.$inferSelect)[],
+    request: typeof disbursements.$inferSelect,
+  ): void {
+    const pipeline = siblings.filter(
+      (x) => x.id !== request.id && (PIPELINE_STATUSES as readonly string[]).includes(x.status),
+    );
+    const usedTotal = round2(pipeline.reduce((sum, x) => sum + x.amount, 0));
+    const availableTotal = round2(facility.committedAmount - usedTotal);
+    if (request.amount > availableTotal + EPS) {
+      throw conflict(
+        `Amount ${request.amount} exceeds the undisbursed balance ${availableTotal} of ${facility.name} ` +
+          `(committed ${facility.committedAmount}, in pipeline or disbursed ${usedTotal})`,
+      );
+    }
+    if (request.categoryId) {
+      const cat = parseCategories(facility).find((c) => c.id === request.categoryId);
+      if (!cat) throw badRequest("categoryId no longer exists on this facility");
+      const usedCat = round2(
+        pipeline
+          .filter((x) => x.categoryId === request.categoryId)
+          .reduce((sum, x) => sum + x.amount, 0),
+      );
+      const availableCat = round2(cat.limit - usedCat);
+      if (request.amount > availableCat + EPS) {
+        throw conflict(
+          `Amount ${request.amount} exceeds the remaining allocation ${availableCat} of category ` +
+            `"${cat.name}" (limit ${cat.limit}, in pipeline or disbursed ${usedCat})`,
+        );
+      }
+    }
+  }
+
+  registerFinanceJobs(app);
 
   /* ---------------------------------------------------------------- */
   /* Facilities (#729, #739-741)                                       */
@@ -386,6 +665,11 @@ export const financeModule: FastifyPluginAsync = async (app) => {
       committedAmount: body.committedAmount,
       availabilityEndDate: body.availabilityEndDate ?? null,
       categories,
+      baseRatePercent: body.baseRatePercent ?? null,
+      marginPercent: body.marginPercent ?? null,
+      commitmentFeePercent: body.commitmentFeePercent ?? null,
+      dayCountConvention: body.dayCountConvention ?? "actual_365",
+      capitaliseInterest: body.capitaliseInterest ? 1 : 0,
       notes: body.notes ?? null,
       createdBy: req.user!.id,
     });
@@ -410,7 +694,7 @@ export const financeModule: FastifyPluginAsync = async (app) => {
 
   app.get("/projects/:projectId/facilities", { preHandler: readGate }, async (req) => {
     const q = pageQuerySchema.parse(req.query);
-    await sweepOverdueConditions(req.companyId!, req.projectId!, req.user!.id);
+    await sweepOverdueConditions(req.companyId!, req.projectId!);
     const where = and(
       eq(fundingFacilities.companyId, req.companyId!),
       eq(fundingFacilities.projectId, req.projectId!),
@@ -450,7 +734,7 @@ export const financeModule: FastifyPluginAsync = async (app) => {
     async (req) => {
       const { facilityId } = req.params as { facilityId: string };
       await fetchFacility(facilityId, req.companyId!, req.projectId!); // 404 before sweeping
-      await sweepOverdueConditions(req.companyId!, req.projectId!, req.user!.id);
+      await sweepOverdueConditions(req.companyId!, req.projectId!);
       const facility = await fetchFacility(facilityId, req.companyId!, req.projectId!);
       const conds = await app.db
         .select()
@@ -513,6 +797,17 @@ export const financeModule: FastifyPluginAsync = async (app) => {
         set["availabilityEndDate"] = body.availabilityEndDate;
       }
       if (body.notes !== undefined) set["notes"] = body.notes;
+      if (body.baseRatePercent !== undefined) set["baseRatePercent"] = body.baseRatePercent;
+      if (body.marginPercent !== undefined) set["marginPercent"] = body.marginPercent;
+      if (body.commitmentFeePercent !== undefined) {
+        set["commitmentFeePercent"] = body.commitmentFeePercent;
+      }
+      if (body.dayCountConvention !== undefined) {
+        set["dayCountConvention"] = body.dayCountConvention;
+      }
+      if (body.capitaliseInterest !== undefined) {
+        set["capitaliseInterest"] = body.capitaliseInterest ? 1 : 0;
+      }
       if (body.categories !== undefined) {
         const existing = parseCategories(facility);
         const existingIds = new Set(existing.map((c) => c.id));
@@ -578,10 +873,17 @@ export const financeModule: FastifyPluginAsync = async (app) => {
       const { facilityId } = req.params as { facilityId: string };
       const body = conditionCreateSchema.parse(req.body);
       const facility = await fetchFacility(facilityId, req.companyId!, req.projectId!);
-      // The condition materializes as an assurance Obligation so the
+      // The condition materialises as an assurance Obligation so the
       // facility clock and the obligation register see the same date.
+      //
+      // These used to be three separate statements: obligation, then
+      // condition, then ledger. A failure after the first left an
+      // obligation with no owning record on the register the platform sells
+      // as trustworthy, and the caller got a 500 having partly committed.
       const obligationId = newId("obl");
-      await app.db.insert(obligations).values({
+      const id = newId("fcd");
+      await app.db.transaction(async (tx) => {
+      await tx.insert(obligations).values({
         id: obligationId,
         companyId: req.companyId!,
         projectId: req.projectId!,
@@ -593,8 +895,7 @@ export const financeModule: FastifyPluginAsync = async (app) => {
         status: "open",
         createdBy: req.user!.id,
       });
-      const id = newId("fcd");
-      await app.db.insert(facilityConditions).values({
+      await tx.insert(facilityConditions).values({
         id,
         facilityId,
         companyId: req.companyId!,
@@ -606,20 +907,22 @@ export const financeModule: FastifyPluginAsync = async (app) => {
         status: "open",
         obligationId,
       });
-      await appendLedger(app.db, {
+      await appendLedger(tx as Db, {
         companyId: req.companyId!,
         actorId: req.user!.id,
         action: "create",
         objectType: "facility_condition",
         objectId: id,
         payload: {
-          facilityId,
+          facilityId: facility.id,
           kind: body.kind,
           reference: body.reference ?? null,
           dueDate: body.dueDate ?? null,
           obligationId,
         },
         storePayload: true,
+        projectId: req.projectId!,
+      });
       });
       const created = await fetchCondition(id, req.companyId!, req.projectId!);
       return reply.status(201).send(created);
@@ -633,7 +936,7 @@ export const financeModule: FastifyPluginAsync = async (app) => {
       const { facilityId } = req.params as { facilityId: string };
       const q = pageQuerySchema.parse(req.query);
       await fetchFacility(facilityId, req.companyId!, req.projectId!);
-      await sweepOverdueConditions(req.companyId!, req.projectId!, req.user!.id);
+      await sweepOverdueConditions(req.companyId!, req.projectId!);
       const where = eq(facilityConditions.facilityId, facilityId);
       const [totalRow] = await app.db.select({ n: count() }).from(facilityConditions).where(where);
       const rows = await app.db
@@ -661,32 +964,40 @@ export const financeModule: FastifyPluginAsync = async (app) => {
       }
       await validateEvidence(req.companyId!, req.projectId!, body.evidenceIds);
       const now = new Date().toISOString();
-      await app.db
-        .update(facilityConditions)
-        .set({
-          status: "satisfied",
-          evidenceIds: body.evidenceIds,
-          satisfiedAt: now,
-          satisfiedBy: req.user!.id,
-          updatedAt: now,
-        })
-        .where(eq(facilityConditions.id, conditionId));
-      if (cond.obligationId) {
-        // A late satisfaction does not rewrite the register: only a still-
-        // open obligation flips to satisfied; a breached one stays breached.
-        await app.db
-          .update(obligations)
-          .set({ status: "satisfied", satisfiedEvidenceId: body.evidenceIds[0] })
-          .where(and(eq(obligations.id, cond.obligationId), eq(obligations.status, "open")));
-      }
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "state_change",
-        objectType: "facility_condition",
-        objectId: conditionId,
-        payload: { from: cond.status, to: "satisfied", evidenceIds: body.evidenceIds },
-        storePayload: true,
+      // The condition, its obligation and the ledger entry move together.
+      // Three loose statements meant a failure after the first left a
+      // "satisfied" condition whose obligation was still open on the
+      // assurance register — the register disagreeing with the record it
+      // was created from.
+      await app.db.transaction(async (tx) => {
+        await tx
+          .update(facilityConditions)
+          .set({
+            status: "satisfied",
+            evidenceIds: body.evidenceIds,
+            satisfiedAt: now,
+            satisfiedBy: req.user!.id,
+            updatedAt: now,
+          })
+          .where(eq(facilityConditions.id, conditionId));
+        if (cond.obligationId) {
+          // A late satisfaction does not rewrite the register: only a still-
+          // open obligation flips to satisfied; a breached one stays breached.
+          await tx
+            .update(obligations)
+            .set({ status: "satisfied", satisfiedEvidenceId: body.evidenceIds[0] })
+            .where(and(eq(obligations.id, cond.obligationId), eq(obligations.status, "open")));
+        }
+        await appendLedger(tx as Db, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "facility_condition",
+          objectId: conditionId,
+          payload: { from: cond.status, to: "satisfied", evidenceIds: body.evidenceIds },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
       });
       return fetchCondition(conditionId, req.companyId!, req.projectId!);
     },
@@ -703,30 +1014,33 @@ export const financeModule: FastifyPluginAsync = async (app) => {
         throw badRequest(`A ${cond.status} condition cannot be waived`);
       }
       const now = new Date().toISOString();
-      await app.db
-        .update(facilityConditions)
-        .set({ status: "waived", updatedAt: now })
-        .where(eq(facilityConditions.id, conditionId));
-      if (cond.obligationId) {
-        // An explicit lender waiver supersedes the breach state.
-        await app.db
-          .update(obligations)
-          .set({ status: "waived" })
-          .where(
-            and(
-              eq(obligations.id, cond.obligationId),
-              inArray(obligations.status, ["open", "breached"]),
-            ),
-          );
-      }
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "state_change",
-        objectType: "facility_condition",
-        objectId: conditionId,
-        payload: { from: cond.status, to: "waived", reason: body.reason },
-        storePayload: true,
+      await app.db.transaction(async (tx) => {
+        await tx
+          .update(facilityConditions)
+          .set({ status: "waived", updatedAt: now })
+          .where(eq(facilityConditions.id, conditionId));
+        if (cond.obligationId) {
+          // An explicit lender waiver supersedes the breach state.
+          await tx
+            .update(obligations)
+            .set({ status: "waived" })
+            .where(
+              and(
+                eq(obligations.id, cond.obligationId),
+                inArray(obligations.status, ["open", "breached"]),
+              ),
+            );
+        }
+        await appendLedger(tx as Db, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "facility_condition",
+          objectId: conditionId,
+          payload: { from: cond.status, to: "waived", reason: body.reason },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
       });
       return fetchCondition(conditionId, req.companyId!, req.projectId!);
     },
@@ -784,11 +1098,56 @@ export const financeModule: FastifyPluginAsync = async (app) => {
     },
   );
 
+  /* ---------------------------------------------------------------- */
+  /* Draw-stop (#741, #747)                                            */
+  /* ---------------------------------------------------------------- */
+
   /**
-   * The conditionality gate (#733-734) — the module's core rule: a
-   * disbursement request cannot be submitted while any condition precedent
-   * on the facility is unsatisfied. The verification is snapshotted onto
-   * the request either way, so the record shows what was checked and when.
+   * The lender's two absolute bars on money moving: the availability period
+   * has ended, or a covenant is in breach with no recorded waiver.
+   *
+   * Neither was enforced. The covenant breach signal even SAID a breach
+   * "may suspend further disbursements" while nothing suspended anything,
+   * and a facility whose availability ended last quarter still accepted and
+   * paid draws. Both are now checked at submit and at disburse — the two
+   * moments a request enters and leaves the pipeline.
+   */
+  async function assertDrawable(
+    facility: typeof fundingFacilities.$inferSelect,
+    stage: "submitted" | "disbursed",
+  ): Promise<void> {
+    const today = todayISO();
+    const standing = await covenantStanding(app.db, facility.id, today);
+    const stop = evaluateDrawStop({
+      availabilityEndDate: facility.availabilityEndDate,
+      today,
+      covenants: standing,
+    });
+    if (!stop.stopped) return;
+    throw conflict(
+      `This disbursement cannot be ${stage} against ${facility.name}: ${stop.reasons.join(" ")}` +
+        (stop.breachedCovenantIds.length > 0
+          ? " Record a lender waiver against the covenant if the lender has granted one."
+          : ""),
+    );
+  }
+
+  /**
+   * The conditionality gate (#733-737, #739-741, #747) — the module's core
+   * rule, now enforced atomically.
+   *
+   * What changed:
+   *  - HEADROOM RACE. The sibling requests were loaded, the totals computed
+   *    in memory and the status flipped, with no transaction and no lock.
+   *    Two draft requests of 6M against a facility with 10M available both
+   *    passed and both entered the pipeline; approve and disburse never
+   *    re-checked, so 12M could be paid against 10M committed. The whole
+   *    sequence now runs inside one transaction with the facility row locked
+   *    FOR UPDATE.
+   *  - ELIGIBILITY. Every attached evidence item must be classified
+   *    eligible; an ineligible or unassessed item blocks submission (#736).
+   *  - DRAW-STOP. Availability period and covenant standing are checked
+   *    before anything moves (#741, #747).
    */
   app.post(
     "/projects/:projectId/disbursements/:disbursementId/submit",
@@ -800,8 +1159,27 @@ export const financeModule: FastifyPluginAsync = async (app) => {
         throw badRequest(`A ${d.status} disbursement cannot be submitted`);
       }
       // Refresh condition states first so an overdue CP blocks as breached.
-      await sweepOverdueConditions(req.companyId!, req.projectId!, req.user!.id);
+      await sweepOverdueConditions(req.companyId!, req.projectId!);
       const facility = await fetchFacility(d.facilityId, req.companyId!, req.projectId!);
+      await assertDrawable(facility, "submitted");
+
+      // Eligibility of the attached expenditure (#736-737).
+      const eligibility = assessEligibility(
+        d.evidenceIds,
+        (d.evidenceEligibility ?? []) as EligibilityEntry[],
+      );
+      if (!eligibility.submittable) {
+        return reply.status(409).send({
+          statusCode: 409,
+          error: "ConflictError",
+          message:
+            "This withdrawal application cannot be submitted until every attached item is classified eligible: " +
+            eligibility.reasons.join(" "),
+          eligibility,
+        });
+      }
+
+      const verifiedAt = new Date().toISOString();
       const blocking = await app.db
         .select()
         .from(facilityConditions)
@@ -813,7 +1191,6 @@ export const financeModule: FastifyPluginAsync = async (app) => {
           ),
         )
         .orderBy(asc(facilityConditions.createdAt));
-      const verifiedAt = new Date().toISOString();
       const conditionality = {
         verifiedAt,
         openConditions: blocking.map((c) => ({
@@ -823,6 +1200,12 @@ export const financeModule: FastifyPluginAsync = async (app) => {
           status: c.status,
           dueDate: c.dueDate,
         })),
+        eligibility: {
+          total: eligibility.total,
+          eligible: eligibility.eligible,
+          ineligible: eligibility.ineligible,
+          unassessed: eligibility.unassessed,
+        },
       };
       // Persist the verification snapshot whether or not it passed.
       await app.db
@@ -842,6 +1225,7 @@ export const financeModule: FastifyPluginAsync = async (app) => {
             openConditionIds: blocking.map((c) => c.id),
           },
           storePayload: true,
+          projectId: req.projectId!,
         });
         return reply.status(409).send({
           statusCode: 409,
@@ -852,50 +1236,50 @@ export const financeModule: FastifyPluginAsync = async (app) => {
           openConditions: conditionality.openConditions,
         });
       }
-      // Headroom checks (#739-741): the pipeline (submitted + approved +
-      // disbursed) may never exceed the committed amount or a category
-      // limit — draft and rejected requests consume nothing.
-      const siblings = await app.db
-        .select()
-        .from(disbursements)
-        .where(eq(disbursements.facilityId, d.facilityId));
-      const pipeline = siblings.filter(
-        (s) => s.id !== d.id && (PIPELINE_STATUSES as readonly string[]).includes(s.status),
-      );
-      const usedTotal = round2(pipeline.reduce((s, x) => s + x.amount, 0));
-      const availableTotal = round2(facility.committedAmount - usedTotal);
-      if (d.amount > availableTotal + EPS) {
-        throw conflict(
-          `Amount ${d.amount} exceeds the undisbursed balance ${availableTotal} of ${facility.name} ` +
-            `(committed ${facility.committedAmount}, in pipeline or disbursed ${usedTotal})`,
-        );
-      }
-      if (d.categoryId) {
-        const cat = parseCategories(facility).find((c) => c.id === d.categoryId);
-        if (!cat) throw badRequest("categoryId no longer exists on this facility");
-        const usedCat = round2(
-          pipeline.filter((x) => x.categoryId === d.categoryId).reduce((s, x) => s + x.amount, 0),
-        );
-        const availableCat = round2(cat.limit - usedCat);
-        if (d.amount > availableCat + EPS) {
-          throw conflict(
-            `Amount ${d.amount} exceeds the remaining allocation ${availableCat} of category ` +
-              `"${cat.name}" (limit ${cat.limit}, in pipeline or disbursed ${usedCat})`,
-          );
+
+      await app.db.transaction(async (tx) => {
+        // Lock the facility: headroom is read, compared and consumed under
+        // one lock, so two concurrent submits serialise instead of both
+        // passing a stale check.
+        const locked = (
+          await tx
+            .select()
+            .from(fundingFacilities)
+            .where(eq(fundingFacilities.id, d.facilityId))
+            .for("update")
+        )[0];
+        if (!locked) throw notFound("Funding facility not found");
+        const fresh = (
+          await tx.select().from(disbursements).where(eq(disbursements.id, disbursementId)).limit(1)
+        )[0];
+        if (!fresh || fresh.status !== "draft") {
+          throw conflict("This disbursement has already been submitted");
         }
-      }
-      await app.db
-        .update(disbursements)
-        .set({ status: "submitted", submittedAt: verifiedAt, submittedBy: req.user!.id })
-        .where(eq(disbursements.id, disbursementId));
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "state_change",
-        objectType: "disbursement",
-        objectId: disbursementId,
-        payload: { from: "draft", to: "submitted", verifiedAt, openConditions: 0 },
-        storePayload: true,
+        const siblings = await tx
+          .select()
+          .from(disbursements)
+          .where(eq(disbursements.facilityId, d.facilityId));
+        checkHeadroom(locked, siblings, fresh);
+        await tx
+          .update(disbursements)
+          .set({ status: "submitted", submittedAt: verifiedAt, submittedBy: req.user!.id })
+          .where(and(eq(disbursements.id, disbursementId), eq(disbursements.status, "draft")));
+        await appendLedger(tx as Db, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "disbursement",
+          objectId: disbursementId,
+          payload: {
+            from: "draft",
+            to: "submitted",
+            verifiedAt,
+            openConditions: 0,
+            eligibleItems: eligibility.eligible,
+          },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
       });
       return fetchDisbursement(disbursementId, req.companyId!, req.projectId!);
     },
@@ -910,16 +1294,106 @@ export const financeModule: FastifyPluginAsync = async (app) => {
       if (d.status !== "submitted") {
         throw badRequest(`A ${d.status} disbursement cannot be approved`);
       }
-      // Separation of duties: the requester never approves their own draw.
-      if (d.createdBy === req.user!.id) {
+      // Separation of duties: neither the requester NOR the submitter may
+      // approve. The old check looked at createdBy alone, so a request
+      // created by A and submitted by B could be approved by B — two roles
+      // collapsed into one person.
+      if (d.createdBy === req.user!.id || d.submittedBy === req.user!.id) {
         throw forbidden(
-          "Separation of duties: a disbursement request cannot be approved by its creator",
+          "Separation of duties: a disbursement request cannot be approved by the person who created or submitted it",
         );
+      }
+      const now = new Date().toISOString();
+      await app.db.transaction(async (tx) => {
+        const locked = (
+          await tx
+            .select()
+            .from(fundingFacilities)
+            .where(eq(fundingFacilities.id, d.facilityId))
+            .for("update")
+        )[0];
+        if (!locked) throw notFound("Funding facility not found");
+        const fresh = (
+          await tx.select().from(disbursements).where(eq(disbursements.id, disbursementId)).limit(1)
+        )[0];
+        if (!fresh || fresh.status !== "submitted") {
+          throw conflict("This disbursement is no longer awaiting approval");
+        }
+        // Re-check headroom at approval: conditions and other requests may
+        // have moved since the request was submitted.
+        const siblings = await tx
+          .select()
+          .from(disbursements)
+          .where(eq(disbursements.facilityId, d.facilityId));
+        checkHeadroom(locked, siblings, fresh);
+        await tx
+          .update(disbursements)
+          .set({ status: "approved", approvedAt: now, approvedBy: req.user!.id, updatedAt: now })
+          .where(and(eq(disbursements.id, disbursementId), eq(disbursements.status, "submitted")));
+        await appendLedger(tx as Db, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "disbursement",
+          objectId: disbursementId,
+          payload: { from: "submitted", to: "approved", headroomRechecked: true },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
+      });
+      return fetchDisbursement(disbursementId, req.companyId!, req.projectId!);
+    },
+  );
+
+  /**
+   * Independent certification (#738). On an IFI-financed project the
+   * lender's technical adviser (LTA) or independent engineer certifies that
+   * the expenditure was actually incurred on eligible works before the
+   * money moves. It is a distinct role from the approver — that is the
+   * whole point — so it needs the assurance grant, and it is refused to
+   * anyone already in the chain.
+   */
+  app.post(
+    "/projects/:projectId/disbursements/:disbursementId/certify",
+    { preHandler: standardGate },
+    async (req) => {
+      const { disbursementId } = req.params as { disbursementId: string };
+      const body = certifySchema.parse(req.body ?? {});
+      const d = await fetchDisbursement(disbursementId, req.companyId!, req.projectId!);
+      if (d.status !== "approved") {
+        throw badRequest(`Only an approved disbursement can be certified (this one is ${d.status})`);
+      }
+      if (d.certifiedAt) throw badRequest("This disbursement has already been certified");
+      const independence = await isIndependentReviewer(app, req);
+      if (!independence.independent) {
+        throw forbidden(
+          `Certification is the independent engineer's step. ${independence.basis} Grant the ` +
+            `certifier an assurance role (integrity_reviewer or auditor), or have a company owner ` +
+            `or admin certify.`,
+        );
+      }
+      if (
+        d.createdBy === req.user!.id ||
+        d.submittedBy === req.user!.id ||
+        d.approvedBy === req.user!.id
+      ) {
+        throw forbidden(
+          "Separation of duties: the certifier cannot be the person who created, submitted or approved the request",
+        );
+      }
+      if (body.evidenceIds && body.evidenceIds.length > 0) {
+        await validateEvidence(req.companyId!, req.projectId!, body.evidenceIds);
       }
       const now = new Date().toISOString();
       await app.db
         .update(disbursements)
-        .set({ status: "approved", approvedAt: now, approvedBy: req.user!.id, updatedAt: now })
+        .set({
+          certifiedAt: now,
+          certifiedBy: req.user!.id,
+          certificationNote: body.note ?? null,
+          certificationEvidenceIds: body.evidenceIds ?? [],
+          updatedAt: now,
+        })
         .where(eq(disbursements.id, disbursementId));
       await appendLedger(app.db, {
         companyId: req.companyId!,
@@ -927,16 +1401,28 @@ export const financeModule: FastifyPluginAsync = async (app) => {
         action: "state_change",
         objectType: "disbursement",
         objectId: disbursementId,
-        payload: { from: "submitted", to: "approved" },
+        payload: {
+          event: "certified",
+          basis: independence.basis,
+          note: body.note ?? null,
+          evidenceIds: body.evidenceIds ?? [],
+        },
         storePayload: true,
+        projectId: req.projectId!,
       });
       return fetchDisbursement(disbursementId, req.companyId!, req.projectId!);
     },
   );
 
+  /**
+   * Pay it. This was `standard` with no separation-of-duties check at all,
+   * so the requester could pay their own draw. It now needs finance:admin
+   * and refuses anyone already in the chain, and it re-tests the draw-stop:
+   * a covenant can breach between approval and payment.
+   */
   app.post(
     "/projects/:projectId/disbursements/:disbursementId/disburse",
-    { preHandler: standardGate },
+    { preHandler: adminGate },
     async (req) => {
       const { disbursementId } = req.params as { disbursementId: string };
       const body = disburseSchema.parse(req.body ?? {});
@@ -944,21 +1430,66 @@ export const financeModule: FastifyPluginAsync = async (app) => {
       if (d.status !== "approved") {
         throw badRequest(`Only an approved disbursement can be disbursed (this one is ${d.status})`);
       }
+      if (
+        d.createdBy === req.user!.id ||
+        d.submittedBy === req.user!.id ||
+        d.approvedBy === req.user!.id
+      ) {
+        throw forbidden(
+          "Separation of duties: the person who created, submitted or approved a request cannot also pay it",
+        );
+      }
+      const facility = await fetchFacility(d.facilityId, req.companyId!, req.projectId!);
+      await assertDrawable(facility, "disbursed");
+      // Loan and blended facilities are the DFI case: independent
+      // certification is a precondition of payment. Grants, equity and
+      // guarantees do not carry the same requirement, so certification is
+      // recorded where it happens but not demanded.
+      if (CERTIFICATION_REQUIRED_INSTRUMENTS.includes(facility.instrument) && !d.certifiedAt) {
+        throw conflict(
+          `A ${facility.instrument} facility requires independent certification before payment. ` +
+            "Have the lender's technical adviser or independent engineer certify the request first.",
+        );
+      }
       const disbursedAt = body.disbursedAt
         ? new Date(body.disbursedAt).toISOString()
         : new Date().toISOString();
-      await app.db
-        .update(disbursements)
-        .set({ status: "disbursed", disbursedAt, updatedAt: new Date().toISOString() })
-        .where(eq(disbursements.id, disbursementId));
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "state_change",
-        objectType: "disbursement",
-        objectId: disbursementId,
-        payload: { from: "approved", to: "disbursed", disbursedAt, amount: d.amount },
-        storePayload: true,
+      await app.db.transaction(async (tx) => {
+        const locked = (
+          await tx
+            .select()
+            .from(fundingFacilities)
+            .where(eq(fundingFacilities.id, d.facilityId))
+            .for("update")
+        )[0];
+        if (!locked) throw notFound("Funding facility not found");
+        const fresh = (
+          await tx.select().from(disbursements).where(eq(disbursements.id, disbursementId)).limit(1)
+        )[0];
+        if (!fresh || fresh.status !== "approved") {
+          throw conflict("This disbursement is no longer approved");
+        }
+        await tx
+          .update(disbursements)
+          .set({ status: "disbursed", disbursedAt, updatedAt: new Date().toISOString() })
+          .where(and(eq(disbursements.id, disbursementId), eq(disbursements.status, "approved")));
+        await appendLedger(tx as Db, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "state_change",
+          objectType: "disbursement",
+          objectId: disbursementId,
+          payload: {
+            from: "approved",
+            to: "disbursed",
+            disbursedAt,
+            amount: d.amount,
+            currency: locked.currency,
+            certifiedBy: d.certifiedBy,
+          },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
       });
       return fetchDisbursement(disbursementId, req.companyId!, req.projectId!);
     },
@@ -1016,8 +1547,21 @@ export const financeModule: FastifyPluginAsync = async (app) => {
   /* Project finance summary (#739-742)                                */
   /* ---------------------------------------------------------------- */
 
+  /**
+   * The headline figures — per currency.
+   *
+   * This route used to add every facility's committed amount together and
+   * the page labelled the total with the FIRST facility's currency. A
+   * project with a USD 100m loan and a EUR 50m grant reported
+   * "GBP 150,000,000 committed" on its dashboard: a wrong money figure in
+   * the most prominent place on the screen. There is no exchange rate on
+   * this platform, so the numbers are bucketed by currency and the single
+   * total is returned only when every facility shares one. Otherwise the
+   * total is an Unknowable — a null with the reason — and the buckets are
+   * what the page must render.
+   */
   app.get("/projects/:projectId/finance/summary", { preHandler: readGate }, async (req) => {
-    await sweepOverdueConditions(req.companyId!, req.projectId!, req.user!.id);
+    await sweepOverdueConditions(req.companyId!, req.projectId!);
     const where = and(
       eq(fundingFacilities.companyId, req.companyId!),
       eq(fundingFacilities.projectId, req.projectId!),
@@ -1045,71 +1589,112 @@ export const financeModule: FastifyPluginAsync = async (app) => {
           eq(facilityConditions.projectId, req.projectId!),
         ),
       );
-    const committed = round2(facs.reduce((s, f) => s + f.committedAmount, 0));
-    const disbursed = round2(
-      allDisb.filter((d) => d.status === "disbursed").reduce((s, d) => s + d.amount, 0),
+
+    const currencyOf = new Map(facs.map((f) => [f.id, f.currency]));
+    const committedByCurrency = bucketByCurrency(
+      facs.map((f) => ({ amount: f.committedAmount, currency: f.currency })),
     );
+    const disbursedByCurrency = bucketByCurrency(
+      allDisb
+        .filter((d) => d.status === "disbursed")
+        .map((d) => ({ amount: d.amount, currency: currencyOf.get(d.facilityId) ?? null })),
+    );
+    const pipelineByCurrency = bucketByCurrency(
+      allDisb
+        .filter((d) => (PIPELINE_STATUSES as readonly string[]).includes(d.status))
+        .map((d) => ({ amount: d.amount, currency: currencyOf.get(d.facilityId) ?? null })),
+    );
+    const disbursedLookup = new Map(disbursedByCurrency.map((b) => [b.currency, b.amount]));
+    const pipelineLookup = new Map(pipelineByCurrency.map((b) => [b.currency, b.amount]));
+    const undisbursedByCurrency = committedByCurrency.map((b) => ({
+      currency: b.currency,
+      amount: round2(b.amount - (disbursedLookup.get(b.currency) ?? 0)),
+      recordCount: b.recordCount,
+    }));
+    const availableByCurrency = committedByCurrency.map((b) => ({
+      currency: b.currency,
+      amount: round2(b.amount - (pipelineLookup.get(b.currency) ?? 0)),
+      recordCount: b.recordCount,
+    }));
+
     const byCategory = facs.flatMap((f) => {
       const rows = allDisb.filter((d) => d.facilityId === f.id);
+      const inPipeline = rows.filter((d) =>
+        (PIPELINE_STATUSES as readonly string[]).includes(d.status),
+      );
       return parseCategories(f).map((c) => {
         const catDisbursed = round2(
           rows
             .filter((d) => d.status === "disbursed" && d.categoryId === c.id)
-            .reduce((s, d) => s + d.amount, 0),
+            .reduce((sum, d) => sum + d.amount, 0),
+        );
+        const catPipeline = round2(
+          inPipeline.filter((d) => d.categoryId === c.id).reduce((sum, d) => sum + d.amount, 0),
         );
         return {
           facilityId: f.id,
           facilityName: f.name,
+          currency: f.currency,
           id: c.id,
           name: c.name,
           limit: c.limit,
           disbursed: catDisbursed,
+          pipeline: catPipeline,
+          available: round2(c.limit - catPipeline),
           remaining: round2(c.limit - catDisbursed),
         };
       });
     });
+
     // Covenant status = worst of the LATEST reading per covenant:
     // breached > unknown (a covenant with no readings yet) > compliant;
-    // null when the project has no covenants at all (#742).
+    // null when the project has no covenants at all (#742). A breach with a
+    // lender waiver in force is reported as `waived`, not `breached` — it is
+    // not a draw-stop.
     const covs = await app.db
       .select()
       .from(covenants)
       .where(
         and(eq(covenants.companyId, req.companyId!), eq(covenants.projectId, req.projectId!)),
       );
-    let covenantStatus: "breached" | "unknown" | "compliant" | null = null;
+    let covenantStatus: "breached" | "waived" | "unknown" | "compliant" | null = null;
     if (covs.length > 0) {
-      const readings = await app.db
-        .select()
-        .from(covenantReadings)
-        .where(
-          inArray(
-            covenantReadings.covenantId,
-            covs.map((c) => c.id),
-          ),
-        )
-        .orderBy(asc(covenantReadings.readingDate), asc(covenantReadings.createdAt));
-      let anyBreached = false;
-      let anyUnread = false;
-      for (const c of covs) {
-        const series = readings.filter((r) => r.covenantId === c.id);
-        const latest = series[series.length - 1];
-        if (!latest) anyUnread = true;
-        else if (latest.compliant !== 1) anyBreached = true;
-      }
-      covenantStatus = anyBreached ? "breached" : anyUnread ? "unknown" : "compliant";
+      const today = todayISO();
+      const standings = (
+        await Promise.all(facs.map((f) => covenantStanding(app.db, f.id, today)))
+      ).flat();
+      const anyBreached = standings.some((c) => c.compliant === false && c.waivedBy === null);
+      const anyWaived = standings.some((c) => c.compliant === false && c.waivedBy !== null);
+      const anyUnread = standings.some((c) => c.compliant === null);
+      covenantStatus = anyBreached
+        ? "breached"
+        : anyWaived
+          ? "waived"
+          : anyUnread
+            ? "unknown"
+            : "compliant";
     }
+
     return {
       facilities: facs.length,
-      committed,
-      disbursed,
-      undisbursed: round2(committed - disbursed),
+      committedByCurrency,
+      disbursedByCurrency,
+      pipelineByCurrency,
+      undisbursedByCurrency,
+      availableByCurrency,
+      /** a single figure only when every facility shares one currency */
+      committedTotal: singleCurrencyTotal(committedByCurrency, "committed funding"),
+      disbursedTotal: singleCurrencyTotal(disbursedByCurrency, "disbursed funding"),
+      undisbursedTotal: singleCurrencyTotal(undisbursedByCurrency, "undisbursed funding"),
       pendingRequests: allDisb.filter((d) => d.status === "submitted" || d.status === "approved")
+        .length,
+      awaitingCertification: allDisb.filter((d) => d.status === "approved" && !d.certifiedAt)
         .length,
       openConditions: allConds.filter((c) => c.status === "open" || c.status === "breached")
         .length,
       byCategory,
       covenantStatus,
+      currencies: committedByCurrency.map((b) => b.currency),
     };
   });
 
@@ -1223,6 +1808,8 @@ export const financeModule: FastifyPluginAsync = async (app) => {
         operator: body.operator,
         threshold: body.threshold,
         unit: body.unit ?? null,
+        formula: body.formula,
+        testFrequencyMonths: body.testFrequencyMonths ?? null,
       });
       await appendLedger(app.db, {
         companyId: req.companyId!,
@@ -1281,6 +1868,16 @@ export const financeModule: FastifyPluginAsync = async (app) => {
     },
   );
 
+  /**
+   * Record (or correct) a covenant reading by hand — the override path for
+   * covenants whose inputs are not on the cashflow table.
+   *
+   * ONE READING PER TEST DATE. A period is tested once: re-posting the same
+   * readingDate CORRECTS the reading rather than stacking a second one, and
+   * the breach signal is fingerprinted on `${covenantId}:${readingDate}` so
+   * a mistyped ratio posted three times leaves one signal that the compliant
+   * correction closes — not three that nothing ever closes.
+   */
   app.post(
     "/projects/:projectId/covenants/:covenantId/readings",
     { preHandler: standardGate },
@@ -1290,59 +1887,111 @@ export const financeModule: FastifyPluginAsync = async (app) => {
       const covenant = await fetchCovenant(covenantId, req.companyId!, req.projectId!);
       const compliant = covenantCompliant(covenant.operator, body.value, covenant.threshold);
       const headroom = covenantHeadroom(covenant.operator, body.value, covenant.threshold);
-      const id = newId("cvr");
-      await app.db.insert(covenantReadings).values({
-        id,
-        covenantId,
-        companyId: req.companyId!,
-        readingDate: body.readingDate,
-        value: body.value,
-        compliant: compliant ? 1 : 0,
-        headroom,
-        note: body.note ?? null,
-        recordedBy: req.user!.id,
-      });
-      if (!compliant) {
-        // A covenant breach is a lender event of default risk — critical
-        // signal, no obligation (the covenant is continuous, not dated).
-        const opText = covenant.operator === "gte" ? "≥" : "≤";
-        await app.db.insert(signals).values({
-          id: newId("sig"),
+      const existing = (
+        await app.db
+          .select({ id: covenantReadings.id, value: covenantReadings.value })
+          .from(covenantReadings)
+          .where(
+            and(
+              eq(covenantReadings.covenantId, covenantId),
+              eq(covenantReadings.readingDate, body.readingDate),
+            ),
+          )
+          .limit(1)
+      )[0];
+      const id = existing?.id ?? newId("cvr");
+      // Reading, breach signal and ledger entry are one act. Split across
+      // three statements, a failure after the insert left a breach nobody
+      // was told about — or a signal for a reading that was never stored.
+      await app.db.transaction(async (tx) => {
+        if (existing) {
+          await tx
+            .update(covenantReadings)
+            .set({
+              value: body.value,
+              compliant: compliant ? 1 : 0,
+              headroom,
+              note: body.note ?? null,
+              basis: "manual",
+              computedFrom: null,
+              recordedBy: req.user!.id,
+            })
+            .where(eq(covenantReadings.id, id));
+        } else {
+          await tx.insert(covenantReadings).values({
+            id,
+            covenantId,
+            companyId: req.companyId!,
+            readingDate: body.readingDate,
+            value: body.value,
+            compliant: compliant ? 1 : 0,
+            headroom,
+            note: body.note ?? null,
+            basis: "manual",
+            recordedBy: req.user!.id,
+          });
+        }
+        if (!compliant) {
+          // A covenant breach is a lender event-of-default risk — critical
+          // signal, no obligation (the covenant is continuous, not dated).
+          const opText = covenant.operator === "gte" ? "≥" : "≤";
+          await raiseSignalOnce(tx as Db, {
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            detector: "covenant_breach",
+            key: `${covenantId}:${body.readingDate}`,
+            severity: "critical",
+            confidence: 1,
+            title:
+              `Covenant breach — ${covenant.name}: ${body.value} vs required ${opText} ` +
+              `${covenant.threshold}${covenant.unit ? ` ${covenant.unit}` : ""}`,
+            explanation:
+              `The ${body.readingDate} reading of covenant "${covenant.name}" is ${body.value}` +
+              `${covenant.unit ? ` ${covenant.unit}` : ""}, against a required level of ${opText} ` +
+              `${covenant.threshold}. Headroom is ${headroom} (negative = depth of breach). ` +
+              `A financial covenant breach typically constitutes a default or draw-stop event ` +
+              `under the facility agreement and suspends further disbursements until it clears ` +
+              `or a lender waiver is recorded.`,
+            subjectType: "covenant",
+            subjectId: covenantId,
+            evidenceRefs: {
+              covenantId,
+              readingDate: body.readingDate,
+              value: body.value,
+              threshold: covenant.threshold,
+            },
+          });
+        } else {
+          await closeSignalByKey(
+            tx as Db,
+            req.companyId!,
+            "covenant_breach",
+            `${covenantId}:${body.readingDate}`,
+            "The reading recorded for this test date complies with the covenant.",
+          );
+        }
+        await appendLedger(tx as Db, {
           companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: existing ? "update" : "create",
+          objectType: "covenant_reading",
+          objectId: id,
+          payload: {
+            covenantId,
+            readingDate: body.readingDate,
+            value: body.value,
+            compliant,
+            headroom,
+            ...(existing ? { correctedFrom: existing.value } : {}),
+          },
+          storePayload: true,
           projectId: req.projectId!,
-          detector: "covenant_breach",
-          severity: "critical",
-          confidence: 1,
-          title:
-            `Covenant breach — ${covenant.name}: ${body.value} vs required ${opText} ` +
-            `${covenant.threshold}${covenant.unit ? ` ${covenant.unit}` : ""}`,
-          explanation:
-            `The ${body.readingDate} reading of covenant "${covenant.name}" is ${body.value}` +
-            `${covenant.unit ? ` ${covenant.unit}` : ""}, against a required level of ${opText} ` +
-            `${covenant.threshold}. Headroom is ${headroom} (negative = depth of breach). ` +
-            `A financial covenant breach typically constitutes a default or draw-stop event ` +
-            `under the facility agreement and may suspend further disbursements.`,
         });
-      }
-      await appendLedger(app.db, {
-        companyId: req.companyId!,
-        actorId: req.user!.id,
-        action: "create",
-        objectType: "covenant_reading",
-        objectId: id,
-        payload: {
-          covenantId,
-          readingDate: body.readingDate,
-          value: body.value,
-          compliant,
-          headroom,
-        },
-        storePayload: true,
       });
       const created = (
         await app.db.select().from(covenantReadings).where(eq(covenantReadings.id, id)).limit(1)
       )[0];
-      return reply.status(201).send(created);
+      return reply.status(existing ? 200 : 201).send(created);
     },
   );
 
@@ -1360,4 +2009,1771 @@ export const financeModule: FastifyPluginAsync = async (app) => {
       return { covenant, items: rows, total: rows.length };
     },
   );
+
+  /* ---------------------------------------------------------------- */
+  /* Expenditure eligibility (#736-737)                                */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Classify each attached item as eligible or ineligible for financing.
+   * A withdrawal application carrying an ineligible or unassessed item
+   * cannot be submitted — the whole point of the classification is that
+   * "we didn't look" is not an answer a financier accepts.
+   */
+  app.put(
+    "/projects/:projectId/disbursements/:disbursementId/eligibility",
+    { preHandler: standardGate },
+    async (req) => {
+      const { disbursementId } = req.params as { disbursementId: string };
+      const body = eligibilityPutSchema.parse(req.body);
+      const d = await fetchDisbursement(disbursementId, req.companyId!, req.projectId!);
+      if (d.status !== "draft" && d.status !== "rejected") {
+        throw badRequest(
+          `Eligibility can only be classified while the request is draft or rejected (this one is ${d.status})`,
+        );
+      }
+      const known = new Set(d.evidenceIds);
+      const unknown = body.entries.filter((e) => !known.has(e.evidenceId));
+      if (unknown.length > 0) {
+        throw badRequest("Eligibility entries must reference evidence attached to this request", {
+          unknownEvidenceIds: unknown.map((e) => e.evidenceId),
+        });
+      }
+      for (const e of body.entries) {
+        if (e.eligibility === "ineligible" && !e.reason) {
+          throw badRequest(
+            `Evidence ${e.evidenceId} is classified ineligible without a reason — an ineligibility finding must say why`,
+          );
+        }
+      }
+      const entries: EligibilityEntry[] = body.entries.map((e) => ({
+        evidenceId: e.evidenceId,
+        eligibility: e.eligibility,
+        reason: e.reason ?? null,
+        amount: e.amount ?? null,
+        note: e.note ?? null,
+      }));
+      await app.db
+        .update(disbursements)
+        .set({ evidenceEligibility: entries, updatedAt: new Date().toISOString() })
+        .where(eq(disbursements.id, disbursementId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "disbursement",
+        objectId: disbursementId,
+        payload: { eligibility: entries },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const assessment = assessEligibility(d.evidenceIds, entries);
+      return { ...(await fetchDisbursement(disbursementId, req.companyId!, req.projectId!)), assessment };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Ineligible expenditure recoveries (#744)                          */
+  /* ---------------------------------------------------------------- */
+
+  app.post(
+    "/projects/:projectId/facilities/:facilityId/recoveries",
+    { preHandler: adminGate },
+    async (req, reply) => {
+      const { facilityId } = req.params as { facilityId: string };
+      const body = recoveryCreateSchema.parse(req.body);
+      const facility = await fetchFacility(facilityId, req.companyId!, req.projectId!);
+      if (body.disbursementId) {
+        const d = await fetchDisbursement(body.disbursementId, req.companyId!, req.projectId!);
+        if (d.facilityId !== facilityId) {
+          throw badRequest("disbursementId belongs to a different facility");
+        }
+      }
+      if (body.evidenceId) {
+        await validateEvidence(req.companyId!, req.projectId!, [body.evidenceId]);
+      }
+      const id = newId("irc");
+      await app.db.insert(ineligibleRecoveries).values({
+        id,
+        facilityId,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        disbursementId: body.disbursementId ?? null,
+        evidenceId: body.evidenceId ?? null,
+        amount: body.amount,
+        currency: body.currency ?? facility.currency,
+        reason: body.reason,
+        detail: body.detail ?? null,
+        status: "open",
+        createdBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "ineligible_recovery",
+        objectId: id,
+        payload: {
+          facilityId,
+          amount: body.amount,
+          currency: body.currency ?? facility.currency,
+          reason: body.reason,
+          disbursementId: body.disbursementId ?? null,
+        },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const [row] = await app.db
+        .select()
+        .from(ineligibleRecoveries)
+        .where(eq(ineligibleRecoveries.id, id))
+        .limit(1);
+      return reply.status(201).send(row);
+    },
+  );
+
+  app.get(
+    "/projects/:projectId/facilities/:facilityId/recoveries",
+    { preHandler: readGate },
+    async (req) => {
+      const { facilityId } = req.params as { facilityId: string };
+      await fetchFacility(facilityId, req.companyId!, req.projectId!);
+      const items = await app.db
+        .select()
+        .from(ineligibleRecoveries)
+        .where(
+          and(
+            eq(ineligibleRecoveries.facilityId, facilityId),
+            eq(ineligibleRecoveries.companyId, req.companyId!),
+          ),
+        )
+        .orderBy(desc(ineligibleRecoveries.createdAt));
+      return {
+        items,
+        total: items.length,
+        openByCurrency: bucketByCurrency(
+          items.filter((r) => r.status === "open").map((r) => ({ amount: r.amount, currency: r.currency })),
+        ),
+      };
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/recoveries/:recoveryId/resolve",
+    { preHandler: adminGate },
+    async (req) => {
+      const { recoveryId } = req.params as { recoveryId: string };
+      const body = recoveryResolveSchema.parse(req.body);
+      const rows = await app.db
+        .select()
+        .from(ineligibleRecoveries)
+        .where(
+          and(
+            eq(ineligibleRecoveries.id, recoveryId),
+            eq(ineligibleRecoveries.companyId, req.companyId!),
+            eq(ineligibleRecoveries.projectId, req.projectId!),
+          ),
+        )
+        .limit(1);
+      const recovery = rows[0];
+      if (!recovery) throw notFound("Recovery not found");
+      if (recovery.status !== "open") {
+        throw badRequest(`A ${recovery.status} recovery cannot be resolved again`);
+      }
+      const now = new Date().toISOString();
+      await app.db
+        .update(ineligibleRecoveries)
+        .set({
+          status: body.status,
+          resolvedAt: now,
+          resolvedBy: req.user!.id,
+          resolutionNote: body.note ?? null,
+          updatedAt: now,
+        })
+        .where(eq(ineligibleRecoveries.id, recoveryId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "ineligible_recovery",
+        objectId: recoveryId,
+        payload: { from: "open", to: body.status, amount: recovery.amount, note: body.note ?? null },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const [after] = await app.db
+        .select()
+        .from(ineligibleRecoveries)
+        .where(eq(ineligibleRecoveries.id, recoveryId))
+        .limit(1);
+      return after;
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Drawdown forecast (#745-746)                                      */
+  /* ---------------------------------------------------------------- */
+
+  app.post(
+    "/projects/:projectId/facilities/:facilityId/forecasts",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { facilityId } = req.params as { facilityId: string };
+      const body = forecastCreateSchema.parse(req.body);
+      const facility = await fetchFacility(facilityId, req.companyId!, req.projectId!);
+      if (body.periodEnd <= body.periodStart) {
+        throw badRequest("periodEnd must fall after periodStart");
+      }
+      if (body.categoryId && !parseCategories(facility).some((c) => c.id === body.categoryId)) {
+        throw badRequest("categoryId does not belong to this facility");
+      }
+      if (body.milestoneTaskId) {
+        const rows = await app.db
+          .select({ id: scheduleTasks.id })
+          .from(scheduleTasks)
+          .where(
+            and(
+              eq(scheduleTasks.id, body.milestoneTaskId),
+              eq(scheduleTasks.projectId, req.projectId!),
+            ),
+          )
+          .limit(1);
+        if (!rows[0]) {
+          throw badRequest("milestoneTaskId does not belong to a schedule on this project");
+        }
+      }
+      const id = newId("dfc");
+      await app.db.insert(disbursementForecasts).values({
+        id,
+        facilityId,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        periodStart: body.periodStart,
+        periodEnd: body.periodEnd,
+        plannedAmount: body.plannedAmount,
+        categoryId: body.categoryId ?? null,
+        milestoneTaskId: body.milestoneTaskId ?? null,
+        note: body.note ?? null,
+        createdBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "disbursement_forecast",
+        objectId: id,
+        payload: {
+          facilityId,
+          periodEnd: body.periodEnd,
+          plannedAmount: body.plannedAmount,
+          milestoneTaskId: body.milestoneTaskId ?? null,
+        },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const [row] = await app.db
+        .select()
+        .from(disbursementForecasts)
+        .where(eq(disbursementForecasts.id, id))
+        .limit(1);
+      return reply.status(201).send(row);
+    },
+  );
+
+  app.delete(
+    "/projects/:projectId/disbursement-forecasts/:forecastId",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { forecastId } = req.params as { forecastId: string };
+      const rows = await app.db
+        .select({ id: disbursementForecasts.id })
+        .from(disbursementForecasts)
+        .where(
+          and(
+            eq(disbursementForecasts.id, forecastId),
+            eq(disbursementForecasts.companyId, req.companyId!),
+            eq(disbursementForecasts.projectId, req.projectId!),
+          ),
+        )
+        .limit(1);
+      if (!rows[0]) throw notFound("Forecast period not found");
+      await app.db.delete(disbursementForecasts).where(eq(disbursementForecasts.id, forecastId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "delete",
+        objectType: "disbursement_forecast",
+        objectId: forecastId,
+        payload: null,
+        projectId: req.projectId!,
+      });
+      return reply.status(204).send();
+    },
+  );
+
+  /** Planned vs actual drawdown, with the milestone test (#745-746). */
+  app.get(
+    "/projects/:projectId/facilities/:facilityId/forecast",
+    { preHandler: readGate },
+    async (req) => {
+      const { facilityId } = req.params as { facilityId: string };
+      const facility = await fetchFacility(facilityId, req.companyId!, req.projectId!);
+      const rows = await app.db
+        .select()
+        .from(disbursementForecasts)
+        .where(eq(disbursementForecasts.facilityId, facilityId))
+        .orderBy(asc(disbursementForecasts.periodEnd));
+      const draws = await app.db
+        .select()
+        .from(disbursements)
+        .where(eq(disbursements.facilityId, facilityId));
+      const milestoneIds = [
+        ...new Set(rows.map((r) => r.milestoneTaskId).filter((x): x is string => Boolean(x))),
+      ];
+      const tasks = milestoneIds.length
+        ? await app.db
+            .select({
+              id: scheduleTasks.id,
+              name: scheduleTasks.name,
+              actualFinish: scheduleTasks.actualFinish,
+            })
+            .from(scheduleTasks)
+            .where(
+              and(
+                inArray(scheduleTasks.id, milestoneIds),
+                eq(scheduleTasks.projectId, req.projectId!),
+              ),
+            )
+        : [];
+      const finished = new Map(tasks.map((t) => [t.id, t.actualFinish !== null]));
+      const periods: ForecastPeriod[] = rows.map((r) => ({
+        periodStart: r.periodStart,
+        periodEnd: r.periodEnd,
+        plannedAmount: r.plannedAmount,
+        milestoneTaskId: r.milestoneTaskId,
+        milestoneComplete: r.milestoneTaskId ? (finished.get(r.milestoneTaskId) ?? false) : null,
+      }));
+      const comparison = compareForecast(
+        periods,
+        draws
+          .filter((d) => d.status === "disbursed" && d.disbursedAt)
+          .map((d) => ({ date: d.disbursedAt!.slice(0, 10), amount: d.amount })),
+        todayISO(),
+      );
+      return {
+        facilityId,
+        currency: facility.currency,
+        forecasts: rows,
+        milestones: tasks,
+        ...comparison,
+      };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Computed covenants and lender waivers (#743, #747)                */
+  /* ---------------------------------------------------------------- */
+
+  /** The formula library, read-only: named ratios anyone can check. */
+  app.get("/finance/covenant-formulas", { preHandler: companyReadGate }, async () => ({
+    formulas: COVENANT_FORMULA_LIBRARY,
+    inputs: FACILITY_CASHFLOW_INPUTS,
+  }));
+
+  app.put(
+    "/projects/:projectId/facilities/:facilityId/cashflows",
+    { preHandler: standardGate },
+    async (req) => {
+      const { facilityId } = req.params as { facilityId: string };
+      const body = cashflowPutSchema.parse(req.body);
+      await fetchFacility(facilityId, req.companyId!, req.projectId!);
+      const existing = await app.db
+        .select()
+        .from(facilityCashflows)
+        .where(
+          and(
+            eq(facilityCashflows.facilityId, facilityId),
+            eq(facilityCashflows.periodEnd, body.periodEnd),
+          ),
+        )
+        .limit(1);
+      const id = existing[0]?.id ?? newId("fcf");
+      const inputs = body.inputs as Record<string, number>;
+      if (existing[0]) {
+        await app.db
+          .update(facilityCashflows)
+          .set({ inputs, note: body.note ?? null, updatedAt: new Date().toISOString() })
+          .where(eq(facilityCashflows.id, id));
+      } else {
+        await app.db.insert(facilityCashflows).values({
+          id,
+          facilityId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          periodEnd: body.periodEnd,
+          inputs,
+          note: body.note ?? null,
+          recordedBy: req.user!.id,
+        });
+      }
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: existing[0] ? "update" : "create",
+        objectType: "facility_cashflow",
+        objectId: id,
+        payload: { facilityId, periodEnd: body.periodEnd, inputs },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      // Recompute every formula-driven covenant on this facility now, so the
+      // reading appears with the period rather than at the next sweep.
+      const covs = await app.db
+        .select()
+        .from(covenants)
+        .where(eq(covenants.facilityId, facilityId));
+      const computed: Array<Record<string, unknown>> = [];
+      for (const cov of covs) {
+        if (cov.formula === "custom") continue;
+        const result = computeCovenantReading(cov.formula, inputs);
+        computed.push({
+          covenantId: cov.id,
+          name: cov.name,
+          formula: cov.formula,
+          value: result.value,
+          basis: result.basis,
+          unavailableReason: result.unavailableReason,
+        });
+        if (result.value === null) continue;
+        const compliant = covenantCompliant(cov.operator, result.value, cov.threshold);
+        const headroom = covenantHeadroom(cov.operator, result.value, cov.threshold);
+        const already = await app.db
+          .select({ id: covenantReadings.id })
+          .from(covenantReadings)
+          .where(
+            and(
+              eq(covenantReadings.covenantId, cov.id),
+              eq(covenantReadings.readingDate, body.periodEnd),
+            ),
+          )
+          .limit(1);
+        if (already[0]) {
+          await app.db
+            .update(covenantReadings)
+            .set({
+              value: result.value,
+              compliant: compliant ? 1 : 0,
+              headroom,
+              basis: cov.formula,
+              computedFrom: { inputs: result.used, basis: result.basis, cashflowId: id },
+            })
+            .where(eq(covenantReadings.id, already[0].id));
+        } else {
+          await app.db.insert(covenantReadings).values({
+            id: newId("cvr"),
+            covenantId: cov.id,
+            companyId: req.companyId!,
+            readingDate: body.periodEnd,
+            value: result.value,
+            compliant: compliant ? 1 : 0,
+            headroom,
+            note: null,
+            basis: cov.formula,
+            computedFrom: { inputs: result.used, basis: result.basis, cashflowId: id },
+            recordedBy: req.user!.id,
+          });
+        }
+        // Same fingerprint the scheduled recompute uses, so a breach found
+        // here and a breach found by the sweep are ONE finding, and a
+        // corrected cashflow closes it instead of leaving it open forever.
+        // (The sweep skips periods that already have a reading, so without
+        // this the breach recorded here would never be signalled at all.)
+        if (!compliant) {
+          await raiseSignalOnce(app.db, {
+            companyId: req.companyId!,
+            projectId: req.projectId!,
+            detector: "covenant_breach",
+            key: `${cov.id}:${body.periodEnd}`,
+            severity: "critical",
+            confidence: 1,
+            title: `Covenant breach — ${cov.name} at ${body.periodEnd}`,
+            explanation:
+              `The computed ${formulaSpec(cov.formula)?.label ?? cov.formula} for the period ending ` +
+              `${body.periodEnd} is ${result.value} against a required level of ` +
+              `${cov.operator === "gte" ? "≥" : "≤"} ${cov.threshold}. ${result.basis} ` +
+              `A financial covenant breach is a draw-stop event: further disbursements are refused ` +
+              `until the breach clears or a lender waiver is recorded.`,
+            subjectType: "covenant",
+            subjectId: cov.id,
+            evidenceRefs: { covenantId: cov.id, periodEnd: body.periodEnd, inputs: result.used },
+          });
+        } else {
+          await closeSignalByKey(
+            app.db,
+            req.companyId!,
+            "covenant_breach",
+            `${cov.id}:${body.periodEnd}`,
+            "The recomputed reading for this period complies.",
+          );
+        }
+      }
+      const [row] = await app.db
+        .select()
+        .from(facilityCashflows)
+        .where(eq(facilityCashflows.id, id))
+        .limit(1);
+      return { ...row, computed };
+    },
+  );
+
+  app.get(
+    "/projects/:projectId/facilities/:facilityId/cashflows",
+    { preHandler: readGate },
+    async (req) => {
+      const { facilityId } = req.params as { facilityId: string };
+      await fetchFacility(facilityId, req.companyId!, req.projectId!);
+      const items = await app.db
+        .select()
+        .from(facilityCashflows)
+        .where(eq(facilityCashflows.facilityId, facilityId))
+        .orderBy(asc(facilityCashflows.periodEnd));
+      return { items, total: items.length, inputs: FACILITY_CASHFLOW_INPUTS };
+    },
+  );
+
+  /**
+   * Record a lender waiver of a covenant breach (#747). Without one, a
+   * facility in breach is under a draw-stop; with one, money may move again
+   * for as long as the waiver runs. Admin-only, because it lifts the bar
+   * the module exists to hold.
+   */
+  app.post(
+    "/projects/:projectId/covenants/:covenantId/waive",
+    { preHandler: adminGate },
+    async (req, reply) => {
+      const { covenantId } = req.params as { covenantId: string };
+      const body = covenantWaiveSchema.parse(req.body);
+      const covenant = await fetchCovenant(covenantId, req.companyId!, req.projectId!);
+      if (body.effectiveTo && body.effectiveTo < body.effectiveFrom) {
+        throw badRequest("effectiveTo cannot fall before effectiveFrom");
+      }
+      if (body.evidenceIds && body.evidenceIds.length > 0) {
+        await validateEvidence(req.companyId!, req.projectId!, body.evidenceIds);
+      }
+      const id = newId("cwv");
+      await app.db.insert(covenantWaivers).values({
+        id,
+        covenantId,
+        facilityId: covenant.facilityId,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        reason: body.reason,
+        lenderReference: body.lenderReference ?? null,
+        effectiveFrom: body.effectiveFrom,
+        effectiveTo: body.effectiveTo ?? null,
+        evidenceIds: body.evidenceIds ?? [],
+        grantedBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "covenant_waiver",
+        objectId: id,
+        payload: {
+          covenantId,
+          facilityId: covenant.facilityId,
+          reason: body.reason,
+          lenderReference: body.lenderReference ?? null,
+          effectiveFrom: body.effectiveFrom,
+          effectiveTo: body.effectiveTo ?? null,
+        },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const [row] = await app.db
+        .select()
+        .from(covenantWaivers)
+        .where(eq(covenantWaivers.id, id))
+        .limit(1);
+      return reply.status(201).send(row);
+    },
+  );
+
+  app.get(
+    "/projects/:projectId/facilities/:facilityId/draw-stop",
+    { preHandler: readGate },
+    async (req) => {
+      const { facilityId } = req.params as { facilityId: string };
+      const facility = await fetchFacility(facilityId, req.companyId!, req.projectId!);
+      const today = todayISO();
+      const standing = await covenantStanding(app.db, facilityId, today);
+      return {
+        facilityId,
+        ...evaluateDrawStop({
+          availabilityEndDate: facility.availabilityEndDate,
+          today,
+          covenants: standing,
+        }),
+        covenants: standing,
+      };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Cost of finance (#748-751)                                        */
+  /* ---------------------------------------------------------------- */
+
+  app.get(
+    "/projects/:projectId/facilities/:facilityId/cost-of-finance",
+    { preHandler: readGate },
+    async (req) => {
+      const { facilityId } = req.params as { facilityId: string };
+      const q = costOfFinanceQuery.parse(req.query);
+      const facility = await fetchFacility(facilityId, req.companyId!, req.projectId!);
+      const draws = await app.db
+        .select()
+        .from(disbursements)
+        .where(eq(disbursements.facilityId, facilityId));
+      const paid = draws
+        .filter((d) => d.status === "disbursed" && d.disbursedAt)
+        .map((d) => ({ date: d.disbursedAt!.slice(0, 10), amount: d.amount }))
+        .sort((a, b) => (a.date < b.date ? -1 : 1));
+      const from = q.from ?? paid[0]?.date ?? facility.createdAt.slice(0, 10);
+      const to = q.to ?? facility.availabilityEndDate ?? todayISO();
+      if (to <= from) {
+        return {
+          facilityId,
+          currency: facility.currency,
+          periods: [],
+          totalInterest: 0,
+          totalCommitmentFees: 0,
+          totalCostOfFinance: 0,
+          basis: "",
+          unavailableReason:
+            `The accrual window ends on or before it begins (${from} → ${to}); nothing can be accrued. ` +
+            `Set an availability end date on the facility or pass explicit from/to dates.`,
+        };
+      }
+      const schedule = buildAccrualSchedule({
+        committedAmount: facility.committedAmount,
+        currency: facility.currency,
+        baseRatePercent: facility.baseRatePercent,
+        marginPercent: facility.marginPercent,
+        commitmentFeePercent: facility.commitmentFeePercent,
+        convention: (facility.dayCountConvention as DayCountConvention) ?? "actual_365",
+        capitalise: facility.capitaliseInterest === 1,
+        periodStart: from,
+        periodEnds: quarterEnds(from, to),
+        draws: paid,
+      });
+      return { facilityId, ...schedule };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Withdrawal application (#732, #735)                               */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * The withdrawal application in the layout an IFI expects: a summary
+   * page, a statement of expenditure schedule and the certification block.
+   * Assembled from recorded fields only — every line is traceable to a row,
+   * and anything missing is stated rather than filled in.
+   */
+  async function buildApplication(
+    disbursementId: string,
+    companyId: string,
+    projectId: string,
+  ): Promise<WithdrawalApplicationDocument> {
+    const d = await fetchDisbursement(disbursementId, companyId, projectId);
+    const facility = await fetchFacility(d.facilityId, companyId, projectId);
+    const projectRow = (
+      await app.db.select({ name: projects.name }).from(projects).where(eq(projects.id, projectId)).limit(1)
+    )[0];
+    const evidenceRows = d.evidenceIds.length
+      ? await app.db
+          .select()
+          .from(evidence)
+          .where(
+            and(
+              inArray(evidence.id, d.evidenceIds),
+              eq(evidence.companyId, companyId),
+              eq(evidence.projectId, projectId),
+            ),
+          )
+      : [];
+    const eligibility = assessEligibility(
+      d.evidenceIds,
+      (d.evidenceEligibility ?? []) as EligibilityEntry[],
+    );
+    const category = d.categoryId
+      ? (parseCategories(facility).find((c) => c.id === d.categoryId) ?? null)
+      : null;
+    const warnings: string[] = [];
+    if (!d.certifiedAt) {
+      warnings.push(
+        CERTIFICATION_REQUIRED_INSTRUMENTS.includes(facility.instrument)
+          ? "This application has NOT been certified by the independent engineer, and this facility requires certification before payment."
+          : "This application has not been certified; certification is optional for this instrument.",
+      );
+    }
+    if (eligibility.unassessed > 0) {
+      warnings.push(`${eligibility.unassessed} attached item(s) have not been classified for eligibility.`);
+    }
+    if (evidenceRows.length !== d.evidenceIds.length) {
+      warnings.push(
+        `${d.evidenceIds.length - evidenceRows.length} attached evidence id(s) no longer resolve in this project.`,
+      );
+    }
+    return {
+      header: {
+        applicationNumber: d.number,
+        project: projectRow?.name ?? null,
+        borrowerReference: facility.name,
+        lender: facility.lender,
+        instrument: facility.instrument,
+        currency: facility.currency,
+        committedAmount: facility.committedAmount,
+        availabilityEndDate: facility.availabilityEndDate,
+        category: category ? { id: category.id, name: category.name, limit: category.limit } : null,
+      },
+      application: {
+        amount: d.amount,
+        purpose: d.purpose,
+        status: d.status,
+        submittedAt: d.submittedAt,
+        approvedAt: d.approvedAt,
+        disbursedAt: d.disbursedAt,
+      },
+      statementOfExpenditure: evidenceRows.map((e) => {
+        const entry = ((d.evidenceEligibility ?? []) as EligibilityEntry[]).find(
+          (x) => x.evidenceId === e.id,
+        );
+        return {
+          evidenceId: e.id,
+          kind: e.kind,
+          source: e.source,
+          capturedAt: e.capturedAt,
+          contentHash: e.contentHash,
+          eligibility: entry?.eligibility ?? "unassessed",
+          reason: entry?.reason ?? null,
+          amount: entry?.amount ?? null,
+        };
+      }),
+      eligibility: {
+        total: eligibility.total,
+        eligible: eligibility.eligible,
+        ineligible: eligibility.ineligible,
+        unassessed: eligibility.unassessed,
+        ineligibleAmount: eligibility.ineligibleAmount,
+        submittable: eligibility.submittable,
+        reasons: eligibility.reasons,
+      },
+      certification: {
+        certified: Boolean(d.certifiedAt),
+        certifiedAt: d.certifiedAt,
+        certifiedBy: d.certifiedBy,
+        note: d.certificationNote,
+        evidenceIds: d.certificationEvidenceIds,
+        requiredForInstrument: CERTIFICATION_REQUIRED_INSTRUMENTS.includes(facility.instrument),
+      },
+      conditionality: d.conditionality ?? null,
+      warnings,
+      basis:
+        "Assembled from the disbursement record, the facility agreement terms held on the " +
+        "platform and the evidence attached to the application. Nothing on this form is " +
+        "computed from anything the platform does not hold; anything missing is named in warnings.",
+    };
+  }
+
+  app.get(
+    "/projects/:projectId/disbursements/:disbursementId/application",
+    { preHandler: readGate },
+    async (req) => {
+      const { disbursementId } = req.params as { disbursementId: string };
+      return buildApplication(disbursementId, req.companyId!, req.projectId!);
+    },
+  );
+
+  /**
+   * The same application as the printed IFI form. There is no PDF writer in
+   * this runtime, so the platform emits the print-ready document (the
+   * browser's "save as PDF" produces the file the lender receives) rather
+   * than claiming a PDF it cannot produce.
+   */
+  app.get(
+    "/projects/:projectId/disbursements/:disbursementId/application.html",
+    { preHandler: readGate },
+    async (req, reply) => {
+      const { disbursementId } = req.params as { disbursementId: string };
+      const doc = await buildApplication(disbursementId, req.companyId!, req.projectId!);
+      return reply
+        .type("text/html; charset=utf-8")
+        .header(
+          "content-disposition",
+          `inline; filename="withdrawal-application-${doc.header.applicationNumber}.html"`,
+        )
+        .send(renderWithdrawalApplicationHtml(doc));
+    },
+  );
+
+  /** The statement-of-expenditure schedule for the lender's own system. */
+  app.get(
+    "/projects/:projectId/disbursements/:disbursementId/application.csv",
+    { preHandler: readGate },
+    async (req, reply) => {
+      const { disbursementId } = req.params as { disbursementId: string };
+      const doc = await buildApplication(disbursementId, req.companyId!, req.projectId!);
+      return reply
+        .type("text/csv; charset=utf-8")
+        .header(
+          "content-disposition",
+          `attachment; filename="withdrawal-application-${doc.header.applicationNumber}.csv"`,
+        )
+        .send(withdrawalApplicationCsv(doc));
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Health inputs (contract 3.5)                                      */
+  /* ---------------------------------------------------------------- */
+
+  app.get("/projects/:projectId/finance/health-inputs", { preHandler: readGate }, async (req) => {
+    const companyId = req.companyId!;
+    const projectId = req.projectId!;
+    const today = todayISO();
+    await sweepOverdueConditions(companyId, projectId);
+    const reasons: string[] = [];
+    const facs = await app.db
+      .select()
+      .from(fundingFacilities)
+      .where(
+        and(eq(fundingFacilities.companyId, companyId), eq(fundingFacilities.projectId, projectId)),
+      );
+    if (facs.length === 0) {
+      reasons.push("No funding facility is recorded on this project.");
+      return {
+        metrics: {
+          facilities: 0,
+          openConditions: null,
+          breachedConditions: null,
+          covenantBreaches: null,
+          drawStopped: null,
+          disbursedPercent: null,
+          daysToClosing: null,
+          awaitingCertification: null,
+          openRecoveries: null,
+        },
+        reasons,
+      };
+    }
+    const conds = await app.db
+      .select()
+      .from(facilityConditions)
+      .where(
+        and(
+          eq(facilityConditions.companyId, companyId),
+          eq(facilityConditions.projectId, projectId),
+        ),
+      );
+    const draws = await app.db
+      .select()
+      .from(disbursements)
+      .where(and(eq(disbursements.companyId, companyId), eq(disbursements.projectId, projectId)));
+    const recoveries = await app.db
+      .select()
+      .from(ineligibleRecoveries)
+      .where(
+        and(
+          eq(ineligibleRecoveries.companyId, companyId),
+          eq(ineligibleRecoveries.projectId, projectId),
+        ),
+      );
+
+    const standings = (
+      await Promise.all(facs.map((f) => covenantStanding(app.db, f.id, today)))
+    ).flat();
+    if (standings.length === 0) reasons.push("No covenants are defined on this project's facilities.");
+    const stops = facs.map((f) =>
+      evaluateDrawStop({
+        availabilityEndDate: f.availabilityEndDate,
+        today,
+        covenants: standings.filter(() => true),
+      }),
+    );
+
+    // Disbursed percentage is only meaningful inside one currency.
+    const currencies = new Set(facs.map((f) => f.currency));
+    let disbursedPercent: number | null = null;
+    if (currencies.size > 1) {
+      reasons.push(
+        `Facilities span ${[...currencies].join(", ")}; a single disbursed percentage would require an exchange rate this platform does not hold.`,
+      );
+    } else {
+      const committed = facs.reduce((sum, f) => sum + f.committedAmount, 0);
+      const disbursed = draws
+        .filter((d) => d.status === "disbursed")
+        .reduce((sum, d) => sum + d.amount, 0);
+      disbursedPercent = committed > 0 ? round2((disbursed / committed) * 100) : null;
+      if (disbursedPercent === null) {
+        reasons.push("Committed funding is zero, so a disbursed percentage is undefined.");
+      }
+    }
+
+    const closingDates = facs
+      .map((f) => f.availabilityEndDate)
+      .filter((d): d is string => Boolean(d))
+      .sort();
+    if (closingDates.length === 0) {
+      reasons.push("No facility carries an availability end date, so closing pressure is unknown.");
+    }
+
+    // Designated accounts: an unreconciled advance account is a health input
+    // in its own right, and "no accounts" is stated rather than scored 0.
+    const accounts = await app.db
+      .select()
+      .from(designatedAccounts)
+      .where(
+        and(
+          eq(designatedAccounts.companyId, companyId),
+          eq(designatedAccounts.projectId, projectId),
+          eq(designatedAccounts.status, "active"),
+        ),
+      );
+    let unreconciledAccounts: number | null = null;
+    if (accounts.length === 0) {
+      reasons.push(
+        "No designated account is held on this project, so account reconciliation is not a measure here.",
+      );
+    } else {
+      const recs = await app.db
+        .select({
+          accountId: designatedAccountReconciliations.accountId,
+          outcome: designatedAccountReconciliations.outcome,
+          periodEnd: designatedAccountReconciliations.periodEnd,
+        })
+        .from(designatedAccountReconciliations)
+        .where(
+          inArray(
+            designatedAccountReconciliations.accountId,
+            accounts.map((a) => a.id),
+          ),
+        );
+      const latest = new Map<string, { outcome: string; periodEnd: string }>();
+      for (const r of recs) {
+        const current = latest.get(r.accountId);
+        if (!current || r.periodEnd > current.periodEnd) {
+          latest.set(r.accountId, { outcome: r.outcome, periodEnd: r.periodEnd });
+        }
+      }
+      unreconciledAccounts = accounts.filter((a) => {
+        const last = latest.get(a.id);
+        return !last || last.outcome !== "reconciled";
+      }).length;
+    }
+
+    return {
+      metrics: {
+        facilities: facs.length,
+        openConditions: conds.filter((c) => c.status === "open").length,
+        breachedConditions: conds.filter((c) => c.status === "breached").length,
+        covenantBreaches:
+          standings.length === 0
+            ? null
+            : standings.filter((c) => c.compliant === false && c.waivedBy === null).length,
+        drawStopped: stops.filter((s) => s.stopped).length,
+        disbursedPercent,
+        daysToClosing: closingDates[0] ? daysUntil(closingDates[0]) : null,
+        awaitingCertification: draws.filter((d) => d.status === "approved" && !d.certifiedAt).length,
+        openRecoveries: recoveries.filter((r) => r.status === "open").length,
+        designatedAccounts: accounts.length,
+        unreconciledAccounts,
+      },
+      reasons,
+    };
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Designated (special) account reconciliation (#735, #745)           */
+  /* ---------------------------------------------------------------- */
+
+  async function fetchAccount(accountId: string, companyId: string, projectId: string) {
+    const rows = await app.db
+      .select()
+      .from(designatedAccounts)
+      .where(
+        and(
+          eq(designatedAccounts.id, accountId),
+          eq(designatedAccounts.companyId, companyId),
+          eq(designatedAccounts.projectId, projectId),
+        ),
+      )
+      .limit(1);
+    if (!rows[0]) throw notFound("Designated account not found");
+    return rows[0];
+  }
+
+  async function accountEntries(accountId: string): Promise<AccountEntryInput[]> {
+    const rows = await app.db
+      .select({
+        entryDate: designatedAccountEntries.entryDate,
+        kind: designatedAccountEntries.kind,
+        amount: designatedAccountEntries.amount,
+      })
+      .from(designatedAccountEntries)
+      .where(eq(designatedAccountEntries.accountId, accountId))
+      .orderBy(asc(designatedAccountEntries.entryDate), asc(designatedAccountEntries.createdAt));
+    return rows;
+  }
+
+  app.post(
+    "/projects/:projectId/facilities/:facilityId/designated-accounts",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { facilityId } = req.params as { facilityId: string };
+      const body = accountCreateSchema.parse(req.body);
+      const facility = await fetchFacility(facilityId, req.companyId!, req.projectId!);
+      const id = newId("dac");
+      await app.db.insert(designatedAccounts).values({
+        id,
+        facilityId,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        name: body.name,
+        bankName: body.bankName ?? null,
+        accountRef: body.accountRef ?? null,
+        currency: (body.currency ?? facility.currency).toUpperCase(),
+        authorisedCeiling: body.authorisedCeiling,
+        openingBalance: body.openingBalance ?? 0,
+        openedOn: body.openedOn ?? null,
+        // Honoured, not swallowed: an account recorded as already closed
+        // must not start accepting entries or appear in the unreconciled
+        // sweep (jobs.ts sweeps status = "active" only).
+        status: body.status ?? "active",
+        createdBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "designated_account",
+        objectId: id,
+        payload: {
+          facilityId,
+          name: body.name,
+          authorisedCeiling: body.authorisedCeiling,
+          currency: body.currency ?? facility.currency,
+          status: body.status ?? "active",
+        },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const row = await fetchAccount(id, req.companyId!, req.projectId!);
+      return reply.status(201).send(row);
+    },
+  );
+
+  app.get(
+    "/projects/:projectId/facilities/:facilityId/designated-accounts",
+    { preHandler: readGate },
+    async (req) => {
+      const { facilityId } = req.params as { facilityId: string };
+      await fetchFacility(facilityId, req.companyId!, req.projectId!);
+      const rows = await app.db
+        .select()
+        .from(designatedAccounts)
+        .where(
+          and(
+            eq(designatedAccounts.facilityId, facilityId),
+            eq(designatedAccounts.companyId, req.companyId!),
+          ),
+        )
+        .orderBy(asc(designatedAccounts.createdAt));
+      const today = todayISO();
+      const items = [];
+      for (const account of rows) {
+        const position = computeAccountPosition(
+          { openingBalance: account.openingBalance, authorisedCeiling: account.authorisedCeiling },
+          await accountEntries(account.id),
+          today,
+        );
+        items.push({ ...account, position });
+      }
+      return { items, total: items.length };
+    },
+  );
+
+  app.get(
+    "/projects/:projectId/designated-accounts/:accountId",
+    { preHandler: readGate },
+    async (req) => {
+      const { accountId } = req.params as { accountId: string };
+      const q = accountViewQuery.parse(req.query);
+      const account = await fetchAccount(accountId, req.companyId!, req.projectId!);
+      const asAt = q.asAt ?? todayISO();
+      const entries = await app.db
+        .select()
+        .from(designatedAccountEntries)
+        .where(eq(designatedAccountEntries.accountId, accountId))
+        .orderBy(asc(designatedAccountEntries.entryDate), asc(designatedAccountEntries.createdAt));
+      const recs = await app.db
+        .select()
+        .from(designatedAccountReconciliations)
+        .where(eq(designatedAccountReconciliations.accountId, accountId))
+        .orderBy(desc(designatedAccountReconciliations.periodEnd));
+      const position = computeAccountPosition(
+        { openingBalance: account.openingBalance, authorisedCeiling: account.authorisedCeiling },
+        entries,
+        asAt,
+      );
+      return { ...account, asAt, entries, reconciliations: recs, position };
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/designated-accounts/:accountId/entries",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { accountId } = req.params as { accountId: string };
+      const body = accountEntrySchema.parse(req.body);
+      const account = await fetchAccount(accountId, req.companyId!, req.projectId!);
+      if (account.status !== "active") {
+        throw badRequest(`A ${account.status} designated account cannot take new entries`);
+      }
+      if (body.disbursementId) {
+        const d = await fetchDisbursement(body.disbursementId, req.companyId!, req.projectId!);
+        if (d.facilityId !== account.facilityId) {
+          throw badRequest("disbursementId belongs to a different facility");
+        }
+      }
+      if (body.evidenceId) {
+        await validateEvidence(req.companyId!, req.projectId!, [body.evidenceId]);
+      }
+      const id = newId("dae");
+      await app.db.insert(designatedAccountEntries).values({
+        id,
+        accountId,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        entryDate: body.entryDate,
+        kind: body.kind,
+        amount: body.amount,
+        description: body.description,
+        reference: body.reference ?? null,
+        disbursementId: body.disbursementId ?? null,
+        evidenceId: body.evidenceId ?? null,
+        createdBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "designated_account_entry",
+        objectId: id,
+        payload: {
+          accountId,
+          kind: body.kind,
+          amount: body.amount,
+          entryDate: body.entryDate,
+        },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const position = computeAccountPosition(
+        { openingBalance: account.openingBalance, authorisedCeiling: account.authorisedCeiling },
+        await accountEntries(accountId),
+        todayISO(),
+      );
+      // The ceiling is a lender term, not a system limit: an entry that
+      // breaches it is recorded and raised, never silently refused.
+      if (position.overCeiling) {
+        await raiseAccountSignal(req.companyId!, req.projectId!, account, position.balance);
+      }
+      const [row] = await app.db
+        .select()
+        .from(designatedAccountEntries)
+        .where(eq(designatedAccountEntries.id, id))
+        .limit(1);
+      return reply.status(201).send({ ...row, position });
+    },
+  );
+
+  /** One signal per ACCOUNT while it is over its ceiling, not one per entry. */
+  async function raiseAccountSignal(
+    companyId: string,
+    projectId: string,
+    account: typeof designatedAccounts.$inferSelect,
+    balance: number,
+  ): Promise<void> {
+    await raiseSignalOnce(app.db, {
+      companyId,
+      projectId,
+      detector: "designated_account_over_ceiling",
+      key: account.id,
+      severity: "high",
+      confidence: 1,
+      title: `Designated account "${account.name}" is above its authorised ceiling`,
+      explanation:
+        `The ledger balance of ${account.name} is ${balance} ${account.currency} against an ` +
+        `authorised ceiling of ${account.authorisedCeiling}. An advance account held above its ` +
+        `ceiling is a breach of the financing agreement's account conditions and is usually a ` +
+        `refund event, not a rounding matter.`,
+      subjectType: "designated_account",
+      subjectId: account.id,
+    });
+  }
+
+  /**
+   * Reconcile the account against the bank statement for a period.
+   *
+   * Admin-gated and mirrored into the assurance register: the statement
+   * balance is recorded as an ASSERTION and the comparison as a
+   * RECONCILIATION, so an account nobody can reconcile shows up in the same
+   * place as every other unsupported claim on the platform.
+   */
+  app.post(
+    "/projects/:projectId/designated-accounts/:accountId/reconcile",
+    { preHandler: adminGate },
+    async (req, reply) => {
+      const { accountId } = req.params as { accountId: string };
+      const body = accountReconcileSchema.parse(req.body);
+      const account = await fetchAccount(accountId, req.companyId!, req.projectId!);
+      if (body.evidenceIds && body.evidenceIds.length > 0) {
+        await validateEvidence(req.companyId!, req.projectId!, body.evidenceIds);
+      }
+      const existing = await app.db
+        .select({ id: designatedAccountReconciliations.id })
+        .from(designatedAccountReconciliations)
+        .where(
+          and(
+            eq(designatedAccountReconciliations.accountId, accountId),
+            eq(designatedAccountReconciliations.periodEnd, body.periodEnd),
+          ),
+        )
+        .limit(1);
+      if (existing[0]) {
+        throw conflict(
+          `This account has already been reconciled to ${body.periodEnd}. Reconciliations are a ` +
+            `record of what was checked on a date and are not rewritten.`,
+        );
+      }
+      const position = computeAccountPosition(
+        { openingBalance: account.openingBalance, authorisedCeiling: account.authorisedCeiling },
+        await accountEntries(accountId),
+        body.periodEnd,
+      );
+      const result = reconcileAccount({
+        statementBalance: body.statementBalance,
+        computedBalance: position.balance,
+        tolerance: body.tolerance,
+      });
+
+      const id = newId("dar");
+      const assertionId = newId("ast");
+      const assuranceRecId = newId("rec");
+      const now = new Date().toISOString();
+
+      await app.db.transaction(async (tx) => {
+        await tx.insert(assertions).values({
+          id: assertionId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          kind: "cost",
+          claimantId: req.user!.id,
+          claimantKind: "user",
+          value: body.statementBalance,
+          unit: account.currency,
+          basis:
+            `Bank statement balance of designated account "${account.name}" at ${body.periodEnd}.`,
+          sourceType: "designated_account",
+          sourceId: accountId,
+          assertedAt: now,
+          createdBy: req.user!.id,
+        });
+        await tx.insert(reconciliations).values({
+          id: assuranceRecId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          assertionId,
+          evidenceIds: body.evidenceIds ?? [],
+          method: "designated_account_balance",
+          result: result.outcome === "reconciled" ? "supported" : "contradicted",
+          variance: result.difference,
+          variancePercent:
+            Math.abs(position.balance) < 1e-9
+              ? null
+              : round2((result.difference / position.balance) * 100),
+          confidence: (body.evidenceIds ?? []).length > 0 ? 0.9 : 0.5,
+          notes: result.explanation,
+          selfCertified: (body.evidenceIds ?? []).length === 0,
+          createdBy: req.user!.id,
+        });
+        await tx.insert(designatedAccountReconciliations).values({
+          id,
+          accountId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          periodEnd: body.periodEnd,
+          statementBalance: result.statementBalance,
+          computedBalance: result.computedBalance,
+          difference: result.difference,
+          outcome: result.outcome,
+          explanation: body.explanation ?? result.explanation,
+          evidenceIds: body.evidenceIds ?? [],
+          assuranceReconciliationId: assuranceRecId,
+          reconciledBy: req.user!.id,
+        });
+        await appendLedger(tx as Db, {
+          companyId: req.companyId!,
+          actorId: req.user!.id,
+          action: "create",
+          objectType: "designated_account_reconciliation",
+          objectId: id,
+          payload: {
+            accountId,
+            periodEnd: body.periodEnd,
+            statementBalance: result.statementBalance,
+            computedBalance: result.computedBalance,
+            difference: result.difference,
+            outcome: result.outcome,
+          },
+          storePayload: true,
+          projectId: req.projectId!,
+        });
+      });
+
+      if (result.outcome === "unreconciled") {
+        await raiseSignalOnce(app.db, {
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          detector: "designated_account_unreconciled",
+          key: `${accountId}:${body.periodEnd}`,
+          severity: "high",
+          confidence: 1,
+          title: `Designated account "${account.name}" does not reconcile at ${body.periodEnd}`,
+          explanation: result.explanation,
+          subjectType: "designated_account",
+          subjectId: accountId,
+          evidenceRefs: { reconciliationId: id },
+        });
+      } else {
+        // A clean period closes the standing "never reconciled" finding.
+        await closeSignalByKey(
+          app.db,
+          req.companyId!,
+          "designated_account_unreconciled_overdue",
+          accountId,
+          `Reconciled to ${body.periodEnd} with no unexplained difference.`,
+        );
+      }
+
+      const [row] = await app.db
+        .select()
+        .from(designatedAccountReconciliations)
+        .where(eq(designatedAccountReconciliations.id, id))
+        .limit(1);
+      return reply.status(201).send({ ...row, position, result });
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* PPP / availability payment mechanism                              */
+  /* ---------------------------------------------------------------- */
+
+  async function fetchAvailabilityModel(
+    modelId: string,
+    companyId: string,
+    projectId: string,
+  ) {
+    const rows = await app.db
+      .select()
+      .from(availabilityPaymentModels)
+      .where(
+        and(
+          eq(availabilityPaymentModels.id, modelId),
+          eq(availabilityPaymentModels.companyId, companyId),
+          eq(availabilityPaymentModels.projectId, projectId),
+        ),
+      )
+      .limit(1);
+    if (!rows[0]) throw notFound("Availability payment model not found");
+    return rows[0];
+  }
+
+  function modelInput(model: typeof availabilityPaymentModels.$inferSelect) {
+    return {
+      unitaryCharge: model.unitaryCharge,
+      currency: model.currency,
+      availabilityWeightPercent: model.availabilityWeightPercent,
+      performanceWeightPercent: model.performanceWeightPercent,
+      performancePointValuePercent: model.performancePointValuePercent,
+      deductionCapPercent: model.deductionCapPercent,
+      persistentBreachPoints: model.persistentBreachPoints,
+    };
+  }
+
+  app.post(
+    "/projects/:projectId/availability-models",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const body = availabilityModelSchema.parse(req.body);
+      if (body.availabilityWeightPercent + body.performanceWeightPercent > 100) {
+        throw badRequest(
+          "The availability and performance weights cannot together exceed 100% of the charge",
+        );
+      }
+      if (body.facilityId) {
+        await fetchFacility(body.facilityId, req.companyId!, req.projectId!);
+      }
+      const id = newId("apm");
+      await app.db.insert(availabilityPaymentModels).values({
+        id,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        facilityId: body.facilityId ?? null,
+        name: body.name,
+        currency: (body.currency ?? "GBP").toUpperCase(),
+        unitaryCharge: body.unitaryCharge,
+        periodMonths: body.periodMonths,
+        availabilityWeightPercent: body.availabilityWeightPercent,
+        performanceWeightPercent: body.performanceWeightPercent,
+        performancePointValuePercent: body.performancePointValuePercent,
+        deductionCapPercent: body.deductionCapPercent ?? null,
+        persistentBreachPoints: body.persistentBreachPoints ?? null,
+        notes: body.notes ?? null,
+        createdBy: req.user!.id,
+      });
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "availability_payment_model",
+        objectId: id,
+        payload: { name: body.name, unitaryCharge: body.unitaryCharge },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const row = await fetchAvailabilityModel(id, req.companyId!, req.projectId!);
+      return reply.status(201).send(row);
+    },
+  );
+
+  app.get("/projects/:projectId/availability-models", { preHandler: readGate }, async (req) => {
+    const rows = await app.db
+      .select()
+      .from(availabilityPaymentModels)
+      .where(
+        and(
+          eq(availabilityPaymentModels.companyId, req.companyId!),
+          eq(availabilityPaymentModels.projectId, req.projectId!),
+        ),
+      )
+      .orderBy(asc(availabilityPaymentModels.createdAt));
+    return { items: rows, total: rows.length };
+  });
+
+  app.post(
+    "/projects/:projectId/availability-models/:modelId/periods",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { modelId } = req.params as { modelId: string };
+      const body = availabilityPeriodSchema.parse(req.body);
+      const model = await fetchAvailabilityModel(modelId, req.companyId!, req.projectId!);
+      if (body.periodEnd <= body.periodStart) {
+        throw badRequest("periodEnd must fall after periodStart");
+      }
+      const id = newId("avp");
+      const computed = computeAvailabilityPayment(modelInput(model), {
+        requiredHours: body.requiredHours,
+        events: body.unavailabilityEvents as UnavailabilityEvent[],
+        performancePoints: body.performancePoints,
+      });
+      const inserted = await app.db
+        .insert(availabilityPeriods)
+        .values({
+          id,
+          modelId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          periodStart: body.periodStart,
+          periodEnd: body.periodEnd,
+          requiredHours: body.requiredHours,
+          unavailabilityEvents: body.unavailabilityEvents,
+          performancePoints: body.performancePoints,
+          computed: computed as unknown as Record<string, unknown>,
+          createdBy: req.user!.id,
+        })
+        .onConflictDoNothing({
+          target: [availabilityPeriods.modelId, availabilityPeriods.periodStart],
+        })
+        .returning({ id: availabilityPeriods.id });
+      if (inserted.length === 0) {
+        throw conflict(`A period starting ${body.periodStart} already exists on this model`);
+      }
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "availability_period",
+        objectId: id,
+        payload: {
+          modelId,
+          periodStart: body.periodStart,
+          periodEnd: body.periodEnd,
+          netPayment: computed.netPayment,
+          totalDeduction: computed.totalDeduction,
+        },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      const [row] = await app.db
+        .select()
+        .from(availabilityPeriods)
+        .where(eq(availabilityPeriods.id, id))
+        .limit(1);
+      return reply.status(201).send(row);
+    },
+  );
+
+  app.get(
+    "/projects/:projectId/availability-models/:modelId/periods",
+    { preHandler: readGate },
+    async (req) => {
+      const { modelId } = req.params as { modelId: string };
+      const model = await fetchAvailabilityModel(modelId, req.companyId!, req.projectId!);
+      const rows = await app.db
+        .select()
+        .from(availabilityPeriods)
+        .where(eq(availabilityPeriods.modelId, modelId))
+        .orderBy(asc(availabilityPeriods.periodStart));
+      // Recompute uncertified periods against the CURRENT model terms; a
+      // certified period keeps the figures it was certified on.
+      const items = rows.map((p) =>
+        p.status === "draft"
+          ? {
+              ...p,
+              computed: computeAvailabilityPayment(modelInput(model), {
+                requiredHours: p.requiredHours,
+                events: (p.unavailabilityEvents ?? []) as UnavailabilityEvent[],
+                performancePoints: p.performancePoints,
+              }) as unknown as Record<string, unknown>,
+            }
+          : p,
+      );
+      const certified = items.filter((p) => p.status !== "draft");
+      const totals = {
+        currency: model.currency,
+        periods: items.length,
+        certifiedPeriods: certified.length,
+        certifiedGross: round2(
+          certified.reduce(
+            (s, p) => s + Number((p.computed as { grossCharge?: number })?.grossCharge ?? 0),
+            0,
+          ),
+        ),
+        certifiedDeductions: round2(
+          certified.reduce(
+            (s, p) => s + Number((p.computed as { totalDeduction?: number })?.totalDeduction ?? 0),
+            0,
+          ),
+        ),
+        certifiedNet: round2(
+          certified.reduce(
+            (s, p) => s + Number((p.computed as { netPayment?: number })?.netPayment ?? 0),
+            0,
+          ),
+        ),
+      };
+      return {
+        model,
+        items,
+        total: items.length,
+        totals,
+        basis:
+          "Totals cover CERTIFIED periods only — a draft period is an unagreed number and is " +
+          "shown but not added in. Every period is denominated in the model's single currency.",
+      };
+    },
+  );
+
+  /**
+   * Certify a period: freeze the computed figures. Separation of duties —
+   * the certifier may not be the person who recorded the period, because
+   * this is the step that turns a claim into a payable amount.
+   */
+  app.post(
+    "/projects/:projectId/availability-periods/:periodId/certify",
+    { preHandler: adminGate },
+    async (req) => {
+      const { periodId } = req.params as { periodId: string };
+      const rows = await app.db
+        .select()
+        .from(availabilityPeriods)
+        .where(
+          and(
+            eq(availabilityPeriods.id, periodId),
+            eq(availabilityPeriods.companyId, req.companyId!),
+            eq(availabilityPeriods.projectId, req.projectId!),
+          ),
+        )
+        .limit(1);
+      const period = rows[0];
+      if (!period) throw notFound("Availability period not found");
+      if (period.status !== "draft") {
+        throw badRequest(`A ${period.status} period cannot be certified again`);
+      }
+      if (period.createdBy === req.user!.id) {
+        throw forbidden(
+          "Separation of duties: the person who recorded the period cannot also certify it",
+        );
+      }
+      const model = await fetchAvailabilityModel(
+        period.modelId,
+        req.companyId!,
+        req.projectId!,
+      );
+      const computed = computeAvailabilityPayment(modelInput(model), {
+        requiredHours: period.requiredHours,
+        events: (period.unavailabilityEvents ?? []) as UnavailabilityEvent[],
+        performancePoints: period.performancePoints,
+      });
+      const now = new Date().toISOString();
+      await app.db
+        .update(availabilityPeriods)
+        .set({
+          status: "certified",
+          computed: computed as unknown as Record<string, unknown>,
+          certifiedBy: req.user!.id,
+          certifiedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(availabilityPeriods.id, periodId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "availability_period",
+        objectId: periodId,
+        payload: {
+          from: "draft",
+          to: "certified",
+          netPayment: computed.netPayment,
+          totalDeduction: computed.totalDeduction,
+          persistentBreach: computed.persistentBreach,
+        },
+        storePayload: true,
+        projectId: req.projectId!,
+      });
+      if (computed.persistentBreach) {
+        await raiseSignalOnce(app.db, {
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          detector: "availability_persistent_breach",
+          key: periodId,
+          severity: "high",
+          confidence: 1,
+          title: `Persistent breach threshold reached on "${model.name}"`,
+          explanation:
+            `The period ${period.periodStart} → ${period.periodEnd} accrued ` +
+            `${period.performancePoints} performance failure points against a threshold of ` +
+            `${model.persistentBreachPoints}. Under an availability-based concession this ` +
+            `normally engages a warning notice and, if repeated, step-in or termination rights.`,
+          subjectType: "availability_period",
+          subjectId: periodId,
+        });
+      }
+      const [row] = await app.db
+        .select()
+        .from(availabilityPeriods)
+        .where(eq(availabilityPeriods.id, periodId))
+        .limit(1);
+      return row;
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Company-level portfolio view                                      */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Every facility the caller can see, per currency. Company-level, so it
+   * is gated by the same tool the project routes are and scoped to the
+   * projects the caller actually holds finance access on.
+   */
+  app.get("/finance/portfolio", { preHandler: companyReadGate }, async (req) => {
+    const scope = await visibleProjectIds(app, req, "finance");
+    if (scope !== null && scope.length === 0) {
+      return {
+        facilities: [],
+        committedByCurrency: [],
+        disbursedByCurrency: [],
+        reason: "You do not hold finance access on any project in this company.",
+      };
+    }
+    const clauses = [eq(fundingFacilities.companyId, req.companyId!)];
+    if (scope !== null) clauses.push(inArray(fundingFacilities.projectId, scope));
+    const facs = await app.db
+      .select()
+      .from(fundingFacilities)
+      .where(and(...clauses))
+      .orderBy(desc(fundingFacilities.createdAt));
+    if (facs.length === 0) {
+      return {
+        facilities: [],
+        committedByCurrency: [],
+        disbursedByCurrency: [],
+        reason: "No funding facilities are recorded on the projects you can see.",
+      };
+    }
+    const ids = facs.map((f) => f.id);
+    const draws = await app.db
+      .select()
+      .from(disbursements)
+      .where(inArray(disbursements.facilityId, ids));
+    const projectRows = await app.db
+      .select({ id: projects.id, name: projects.name })
+      .from(projects)
+      .where(
+        and(
+          eq(projects.companyId, req.companyId!),
+          inArray(projects.id, [...new Set(facs.map((f) => f.projectId))]),
+        ),
+      );
+    const projectName = new Map(projectRows.map((p) => [p.id, p.name]));
+    const currencyOf = new Map(facs.map((f) => [f.id, f.currency]));
+    return {
+      facilities: facs.map((f) => {
+        const rows = draws.filter((d) => d.facilityId === f.id);
+        return {
+          id: f.id,
+          projectId: f.projectId,
+          projectName: projectName.get(f.projectId) ?? null,
+          name: f.name,
+          lender: f.lender,
+          instrument: f.instrument,
+          currency: f.currency,
+          committedAmount: f.committedAmount,
+          disbursed: round2(
+            rows.filter((d) => d.status === "disbursed").reduce((sum, d) => sum + d.amount, 0),
+          ),
+          pipeline: round2(
+            rows
+              .filter((d) => (PIPELINE_STATUSES as readonly string[]).includes(d.status))
+              .reduce((sum, d) => sum + d.amount, 0),
+          ),
+          daysToClosing: f.availabilityEndDate ? daysUntil(f.availabilityEndDate) : null,
+        };
+      }),
+      committedByCurrency: bucketByCurrency(
+        facs.map((f) => ({ amount: f.committedAmount, currency: f.currency })),
+      ),
+      disbursedByCurrency: bucketByCurrency(
+        draws
+          .filter((d) => d.status === "disbursed")
+          .map((d) => ({ amount: d.amount, currency: currencyOf.get(d.facilityId) ?? null })),
+      ),
+      scoped: scope !== null,
+    };
+  });
 };

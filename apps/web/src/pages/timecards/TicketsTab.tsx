@@ -51,6 +51,7 @@ import {
   type ListResponse,
   type Loadable,
   type SignatureState,
+  type TicketListRow,
   type TicketRecord,
 } from "./timecardsShared";
 
@@ -68,7 +69,7 @@ export default function TicketsTab({
   tickets,
   onOpenTicket,
 }: {
-  tickets: Loadable<ListResponse<TicketRecord>>;
+  tickets: Loadable<ListResponse<TicketListRow>>;
   onOpenTicket: (ticketId: string) => void;
 }) {
   const [filter, setFilter] = useState<Filter>("all");
@@ -102,7 +103,7 @@ export default function TicketsTab({
     [counts],
   );
 
-  const columns = useMemo<DataColumns<TicketRecord>>(
+  const columns = useMemo<DataColumns<TicketListRow>>(
     () => [
       {
         id: "reference",
@@ -196,10 +197,21 @@ export default function TicketsTab({
         align: "right",
         width: 155,
         aggregate: "none",
-        cell: ({ row }) => (
-          <span className="tabular-nums">{money(row.total, row.currency)}</span>
-        ),
-        toCsv: ({ row }) => `${row.total} ${row.currency}`,
+        cell: ({ row }) =>
+          row.totalsAreComplete === false ? (
+            <Tooltip
+              content={
+                row.totalNote ??
+                "Some lines on this ticket carry no rate, so its value cannot be stated yet."
+              }
+            >
+              <span className="text-content-muted">Not available</span>
+            </Tooltip>
+          ) : (
+            <span className="tabular-nums">{money(row.total, row.currency)}</span>
+          ),
+        toCsv: ({ row }) =>
+          row.totalsAreComplete === false ? "" : `${row.total} ${row.currency}`,
       },
       {
         id: "rateBasis",
@@ -380,7 +392,7 @@ export default function TicketsTab({
           }
         />
       ) : (
-        <DataTable<TicketRecord>
+        <DataTable<TicketListRow>
           tableId="tm-tickets"
           data={filtered}
           columns={columns}

@@ -90,6 +90,13 @@ export default function RetainageTab({ contract, retainage }: { contract: Contra
           <p className="text-2xs text-content-subtle">
             {view.gate.openApplications} open application{view.gate.openApplications === 1 ? "" : "s"} · {view.gate.outstandingLienWaivers.length} commitment{view.gate.outstandingLienWaivers.length === 1 ? "" : "s"} still awaiting a lien waiver · compliance {view.gate.compliance.ok ? "clear" : `blocked (${view.gate.compliance.blocking.length})`}
           </p>
+          <p className="text-2xs text-content-subtle">
+            This tab reports the held position, the releases already raised and the contractual
+            step-down, and it does so deliberately as a read-only view: a release is an approval
+            event with money attached, and it is raised, approved and paid in the invoicing
+            workspace, which owns retainage releases for both sides of the contract. Every
+            step-down decision taken at certification is recorded as its own ledgered event.
+          </p>
         </CardBody>
       </Card>
 

@@ -205,5 +205,15 @@ export const NOTIFICATION_DUTY_STATES = [
   "notified",
   "notified_late",
   "missed",
+  /**
+   * A duty is OWED but no deadline can be established from the record — a row
+   * written before the rules engine existed whose `reportDueAt` was never set.
+   * It is deliberately not `outstanding`: an outstanding duty has a clock that
+   * will eventually make it `missed`, and this one never will, so treating it
+   * as a live clock leaves an incident that can never be closed. It is a
+   * request for a human to reassess, and the close gate takes an explicit,
+   * ledgered override naming the reason instead.
+   */
+  "deadline_unknown",
 ] as const;
 export type NotificationDutyState = (typeof NOTIFICATION_DUTY_STATES)[number];

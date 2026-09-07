@@ -111,7 +111,12 @@ export default function IssuesTab({ projectId, version, onChanged }: { projectId
             {d.notes ? <p className="text-sm text-ink-700">{d.notes}</p> : null}
             {d.transmittalId ? <p className="text-xs text-ink-500">Linked transmittal: <span className="font-mono">{d.transmittalId}</span></p> : null}
             <section>
-              <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-ink-500">Sheets issued ({d.sheets.length})</h3>
+              <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-ink-500">Sheets issued ({d.sheets.length + d.hiddenSheets})</h3>
+              {d.hiddenSheets > 0 ? (
+                <p className="mb-1 text-2xs text-ink-500">
+                  {d.hiddenSheets} of these {d.sheets.length + d.hiddenSheets} sheets are restricted from you by a discipline, area or sheet rule and are not listed. The count is shown so the distribution record stays honest.
+                </p>
+              ) : null}
               <table className="w-full text-sm">
                 <thead><tr className="text-left text-2xs uppercase text-ink-400"><th className="py-1">Number</th><th>Title</th><th>Rev</th><th>Discipline</th></tr></thead>
                 <tbody className="divide-y divide-ink-100">

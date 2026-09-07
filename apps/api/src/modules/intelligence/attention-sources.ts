@@ -8,6 +8,12 @@
  * tenant with a million punch items cannot make the refresh unbounded. A
  * source that yields nothing is simply absent — the feed never fabricates.
  *
+ * A cap that is REACHED is reported: `truncatedSources` names every source
+ * type whose query returned more rows than it may keep. The refresh must not
+ * treat a row pushed out of a capped query as "the condition is gone", so
+ * resolution is skipped for those source types (service.ts) and the feed says
+ * it is showing the top N of more.
+ *
  * Money on a candidate is the amount in the record's own currency; it is
  * used as a magnitude multiplier by the engine and never summed.
  */
@@ -31,6 +37,7 @@ import {
   signals,
   submittals,
 } from "@constructos/db";
+import type { PgColumn } from "drizzle-orm/pg-core";
 import type { AttentionSeverity } from "@constructos/shared";
 import type { Db } from "../../lib/db.js";
 import { daysUntil, severityForDeadline, type AttentionCandidate } from "./attention-engine.js";
@@ -45,7 +52,9 @@ export interface ProjectLite {
 }
 
 const DAY_MS = 86_400_000;
-const SOURCE_LIMIT = 300;
+export const SOURCE_LIMIT = 300;
+/** punch is high-volume and low-severity: a tighter cap than the rest */
+export const PUNCH_LIMIT = 100;
 const isoDate = (d: Date) => d.toISOString().slice(0, 10);
 const plusDays = (d: Date, days: number) => new Date(d.getTime() + days * DAY_MS);
 /** ISO date (YYYY-MM-DD) → end-of-day ISO timestamp, so a date-only deadline is "due today" until midnight UTC. */
@@ -63,13 +72,51 @@ const tsToIso = (ts: string | null): string | null => {
 const overdueText = (days: number | null) =>
   days === null ? "" : days < 0 ? `${Math.abs(days)} day${Math.abs(days) === 1 ? "" : "s"} overdue` : days === 0 ? "due today" : `due in ${days} day${days === 1 ? "" : "s"}`;
 
+/** A query builder that can still take a LIMIT and then be awaited. */
+interface Limitable<T> {
+  limit(n: number): PromiseLike<T[]>;
+}
+
+export interface CollectOptions {
+  /** restrict every source to one project (the single-project refresh path) */
+  projectId?: string | null;
+  /** override the per-source row cap — tests use a tiny one to exercise truncation */
+  sourceLimit?: number;
+}
+
+export interface AttentionCandidates {
+  candidates: AttentionCandidate[];
+  /** source types whose query hit its cap: there is more than the feed holds */
+  truncatedSources: string[];
+}
+
 export async function collectAttentionCandidates(
   db: Db,
   companyId: string,
   projects: ProjectLite[],
   now: Date,
-): Promise<AttentionCandidate[]> {
+  opts: CollectOptions = {},
+): Promise<AttentionCandidates> {
   const byId = new Map(projects.map((p) => [p.id, p] as const));
+  const only = opts.projectId ?? null;
+  const cap = opts.sourceLimit ?? SOURCE_LIMIT;
+  const punchCap = Math.min(cap, PUNCH_LIMIT);
+  const truncated = new Set<string>();
+  /**
+   * Fetch cap + 1 rows: if the extra row exists the source is truncated, the
+   * feed is the top `cap`, and refreshAttention must not resolve what it could
+   * not see this time round.
+   */
+  const capped = async <T>(sourceType: string, q: Limitable<T>, limit: number): Promise<T[]> => {
+    const rows = await q.limit(limit + 1);
+    if (rows.length > limit) {
+      truncated.add(sourceType);
+      return rows.slice(0, limit);
+    }
+    return rows;
+  };
+  /** project scope for a source table, or undefined when the sweep is company-wide */
+  const scope = (col: PgColumn) => (only === null ? undefined : eq(col, only));
   const today = isoDate(now);
   const in14 = isoDate(plusDays(now, 14));
   const in30 = isoDate(plusDays(now, 30));
@@ -84,17 +131,21 @@ export async function collectAttentionCandidates(
   };
 
   /* --- obligations due / breached (#1008) --- */
-  const obl = await db
-    .select()
-    .from(obligations)
-    .where(
-      and(
-        eq(obligations.companyId, companyId),
-        sql`(${obligations.status} = 'open' and ${obligations.deadline} is not null and ${obligations.deadline} <= ${in14Iso}) or (${obligations.status} = 'breached' and ${obligations.createdAt} >= ${ago30Iso})`,
-      ),
-    )
-    .orderBy(asc(obligations.deadline))
-    .limit(SOURCE_LIMIT);
+  const obl = await capped(
+    "obligation",
+    db
+      .select()
+      .from(obligations)
+      .where(
+        and(
+          eq(obligations.companyId, companyId),
+          scope(obligations.projectId),
+          sql`(${obligations.status} = 'open' and ${obligations.deadline} is not null and ${obligations.deadline} <= ${in14Iso}) or (${obligations.status} = 'breached' and ${obligations.createdAt} >= ${ago30Iso})`,
+        ),
+      )
+      .orderBy(asc(obligations.deadline)),
+    cap,
+  );
   for (const o of obl) {
     const b = base(o.projectId);
     if (!b) continue;
@@ -114,17 +165,21 @@ export async function collectAttentionCandidates(
   }
 
   /* --- contract time bars (#1006) --- */
-  const ev = await db
-    .select()
-    .from(contractEvents)
-    .where(
-      and(
-        eq(contractEvents.companyId, companyId),
-        sql`(${contractEvents.status} = 'open' and ${contractEvents.noticeDeadline} is not null and ${contractEvents.noticeDeadline} <= ${in14}) or (${contractEvents.status} = 'time_barred' and ${contractEvents.updatedAt} >= ${ago30Iso})`,
-      ),
-    )
-    .orderBy(asc(contractEvents.noticeDeadline))
-    .limit(SOURCE_LIMIT);
+  const ev = await capped(
+    "contract_event",
+    db
+      .select()
+      .from(contractEvents)
+      .where(
+        and(
+          eq(contractEvents.companyId, companyId),
+          scope(contractEvents.projectId),
+          sql`(${contractEvents.status} = 'open' and ${contractEvents.noticeDeadline} is not null and ${contractEvents.noticeDeadline} <= ${in14}) or (${contractEvents.status} = 'time_barred' and ${contractEvents.updatedAt} >= ${ago30Iso})`,
+        ),
+      )
+      .orderBy(asc(contractEvents.noticeDeadline)),
+    cap,
+  );
   for (const e of ev) {
     const b = base(e.projectId);
     if (!b) continue;
@@ -145,18 +200,22 @@ export async function collectAttentionCandidates(
   }
 
   /* --- integrity signals (#1011) --- */
-  const sig = await db
-    .select()
-    .from(signals)
-    .where(
-      and(
-        eq(signals.companyId, companyId),
-        inArray(signals.disposition, OPEN_SIGNAL_DISPOSITIONS),
-        inArray(signals.severity, ["critical", "high"]),
-      ),
-    )
-    .orderBy(sql`${signals.createdAt} desc`)
-    .limit(SOURCE_LIMIT);
+  const sig = await capped(
+    "signal",
+    db
+      .select()
+      .from(signals)
+      .where(
+        and(
+          eq(signals.companyId, companyId),
+          scope(signals.projectId),
+          inArray(signals.disposition, OPEN_SIGNAL_DISPOSITIONS),
+          inArray(signals.severity, ["critical", "high"]),
+        ),
+      )
+      .orderBy(sql`${signals.createdAt} desc`),
+    cap,
+  );
   for (const s of sig) {
     const b = base(s.projectId);
     if (!b) continue;
@@ -174,17 +233,21 @@ export async function collectAttentionCandidates(
   }
 
   /* --- statutory payment claims --- */
-  const claims = await db
-    .select()
-    .from(paymentClaims)
-    .where(
-      and(
-        eq(paymentClaims.companyId, companyId),
-        sql`(${paymentClaims.status} = 'served' and ${paymentClaims.responseDeadline} is not null and ${paymentClaims.responseDeadline} <= ${in14}) or ${paymentClaims.status} in ('deemed','suspended')`,
-      ),
-    )
-    .orderBy(asc(paymentClaims.responseDeadline))
-    .limit(SOURCE_LIMIT);
+  const claims = await capped(
+    "payment_claim",
+    db
+      .select()
+      .from(paymentClaims)
+      .where(
+        and(
+          eq(paymentClaims.companyId, companyId),
+          scope(paymentClaims.projectId),
+          sql`(${paymentClaims.status} = 'served' and ${paymentClaims.responseDeadline} is not null and ${paymentClaims.responseDeadline} <= ${in14}) or ${paymentClaims.status} in ('deemed','suspended')`,
+        ),
+      )
+      .orderBy(asc(paymentClaims.responseDeadline)),
+    cap,
+  );
   for (const c of claims) {
     const b = base(c.projectId);
     if (!b) continue;
@@ -206,12 +269,15 @@ export async function collectAttentionCandidates(
   }
 
   /* --- overdue RFIs --- */
-  const rfiRows = await db
-    .select({ id: rfis.id, projectId: rfis.projectId, number: rfis.number, subject: rfis.subject, dueDate: rfis.dueDate, status: rfis.status })
-    .from(rfis)
-    .where(and(eq(rfis.companyId, companyId), inArray(rfis.status, ["open", "answered"]), isNotNull(rfis.dueDate), lt(rfis.dueDate, today)))
-    .orderBy(asc(rfis.dueDate))
-    .limit(SOURCE_LIMIT);
+  const rfiRows = await capped(
+    "rfi",
+    db
+      .select({ id: rfis.id, projectId: rfis.projectId, number: rfis.number, subject: rfis.subject, dueDate: rfis.dueDate, status: rfis.status })
+      .from(rfis)
+      .where(and(eq(rfis.companyId, companyId), scope(rfis.projectId), inArray(rfis.status, ["open", "answered"]), isNotNull(rfis.dueDate), lt(rfis.dueDate, today)))
+      .orderBy(asc(rfis.dueDate)),
+    cap,
+  );
   for (const r of rfiRows) {
     const b = base(r.projectId);
     if (!b) continue;
@@ -231,12 +297,23 @@ export async function collectAttentionCandidates(
   }
 
   /* --- overdue submittals --- */
-  const subRows = await db
-    .select({ id: submittals.id, projectId: submittals.projectId, number: submittals.number, title: submittals.title, submitByDate: submittals.submitByDate, status: submittals.status })
-    .from(submittals)
-    .where(and(eq(submittals.companyId, companyId), inArray(submittals.status, ["draft", "open"]), isNotNull(submittals.submitByDate), lt(submittals.submitByDate, today)))
-    .orderBy(asc(submittals.submitByDate))
-    .limit(SOURCE_LIMIT);
+  const subRows = await capped(
+    "submittal",
+    db
+      .select({ id: submittals.id, projectId: submittals.projectId, number: submittals.number, title: submittals.title, submitByDate: submittals.submitByDate, status: submittals.status })
+      .from(submittals)
+      .where(
+        and(
+          eq(submittals.companyId, companyId),
+          scope(submittals.projectId),
+          inArray(submittals.status, ["draft", "open"]),
+          isNotNull(submittals.submitByDate),
+          lt(submittals.submitByDate, today),
+        ),
+      )
+      .orderBy(asc(submittals.submitByDate)),
+    cap,
+  );
   for (const s of subRows) {
     const b = base(s.projectId);
     if (!b) continue;
@@ -256,12 +333,23 @@ export async function collectAttentionCandidates(
   }
 
   /* --- overdue punch (low, bounded) --- */
-  const punchRows = await db
-    .select({ id: punchItems.id, projectId: punchItems.projectId, number: punchItems.number, title: punchItems.title, dueDate: punchItems.dueDate, priority: punchItems.priority })
-    .from(punchItems)
-    .where(and(eq(punchItems.companyId, companyId), inArray(punchItems.status, ["open", "in_progress", "ready_for_review"]), isNotNull(punchItems.dueDate), lt(punchItems.dueDate, today)))
-    .orderBy(asc(punchItems.dueDate))
-    .limit(100);
+  const punchRows = await capped(
+    "punch_item",
+    db
+      .select({ id: punchItems.id, projectId: punchItems.projectId, number: punchItems.number, title: punchItems.title, dueDate: punchItems.dueDate, priority: punchItems.priority })
+      .from(punchItems)
+      .where(
+        and(
+          eq(punchItems.companyId, companyId),
+          scope(punchItems.projectId),
+          inArray(punchItems.status, ["open", "in_progress", "ready_for_review"]),
+          isNotNull(punchItems.dueDate),
+          lt(punchItems.dueDate, today),
+        ),
+      )
+      .orderBy(asc(punchItems.dueDate)),
+    punchCap,
+  );
   for (const p of punchRows) {
     const b = base(p.projectId);
     if (!b) continue;
@@ -280,18 +368,22 @@ export async function collectAttentionCandidates(
   }
 
   /* --- open serious+ safety incidents --- */
-  const inc = await db
-    .select({ id: safetyIncidents.id, projectId: safetyIncidents.projectId, reference: safetyIncidents.reference, title: safetyIncidents.title, severity: safetyIncidents.severity, isFatality: safetyIncidents.isFatality, status: safetyIncidents.status, occurredAt: safetyIncidents.occurredAt, investigationDueDate: safetyIncidents.investigationDueDate })
-    .from(safetyIncidents)
-    .where(
-      and(
-        eq(safetyIncidents.companyId, companyId),
-        sql`${safetyIncidents.status} not in ('closed','void')`,
-        sql`(${safetyIncidents.severity} in ('serious','major','catastrophic') or ${safetyIncidents.isFatality} = 1)`,
-      ),
-    )
-    .orderBy(sql`${safetyIncidents.occurredAt} desc`)
-    .limit(SOURCE_LIMIT);
+  const inc = await capped(
+    "safety_incident",
+    db
+      .select({ id: safetyIncidents.id, projectId: safetyIncidents.projectId, reference: safetyIncidents.reference, title: safetyIncidents.title, severity: safetyIncidents.severity, isFatality: safetyIncidents.isFatality, status: safetyIncidents.status, occurredAt: safetyIncidents.occurredAt, investigationDueDate: safetyIncidents.investigationDueDate })
+      .from(safetyIncidents)
+      .where(
+        and(
+          eq(safetyIncidents.companyId, companyId),
+          scope(safetyIncidents.projectId),
+          sql`${safetyIncidents.status} not in ('closed','void')`,
+          sql`(${safetyIncidents.severity} in ('serious','major','catastrophic') or ${safetyIncidents.isFatality} = 1)`,
+        ),
+      )
+      .orderBy(sql`${safetyIncidents.occurredAt} desc`),
+    cap,
+  );
   for (const i of inc) {
     const b = base(i.projectId);
     if (!b) continue;
@@ -310,18 +402,22 @@ export async function collectAttentionCandidates(
   }
 
   /* --- open major/critical NCRs --- */
-  const ncrs = await db
-    .select({ id: nonConformanceReports.id, projectId: nonConformanceReports.projectId, reference: nonConformanceReports.reference, title: nonConformanceReports.title, severity: nonConformanceReports.severity, status: nonConformanceReports.status, responseDueDate: nonConformanceReports.responseDueDate })
-    .from(nonConformanceReports)
-    .where(
-      and(
-        eq(nonConformanceReports.companyId, companyId),
-        sql`${nonConformanceReports.status} not in ('closed','rejected','void')`,
-        inArray(nonConformanceReports.severity, ["major", "critical"]),
-      ),
-    )
-    .orderBy(asc(nonConformanceReports.responseDueDate))
-    .limit(SOURCE_LIMIT);
+  const ncrs = await capped(
+    "non_conformance_report",
+    db
+      .select({ id: nonConformanceReports.id, projectId: nonConformanceReports.projectId, reference: nonConformanceReports.reference, title: nonConformanceReports.title, severity: nonConformanceReports.severity, status: nonConformanceReports.status, responseDueDate: nonConformanceReports.responseDueDate })
+      .from(nonConformanceReports)
+      .where(
+        and(
+          eq(nonConformanceReports.companyId, companyId),
+          scope(nonConformanceReports.projectId),
+          sql`${nonConformanceReports.status} not in ('closed','rejected','void')`,
+          inArray(nonConformanceReports.severity, ["major", "critical"]),
+        ),
+      )
+      .orderBy(asc(nonConformanceReports.responseDueDate)),
+    cap,
+  );
   for (const q of ncrs) {
     const b = base(q.projectId);
     if (!b) continue;
@@ -340,11 +436,15 @@ export async function collectAttentionCandidates(
   }
 
   /* --- schedule slip --- */
-  const sched = await db
-    .select({ id: schedules.id, projectId: schedules.projectId, name: schedules.name, computedFinish: schedules.computedFinish })
-    .from(schedules)
-    .where(and(eq(schedules.companyId, companyId), eq(schedules.isActive, 1), isNotNull(schedules.computedFinish)))
-    .limit(SOURCE_LIMIT);
+  const sched = await capped(
+    "schedule",
+    db
+      .select({ id: schedules.id, projectId: schedules.projectId, name: schedules.name, computedFinish: schedules.computedFinish })
+      .from(schedules)
+      .where(and(eq(schedules.companyId, companyId), scope(schedules.projectId), eq(schedules.isActive, 1), isNotNull(schedules.computedFinish)))
+      .orderBy(asc(schedules.id)),
+    cap,
+  );
   for (const s of sched) {
     const p = byId.get(s.projectId);
     if (!p || !p.finishDate) continue;
@@ -367,11 +467,15 @@ export async function collectAttentionCandidates(
   }
 
   /* --- budget overrun --- */
-  const bud = await db
-    .select({ id: budgets.id, projectId: budgets.projectId, name: budgets.name, currency: budgets.currency, revised: budgets.revisedBudgetTotal, variance: budgets.varianceTotal })
-    .from(budgets)
-    .where(and(eq(budgets.companyId, companyId), eq(budgets.isActive, 1), lt(budgets.varianceTotal, 0)))
-    .limit(SOURCE_LIMIT);
+  const bud = await capped(
+    "budget",
+    db
+      .select({ id: budgets.id, projectId: budgets.projectId, name: budgets.name, currency: budgets.currency, revised: budgets.revisedBudgetTotal, variance: budgets.varianceTotal })
+      .from(budgets)
+      .where(and(eq(budgets.companyId, companyId), scope(budgets.projectId), eq(budgets.isActive, 1), lt(budgets.varianceTotal, 0)))
+      .orderBy(asc(budgets.varianceTotal)),
+    cap,
+  );
   for (const bg of bud) {
     const b = base(bg.projectId);
     if (!b) continue;
@@ -392,11 +496,22 @@ export async function collectAttentionCandidates(
   }
 
   /* --- commitments on payment hold --- */
-  const holds = await db
-    .select({ id: commitments.id, projectId: commitments.projectId, reference: commitments.reference, title: commitments.title, currency: commitments.currency, reason: commitments.complianceHoldReason, balance: commitments.balanceToFinish })
-    .from(commitments)
-    .where(and(eq(commitments.companyId, companyId), eq(commitments.paymentHold, 1), sql`${commitments.status} not in ('void','terminated','complete')`))
-    .limit(SOURCE_LIMIT);
+  const holds = await capped(
+    "commitment",
+    db
+      .select({ id: commitments.id, projectId: commitments.projectId, reference: commitments.reference, title: commitments.title, currency: commitments.currency, reason: commitments.complianceHoldReason, balance: commitments.balanceToFinish })
+      .from(commitments)
+      .where(
+        and(
+          eq(commitments.companyId, companyId),
+          scope(commitments.projectId),
+          eq(commitments.paymentHold, 1),
+          sql`${commitments.status} not in ('void','terminated','complete')`,
+        ),
+      )
+      .orderBy(asc(commitments.reference)),
+    cap,
+  );
   for (const h of holds) {
     const b = base(h.projectId);
     if (!b) continue;
@@ -416,12 +531,15 @@ export async function collectAttentionCandidates(
   }
 
   /* --- pending agent proposals (#1020) --- */
-  const props = await db
-    .select({ id: aiReviewQueue.id, projectId: aiReviewQueue.projectId, targetType: aiReviewQueue.targetType, summary: aiReviewQueue.summary, confidence: aiReviewQueue.confidence, createdAt: aiReviewQueue.createdAt })
-    .from(aiReviewQueue)
-    .where(and(eq(aiReviewQueue.companyId, companyId), eq(aiReviewQueue.status, "pending")))
-    .orderBy(sql`${aiReviewQueue.createdAt} desc`)
-    .limit(SOURCE_LIMIT);
+  const props = await capped(
+    "ai_review_item",
+    db
+      .select({ id: aiReviewQueue.id, projectId: aiReviewQueue.projectId, targetType: aiReviewQueue.targetType, summary: aiReviewQueue.summary, confidence: aiReviewQueue.confidence, createdAt: aiReviewQueue.createdAt })
+      .from(aiReviewQueue)
+      .where(and(eq(aiReviewQueue.companyId, companyId), scope(aiReviewQueue.projectId), eq(aiReviewQueue.status, "pending")))
+      .orderBy(sql`${aiReviewQueue.createdAt} desc`),
+    cap,
+  );
   for (const pr of props) {
     const b = base(pr.projectId);
     if (!b) continue;
@@ -439,12 +557,23 @@ export async function collectAttentionCandidates(
   }
 
   /* --- insurance certificates expiring --- */
-  const certs = await db
-    .select({ id: insuranceCertificates.id, projectId: insuranceCertificates.projectId, subjectName: insuranceCertificates.subjectName, policyType: insuranceCertificates.policyType, validTo: insuranceCertificates.validTo })
-    .from(insuranceCertificates)
-    .where(and(eq(insuranceCertificates.companyId, companyId), eq(insuranceCertificates.status, "active"), lte(insuranceCertificates.validTo, in30), gte(insuranceCertificates.validTo, isoDate(plusDays(now, -30)))))
-    .orderBy(asc(insuranceCertificates.validTo))
-    .limit(SOURCE_LIMIT);
+  const certs = await capped(
+    "insurance_certificate",
+    db
+      .select({ id: insuranceCertificates.id, projectId: insuranceCertificates.projectId, subjectName: insuranceCertificates.subjectName, policyType: insuranceCertificates.policyType, validTo: insuranceCertificates.validTo })
+      .from(insuranceCertificates)
+      .where(
+        and(
+          eq(insuranceCertificates.companyId, companyId),
+          scope(insuranceCertificates.projectId),
+          eq(insuranceCertificates.status, "active"),
+          lte(insuranceCertificates.validTo, in30),
+          gte(insuranceCertificates.validTo, isoDate(plusDays(now, -30))),
+        ),
+      )
+      .orderBy(asc(insuranceCertificates.validTo)),
+    cap,
+  );
   for (const c of certs) {
     const b = base(c.projectId);
     if (!b) continue;
@@ -463,11 +592,15 @@ export async function collectAttentionCandidates(
   }
 
   /* --- covenant breaches (latest reading) --- */
-  const covRows = await db
-    .select({ id: covenants.id, projectId: covenants.projectId, name: covenants.name })
-    .from(covenants)
-    .where(eq(covenants.companyId, companyId))
-    .limit(SOURCE_LIMIT);
+  const covRows = await capped(
+    "covenant",
+    db
+      .select({ id: covenants.id, projectId: covenants.projectId, name: covenants.name })
+      .from(covenants)
+      .where(and(eq(covenants.companyId, companyId), scope(covenants.projectId)))
+      .orderBy(asc(covenants.id)),
+    cap,
+  );
   if (covRows.length > 0) {
     const readings = await db
       .select({ covenantId: covenantReadings.covenantId, compliant: covenantReadings.compliant, headroom: covenantReadings.headroom, readingDate: covenantReadings.readingDate })
@@ -497,12 +630,23 @@ export async function collectAttentionCandidates(
   }
 
   /* --- change events past due --- */
-  const ces = await db
-    .select({ id: changeEvents.id, projectId: changeEvents.projectId, reference: changeEvents.reference, title: changeEvents.title, latestCost: changeEvents.latestCost, dueDate: changeEvents.dueDate, status: changeEvents.status })
-    .from(changeEvents)
-    .where(and(eq(changeEvents.companyId, companyId), inArray(changeEvents.status, ["open", "pending"]), isNotNull(changeEvents.dueDate), lt(changeEvents.dueDate, today)))
-    .orderBy(asc(changeEvents.dueDate))
-    .limit(SOURCE_LIMIT);
+  const ces = await capped(
+    "change_event",
+    db
+      .select({ id: changeEvents.id, projectId: changeEvents.projectId, reference: changeEvents.reference, title: changeEvents.title, latestCost: changeEvents.latestCost, dueDate: changeEvents.dueDate, status: changeEvents.status })
+      .from(changeEvents)
+      .where(
+        and(
+          eq(changeEvents.companyId, companyId),
+          scope(changeEvents.projectId),
+          inArray(changeEvents.status, ["open", "pending"]),
+          isNotNull(changeEvents.dueDate),
+          lt(changeEvents.dueDate, today),
+        ),
+      )
+      .orderBy(asc(changeEvents.dueDate)),
+    cap,
+  );
   for (const c of ces) {
     const b = base(c.projectId);
     if (!b) continue;
@@ -522,5 +666,5 @@ export async function collectAttentionCandidates(
     });
   }
 
-  return out;
+  return { candidates: out, truncatedSources: [...truncated].sort() };
 }

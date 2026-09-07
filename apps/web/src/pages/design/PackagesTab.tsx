@@ -13,8 +13,10 @@ import { IconCheck, IconLock, IconPlus } from "../../ui/icons";
 import { api } from "../../lib/api";
 import {
   EM_DASH,
+  EditPanel,
   GATE_STATUS_TONE,
   KeyValue,
+  LinkPanel,
   LoadError,
   PACKAGE_STATUS_TONE,
   READINESS_TONE,
@@ -245,7 +247,14 @@ export default function PackagesTab({
           changed();
         }}
       />
-      <PackageDrawer base={base} packageId={openId} detail={detail} onClose={() => setOpenId(null)} onChanged={changed} />
+      <PackageDrawer
+        base={base}
+        packageId={openId}
+        detail={detail}
+        lookups={lookups}
+        onClose={() => setOpenId(null)}
+        onChanged={changed}
+      />
     </div>
   );
 }
@@ -309,6 +318,21 @@ function StagePlan({
     const r = await action.run(`signoff-${gateId}`, () => api.post(`${base}/stages/${gateId}/sign-off`, { force }));
     if (r) {
       toast.success(force ? "Gate signed off with the unmet criteria recorded" : "Gate signed off");
+      onChanged();
+    }
+  }
+
+  /**
+   * A gate that was held at the gate meeting is a fact worth recording: the
+   * API keeps the reason on the gate, so the next attempt starts from what was
+   * actually said rather than from silence.
+   */
+  async function rejectGate(gateId: string) {
+    const reason = window.prompt("Why was this gate not passed?");
+    if (!reason) return;
+    const r = await action.run(`reject-${gateId}`, () => api.post(`${base}/stages/${gateId}/reject`, { reason }));
+    if (r) {
+      toast.success("Gate recorded as not passed");
       onChanged();
     }
   }
@@ -414,21 +438,34 @@ function StagePlan({
                     {gate.signOffNotes ? ` — ${gate.signOffNotes}` : ""}
                   </p>
                 ) : (
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    <Button
-                      size="xs"
-                      variant="secondary"
-                      loading={action.busy === `signoff-${gate.id}`}
-                      onClick={() => void signOff(gate.id, false)}
-                    >
-                      Sign off
-                    </Button>
-                    {gate.blockers.length > 0 ? (
-                      <Button size="xs" variant="ghost" onClick={() => void signOff(gate.id, true)}>
-                        Override {gate.blockers.length}
-                      </Button>
+                  <>
+                    {gate.status === "rejected" && gate.rejectedReason ? (
+                      <p className="mt-2 text-2xs text-danger-fg">Held at the gate: {gate.rejectedReason}</p>
                     ) : null}
-                  </div>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <Button
+                        size="xs"
+                        variant="secondary"
+                        loading={action.busy === `signoff-${gate.id}`}
+                        onClick={() => void signOff(gate.id, false)}
+                      >
+                        Sign off
+                      </Button>
+                      {gate.blockers.length > 0 ? (
+                        <Button size="xs" variant="ghost" onClick={() => void signOff(gate.id, true)}>
+                          Override {gate.blockers.length}
+                        </Button>
+                      ) : null}
+                      <Button
+                        size="xs"
+                        variant="ghost"
+                        loading={action.busy === `reject-${gate.id}`}
+                        onClick={() => void rejectGate(gate.id)}
+                      >
+                        Not passed
+                      </Button>
+                    </div>
+                  </>
                 )}
               </div>
             ))}
@@ -566,12 +603,14 @@ function PackageDrawer({
   base,
   packageId,
   detail,
+  lookups,
   onClose,
   onChanged,
 }: {
   base: string;
   packageId: string | null;
   detail: ReturnType<typeof useResource<PackageDetail>>;
+  lookups: Lookups;
   onClose: () => void;
   onChanged: () => void;
 }) {
@@ -634,6 +673,44 @@ function PackageDrawer({
               ]}
             />
             {row.description ? <p className="text-meta text-content-muted">{row.description}</p> : null}
+
+            <EditPanel
+              title="Correct this package"
+              hint="Only while it is still being drawn: an approved or frozen package is changed through a design change notice."
+              path={`${base}/packages/${row.id}`}
+              initial={row as unknown as Record<string, unknown>}
+              disabled={row.status === "approved" || row.status === "frozen"}
+              disabledReason={`${row.reference} is ${labelize(row.status).toLowerCase()}. Raise a design change notice rather than editing what has been fixed.`}
+              onSaved={onChanged}
+              fields={[
+                { key: "name", label: "Name", kind: "text", maxLength: 200, nullable: false },
+                { key: "description", label: "Description", kind: "textarea" },
+                {
+                  key: "discipline",
+                  label: "Discipline",
+                  kind: "select",
+                  options: DESIGN_DISCIPLINES.map((d) => ({ value: d, label: labelize(d) })),
+                },
+                {
+                  key: "stageKey",
+                  label: "Stage",
+                  kind: "select",
+                  options: [{ value: "", label: "— not assigned —" }, ...DESIGN_STAGE_KEYS.map((s) => ({ value: s, label: labelize(s) }))],
+                },
+                { key: "plannedIssueDate", label: "Planned issue", kind: "date" },
+                { key: "plannedApprovalDate", label: "Planned approval", kind: "date" },
+                { key: "revision", label: "Revision", kind: "text", maxLength: 20, placeholder: "P01" },
+                { key: "notes", label: "Notes", kind: "textarea" },
+              ]}
+            />
+
+            <LinkPanel
+              base={base}
+              fromType="design_package"
+              fromId={row.id}
+              sheets={lookups.sheets}
+              tasks={lookups.tasks}
+            />
 
             <div className="flex flex-wrap gap-2">
               {(TRANSITIONS[row.status] ?? []).map((to) => (

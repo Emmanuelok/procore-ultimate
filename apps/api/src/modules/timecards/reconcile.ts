@@ -566,10 +566,25 @@ export async function reconciliationFor(
         lte(timecards.workDate, to),
       ),
     );
+  /*
+   * BOUNDED BY THE SAME WINDOW AS THE CARDS. This loaded EVERY site-access
+   * record the project has ever held into memory on every reconciliation read
+   * — a turnstile feed is the largest table on the job — while only records
+   * whose `accessDate` falls inside [from, to] can ever match a card, because
+   * the cards themselves are bounded to that window. The company filter goes
+   * on for the same reason every other query here carries one.
+   */
   const access = await db
     .select()
     .from(siteAccessRecords)
-    .where(eq(siteAccessRecords.projectId, projectId));
+    .where(
+      and(
+        eq(siteAccessRecords.companyId, companyId),
+        eq(siteAccessRecords.projectId, projectId),
+        gte(siteAccessRecords.accessDate, from),
+        lte(siteAccessRecords.accessDate, to),
+      ),
+    );
   const byKey = new Map(access.map((a) => [`${a.workerId}|${a.accessDate}`, a]));
   const rows: VarianceRow[] = cards.map(({ card, worker }) => {
     const hit = byKey.get(`${card.workerId}|${card.workDate}`) ?? null;

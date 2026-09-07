@@ -124,7 +124,7 @@ export const variationRoutes: FastifyPluginAsync = async (app) => {
   }
 
   async function ledger(
-    req: { companyId?: string; user?: { id: string } },
+    req: { companyId?: string; projectId?: string; user?: { id: string } },
     action: "create" | "update" | "state_change",
     variationId: string,
     payload: unknown,
@@ -137,6 +137,11 @@ export const variationRoutes: FastifyPluginAsync = async (app) => {
       objectType: "variation",
       objectId: variationId,
       payload,
+      // Every route here is project-resolved before it writes (project-scoped
+      // by the gate, sub-resource by requireCommercialLevel), so the entry
+      // carries its project rather than landing company-wide and invisible to
+      // every project-filtered ledger view.
+      projectId: req.projectId,
       storePayload,
     });
   }

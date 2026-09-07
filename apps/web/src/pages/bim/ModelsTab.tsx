@@ -228,11 +228,23 @@ export default function ModelsTab({
   async function reprocess(versionId: string) {
     setBusy(true);
     try {
-      const res = await api.post<{ processing: string; elementCount: number; processingError: string | null }>(
-        `/api/v1/bim/versions/${versionId}/process`,
-      );
-      if (res.processing === "ready") toast.success(`Extraction complete: ${res.elementCount} elements.`);
-      else toast.error(res.processingError ?? "Extraction failed.");
+      const res = await api.post<{
+        processing: string;
+        elementCount: number;
+        processingError: string | null;
+        queued?: boolean;
+        reason?: string | null;
+      }>(`/api/v1/bim/versions/${versionId}/process`);
+      if (res.processing === "queued" || res.queued) {
+        // over the server's inline-parse limit: the ingest worker takes it
+        toast.success(res.reason ?? "Queued for the ingest worker — this container is too large to parse in-request.");
+      } else if (res.processing === "processing") {
+        toast.success("Extraction is already running for this version.");
+      } else if (res.processing === "ready") {
+        toast.success(`Extraction complete: ${res.elementCount} elements.`);
+      } else {
+        toast.error(res.processingError ?? "Extraction failed.");
+      }
       await load();
       if (detail) await openDetail(detail);
       onChanged();

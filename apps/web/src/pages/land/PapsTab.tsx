@@ -67,6 +67,16 @@ interface EntitlementDraft {
   delivered: boolean;
 }
 
+/** Why each transition is offered — shown on the button, not buried. */
+const STATUS_HINTS: Record<string, string> = {
+  surveyed: "The household's assets and losses have been measured.",
+  entitlement_agreed: "The entitlement matrix has been applied and agreed.",
+  resettled:
+    "Requires physical displacement AND compensation already paid — IFC PS5 para 20 puts payment before the move.",
+  livelihood_restored:
+    "Requires compensation on file, because restoration is measured from the displacement date (IFC PS5 para 29).",
+};
+
 export default function PapsTab({
   projectId,
   onChanged,
@@ -146,6 +156,8 @@ export default function PapsTab({
   const [censusDate, setCensusDate] = useState("");
   const [flags, setFlags] = useState<string[]>([]);
   const [parcelId, setParcelId] = useState("");
+  /* The currency the entitlement matrix will be priced in (#567). */
+  const [currency, setCurrency] = useState("USD");
 
   function openCreate() {
     setCreateError(null);
@@ -156,6 +168,7 @@ export default function PapsTab({
     setCensusDate("");
     setFlags([]);
     setParcelId("");
+    setCurrency("USD");
     setCreateOpen(true);
   }
 
@@ -173,6 +186,7 @@ export default function PapsTab({
       if (censusDate) payload["censusDate"] = censusDate;
       if (flags.length > 0) payload["vulnerabilities"] = flags;
       if (parcelId) payload["parcelId"] = parcelId;
+      if (currency.trim().length === 3) payload["currency"] = currency.trim().toUpperCase();
       await api.post(`${base}/affected-persons`, payload);
       setCreateOpen(false);
       await load();
@@ -231,6 +245,24 @@ export default function PapsTab({
     setEntOpen(true);
   }
 
+  /*
+   * A line with an amount but a blank item or basis used to be filtered out
+   * on save without a word: the server recomputed a LOWER compensation total
+   * and the user watched the figure drop with no explanation. A half-filled
+   * line is a mistake to point at, not a line to discard.
+   */
+  const entRowIssues = entRows.map((r) => {
+    const touched = r.item.trim() !== "" || r.basis.trim() !== "" || r.amount.trim() !== "";
+    if (!touched) return null;
+    if (r.item.trim() === "") return "Item is required";
+    if (r.basis.trim() === "") return "Basis is required";
+    if (r.amount.trim() !== "" && !Number.isFinite(Number(r.amount))) {
+      return "Amount must be a number";
+    }
+    return null;
+  });
+  const entRowsValid = entRowIssues.every((issue) => issue === null);
+
   const entTotal = entRows.reduce((s, r) => s + (Number(r.amount) || 0), 0);
   const entDelivered = entRows.reduce(
     (s, r) => s + (r.delivered ? Number(r.amount) || 0 : 0),
@@ -244,7 +276,9 @@ export default function PapsTab({
     setBusy(true);
     try {
       const entitlements = entRows
-        .filter((r) => r.item.trim() && r.basis.trim())
+        // only genuinely EMPTY rows are dropped; a half-filled one is
+        // blocked at the submit button above, never silently discarded
+        .filter((r) => r.item.trim() !== "" || r.basis.trim() !== "" || r.amount.trim() !== "")
         .map((r) => ({
           item: r.item.trim(),
           basis: r.basis.trim(),
@@ -472,15 +506,24 @@ export default function PapsTab({
                 <Td className="text-right tabular-nums">
                   {p.compensationPaidAt ? (
                     <span className="font-medium text-emerald-700">
-                      {fmtMoney(p.compensationTotal)}
+                      {fmtMoney(p.compensationTotal, p.currency)}
                     </span>
                   ) : (
-                    <span className="text-ink-500">{fmtMoney(p.compensationTotal)}</span>
+                    <span className="text-ink-500">{fmtMoney(p.compensationTotal, p.currency)}</span>
                   )}
                 </Td>
                 <Td className="tabular-nums">{formatDate(p.censusDate)}</Td>
                 <Td>
-                  <Badge tone={papTone(p.status)}>{humanize(p.status)}</Badge>
+                  <div className="flex flex-wrap items-center gap-1">
+                    <Badge tone={papTone(p.effectiveStatus ?? p.status)}>
+                      {humanize(p.effectiveStatus ?? p.status)}
+                    </Badge>
+                    {p.underOpenGrievance ? (
+                      <span title="A grievance naming this household is open; its lifecycle status is unchanged">
+                        <Badge tone="red">Grievance</Badge>
+                      </span>
+                    ) : null}
+                  </div>
                 </Td>
               </tr>
             ))}
@@ -541,6 +584,19 @@ export default function PapsTab({
                 value={censusDate}
                 max={cutOff?.cutOffDate ?? undefined}
                 onChange={(e) => setCensusDate(e.target.value)}
+              />
+            </Field>
+          </div>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <Field
+              label="Compensation currency"
+              hint="What the entitlement matrix is priced in. Totals are never summed across currencies."
+            >
+              <Input
+                value={currency}
+                onChange={(e) => setCurrency(e.target.value.toUpperCase())}
+                maxLength={3}
+                placeholder="USD"
               />
             </Field>
           </div>
@@ -647,7 +703,20 @@ export default function PapsTab({
           <div className="space-y-4">
             <ErrorAlert message={actError} />
             <div className="flex flex-wrap items-center gap-2">
-              <Badge tone={papTone(selected.status)}>{humanize(selected.status)}</Badge>
+              {/*
+                * Both facts, separately. A live complaint about a household
+                * does not undo its resettlement, so the lifecycle badge shows
+                * where the register really has it and the complaint shows as
+                * an overlay next to it.
+                */}
+              <Badge tone={papTone(selected.effectiveStatus ?? selected.status)}>
+                {humanize(selected.effectiveStatus ?? selected.status)}
+              </Badge>
+              {selected.underOpenGrievance ? (
+                <span title="A grievance naming this household is open. Its lifecycle status is unchanged; the flag clears when the last grievance settles.">
+                  <Badge tone="red">Grievance open</Badge>
+                </span>
+              ) : null}
               <Badge tone="gray">{humanize(selected.displacementType)}</Badge>
               {selected.vulnerabilities.map((v) => (
                 <Badge key={v} tone="violet">
@@ -679,7 +748,9 @@ export default function PapsTab({
                       <tr key={`${e.item}-${i}`}>
                         <Td>{e.item}</Td>
                         <Td className="text-ink-500">{e.basis}</Td>
-                        <Td className="text-right tabular-nums">{fmtMoney(e.amount)}</Td>
+                        <Td className="text-right tabular-nums">
+                          {fmtMoney(e.amount, selected.currency)}
+                        </Td>
                         <Td className="text-right">
                           {e.delivered ? (
                             <Badge tone="green">Delivered</Badge>
@@ -693,13 +764,14 @@ export default function PapsTab({
                       <Td className="font-semibold">Total</Td>
                       <Td />
                       <Td className="text-right font-semibold tabular-nums">
-                        {fmtMoney(selected.compensationTotal)}
+                        {fmtMoney(selected.compensationTotal, selected.currency)}
                       </Td>
                       <Td className="text-right text-xs tabular-nums text-ink-500">
                         {fmtMoney(
                           selected.entitlements
                             .filter((e) => e.delivered)
                             .reduce((s, e) => s + e.amount, 0),
+                          selected.currency,
                         )}{" "}
                         delivered
                       </Td>
@@ -711,7 +783,7 @@ export default function PapsTab({
 
             {selected.compensationPaidAt ? (
               <p className="rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
-                Compensation of {fmtMoney(selected.compensationTotal)} recorded as paid on{" "}
+                Compensation of {fmtMoney(selected.compensationTotal, selected.currency)} recorded as paid on{" "}
                 {formatDate(selected.compensationPaidAt)} against evidence held in the ledger.
               </p>
             ) : null}
@@ -738,19 +810,36 @@ export default function PapsTab({
                   Record compensation
                 </Button>
               ) : null}
-              {selected.status !== "livelihood_restored" && selected.livelihoodRequired ? (
+              {/*
+                * Driven by the server's own state machine rather than offered
+                * unconditionally. "Mark resettled" used to appear on every
+                * household including registered and already-restored ones,
+                * and the server accepted it — so the RAP metrics and the
+                * ledger told different stories about the same household.
+                */}
+              {(selected.allowedTransitions ?? []).map((next) => (
                 <Button
+                  key={next}
                   variant="secondary"
                   size="sm"
-                  onClick={() => void setStatus("livelihood_restored")}
+                  onClick={() => void setStatus(next)}
+                  title={STATUS_HINTS[next]}
                 >
-                  Mark livelihood restored
+                  Mark {humanize(next).toLowerCase()}
                 </Button>
+              ))}
+              {(selected.allowedTransitions ?? []).length === 0 ? (
+                <span className="text-xs text-ink-400">
+                  No further status change is available from{" "}
+                  {humanize(selected.effectiveStatus ?? selected.status)}.
+                </span>
               ) : null}
-              {selected.status !== "resettled" ? (
-                <Button variant="secondary" size="sm" onClick={() => void setStatus("resettled")}>
-                  Mark resettled
-                </Button>
+              {selected.underOpenGrievance ? (
+                <p className="basis-full text-xs text-ink-400">
+                  Work on this household continues while the grievance is open: a status change
+                  here advances the lifecycle and leaves the complaint flag in place until the
+                  last grievance naming the household settles.
+                </p>
               ) : null}
             </div>
           </div>
@@ -788,16 +877,24 @@ export default function PapsTab({
                   )
                 }
               />
-              <Input
-                className="flex-1"
-                placeholder="Basis — e.g. Full replacement cost"
-                value={r.basis}
-                onChange={(e) =>
-                  setEntRows((rows) =>
-                    rows.map((x, j) => (j === i ? { ...x, basis: e.target.value } : x)),
-                  )
-                }
-              />
+              <div className="flex-1">
+                <Input
+                  className="w-full"
+                  placeholder="Basis — e.g. Full replacement cost"
+                  value={r.basis}
+                  aria-invalid={entRowIssues[i] ? true : undefined}
+                  onChange={(e) =>
+                    setEntRows((rows) =>
+                      rows.map((x, j) => (j === i ? { ...x, basis: e.target.value } : x)),
+                    )
+                  }
+                />
+                {entRowIssues[i] ? (
+                  <p className="mt-0.5 text-xs text-red-700" role="alert">
+                    {entRowIssues[i]}
+                  </p>
+                ) : null}
+              </div>
               <Input
                 className="w-32 text-right tabular-nums"
                 type="number"
@@ -852,17 +949,26 @@ export default function PapsTab({
             <span className="text-sm tabular-nums text-ink-700">
               {entDelivered > 0 ? (
                 <span className="mr-3 text-xs text-emerald-700">
-                  {fmtMoney(entDelivered)} delivered
+                  {fmtMoney(entDelivered, selected?.currency)} delivered
                 </span>
               ) : null}
-              Total <span className="font-semibold">{fmtMoney(entTotal)}</span>
+              Total{" "}
+              <span className="font-semibold">{fmtMoney(entTotal, selected?.currency)}</span>
             </span>
           </div>
           <div className="flex justify-end gap-2 pt-2">
             <Button variant="secondary" onClick={() => setEntOpen(false)}>
               Cancel
             </Button>
-            <Button type="submit" disabled={busy}>
+            <Button
+              type="submit"
+              disabled={busy || !entRowsValid}
+              title={
+                entRowsValid
+                  ? undefined
+                  : "Every line needs an item and a basis — a line with only an amount would be dropped, and the total would fall with no explanation"
+              }
+            >
               {busy ? "Saving…" : "Apply matrix"}
             </Button>
           </div>
@@ -878,7 +984,8 @@ export default function PapsTab({
       >
         <form onSubmit={onCompensate} className="space-y-4">
           <p className="text-sm text-ink-600">
-            Paying {fmtMoney(selected?.compensationTotal ?? null)} — the determined entitlement
+            Paying {fmtMoney(selected?.compensationTotal ?? null, selected?.currency)} — the
+            determined entitlement
             total. Evidence of the payment reaching the household is mandatory (#567).
           </p>
           <Field label="Paid on">

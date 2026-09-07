@@ -341,7 +341,8 @@ const dlpCreateSchema = z.object({
   endDate: isoDateSchema.optional(),
   durationMonths: z.number().int().min(1).max(240).optional(),
   retentionReleaseDate: isoDateSchema.nullable().optional(),
-  retentionAmount: z.number().finite().nullable().optional(),
+  /* money is never negative here: a negative retention would understate what is held */
+  retentionAmount: z.number().finite().nonnegative().nullable().optional(),
   currency: z.string().length(3).optional(),
   detail: z.record(z.string(), z.unknown()).optional(),
 });
@@ -362,9 +363,15 @@ const guaranteeCreateSchema = z.object({
   commitmentId: idSchema.nullable().optional(),
   vendorId: idSchema.nullable().optional(),
   contractClause: z.string().max(200).nullable().optional(),
-  ldRatePerUnit: z.number().finite().nullable().optional(),
+  /*
+   * A NEGATIVE RATE OR CAP WOULD SUBTRACT FROM THE PROJECT'S LD EXPOSURE.
+   * assessGuarantee multiplies the shortfall by the rate and guaranteeExposure
+   * adds the product into the per-currency total on the closeout dashboard, so
+   * one mistyped minus sign quietly reduced the damages the employer is owed.
+   */
+  ldRatePerUnit: z.number().finite().nonnegative().nullable().optional(),
   ldRateUnit: z.string().max(100).nullable().optional(),
-  ldCapAmount: z.number().finite().nullable().optional(),
+  ldCapAmount: z.number().finite().nonnegative().nullable().optional(),
   currency: z.string().length(3).optional(),
   detail: z.record(z.string(), z.unknown()).optional(),
 });
@@ -397,7 +404,7 @@ const spareCreateSchema = z.object({
   materialItemId: idSchema.nullable().optional(),
   quantityRequired: z.number().finite().min(0).nullable().optional(),
   unit: z.string().max(50).nullable().optional(),
-  unitCost: z.number().finite().nullable().optional(),
+  unitCost: z.number().finite().nonnegative().nullable().optional(),
   currency: z.string().length(3).optional(),
   leadTimeWeeks: z.number().finite().min(0).nullable().optional(),
   storageLocation: z.string().max(200).nullable().optional(),
@@ -644,6 +651,18 @@ export const closeoutRoutes: FastifyPluginAsync = async (app) => {
           `Closing the period releases the retention and issues the final certificate; do that over open defects only deliberately, and say why.`,
       );
     }
+    /*
+     * "…and say why" has to mean it. Closing a defects liability period
+     * releases the retention and issues the final certificate; doing that over
+     * live defects on `{ force: true }` alone left the employer's own record
+     * of why the money went out with nothing in it.
+     */
+    if (open.length > 0 && (body.note ?? "").trim().length < 10) {
+      throw badRequest(
+        `Forcing ${row.reference} closed over ${open.length} open defect(s) needs a stated reason of at least 10 characters. ` +
+          `Retention is released and the final certificate issued on this act; ${open.map((d) => d.reference).join(", ")} stay unremedied, and the note is the only record of the decision that let them.`,
+      );
+    }
     const at = nowISO();
     await app.db
       .update(defectsLiabilityPeriods)
@@ -704,7 +723,7 @@ export const closeoutRoutes: FastifyPluginAsync = async (app) => {
         systemId: idSchema.nullable().optional(),
         responsibleVendorId: idSchema.nullable().optional(),
         targetRectificationDate: isoDateSchema.nullable().optional(),
-        cost: z.number().finite().nullable().optional(),
+        cost: z.number().finite().nonnegative().nullable().optional(),
         currency: z.string().length(3).optional(),
         photoFileIds: fileIdsSchema.optional(),
       })
@@ -713,43 +732,63 @@ export const closeoutRoutes: FastifyPluginAsync = async (app) => {
     const reportedAt = body.reportedAt ?? todayISO();
     const end = dlp.extendedToDate ?? dlp.endDate;
     const outsidePeriod = reportedAt > end;
-    const existing = await app.db.select().from(dlpDefects).where(eq(dlpDefects.dlpId, id));
-    const position = existing.length + 1;
+    /*
+     * SUB-REFERENCE ALLOCATION IS A WRITE, NOT A COUNT.
+     *
+     * `position = rows.length + 1` read outside a transaction against
+     * uniqueIndex(dlpId, reference) meant two concurrent reports on the same
+     * period — a double-clicked button, a retried request — computed the same
+     * position and the second INSERT died on a unique violation the caller
+     * saw as a 500. The parent period row is locked for the length of the
+     * allocation, so the two requests queue and get D001 and D002.
+     */
     const defectId = newId("dfc");
-    const [created] = await app.db
-      .insert(dlpDefects)
-      .values({
-        id: defectId,
-        companyId: req.companyId!,
-        projectId: req.projectId!,
-        dlpId: id,
-        position,
-        reference: `${dlp.reference}-D${String(position).padStart(3, "0")}`,
-        title: body.title,
-        description: body.description ?? null,
-        reportedAt,
-        reportedByName: body.reportedByName ?? null,
-        reportedByOrganisation: body.reportedByOrganisation ?? null,
-        severity: body.severity ?? "minor",
-        locationId: body.locationId ?? null,
-        locationText: body.locationText ?? null,
-        assetId: body.assetId ?? null,
-        systemId: body.systemId ?? null,
-        responsibleVendorId: body.responsibleVendorId ?? dlp.vendorId,
-        targetRectificationDate: body.targetRectificationDate ?? null,
-        cost: body.cost ?? null,
-        currency: body.currency ?? dlp.currency,
-        photoFileIds: body.photoFileIds ?? [],
-        detail: outsidePeriod
-          ? {
-              reportedOutsidePeriod: true,
-              periodEnded: end,
-              note: "Reported after the liability period ended; whether it is covered is a contractual question, and the dates are recorded so it can be argued from fact.",
-            }
-          : {},
-        createdBy: req.user!.id,
-      })
-      .returning();
+    const [created] = await app.db.transaction(async (tx) => {
+      await tx
+        .select({ id: defectsLiabilityPeriods.id })
+        .from(defectsLiabilityPeriods)
+        .where(eq(defectsLiabilityPeriods.id, id))
+        .for("update");
+      const existing = await tx
+        .select({ position: dlpDefects.position })
+        .from(dlpDefects)
+        .where(eq(dlpDefects.dlpId, id));
+      const position = existing.reduce((max, r) => Math.max(max, r.position), 0) + 1;
+      return tx
+        .insert(dlpDefects)
+        .values({
+          id: defectId,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          dlpId: id,
+          position,
+          reference: `${dlp.reference}-D${String(position).padStart(3, "0")}`,
+          title: body.title,
+          description: body.description ?? null,
+          reportedAt,
+          reportedByName: body.reportedByName ?? null,
+          reportedByOrganisation: body.reportedByOrganisation ?? null,
+          severity: body.severity ?? "minor",
+          locationId: body.locationId ?? null,
+          locationText: body.locationText ?? null,
+          assetId: body.assetId ?? null,
+          systemId: body.systemId ?? null,
+          responsibleVendorId: body.responsibleVendorId ?? dlp.vendorId,
+          targetRectificationDate: body.targetRectificationDate ?? null,
+          cost: body.cost ?? null,
+          currency: body.currency ?? dlp.currency,
+          photoFileIds: body.photoFileIds ?? [],
+          detail: outsidePeriod
+            ? {
+                reportedOutsidePeriod: true,
+                periodEnded: end,
+                note: "Reported after the liability period ended; whether it is covered is a contractual question, and the dates are recorded so it can be argued from fact.",
+              }
+            : {},
+          createdBy: req.user!.id,
+        })
+        .returning();
+    });
     await refreshDefectCounts(id);
     await ledger(app.db, {
       ...scope(req),
@@ -776,7 +815,7 @@ export const closeoutRoutes: FastifyPluginAsync = async (app) => {
           disputeReason: z.string().max(4000).nullable().optional(),
           ncrId: idSchema.nullable().optional(),
           reworkItemId: idSchema.nullable().optional(),
-          cost: z.number().finite().nullable().optional(),
+          cost: z.number().finite().nonnegative().nullable().optional(),
         })
         .parse(req.body);
       const rows = await app.db
@@ -973,6 +1012,13 @@ export const closeoutRoutes: FastifyPluginAsync = async (app) => {
    * Record what the test measured. The verdict, the shortfall and the damages
    * are computed — never typed in — and the basis is written out so the number
    * can be argued from rather than asserted.
+   *
+   * A RE-MEASUREMENT CLEARS THE VERIFICATION. The independent verification was
+   * given against a reading; replacing the reading and keeping the signature
+   * would leave the register asserting that somebody checked a number nobody
+   * checked — and the LD exposure hanging off it would read as verified. The
+   * guarantee goes back to measured-but-unverified and has to be verified
+   * again, by somebody other than whoever measured it.
    */
   app.post(
     "/projects/:projectId/performance-guarantees/:id/measure",
@@ -1005,7 +1051,21 @@ export const closeoutRoutes: FastifyPluginAsync = async (app) => {
           shortfallPercent: assessment.shortfallPercent,
           ldAmount: assessment.ldAmount,
           ldBasis: assessment.basis,
-          detail: { ...(row.detail as Record<string, unknown>), measurementNote: body.note ?? null },
+          verifiedBy: null,
+          verifiedAt: null,
+          detail: {
+            ...(row.detail as Record<string, unknown>),
+            measurementNote: body.note ?? null,
+            ...(row.verifiedAt
+              ? {
+                  supersededVerification: {
+                    verifiedBy: row.verifiedBy,
+                    verifiedAt: row.verifiedAt,
+                    measuredValue: row.measuredValue,
+                  },
+                }
+              : {}),
+          },
           updatedAt: nowISO(),
         })
         .where(eq(performanceGuarantees.id, id));
@@ -1023,6 +1083,9 @@ export const closeoutRoutes: FastifyPluginAsync = async (app) => {
           ldAmount: assessment.ldAmount,
           basis: assessment.basis,
           reasons: assessment.reasons,
+          clearedVerification: row.verifiedAt
+            ? { verifiedBy: row.verifiedBy, verifiedAt: row.verifiedAt, measuredValue: row.measuredValue }
+            : null,
         },
         storePayload: true,
       });

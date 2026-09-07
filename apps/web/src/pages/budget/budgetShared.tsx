@@ -1303,7 +1303,8 @@ export interface SourceRow {
 
 export interface ComponentExplanation {
   component: string;
-  stored: number;
+  /** null when the line stores no column for this component (invoiced / paid to date) */
+  stored: number | null;
   value: number | null;
   drift: number | null;
   rows: SourceRow[];

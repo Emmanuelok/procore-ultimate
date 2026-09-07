@@ -77,7 +77,7 @@ beforeAll(async () => {
   app = built.app;
   owner = await registerActor(app);
   other = await registerActor(app);
-});
+}, 300_000);
 
 afterAll(async () => {
   await built.close();

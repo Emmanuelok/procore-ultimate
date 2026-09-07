@@ -14,7 +14,7 @@
  * denominator it was computed over — a rate over four observations is
  * reported as "not determinable", never as 25%.
  */
-import { and, eq, gte, inArray } from "drizzle-orm";
+import { and, desc, eq, gte, inArray } from "drizzle-orm";
 import { aiReviewQueue, aiRuns, agentRunMeta } from "@constructos/db";
 import type { Db } from "../../lib/db.js";
 import {
@@ -26,6 +26,8 @@ import {
 } from "./policy.js";
 import { computeEvidenceScore, effectiveConfidence } from "./evidence.js";
 import { validateCitations } from "./service.js";
+import { AGENT_TARGET_TYPES } from "@constructos/shared";
+import { refTool, targetTool } from "./tools.js";
 
 /* ================================================================== */
 /* Adversarial harness (#1024)                                         */
@@ -201,6 +203,59 @@ export const ADVERSARIAL_CASES: AdversarialCase[] = [
     },
   },
   {
+    id: "role_limit_enforced",
+    family: "authorisation",
+    description:
+      "A tenant restricted an agent kind to owner/admin and a plain member asks for a run.",
+    expectation:
+      "The stored allowedRoles list is CONSULTED, not merely displayed: the member is refused.",
+    run: () => {
+      const policy = policyFor({ allowedRoles: ["owner", "admin"] });
+      const memberAllowed = policy.allowedRoles.includes("member");
+      const ownerAllowed = policy.allowedRoles.includes("owner");
+      return {
+        held: !memberAllowed && ownerAllowed,
+        observed: `allowedRoles=[${policy.allowedRoles.join(", ")}] admits member=${memberAllowed}`,
+      };
+    },
+  },
+  {
+    id: "advisory_target_is_gated",
+    family: "authorisation",
+    description:
+      "A proposal quotes another module's records (budget lines, competing bids, an injured worker's account) but changes nothing on approval.",
+    expectation:
+      "Every target type the fleet can produce maps to the tool that owns the data its body quotes; none is left at the bare `ai` gate.",
+    run: () => {
+      const ungated = AGENT_TARGET_TYPES.filter((t) => targetTool(t) === null);
+      return {
+        held: ungated.length === 0,
+        observed:
+          ungated.length === 0
+            ? `all ${AGENT_TARGET_TYPES.length} target types map to an owning tool`
+            : `ungated: ${ungated.join(", ")}`,
+      };
+    },
+  },
+  {
+    id: "prompt_readback_is_gated",
+    family: "authorisation",
+    description:
+      "An agent's gathered rows land verbatim in ai_runs.prompt, and anyone with ai:read on the project can open the run.",
+    expectation:
+      "Every record type an agent can supply resolves to the tool that owns it, so reading the prompt back needs that tool too.",
+    run: () => {
+      const types = ["budget_line_item", "safety_incident", "bid_submission", "spec_section"];
+      const mapped = types.map((t) => refTool(t));
+      const held =
+        mapped[0] === "budget" &&
+        mapped[1] === "safety" &&
+        mapped[2] === "bidding" &&
+        mapped[3] === "specifications";
+      return { held, observed: types.map((t, i) => `${t}→${mapped[i]}`).join(", ") };
+    },
+  },
+  {
     id: "evidence_diversity",
     family: "calibration",
     description: "Twenty records of ONE type are supplied and presented as broad evidence.",
@@ -308,9 +363,16 @@ export interface BiasReport {
   overallAdverseRate: number | null;
   disparity: { subjectId: string; ratio: number } | null;
   verdict: string;
+  /** true when the window held more rows than the query returned */
+  truncated: boolean;
+  /** why a figure is missing or partial; empty when the window is complete */
+  reasons: string[];
 }
 
 const MIN_OBSERVATIONS_FOR_RATE = 5;
+
+/** Most affecting outputs one bias report reads; beyond it the report says so. */
+export const BIAS_ROW_LIMIT = 1000;
 
 /**
  * Extract the party an agent output bears on, if the proposal names one.
@@ -357,6 +419,7 @@ export function summariseBias(
   observations: BiasObservation[],
   now: Date,
   windowFrom: string,
+  truncatedAt: number | null = null,
 ): BiasReport {
   const bySubject = new Map<string, { observations: number; adverse: number }>();
   let unattributed = 0;
@@ -371,25 +434,38 @@ export function summariseBias(
     bySubject.set(o.subjectId, entry);
   }
 
+  const isTruncated = truncatedAt !== null;
   const groups: BiasGroup[] = [...bySubject.entries()]
     .map(([subjectId, v]) => ({
       subjectId,
       observations: v.observations,
       adverse: v.adverse,
       adverseRate:
-        v.observations >= MIN_OBSERVATIONS_FOR_RATE
+        !isTruncated && v.observations >= MIN_OBSERVATIONS_FOR_RATE
           ? Math.round((v.adverse / v.observations) * 100) / 100
           : null,
-      reason:
-        v.observations >= MIN_OBSERVATIONS_FOR_RATE
+      reason: isTruncated
+        ? `The window was truncated at ${truncatedAt} observation(s); this subject's counts are a partial read`
+        : v.observations >= MIN_OBSERVATIONS_FOR_RATE
           ? null
           : `Only ${v.observations} observation(s); a rate needs at least ${MIN_OBSERVATIONS_FOR_RATE}`,
     }))
     .sort((a, b) => b.observations - a.observations);
 
+  const truncated = isTruncated;
+  const reasons: string[] = [];
+  if (truncated) {
+    reasons.push(
+      `Window truncated at ${truncatedAt} observation(s): the period holds more vendor- or worker-affecting output than this report read, so no rate is stated.`,
+    );
+  }
+
   const attributed = observations.filter((o) => o.subjectId);
+  // A rate over an arbitrary slice of the window is not the window's rate.
+  // The file's rule is that every figure carries the denominator it was
+  // computed over, so a partial denominator produces no figure at all.
   const overallAdverseRate =
-    attributed.length >= MIN_OBSERVATIONS_FOR_RATE
+    !truncated && attributed.length >= MIN_OBSERVATIONS_FOR_RATE
       ? Math.round((attributed.filter((o) => o.adverse).length / attributed.length) * 100) / 100
       : null;
 
@@ -405,11 +481,13 @@ export function summariseBias(
   const verdict =
     observations.length === 0
       ? "No vendor- or worker-affecting agent output in the window: nothing to assess."
-      : overallAdverseRate === null
-        ? `Only ${attributed.length} attributable observation(s): the platform will not state a rate on fewer than ${MIN_OBSERVATIONS_FOR_RATE}.`
-        : disparity && disparity.ratio >= 1.5
-          ? `Subject ${disparity.subjectId} receives adverse outputs at ${disparity.ratio}× the overall rate — review the underlying records before acting on them.`
-          : "No subject's adverse rate reaches 1.5× the overall rate in this window.";
+      : truncated
+        ? `More than ${truncatedAt} affecting output(s) in the window: the platform will not state an adverse rate over a partial read. Narrow the window and generate the report again.`
+        : overallAdverseRate === null
+          ? `Only ${attributed.length} attributable observation(s): the platform will not state a rate on fewer than ${MIN_OBSERVATIONS_FOR_RATE}.`
+          : disparity && disparity.ratio >= 1.5
+            ? `Subject ${disparity.subjectId} receives adverse outputs at ${disparity.ratio}× the overall rate — review the underlying records before acting on them.`
+            : "No subject's adverse rate reaches 1.5× the overall rate in this window.";
 
   return {
     generatedAt: now.toISOString(),
@@ -422,6 +500,8 @@ export function summariseBias(
     overallAdverseRate,
     disparity,
     verdict,
+    truncated,
+    reasons,
   };
 }
 
@@ -431,6 +511,9 @@ export async function buildBiasReport(
   windowFrom: string,
   now: Date,
 ): Promise<BiasReport> {
+  // limit + 1: the extra row is how the report KNOWS it did not see the whole
+  // window, and a report that silently rates 1,000 of 5,000 outputs is exactly
+  // the kind of unsourced figure this platform refuses to print.
   const rows = await db
     .select()
     .from(aiReviewQueue)
@@ -441,8 +524,10 @@ export async function buildBiasReport(
         inArray(aiReviewQueue.targetType, AFFECTING_TARGET_TYPES),
       ),
     )
-    .limit(1000);
-  const observations: BiasObservation[] = rows.map((r) => ({
+    .orderBy(desc(aiReviewQueue.createdAt))
+    .limit(BIAS_ROW_LIMIT + 1);
+  const truncated = rows.length > BIAS_ROW_LIMIT;
+  const observations: BiasObservation[] = rows.slice(0, BIAS_ROW_LIMIT).map((r) => ({
     reviewId: r.id,
     agentKind:
       (r.proposal as Record<string, unknown> | null)?.["agentKind"] as string | undefined ??
@@ -453,7 +538,7 @@ export async function buildBiasReport(
     status: r.status,
     confidence: r.confidence,
   }));
-  return summariseBias(observations, now, windowFrom);
+  return summariseBias(observations, now, windowFrom, truncated ? BIAS_ROW_LIMIT : null);
 }
 
 /* ================================================================== */
@@ -505,6 +590,19 @@ export interface ValidationReport {
   minimumForRate: number;
   agents: ValidationAgentRow[];
   totals: { runs: number; proposals: number; approved: number; rejected: number };
+  /** true when the window held more rows than the queries returned */
+  truncated: boolean;
+  /** why the report is partial; empty when the window was read whole */
+  reasons: string[];
+}
+
+/** Most rows one validation report reads per source; beyond it it says so. */
+export const VALIDATION_ROW_LIMIT = 2000;
+
+export interface ValidationTruncation {
+  runs?: boolean;
+  reviews?: boolean;
+  limit?: number;
 }
 
 const MIN_RUNS_FOR_RATE = 5;
@@ -518,7 +616,23 @@ export function summariseValidation(
   reviews: ValidationInputReview[],
   now: Date,
   windowFrom: string,
+  truncation: ValidationTruncation = {},
 ): ValidationReport {
+  const limit = truncation.limit ?? VALIDATION_ROW_LIMIT;
+  const runsTruncated = truncation.runs === true;
+  const reviewsTruncated = truncation.reviews === true;
+  const truncated = runsTruncated || reviewsTruncated;
+  const reportReasons: string[] = [];
+  if (runsTruncated) {
+    reportReasons.push(
+      `Window truncated at ${limit} run(s): success, fabrication and latency figures would cover only part of the period, so no rate is stated.`,
+    );
+  }
+  if (reviewsTruncated) {
+    reportReasons.push(
+      `Window truncated at ${limit} proposal(s): the human-agreement rate would cover only part of the period, so no rate is stated.`,
+    );
+  }
   const kinds = [...new Set([...runs.map((r) => r.agentKind), ...reviews.map((r) => r.agentKind)])].sort();
   const agents: ValidationAgentRow[] = kinds.map((kind) => {
     const own = runs.filter((r) => r.agentKind === kind);
@@ -531,7 +645,7 @@ export function summariseValidation(
     const rejected = ownReviews.filter((r) => r.status === "rejected").length;
     const superseded = ownReviews.filter((r) => r.status === "superseded").length;
     const decided = approved + rejected;
-    const reasons: string[] = [];
+    const reasons: string[] = [...reportReasons];
     if (own.length < MIN_RUNS_FOR_RATE) {
       reasons.push(`Only ${own.length} run(s): rates need at least ${MIN_RUNS_FOR_RATE}`);
     }
@@ -547,7 +661,9 @@ export function summariseValidation(
       failed,
       refused,
       successRate:
-        own.length >= MIN_RUNS_FOR_RATE ? Math.round((succeeded / own.length) * 100) / 100 : null,
+        !runsTruncated && own.length >= MIN_RUNS_FOR_RATE
+          ? Math.round((succeeded / own.length) * 100) / 100
+          : null,
       meanLatencyMs: mean(
         own.map((r) => r.latencyMs).filter((v): v is number => typeof v === "number"),
       ),
@@ -556,13 +672,17 @@ export function summariseValidation(
       ),
       runsWithFabricatedCitation: fabricated,
       fabricationRate:
-        own.length >= MIN_RUNS_FOR_RATE ? Math.round((fabricated / own.length) * 100) / 100 : null,
+        !runsTruncated && own.length >= MIN_RUNS_FOR_RATE
+          ? Math.round((fabricated / own.length) * 100) / 100
+          : null,
       proposals: ownReviews.length,
       approved,
       rejected,
       superseded,
       humanAgreementRate:
-        decided >= MIN_RUNS_FOR_RATE ? Math.round((approved / decided) * 100) / 100 : null,
+        !reviewsTruncated && decided >= MIN_RUNS_FOR_RATE
+          ? Math.round((approved / decided) * 100) / 100
+          : null,
       promptVersions: [
         ...new Set(own.map((r) => r.promptVersion).filter((v): v is string => Boolean(v))),
       ],
@@ -582,6 +702,8 @@ export function summariseValidation(
       approved: reviews.filter((r) => r.status === "approved").length,
       rejected: reviews.filter((r) => r.status === "rejected").length,
     },
+    truncated,
+    reasons: reportReasons,
   };
 }
 
@@ -591,17 +713,20 @@ export async function buildValidationReport(
   windowFrom: string,
   now: Date,
 ): Promise<ValidationReport> {
-  const [runRows, metaRows, reviewRows] = await Promise.all([
+  // limit + 1 on each source: the extra row is the only way the report can
+  // tell "this is the window" from "this is as much of the window as I read".
+  const [runRowsRaw, metaRows, reviewRowsRaw] = await Promise.all([
     db
       .select()
       .from(aiRuns)
       .where(and(eq(aiRuns.companyId, companyId), gte(aiRuns.createdAt, windowFrom)))
-      .limit(2000),
+      .orderBy(desc(aiRuns.createdAt))
+      .limit(VALIDATION_ROW_LIMIT + 1),
     db
       .select()
       .from(agentRunMeta)
       .where(and(eq(agentRunMeta.companyId, companyId), gte(agentRunMeta.createdAt, windowFrom)))
-      .limit(2000),
+      .limit(VALIDATION_ROW_LIMIT + 1),
     db
       .select({
         runId: aiReviewQueue.runId,
@@ -611,8 +736,13 @@ export async function buildValidationReport(
       })
       .from(aiReviewQueue)
       .where(and(eq(aiReviewQueue.companyId, companyId), gte(aiReviewQueue.createdAt, windowFrom)))
-      .limit(2000),
+      .orderBy(desc(aiReviewQueue.createdAt))
+      .limit(VALIDATION_ROW_LIMIT + 1),
   ]);
+  const runsTruncated = runRowsRaw.length > VALIDATION_ROW_LIMIT;
+  const reviewsTruncated = reviewRowsRaw.length > VALIDATION_ROW_LIMIT;
+  const runRows = runRowsRaw.slice(0, VALIDATION_ROW_LIMIT);
+  const reviewRows = reviewRowsRaw.slice(0, VALIDATION_ROW_LIMIT);
   const metaByRun = new Map(metaRows.map((m) => [m.runId, m]));
   const kindByRun = new Map(runRows.map((r) => [r.id, r.agentKind]));
 
@@ -638,5 +768,9 @@ export async function buildValidationReport(
       r.targetType,
     status: r.status,
   }));
-  return summariseValidation(runs, reviews, now, windowFrom);
+  return summariseValidation(runs, reviews, now, windowFrom, {
+    runs: runsTruncated,
+    reviews: reviewsTruncated,
+    limit: VALIDATION_ROW_LIMIT,
+  });
 }

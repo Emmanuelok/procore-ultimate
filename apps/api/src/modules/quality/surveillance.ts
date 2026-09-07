@@ -17,12 +17,13 @@
  */
 
 import type { FastifyPluginAsync } from "fastify";
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, count, eq, inArray, isNotNull, isNull, notInArray } from "drizzle-orm";
 import { z } from "zod";
 import { inspectionTestPlans, itpActivities, itpActivityReleases } from "@constructos/db";
 import { ITP_RESPONSIBLE_PARTIES } from "@constructos/shared";
 import { newId } from "../../lib/ids.js";
 import { badRequest, forbidden, notFound } from "../../lib/errors.js";
+import { pageOffset, pageQuerySchema, paginate } from "../../lib/pagination.js";
 import { pushNotifications } from "../notifications/service.js";
 import {
   buildGates,
@@ -32,7 +33,7 @@ import {
   nowISO,
   todayISO,
 } from "./shared.js";
-import { summariseActivities } from "./holdPoints.js";
+import { summariseActivities, TERMINAL_ACTIVITY_STATUSES } from "./holdPoints.js";
 import {
   canReleaseLeg,
   chainSummary,
@@ -599,8 +600,8 @@ export const surveillanceRoutes: FastifyPluginAsync = async (app) => {
    * are the ones that stop the programme.
    */
   app.get("/projects/:projectId/surveillance", { preHandler: readGate }, async (req) => {
-    const query = z
-      .object({
+    const query = pageQuerySchema
+      .extend({
         party: z.enum(ITP_RESPONSIBLE_PARTIES).optional(),
         openOnly: z.coerce.boolean().optional(),
       })
@@ -617,39 +618,74 @@ export const surveillanceRoutes: FastifyPluginAsync = async (app) => {
     }
     if (query.openOnly) {
       clauses.push(inArray(itpActivityReleases.status, ["pending", "notified", "attended"]));
+      /*
+       * A LEG ON A POINT THAT IS OVER IS NOT OUTSTANDING.
+       *
+       * The register is the list a surveillance co-ordinator chases, and it
+       * judged only the leg. A point that was waived, failed, marked not
+       * applicable or closed leaves its unsigned legs sitting at `pending` for
+       * ever — nothing reconciles them, because the decision was taken about
+       * the point rather than about the leg — so the co-ordinator was being
+       * sent to chase a notified body for an inspection nobody is going to
+       * hold. Those legs still exist and are still readable without
+       * `openOnly`; they are simply not outstanding work.
+       */
+      clauses.push(notInArray(itpActivities.status, [...TERMINAL_ACTIVITY_STATUSES]));
     }
+    /*
+     * PAGINATED, AND THE TOTAL IS THE REAL TOTAL.
+     *
+     * This used to take 500 rows with no offset and report `rows.length` as
+     * the total, so a project with 900 outstanding legs told its surveillance
+     * co-ordinator there were 500 — and the 400 it dropped were the ones
+     * nobody would then chase. The counts below are computed over the same
+     * where clause as the page, not over the page.
+     */
+    const where = and(...clauses);
+    const joined = () =>
+      app.db
+        .select({ n: count() })
+        .from(itpActivityReleases)
+        .innerJoin(itpActivities, eq(itpActivities.id, itpActivityReleases.activityId));
+    const [totalRow] = await joined().where(where);
+    const [awaitingRow] = await joined().where(
+      and(
+        where,
+        inArray(itpActivityReleases.status, ["pending", "notified", "attended"]),
+        isNull(itpActivityReleases.attendedAt),
+      ),
+    );
+    const [notifiedRow] = await joined().where(
+      and(
+        where,
+        inArray(itpActivityReleases.status, ["pending", "notified", "attended"]),
+        isNotNull(itpActivityReleases.notifiedAt),
+      ),
+    );
     const rows = await app.db
-      .select()
+      .select({ leg: itpActivityReleases, activity: itpActivities })
       .from(itpActivityReleases)
-      .where(and(...clauses))
+      .innerJoin(itpActivities, eq(itpActivities.id, itpActivityReleases.activityId))
+      .where(where)
       .orderBy(asc(itpActivityReleases.createdAt))
-      .limit(500);
-    const activityIds = [...new Set(rows.map((r) => r.activityId))];
-    const activities = activityIds.length
-      ? await app.db
-          .select()
-          .from(itpActivities)
-          .where(inArray(itpActivities.id, activityIds))
-      : [];
-    const byId = new Map(activities.map((a) => [a.id, a] as const));
+      .limit(query.pageSize)
+      .offset(pageOffset(query));
+    const items = rows.map((r) => ({
+      ...r.leg,
+      activity: {
+        id: r.activity.id,
+        activity: r.activity.activity,
+        activityCode: r.activity.activityCode,
+        interventionPoint: r.activity.interventionPoint,
+        plannedDate: r.activity.plannedDate,
+        status: r.activity.status,
+        itpId: r.activity.itpId,
+      },
+    }));
     return {
-      items: rows.map((r) => ({
-        ...r,
-        activity: byId.get(r.activityId)
-          ? {
-              id: r.activityId,
-              activity: byId.get(r.activityId)!.activity,
-              activityCode: byId.get(r.activityId)!.activityCode,
-              interventionPoint: byId.get(r.activityId)!.interventionPoint,
-              plannedDate: byId.get(r.activityId)!.plannedDate,
-              status: byId.get(r.activityId)!.status,
-              itpId: byId.get(r.activityId)!.itpId,
-            }
-          : null,
-      })),
-      total: rows.length,
-      awaitingAttendance: rows.filter((r) => !isLegTerminal(r.status) && !r.attendedAt).length,
-      notifiedAwaitingSignature: rows.filter((r) => !isLegTerminal(r.status) && r.notifiedAt).length,
+      ...paginate(items, Number(totalRow?.n ?? 0), query),
+      awaitingAttendance: Number(awaitingRow?.n ?? 0),
+      notifiedAwaitingSignature: Number(notifiedRow?.n ?? 0),
     };
   });
 };

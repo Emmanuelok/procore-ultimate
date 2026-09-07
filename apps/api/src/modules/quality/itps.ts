@@ -13,7 +13,7 @@
 import type { FastifyPluginAsync } from "fastify";
 import { and, asc, count, desc, eq, ilike, inArray } from "drizzle-orm";
 import { z } from "zod";
-import { inspectionTestPlans, itpActivities } from "@constructos/db";
+import { inspectionTestPlans, itpActivities, itpActivityReleases } from "@constructos/db";
 import {
   INTERVENTION_POINTS,
   ITP_ACTIVITY_STATUSES,
@@ -49,6 +49,7 @@ import {
   summariseActivities,
   type HoldPointActivityLike,
 } from "./holdPoints.js";
+import { chainSummary, isLegTerminal, legLabel, type ReleaseLegLike } from "./releaseChain.js";
 import { sweepQuality } from "./sweeps.js";
 
 /* ------------------------------------------------------------------ */
@@ -292,21 +293,78 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
     const itp = await fetchItp(itpId, companyId, projectId);
     const acts = await loadActivities(itpId);
     const nowMs = Date.now();
+    const chains = await chainsFor(acts.map((a) => a.id));
     return {
       ...itp,
-      activities: acts.map((a) => decorate(a, nowMs)),
+      activities: acts.map((a) => decorate(a, nowMs, chains.get(a.id))),
       holdPoints: summariseActivities(acts, todayISO(), nowMs),
     };
   }
 
+  /**
+   * The sign-off chain legs recorded against a set of activities (#1094).
+   *
+   * The activity-level release route and the plan detail both need to know
+   * whether a chain exists, because a point that has one is released BY the
+   * chain and not by a single button: see the release route below.
+   */
+  async function chainsFor(activityIds: string[]): Promise<Map<string, ReleaseLegLike[]>> {
+    const byActivity = new Map<string, ReleaseLegLike[]>();
+    if (activityIds.length === 0) return byActivity;
+    const rows = await app.db
+      .select()
+      .from(itpActivityReleases)
+      .where(inArray(itpActivityReleases.activityId, activityIds))
+      .orderBy(asc(itpActivityReleases.position), asc(itpActivityReleases.createdAt));
+    for (const row of rows) {
+      const legs = byActivity.get(row.activityId) ?? [];
+      legs.push({
+        id: row.id,
+        position: row.position,
+        party: row.party,
+        required: row.required,
+        userId: row.userId,
+        organisation: row.organisation,
+        contactName: row.contactName,
+        status: row.status,
+        releasedBy: row.releasedBy,
+        releasedAt: row.releasedAt,
+      });
+      byActivity.set(row.activityId, legs);
+    }
+    return byActivity;
+  }
+
+  async function chainOf(activityId: string): Promise<ReleaseLegLike[]> {
+    return (await chainsFor([activityId])).get(activityId) ?? [];
+  }
+
   /** An activity as the API renders it: the row plus its computed standing. */
-  function decorate(a: HoldPointActivityLike & Record<string, unknown>, nowMs: number) {
+  function decorate(
+    a: HoldPointActivityLike & Record<string, unknown>,
+    nowMs: number,
+    legs?: ReleaseLegLike[],
+  ) {
     return {
       ...a,
       parsedVerifyingParties: parseVerifyingParties(a.verifyingParties),
       notice: noticeStatus(a, nowMs),
       mayProceed: mayProceedPast(a, nowMs),
+      /*
+       * null means "no chain is configured, the single-release rule governs".
+       * The UI uses it to hide the activity-level Release button, because a
+       * point with a chain is released by its last required leg.
+       */
+      signOffChain: legs && legs.length > 0 ? chainSummary(legs) : null,
     };
+  }
+
+  /** One activity with its chain — every single-activity response goes through it. */
+  async function decorateOne(
+    a: HoldPointActivityLike & Record<string, unknown> & { id: string },
+    nowMs = Date.now(),
+  ) {
+    return decorate(a, nowMs, await chainOf(a.id));
   }
 
   /* ---------------------------------------------------------------- */
@@ -724,8 +782,9 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
       await fetchItp(itpId, req.companyId!, req.projectId!);
       const acts = await loadActivities(itpId);
       const nowMs = Date.now();
+      const chains = await chainsFor(acts.map((a) => a.id));
       return {
-        items: acts.map((a) => decorate(a, nowMs)),
+        items: acts.map((a) => decorate(a, nowMs, chains.get(a.id))),
         total: acts.length,
         summary: summariseActivities(acts, todayISO(), nowMs),
       };
@@ -795,7 +854,7 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
         payload: created,
         storePayload: true,
       });
-      return reply.status(201).send(decorate(created!, Date.now()));
+      return reply.status(201).send(await decorateOne(created!));
     },
   );
 
@@ -837,7 +896,7 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
         objectId: activityId,
         payload: { changed: Object.keys(body) },
       });
-      return decorate(await fetchActivity(activityId, itpId, req.projectId!), Date.now());
+      return decorateOne(await fetchActivity(activityId, itpId, req.projectId!));
     },
   );
 
@@ -877,7 +936,11 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
       });
       const reordered = await loadActivities(itpId);
       const nowMs = Date.now();
-      return { items: reordered.map((a) => decorate(a, nowMs)), total: reordered.length };
+      const chains = await chainsFor(reordered.map((a) => a.id));
+      return {
+        items: reordered.map((a) => decorate(a, nowMs, chains.get(a.id))),
+        total: reordered.length,
+      };
     },
   );
 
@@ -949,7 +1012,7 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
         );
       }
       const updated = await fetchActivity(activityId, itpId, req.projectId!);
-      return decorate(updated, Date.now());
+      return decorateOne(updated);
     },
   );
 
@@ -966,6 +1029,37 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
       const body = releaseSchema.parse(req.body ?? {});
       const itp = await fetchItp(itpId, req.companyId!, req.projectId!);
       const activity = await fetchActivity(activityId, itpId, req.projectId!);
+      /*
+       * A POINT WITH A CHAIN IS RELEASED BY ITS CHAIN (#1094).
+       *
+       * This route predates the sequential sign-off chain and judged only the
+       * activity's `verifyingParties` JSON, so on a point configured
+       * contractor QC -> engineer -> third party the FIRST nominated party
+       * could press it and move the activity straight to `released`: the
+       * open-hold-point counter dropped, the plan became closable, the
+       * overdue sweep stopped flagging it, and the engineer's and the
+       * notified body's legs stayed pending for ever, because
+       * completeActivityIfChainDone returns early once the activity is
+       * already released. One signature stood in for three.
+       *
+       * So: where a chain exists, the chain governs. The refusal names the
+       * leg whose turn it is and the route that signs it.
+       */
+      const legs = await chainOf(activityId);
+      if (legs.length > 0) {
+        const chain = chainSummary(legs);
+        if (!chain.complete) {
+          const next = legs.find((l) => l.id === chain.nextLegId);
+          throw badRequest(
+            `${activity.activityCode ?? activity.activity} has a sign-off chain of ${chain.requiredCount} required ` +
+              `${chain.requiredCount === 1 ? "leg" : "legs"} and ${chain.rejected ? "a leg has rejected it" : `${chain.outstanding.length} ${chain.outstanding.length === 1 ? "is" : "are"} still outstanding`}. ` +
+              `${chain.reasons.join(" ")} ` +
+              `Sign the ${next ? legLabel(next) : "outstanding"} leg at ` +
+              `POST /projects/{projectId}/itps/${itpId}/activities/${activityId}/parties/${chain.nextLegId ?? "{legId}"}/release — ` +
+              `the point releases itself when the last required leg signs. Releasing it here would record one signature in place of ${chain.requiredCount}.`,
+          );
+        }
+      }
       const decision = canRelease(activity, {
         actorId: req.user!.id,
         raisedBy: activity.notifiedBy ?? itp.createdBy,
@@ -1008,7 +1102,7 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
         },
         storePayload: true,
       });
-      return decorate(await fetchActivity(activityId, itpId, req.projectId!), Date.now());
+      return decorateOne(await fetchActivity(activityId, itpId, req.projectId!));
     },
   );
 
@@ -1023,6 +1117,41 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
       const decision = canWaive(activity, body.reason);
       if (!decision.allowed) throw badRequest(decision.reasons.join(" "));
       const at = nowISO();
+      /*
+       * A WAIVER OF THE POINT IS A WAIVER OF EVERY LEG STILL TO SIGN (#1094).
+       *
+       * The release route refuses where a chain exists, because one signature
+       * may not stand in for three. Waiving the point is the legitimate
+       * override of the same chain — it carries a written reason and names
+       * the person taking it — but it left the outstanding legs at `pending`
+       * for ever: nothing reconciled them, so the surveillance register went
+       * on telling a co-ordinator to chase a notified body for an inspection
+       * that had been waived, and the chain's own record never said what
+       * became of the legs nobody signed.
+       *
+       * Each outstanding leg is therefore waived with the same reason, under
+       * the same actor and timestamp, and named in the ledger entry: the
+       * decision was one act and the record says so.
+       */
+      const legs = await chainOf(activityId);
+      const outstanding = legs.filter((l) => !isLegTerminal(l.status));
+      if (outstanding.length > 0) {
+        await app.db
+          .update(itpActivityReleases)
+          .set({
+            status: "waived",
+            releasedBy: req.user!.id,
+            releasedAt: at,
+            note: `Waived with the point: ${body.reason}`,
+            updatedAt: at,
+          })
+          .where(
+            inArray(
+              itpActivityReleases.id,
+              outstanding.map((l) => l.id),
+            ),
+          );
+      }
       await app.db
         .update(itpActivities)
         .set({
@@ -1041,10 +1170,16 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
         action: "state_change",
         objectType: "itp_activity",
         objectId: activityId,
-        payload: { from: activity.status, to: "waived", waivedBy: req.user!.id, reason: body.reason },
+        payload: {
+          from: activity.status,
+          to: "waived",
+          waivedBy: req.user!.id,
+          reason: body.reason,
+          waivedLegs: outstanding.map((l) => ({ id: l.id, party: l.party })),
+        },
         storePayload: true,
       });
-      return decorate(await fetchActivity(activityId, itpId, req.projectId!), Date.now());
+      return decorateOne(await fetchActivity(activityId, itpId, req.projectId!));
     },
   );
 
@@ -1092,7 +1227,7 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
         payload: { from: activity.status, to: "failed", reason: body.reason, ncrId: body.ncrId ?? null },
         storePayload: true,
       });
-      return decorate(await fetchActivity(activityId, itpId, req.projectId!), Date.now());
+      return decorateOne(await fetchActivity(activityId, itpId, req.projectId!));
     },
   );
 
@@ -1153,7 +1288,7 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
         },
         storePayload: true,
       });
-      return decorate(await fetchActivity(activityId, itpId, req.projectId!), Date.now());
+      return decorateOne(await fetchActivity(activityId, itpId, req.projectId!));
     },
   );
 
@@ -1205,7 +1340,7 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
         payload: { from: activity.status, to: "closed", note: body.note ?? null },
         storePayload: true,
       });
-      return decorate(await fetchActivity(activityId, itpId, req.projectId!), Date.now());
+      return decorateOne(await fetchActivity(activityId, itpId, req.projectId!));
     },
   );
 
@@ -1265,7 +1400,7 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
         },
         storePayload: true,
       });
-      return decorate(await fetchActivity(activityId, itpId, req.projectId!), Date.now());
+      return decorateOne(await fetchActivity(activityId, itpId, req.projectId!));
     },
   );
 
@@ -1303,9 +1438,10 @@ export const itpRoutes: FastifyPluginAsync = async (app) => {
       .offset(pageOffset(q));
     const nowMs = Date.now();
     const today = todayISO();
+    const chains = await chainsFor(rows.map((a) => a.id));
     return {
       ...paginate(
-        rows.map((a) => decorate(a, nowMs)),
+        rows.map((a) => decorate(a, nowMs, chains.get(a.id))),
         Number(totalRow?.n ?? 0),
         q,
       ),

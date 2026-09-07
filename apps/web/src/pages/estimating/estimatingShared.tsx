@@ -14,7 +14,7 @@
  *  · every panel loads, fails and empties on its own.
  */
 import { useCallback, useState, type ReactNode } from "react";
-import { api, ApiClientError } from "../../lib/api";
+import { api, ApiClientError, fetchBlobUrl } from "../../lib/api";
 import { Alert, Badge, cx } from "../../ui";
 import type { Tone } from "../../ui/tokens";
 import { useResource, type Loadable, type Paginated } from "../../layouts/project/lib";
@@ -415,11 +415,14 @@ export interface LevellingRow {
     amount: number;
     unitRate: number | null;
     excluded: boolean;
+    /** listed but left blank — not a price of nil */
+    unpriced: boolean;
     deviation: number | null;
     outlier: boolean;
   }>;
   pricedCount: number;
   excludedCount: number;
+  unpricedCount: number;
   missingVendors: string[];
   low: number | null;
   high: number | null;
@@ -445,11 +448,17 @@ export interface Levelling {
     coverage: number;
     pricedRows: number;
     excludedRows: number;
+    unpricedRows: number;
     missingRows: number;
     comparableTotal: number | null;
     comparableBasis: string;
   }>;
-  scopeGaps: Array<{ scopeKey: string; description: string; missingVendors: string[] }>;
+  scopeGaps: Array<{
+    scopeKey: string;
+    description: string;
+    missingVendors: string[];
+    unpricedVendors: string[];
+  }>;
   outliers: Array<{
     scopeKey: string;
     description: string;
@@ -543,7 +552,9 @@ export interface ConversionResult {
 }
 
 export interface HistoricalRates {
-  query: { costCode: string | null; search: string | null; unit: string | null };
+  query?: { costCode: string | null; search: string | null; unit: string | null };
+  /** "company" for an owner/admin; "visible_projects" for everybody else */
+  scope: string;
   distributions: Array<{
     currency: string;
     unit: string;
@@ -610,7 +621,14 @@ export interface EstimatingSignal {
 }
 
 export interface SweepResult {
-  quotes: { expired: number; expiring: number; signalsRaised: number; signalsClosed: number; ranAt: string };
+  quotes: {
+    expired: number;
+    expiring: number;
+    signalsRaised: number;
+    signalsClosed: number;
+    scope: string;
+    ranAt: string;
+  };
   hygiene: {
     catalogueFlagged: number;
     staleRateEstimates: number;
@@ -619,6 +637,17 @@ export interface SweepResult {
     unpricedTakeoffItems: number;
     signalsRaised: number;
     signalsClosed: number;
+    scope: string;
+    notes: string[];
+    ranAt: string;
+  };
+  outliers: {
+    packs: number;
+    quotesCompared: number;
+    outliers: number;
+    signalsRaised: number;
+    signalsClosed: number;
+    scope: string;
     ranAt: string;
   };
 }
@@ -905,34 +934,70 @@ export function useSummary(projectId: string): Loadable<EstimatingSummary> {
 
 const p = (projectId: string) => `/api/v1/projects/${projectId}`;
 
+/**
+ * Fetch a file the API guards behind the normal gates and hand it to the
+ * browser. A plain `window.open` or `<a href>` carries neither the bearer
+ * token nor the tenant header, so the viewer would get a 401 body where the
+ * document should be; `fetchBlobUrl` sends both and returns an object URL.
+ */
+export async function downloadAuthed(path: string, filename: string): Promise<void> {
+  const url = await fetchBlobUrl(path);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+/** Open an authenticated HTML document in a new tab. */
+export async function openAuthed(path: string): Promise<void> {
+  const url = await fetchBlobUrl(path);
+  const opened = window.open(url, "_blank", "noopener");
+  if (!opened) throw new Error("The browser blocked the new tab. Allow pop-ups for this site.");
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+/**
+ * The write half of the module's API surface. Reads go through `useResource`
+ * on the literal path, the way every other workspace in the app fetches, so
+ * each panel carries its own loading, error and empty state; duplicating the
+ * GETs here as wrappers nobody called was how this file grew a shelf of dead
+ * helpers that read like unbuilt features.
+ */
 export const estimatingApi = {
   /* library */
-  catalogue: (params: string) => api.get<Paginated<CatalogueItem>>(`/api/v1/estimating/catalogue?${params}`),
-  catalogueItem: (id: string) => api.get<CatalogueDetail>(`/api/v1/estimating/catalogue/${id}`),
   createCatalogue: (body: unknown) => api.post<CatalogueItem>("/api/v1/estimating/catalogue", body),
   patchCatalogue: (id: string, body: unknown) =>
     api.patch<CatalogueItem>(`/api/v1/estimating/catalogue/${id}`, body),
   retireCatalogue: (id: string) => api.del<{ id: string }>(`/api/v1/estimating/catalogue/${id}`),
-  assemblies: (params: string) => api.get<Paginated<Assembly>>(`/api/v1/estimating/assemblies?${params}`),
-  assembly: (id: string) => api.get<AssemblyDetail>(`/api/v1/estimating/assemblies/${id}`),
+  bulkCatalogue: (body: unknown) =>
+    api.post<{ created: number; updated: number; skipped: Array<{ code: string; reason: string }> }>(
+      "/api/v1/estimating/catalogue/bulk",
+      body,
+    ),
   createAssembly: (body: unknown) => api.post<AssemblyDetail>("/api/v1/estimating/assemblies", body),
+  patchAssembly: (id: string, body: unknown) =>
+    api.patch<Assembly>(`/api/v1/estimating/assemblies/${id}`, body),
+  retireAssembly: (id: string) => api.del<{ id: string }>(`/api/v1/estimating/assemblies/${id}`),
   setComponents: (id: string, body: unknown) =>
     api.put<AssemblyDetail>(`/api/v1/estimating/assemblies/${id}/components`, body),
   refreshAssembly: (id: string) =>
     api.post<AssemblyDetail>(`/api/v1/estimating/assemblies/${id}/refresh-rates`, {}),
-  crews: (params: string) => api.get<Paginated<Crew>>(`/api/v1/estimating/crews?${params}`),
   createCrew: (body: unknown) => api.post<Crew>("/api/v1/estimating/crews", body),
   patchCrew: (id: string, body: unknown) => api.patch<Crew>(`/api/v1/estimating/crews/${id}`, body),
-  productionRates: (params: string) =>
-    api.get<Paginated<ProductionRate>>(`/api/v1/estimating/production-rates?${params}`),
+  retireCrew: (id: string) => api.del<{ id: string; status: string }>(`/api/v1/estimating/crews/${id}`),
   createProductionRate: (body: unknown) =>
     api.post<ProductionRate>("/api/v1/estimating/production-rates", body),
+  patchProductionRate: (id: string, body: unknown) =>
+    api.patch<ProductionRate>(`/api/v1/estimating/production-rates/${id}`, body),
+  retireProductionRate: (id: string) =>
+    api.del<{ id: string; status: string }>(`/api/v1/estimating/production-rates/${id}`),
 
   /* estimates */
   createEstimate: (projectId: string, body: unknown) =>
     api.post<EstimateDetail>(`${p(projectId)}/estimates`, body),
-  estimate: (projectId: string, id: string) =>
-    api.get<EstimateDetail>(`${p(projectId)}/estimates/${id}`),
   patchEstimate: (projectId: string, id: string, body: unknown) =>
     api.patch<EstimateDetail>(`${p(projectId)}/estimates/${id}`, body),
   voidEstimate: (projectId: string, id: string) =>
@@ -943,14 +1008,17 @@ export const estimatingApi = {
     api.post<EstimateDetail>(`${p(projectId)}/estimates/${id}/recalculate`, {}),
   newVersion: (projectId: string, id: string, body: unknown) =>
     api.post<EstimateDetail>(`${p(projectId)}/estimates/${id}/versions`, body),
-  compare: (projectId: string, id: string, against: string) =>
-    api.get<Comparison>(`${p(projectId)}/estimates/${id}/compare?against=${against}`),
   createSection: (projectId: string, id: string, body: unknown) =>
     api.post<EstimateSection>(`${p(projectId)}/estimates/${id}/sections`, body),
   deleteSection: (projectId: string, id: string, sectionId: string) =>
     api.del<{ id: string }>(`${p(projectId)}/estimates/${id}/sections/${sectionId}`),
   createLine: (projectId: string, id: string, body: unknown) =>
     api.post<LineWriteResult>(`${p(projectId)}/estimates/${id}/lines`, body),
+  createLinesBulk: (projectId: string, id: string, body: unknown) =>
+    api.post<{ created: number; ids: string[]; estimateTotals: { total: number } }>(
+      `${p(projectId)}/estimates/${id}/lines/bulk`,
+      body,
+    ),
   patchLine: (projectId: string, id: string, lineId: string, body: unknown) =>
     api.patch<LineWriteResult>(`${p(projectId)}/estimates/${id}/lines/${lineId}`, body),
   deleteLine: (projectId: string, id: string, lineId: string) =>
@@ -978,6 +1046,31 @@ export const estimatingApi = {
     ),
   createProposal: (projectId: string, id: string, body: unknown) =>
     api.post<Proposal>(`${p(projectId)}/estimates/${id}/proposals`, body),
+  proposalPreview: (
+    projectId: string,
+    id: string,
+    query: { title?: string; clientName?: string | null; detailLevel?: string; validUntil?: string },
+  ) => {
+    const params = new URLSearchParams();
+    if (query.title) params.set("title", query.title);
+    if (query.clientName) params.set("clientName", query.clientName);
+    if (query.detailLevel) params.set("detailLevel", query.detailLevel);
+    if (query.validUntil) params.set("validUntil", query.validUntil);
+    return api.get<ProposalDocument>(
+      `${p(projectId)}/estimates/${id}/proposal-preview?${params.toString()}`,
+    );
+  },
+  pushToChangeEvent: (projectId: string, id: string, body: unknown) =>
+    api.post<{
+      changeEventId: string;
+      changeEventReference: string;
+      pushed: number;
+      currency: string;
+      field: string;
+      warnings: string[];
+    }>(`${p(projectId)}/estimates/${id}/push-to-change-event`, body),
+  exportCsv: (projectId: string, id: string, reference: string) =>
+    downloadAuthed(`${p(projectId)}/estimates/${id}/export.csv`, `${reference}.csv`),
 
   /* takeoff */
   createLayer: (projectId: string, body: unknown) =>
@@ -1008,8 +1101,6 @@ export const estimatingApi = {
     api.post<SubQuoteDetail>(`${p(projectId)}/estimating/sub-quotes`, body),
   patchQuote: (projectId: string, id: string, body: unknown) =>
     api.patch<SubQuoteDetail>(`${p(projectId)}/estimating/sub-quotes/${id}`, body),
-  quote: (projectId: string, id: string) =>
-    api.get<SubQuoteDetail>(`${p(projectId)}/estimating/sub-quotes/${id}`),
   setQuoteLines: (projectId: string, id: string, body: unknown) =>
     api.put<SubQuoteDetail>(`${p(projectId)}/estimating/sub-quotes/${id}/lines`, body),
   acceptQuote: (projectId: string, id: string, body: unknown) =>
@@ -1017,6 +1108,8 @@ export const estimatingApi = {
       `${p(projectId)}/estimating/sub-quotes/${id}/accept`,
       body,
     ),
+  quoteStatus: (projectId: string, id: string, body: unknown) =>
+    api.post<SubQuoteDetail>(`${p(projectId)}/estimating/sub-quotes/${id}/status`, body),
   withdrawQuote: (projectId: string, id: string) =>
     api.del<{ id: string }>(`${p(projectId)}/estimating/sub-quotes/${id}`),
   importBid: (projectId: string, body: unknown) =>
@@ -1025,6 +1118,8 @@ export const estimatingApi = {
   /* proposals */
   proposalStatus: (projectId: string, id: string, body: unknown) =>
     api.post<Proposal>(`${p(projectId)}/estimating/proposals/${id}/status`, body),
+  openProposalHtml: (projectId: string, id: string) =>
+    openAuthed(`${p(projectId)}/estimating/proposals/${id}/html`),
 
   /* sweeps */
   sweep: (projectId: string) => api.post<SweepResult>(`${p(projectId)}/estimating/sweep`, {}),

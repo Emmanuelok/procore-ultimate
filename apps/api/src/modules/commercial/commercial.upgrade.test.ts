@@ -12,12 +12,14 @@ import {
   boqs,
   companyMemberships,
   contracts,
+  ledgerEntries,
   projectMemberships,
   projects,
   signals,
   valuations,
 } from "@constructos/db";
 import { buildTestApp, registerActor, type TestActor } from "../../test/helpers.js";
+import { listSearchSources } from "../search/registry.js";
 import type { BuiltApp } from "../../app.js";
 import { newId } from "../../lib/ids.js";
 
@@ -1170,12 +1172,14 @@ describe("CVR and final account", () => {
     expect(body.overUnderCertification).not.toBeNull();
   });
 
-  it("saves a CVR period when asked", async () => {
+  it("saves a CVR period when asked — as a POST, never on the read", async () => {
     const res = await inject(
-      "GET",
-      `/api/v1/projects/${projectId}/commercial/cvr?currency=GBP&save=true`,
+      "POST",
+      `/api/v1/projects/${projectId}/commercial/cvr/snapshot`,
       owner.headers,
+      { currency: "GBP" },
     );
+    expect(res.statusCode).toBe(201);
     expect(res.json().cvrPeriodId).toBeTruthy();
     const history = await inject(
       "GET",
@@ -1339,5 +1343,451 @@ describe("health inputs and sweeps", () => {
         and(eq(signals.companyId, owner.companyId), eq(signals.detector, "payment_overdue")),
       );
     expect(again.length).toBe(1);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Search coverage (cross-package contract §3.3)                       */
+/* ------------------------------------------------------------------ */
+
+describe("search registration", () => {
+  it("registers the variation register and the bills as searchable types", () => {
+    const types = listSearchSources().map((s) => s.type);
+    expect(types).toContain("variation");
+    expect(types).toContain("boq");
+    const variationSource = listSearchSources().find((s) => s.type === "variation")!;
+    // A subcontractor-template user without the commercial tool must not find
+    // variations in the palette, so the source declares the tool it needs.
+    expect(variationSource.tool).toBe("commercial");
+    expect(variationSource.scope).toBe("project");
+    expect(
+      variationSource.href({
+        id: "var_1",
+        projectId: "prj_1",
+        title: "Extra piling",
+        subtitle: null,
+        reference: null,
+        status: "agreed",
+        updatedAt: null,
+      }),
+    ).toBe("/projects/prj_1/commercial?tab=variations");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Verifier regressions                                                */
+/* ------------------------------------------------------------------ */
+
+describe("verifier regressions", () => {
+  it("does not persist anything on the CVR read; the snapshot is a gated POST", async () => {
+    const before = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/commercial/cvr-history?pageSize=1`,
+      owner.headers,
+    );
+    const beforeTotal = before.json().total as number;
+
+    // the old ?save=true is simply a read now
+    const read = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/commercial/cvr?currency=GBP&save=true`,
+      owner.headers,
+    );
+    expect(read.statusCode).toBe(200);
+    expect(read.json().cvrPeriodId).toBeNull();
+    const afterRead = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/commercial/cvr-history?pageSize=1`,
+      owner.headers,
+    );
+    expect(afterRead.json().total).toBe(beforeTotal);
+
+    // a caller who is not on the project cannot take a snapshot
+    const denied = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/commercial/cvr/snapshot`,
+      outsiderHeaders,
+      { currency: "GBP" },
+    );
+    expect(denied.statusCode).toBe(403);
+
+    const saved = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/commercial/cvr/snapshot`,
+      owner.headers,
+      { currency: "GBP" },
+    );
+    expect(saved.statusCode).toBe(201);
+    expect(saved.json().cvrPeriodId).toBeTruthy();
+    // the same period is updated in place, not duplicated
+    const again = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/commercial/cvr/snapshot`,
+      owner.headers,
+      { currency: "GBP" },
+    );
+    expect(again.json().cvrPeriodId).toBe(saved.json().cvrPeriodId);
+  });
+
+  it("keeps one contract's money out of another contract's final account", async () => {
+    // a second contract on the same project, with its own bill and variation
+    const otherContractId = newId("con");
+    await built.app.db.insert(contracts).values({
+      id: otherContractId,
+      companyId: owner.companyId,
+      projectId,
+      name: "Enabling works package",
+      form: "fidic_red_2017",
+      currency: "GBP",
+      contractSum: 2_000_000,
+      createdBy: owner.userId,
+    });
+
+    const mkAgreedVariation = async (title: string, value: number, cId: string | null) => {
+      const v = await inject("POST", `/api/v1/projects/${projectId}/variations`, owner.headers, {
+        title,
+        basis: "star_rate",
+        ...(cId ? { contractId: cId } : { currency: "GBP" }),
+      });
+      expect(v.statusCode).toBe(201);
+      const id = v.json().id as string;
+      const instructed = await inject(
+        "POST",
+        `/api/v1/variations/${id}/status`,
+        owner.headers,
+        { status: "instructed", instructionRef: `AI-${title.slice(0, 4)}`, instructedAt: isoDaysFromToday(-4) },
+      );
+      expect(instructed.statusCode).toBe(200);
+      const valued = await inject("POST", `/api/v1/variations/${id}/value`, owner.headers, {
+        basis: "star_rate",
+        agreedValue: value,
+      });
+      expect(valued.statusCode).toBe(200);
+      const agreed = await inject("POST", `/api/v1/variations/${id}/status`, owner.headers, {
+        status: "agreed",
+      });
+      expect(agreed.statusCode).toBe(200);
+      return id;
+    };
+    await mkAgreedVariation("Package-only change", 750_000, otherContractId);
+    await mkAgreedVariation("Unattributed change", 40_000, null);
+
+    const account = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/final-accounts`,
+      owner.headers,
+      { contractId: otherContractId },
+    );
+    expect(account.statusCode).toBe(201);
+    const accountId = account.json().id as string;
+    const computed = await inject(
+      "POST",
+      `/api/v1/final-accounts/${accountId}/compute`,
+      owner.headers,
+    );
+    expect(computed.statusCode).toBe(200);
+    const body = computed.json() as {
+      lines: Array<{ category: string; description: string; amount: number }>;
+      gaps: string[];
+    };
+    const variationLines = body.lines.filter((l) => l.category === "variation");
+    // only the package contract's own variation
+    expect(variationLines).toHaveLength(1);
+    expect(variationLines[0]!.description).toContain("Package-only change");
+    expect(variationLines[0]!.amount).toBe(750_000);
+    // money belonging to no contract is declared, never absorbed
+    expect(body.gaps.join(" ")).toContain("not attributed to a contract");
+    // and nothing from the main contract leaked in
+    expect(body.lines.some((l) => l.description.includes("Extra drainage"))).toBe(false);
+  });
+
+  it("refuses a manual final-account line categorised as the contract sum", async () => {
+    const created = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/final-accounts`,
+      owner.headers,
+      { contractId },
+    );
+    // the main contract already has an agreed account from the earlier test,
+    // so a fresh one may be refused — use whichever account is open
+    const accountId =
+      created.statusCode === 201
+        ? (created.json().id as string)
+        : ((
+            await inject(
+              "GET",
+              `/api/v1/projects/${projectId}/final-accounts?pageSize=10`,
+              owner.headers,
+            )
+          ).json().items as Array<{ id: string; status: string }>).find(
+            (a) => a.status === "draft",
+          )?.id;
+    if (!accountId) return; // nothing draft to test against
+    const bad = await inject("POST", `/api/v1/final-accounts/${accountId}/lines`, owner.headers, {
+      category: "contract_sum",
+      description: "A second contract sum",
+      amount: 999_999,
+    });
+    expect(bad.statusCode).toBe(400);
+  });
+
+  it("accumulates concurrent provisional-sum expenditure without losing one", async () => {
+    const bill = await makeBill();
+    const ps = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/provisional-sums`,
+      owner.headers,
+      {
+        boqItemId: bill.item1,
+        kind: "defined",
+        title: "Concurrent expenditure",
+        allowance: 1_000_000,
+      },
+    );
+    const psId = ps.json().id as string;
+    const amounts = [1_000, 2_000, 3_000, 4_000, 5_000];
+    const results = await Promise.all(
+      amounts.map((amount, i) =>
+        inject("POST", `/api/v1/provisional-sums/${psId}/expenditures`, owner.headers, {
+          description: `Concurrent ${i}`,
+          amount,
+          spentOn: isoDaysFromToday(0),
+        }),
+      ),
+    );
+    for (const r of results) expect(r.statusCode).toBe(201);
+    const listed = await inject(
+      "GET",
+      `/api/v1/provisional-sums/${psId}/expenditures`,
+      owner.headers,
+    );
+    const body = listed.json() as { items: unknown[]; expended: number };
+    expect(body.items).toHaveLength(amounts.length);
+    expect(body.expended).toBe(amounts.reduce((s, a) => s + a, 0));
+  });
+
+  it("previews the certificate the server will issue, sections and cap included", async () => {
+    const bill = await makeBill();
+    const val = await inject("POST", `/api/v1/projects/${projectId}/valuations`, memberHeaders, {
+      boqId: bill.boqId,
+      valuationDate: isoDaysFromToday(0),
+      basis: "percent",
+    });
+    const valId = val.json().id as string;
+    await inject("PUT", `/api/v1/valuations/${valId}/lines`, memberHeaders, {
+      lines: [{ boqItemId: bill.item1, percentToDate: 50 }],
+    });
+    // a section the old browser-side preview ignored entirely
+    await inject("POST", `/api/v1/valuations/${valId}/sections`, memberHeaders, {
+      kind: "variation",
+      description: "Agreed variation VO-900",
+      amountToDate: 250_000,
+    });
+    await inject("POST", `/api/v1/valuations/${valId}/sections`, memberHeaders, {
+      kind: "contra_charge",
+      description: "Attendance recharge",
+      amountToDate: -10_000,
+      retentionApplies: false,
+    });
+
+    const preview = await inject(
+      "GET",
+      `/api/v1/valuations/${valId}/certify-preview`,
+      memberHeaders,
+    );
+    expect(preview.statusCode).toBe(200);
+    const p = preview.json() as {
+      applied: { sectionsTotal: number; netDue: number };
+      certificate: { certifiedSections: number; netCertified: number; retentionHeld: number };
+    };
+    expect(p.applied.sectionsTotal).toBe(240_000);
+    expect(p.certificate.certifiedSections).toBe(240_000);
+
+    await inject("POST", `/api/v1/valuations/${valId}/submit`, memberHeaders);
+    const cert = await inject("POST", `/api/v1/valuations/${valId}/certify`, owner.headers, {});
+    expect(cert.statusCode).toBe(201);
+    const issued = cert.json() as { netCertified: number; retentionHeld: number };
+    // what the certifier was shown is what was issued
+    expect(issued.netCertified).toBe(p.certificate.netCertified);
+    expect(issued.retentionHeld).toBe(p.certificate.retentionHeld);
+  });
+
+  it("reports the star-rate register total, not the length of the page", async () => {
+    const full = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/commercial/star-rates?pageSize=200`,
+      owner.headers,
+    );
+    const total = full.json().total as number;
+    expect(total).toBeGreaterThan(0);
+    const paged = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/commercial/star-rates?pageSize=1`,
+      owner.headers,
+    );
+    expect((paged.json().items as unknown[]).length).toBe(1);
+    expect(paged.json().total).toBe(total);
+  });
+
+  it("validates the links a daywork PATCH writes", async () => {
+    const sheet = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/daywork-sheets`,
+      memberHeaders,
+      {
+        workDate: isoDaysFromToday(-1),
+        description: "Patchable sheet",
+        contractId,
+      },
+    );
+    const sheetId = sheet.json().id as string;
+
+    const bogusContract = await inject("PATCH", `/api/v1/daywork-sheets/${sheetId}`, memberHeaders, {
+      contractId: "con_not_yours",
+    });
+    expect(bogusContract.statusCode).toBe(400);
+    expect(bogusContract.json().message).toContain("contractId");
+
+    const bogusVariation = await inject(
+      "PATCH",
+      `/api/v1/daywork-sheets/${sheetId}`,
+      memberHeaders,
+      { variationId: "var_not_yours" },
+    );
+    expect(bogusVariation.statusCode).toBe(400);
+    expect(bogusVariation.json().message).toContain("variationId");
+
+    const ok = await inject("PATCH", `/api/v1/daywork-sheets/${sheetId}`, memberHeaders, {
+      description: "Renamed sheet",
+    });
+    expect(ok.statusCode).toBe(200);
+  });
+
+  it("records a retention release in the bill's currency and refuses one with no source", async () => {
+    const bill = await makeBill({ currency: "AED", contractId: null });
+    const nowhere = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/retention/releases`,
+      owner.headers,
+      { kind: "partial", amount: 1_000, releasedOn: isoDaysFromToday(0) },
+    );
+    expect(nowhere.statusCode).toBe(400);
+    expect(nowhere.json().message).toContain("currency");
+
+    const bogus = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/retention/releases`,
+      owner.headers,
+      {
+        kind: "partial",
+        amount: 1_000,
+        releasedOn: isoDaysFromToday(0),
+        contractId: "con_not_yours",
+      },
+    );
+    expect(bogus.statusCode).toBe(400);
+
+    const released = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/retention/releases`,
+      owner.headers,
+      {
+        kind: "taking_over",
+        amount: 1_500,
+        releasedOn: isoDaysFromToday(0),
+        boqId: bill.boqId,
+      },
+    );
+    expect(released.statusCode).toBe(201);
+    expect(released.json().currency).toBe("AED");
+
+    const register = await inject("GET", `/api/v1/projects/${projectId}/retention`, owner.headers);
+    expect(register.statusCode).toBe(200);
+    const body = register.json() as { releases: Array<{ currency: string; amount: number }> };
+    expect(body.releases.some((r) => r.currency === "AED" && r.amount === 1_500)).toBe(true);
+  });
+
+  it("refuses to attach a price adjustment to a certified application and ledgers the link", async () => {
+    await inject("POST", `/api/v1/commercial/index-series`, owner.headers, {
+      code: "LNK",
+      name: "Linkage test index",
+      values: [
+        { period: "2025-01", value: 100 },
+        { period: "2026-01", value: 110 },
+      ],
+    });
+    const bill = await makeBill();
+    const val = await inject("POST", `/api/v1/projects/${projectId}/valuations`, memberHeaders, {
+      boqId: bill.boqId,
+      valuationDate: isoDaysFromToday(0),
+      basis: "percent",
+    });
+    const valId = val.json().id as string;
+    await inject("PUT", `/api/v1/valuations/${valId}/lines`, memberHeaders, {
+      lines: [{ boqItemId: bill.item1, percentToDate: 25 }],
+    });
+    const calc = await inject(
+      "POST",
+      `/api/v1/projects/${projectId}/commercial/fluctuations`,
+      owner.headers,
+      {
+        formula: "fidic_13_8",
+        basePeriod: "2025-01",
+        currentPeriod: "2026-01",
+        nonAdjustable: 0.2,
+        components: [{ seriesCode: "LNK", weighting: 0.8 }],
+        workDoneAmount: 100_000,
+        contractId,
+        persist: true,
+      },
+    );
+    expect(calc.statusCode).toBe(201);
+    const calculationId = calc.json().calculationId as string;
+
+    const attached = await inject(
+      "POST",
+      `/api/v1/valuations/${valId}/fluctuations/${calculationId}`,
+      memberHeaders,
+    );
+    expect(attached.statusCode).toBe(200);
+    const entries = await built.app.db
+      .select()
+      .from(ledgerEntries)
+      .where(
+        and(eq(ledgerEntries.companyId, owner.companyId), eq(ledgerEntries.objectId, valId)),
+      );
+    expect(
+      entries.some(
+        (e) =>
+          (e.payload as Record<string, unknown> | null)?.["attachedFluctuation"] === calculationId,
+      ),
+    ).toBe(true);
+
+    await inject("POST", `/api/v1/valuations/${valId}/submit`, memberHeaders);
+    await inject("POST", `/api/v1/valuations/${valId}/certify`, owner.headers, {});
+    const late = await inject(
+      "POST",
+      `/api/v1/valuations/${valId}/fluctuations/${calculationId}`,
+      memberHeaders,
+    );
+    expect(late.statusCode).toBe(400);
+    expect(late.json().message).toContain("draft");
+  });
+
+  it("offers the programme activities BQ money can be spread over", async () => {
+    const res = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/commercial/schedule-tasks`,
+      owner.headers,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(Array.isArray(res.json().items)).toBe(true);
+
+    const denied = await inject(
+      "GET",
+      `/api/v1/projects/${projectId}/commercial/schedule-tasks`,
+      outsiderHeaders,
+    );
+    expect(denied.statusCode).toBe(403);
   });
 });

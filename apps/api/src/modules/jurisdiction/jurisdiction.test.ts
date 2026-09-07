@@ -582,10 +582,26 @@ describe("permits", () => {
 });
 
 /* ------------------------------------------------------------------ */
-/* Permit sweeps (lazy, idempotent)                                    */
+/* Permit detectors (scheduled, advisory-locked, fingerprinted)         */
 /* ------------------------------------------------------------------ */
 
-describe("permit sweeps", () => {
+/**
+ * These findings used to be raised as a side effect of the permit list read,
+ * which duplicated them whenever the workspace loaded its two panels in
+ * parallel. They are now a scheduled job; a test triggers a cycle explicitly.
+ */
+async function runJurisdictionCycle(pid: string): Promise<void> {
+  const res = await app.inject({
+    method: "POST",
+    url: `/api/v1/projects/${pid}/jurisdiction/detectors/run`,
+    headers: owner.headers,
+  });
+  if (res.statusCode !== 200) {
+    throw new Error(`detector run failed: ${res.statusCode} ${res.body}`);
+  }
+}
+
+describe("permit detectors", () => {
   it("breaches the obligation and signals once when a determination runs late", async () => {
     const pid = await makeProject("Sweep Determination");
     const created = await createPermit(pid, {
@@ -596,18 +612,22 @@ describe("permit sweeps", () => {
 
     const first = await listPermits(pid);
     expect(first.statusCode).toBe(200);
+    // the READ reports the fact without writing anything
     expect(first.json().items[0].overdue).toBe(true);
     expect(first.json().items[0].daysToDue).toBeLessThan(0);
+    expect(await signalsFor(pid, "permit_determination_overdue")).toHaveLength(0);
 
+    await runJurisdictionCycle(pid);
     const [obl] = await app.db.select().from(obligations).where(eq(obligations.id, obligationId));
     expect(obl?.status).toBe("breached");
     let sigs = await signalsFor(pid, "permit_determination_overdue");
     expect(sigs).toHaveLength(1);
     expect(sigs[0]?.severity).toBe("medium");
 
-    // idempotent: re-reading the list does not re-raise
+    // idempotent: neither re-reading nor re-running re-raises
     await listPermits(pid);
     await listPermits(pid, "?overdue=true");
+    await runJurisdictionCycle(pid);
     sigs = await signalsFor(pid, "permit_determination_overdue");
     expect(sigs).toHaveLength(1);
 
@@ -617,8 +637,12 @@ describe("permit sweeps", () => {
 
   it("expires a lapsed grant and signals once", async () => {
     const pid = await makeProject("Sweep Expiry");
-    const created = await createPermit(pid, {});
+    // a permit that was never applied for cannot be granted: the state
+    // machine refuses not_started -> granted, because a grant with no
+    // application is a consent nobody asked for
+    const created = await createPermit(pid, { appliedAt: addDaysISO(todayISO(), -220) });
     const permitId = created.json().id as string;
+    expect(created.json().status).toBe("applied");
     await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/permits/${permitId}/status`,
@@ -630,6 +654,11 @@ describe("permit sweeps", () => {
       },
     });
 
+    const beforeCycle = await listPermits(pid);
+    expect(beforeCycle.json().items[0].status).toBe("granted");
+    expect(await signalsFor(pid, "permit_expired")).toHaveLength(0);
+
+    await runJurisdictionCycle(pid);
     const first = await listPermits(pid);
     expect(first.json().items[0].status).toBe("expired");
     let sigs = await signalsFor(pid, "permit_expired");
@@ -637,6 +666,7 @@ describe("permit sweeps", () => {
     expect(sigs[0]?.severity).toBe("high");
 
     await listPermits(pid);
+    await runJurisdictionCycle(pid);
     sigs = await signalsFor(pid, "permit_expired");
     expect(sigs).toHaveLength(1);
   });
@@ -649,12 +679,30 @@ describe("permit sweeps", () => {
     const permitId = created.json().id as string;
 
     await listPermits(pid);
+    expect(await signalsFor(pid, "permit_blocks_programme")).toHaveLength(0);
+
+    /*
+     * The consent-to-programme finding is raised by the LAND detector now:
+     * parcels and permits are one dependency set, because a task blocked by
+     * both is not two separate risks to a programme director.
+     */
+    const landCycle = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/land/detectors/run`,
+      headers: owner.headers,
+    });
+    expect(landCycle.statusCode).toBe(200);
     let sigs = await signalsFor(pid, "permit_blocks_programme");
     expect(sigs).toHaveLength(1);
     expect(sigs[0]?.severity).toBe("high");
-    expect(sigs[0]?.title).toMatch(/10 days/);
+    expect(sigs[0]?.title).toContain("Carriageway excavation");
 
     await listPermits(pid);
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/land/detectors/run`,
+      headers: owner.headers,
+    });
     sigs = await signalsFor(pid, "permit_blocks_programme");
     expect(sigs).toHaveLength(1);
 
@@ -679,6 +727,52 @@ describe("permit sweeps", () => {
       headers: owner.headers,
     });
     expect(wide.json().total).toBe(2);
+  });
+
+  /*
+   * The permits workspace and the land workspace look at the same programme.
+   * If each computed its own delay arithmetic they would disagree the moment
+   * a permit and a parcel blocked one task, so the permit view is quantified
+   * by the SHARED consent engine — same expected-resolution estimate, same
+   * days-at-risk, same stated basis.
+   */
+  it("quantifies blocked permit links with the shared consent engine", async () => {
+    const pid = await makeProject("Permit consent quantification");
+    const soon = await makeTask(pid, "Piling", addDaysISO(todayISO(), 5));
+    await createPermit(pid, { blockingTaskIds: [soon] });
+
+    const risk = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/permits/schedule-risk?days=60`,
+      headers: owner.headers,
+    });
+    expect(risk.statusCode).toBe(200);
+    const item = risk.json().items[0] as {
+      blocked: boolean;
+      daysAtRisk: number | null;
+      expectedResolutionDate: string | null;
+      estimateSource: string | null;
+      startedUnconsented: boolean;
+    };
+    expect(item.blocked).toBe(true);
+    // no determination history on a fresh company, so the engine says so
+    // rather than pretending to an observed median
+    expect(item.estimateSource).toBe("default");
+    expect(item.daysAtRisk).toBeGreaterThan(0);
+    expect(item.expectedResolutionDate).not.toBeNull();
+    expect(item.startedUnconsented).toBe(false);
+
+    // and the land workspace's unified view answers with the same number
+    const land = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/land/schedule-risk?days=60`,
+      headers: owner.headers,
+    });
+    expect(land.statusCode).toBe(200);
+    const landItem = (
+      land.json().items as { kind: string; taskId: string; daysAtRisk: number }[]
+    ).find((i) => i.kind === "permit" && i.taskId === soon);
+    expect(landItem?.daysAtRisk).toBe(item.daysAtRisk);
   });
 });
 
@@ -724,6 +818,12 @@ describe("local content", () => {
     expect(short.statusCode).toBe(201);
     expect(short.json().compliant).toBe(0);
     expect(short.json().gap).toBe(7);
+    // recording a reading does not raise a finding — the detector does, as
+    // the system actor, so whoever keyed the number is not the ledger actor
+    // for an integrity finding about it
+    expect(await signalsFor(pid, "local_content_shortfall")).toHaveLength(0);
+
+    await runJurisdictionCycle(pid);
     const sigs = await signalsFor(pid, "local_content_shortfall");
     expect(sigs).toHaveLength(1);
     expect(sigs[0]?.severity).toBe("medium");
@@ -819,5 +919,35 @@ describe("tenant isolation", () => {
 
     const unauth = await app.inject({ method: "GET", url: "/api/v1/fx-rates" });
     expect(unauth.statusCode).toBe(401);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Company-wide search (contract §3.3)                                 */
+/* ------------------------------------------------------------------ */
+
+describe("search sources", () => {
+  it("finds permits from the company search", async () => {
+    const pid = await makeProject("Searchable permits");
+    const created = await createPermit(pid, {
+      title: "Riparian works licence",
+      authority: "Rivers Authority of Kibaale",
+    });
+    expect(created.statusCode).toBe(201);
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/search?q=${encodeURIComponent("riparian")}&limit=20`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      items: { type: string; id: string; href: string }[];
+      coverage: string[];
+    };
+    expect(body.coverage).toContain("permit");
+    const hit = body.items.find((i) => i.type === "permit");
+    expect(hit?.id).toBe(created.json().id);
+    expect(hit?.href).toBe(`/projects/${pid}/jurisdiction?tab=permits`);
   });
 });

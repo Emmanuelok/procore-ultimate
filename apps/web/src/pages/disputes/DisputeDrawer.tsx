@@ -21,12 +21,18 @@ import TimelineTab from "./TimelineTab";
 import SubmissionsTab from "./SubmissionsTab";
 import BundleBuilder from "./BundleBuilder";
 import SettlementTab from "./SettlementTab";
+import BoardTab from "./BoardTab";
+import CostsTab from "./CostsTab";
+import ProductionTab from "./ProductionTab";
 
 const TABS = [
   { key: "timeline", label: "Timeline" },
   { key: "submissions", label: "Submissions" },
   { key: "bundles", label: "Bundles" },
   { key: "settlement", label: "Settlement" },
+  { key: "board", label: "Board" },
+  { key: "production", label: "Production" },
+  { key: "costs", label: "Costs" },
 ];
 
 export default function DisputeDrawer({
@@ -150,6 +156,15 @@ export default function DisputeDrawer({
             ) : null}
             {tab === "settlement" ? (
               <SettlementTab projectId={projectId} dispute={dispute} onChanged={refresh} />
+            ) : null}
+            {tab === "board" ? (
+              <BoardTab projectId={projectId} dispute={dispute} onChanged={refresh} />
+            ) : null}
+            {tab === "production" ? (
+              <ProductionTab projectId={projectId} dispute={dispute} onChanged={refresh} />
+            ) : null}
+            {tab === "costs" ? (
+              <CostsTab projectId={projectId} dispute={dispute} onChanged={refresh} />
             ) : null}
           </>
         )}

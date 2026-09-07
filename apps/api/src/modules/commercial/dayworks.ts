@@ -149,16 +149,25 @@ export const dayworkRoutes: FastifyPluginAsync = async (app) => {
     });
   }
 
-  app.post("/projects/:projectId/daywork-sheets", { preHandler: standardGate }, async (req, reply) => {
-    const body = sheetCreateSchema.parse(req.body);
-    let currency = body.currency ?? null;
-    if (body.contractId) {
+  /**
+   * Resolve the contract / variation a sheet hangs off, and the currency they
+   * imply. Both the create and the PATCH route go through here: a link written
+   * without this check could name ANOTHER TENANT'S contract, and a variationId
+   * set to an arbitrary value silently removes the sheet's money from the
+   * final account (a sheet carried by a variation is not double-counted).
+   */
+  async function resolveSheetLinks(
+    req: { companyId?: string; projectId?: string },
+    link: { contractId?: string | null; variationId?: string | null; currency?: string | null },
+  ): Promise<string | null> {
+    let currency = link.currency ?? null;
+    if (link.contractId) {
       const c = await app.db
         .select({ id: contracts.id, currency: contracts.currency })
         .from(contracts)
         .where(
           and(
-            eq(contracts.id, body.contractId),
+            eq(contracts.id, link.contractId),
             eq(contracts.companyId, req.companyId!),
             eq(contracts.projectId, req.projectId!),
           ),
@@ -167,13 +176,13 @@ export const dayworkRoutes: FastifyPluginAsync = async (app) => {
       if (!c[0]) throw badRequest("contractId does not reference a contract on this project");
       currency = c[0].currency;
     }
-    if (body.variationId) {
+    if (link.variationId) {
       const v = await app.db
         .select({ id: variations.id, currency: variations.currency })
         .from(variations)
         .where(
           and(
-            eq(variations.id, body.variationId),
+            eq(variations.id, link.variationId),
             eq(variations.companyId, req.companyId!),
             eq(variations.projectId, req.projectId!),
           ),
@@ -182,6 +191,16 @@ export const dayworkRoutes: FastifyPluginAsync = async (app) => {
       if (!v[0]) throw badRequest("variationId does not reference a variation on this project");
       currency = currency ?? v[0].currency;
     }
+    return currency;
+  }
+
+  app.post("/projects/:projectId/daywork-sheets", { preHandler: standardGate }, async (req, reply) => {
+    const body = sheetCreateSchema.parse(req.body);
+    const currency = await resolveSheetLinks(req, {
+      contractId: body.contractId ?? null,
+      variationId: body.variationId ?? null,
+      currency: body.currency ?? null,
+    });
 
     const number = await nextRecordNumber(app.db, req.projectId!, "daywork_sheet");
     const id = newId("dws");
@@ -269,7 +288,34 @@ export const dayworkRoutes: FastifyPluginAsync = async (app) => {
     const sheet = await fetchSheet(sheetId, req.companyId!);
     await requireCommercialLevel(app, req, reply, sheet.projectId, "standard");
     if (sheet.status !== "draft") throw badRequest("Only a draft daywork sheet can be edited");
+    // The same validation POST performs — a PATCH used to write any string
+    // into contractId/variationId, including another tenant's contract id.
     const set: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+    if (body.contractId !== undefined || body.variationId !== undefined) {
+      const nextContractId =
+        body.contractId !== undefined ? body.contractId : sheet.contractId;
+      const nextVariationId =
+        body.variationId !== undefined ? body.variationId : sheet.variationId;
+      const currency = await resolveSheetLinks(req, {
+        contractId: nextContractId,
+        variationId: nextVariationId,
+        currency: null,
+      });
+      if (currency && currency !== sheet.currency) {
+        // Re-pointing a priced sheet at a differently-priced contract would
+        // silently restate its money; refuse rather than convert.
+        const priced = await app.db
+          .select({ n: count() })
+          .from(dayworkItems)
+          .where(eq(dayworkItems.sheetId, sheetId));
+        if (Number(priced[0]?.n ?? 0) > 0) {
+          throw badRequest(
+            `This sheet is priced in ${sheet.currency}; it cannot be moved to a ${currency} contract while it has items.`,
+          );
+        }
+        set["currency"] = currency;
+      }
+    }
     for (const [k, v] of Object.entries(body)) if (v !== undefined) set[k] = v;
     await app.db.transaction(async (tx) => {
       await tx.update(dayworkSheets).set(set).where(eq(dayworkSheets.id, sheetId));

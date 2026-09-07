@@ -1,11 +1,18 @@
 import { createHash } from "node:crypto";
-import type { FastifyPluginAsync } from "fastify";
-import { and, asc, count, desc, eq, gte, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
+import type { FastifyPluginAsync, FastifyRequest } from "fastify";
+import { and, asc, count, desc, eq, gte, inArray, isNotNull, isNull, lte, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
+  aiRuns,
+  assuranceGrants,
+  companies,
   files,
+  locations,
   nonConformanceReports,
   obligations,
+  permissionTemplates,
+  prequalificationSubmissions,
+  projectMemberships,
   projects,
   safetyCorrectiveActions,
   safetyIncidents,
@@ -17,6 +24,7 @@ import {
   safetyRiskSnapshots,
   safetySensorEvents,
   signals,
+  sitePermits,
   siteAccessRecords,
   timecards,
   toolboxTalkAttendees,
@@ -27,6 +35,13 @@ import {
 import {
   ACKNOWLEDGEMENT_METHODS,
   ACTION_EFFECTIVENESS_VERDICTS,
+  BUILTIN_PERMISSION_TEMPLATES,
+  meetsLevel,
+  resolveLevel,
+  type PermissionLevel,
+  type ToolPermissionMap,
+  DRUG_ALCOHOL_TEST_REASONS,
+  DRUG_ALCOHOL_TEST_RESULTS,
   BODY_PARTS,
   CHECKLIST_ITEM_TYPES,
   CORRECTIVE_ACTION_KINDS,
@@ -49,6 +64,7 @@ import {
   SAFETY_RECORD_KINDS_ALL,
   SAFETY_REGULATORY_FORMS,
   SAFETY_SENSOR_EVENT_KINDS,
+  SAFETY_REGULATORY_REPORT_STATUSES,
   SAFETY_SENSOR_SOURCES,
   SAFETY_SEVERITIES,
   SHIFTS,
@@ -118,8 +134,9 @@ import {
   type AssistContext,
   type AssistRecordRef,
 } from "./assist.js";
-import { aiEnabled, runAgent } from "../ai/service.js";
+import { aiDisabledError, aiEnabled, runAgent } from "../ai/service.js";
 import { forEachCompany } from "../../lib/scheduler.js";
+import { isExpired } from "../../lib/time.js";
 
 /* ------------------------------------------------------------------ */
 /* Vocabularies local to this module                                   */
@@ -139,6 +156,14 @@ const SAFETY_DETECTORS = [
 
 /** Obligations created here carry this prefix so they can be counted back. */
 const OBLIGATION_PREFIX = "safety";
+
+/**
+ * How many open reportable incidents the workspace header's statutory standing
+ * reads. The summary is the first call of every visit and it parses each row's
+ * stored determination, so it is bounded; the response discloses when the cap
+ * bit rather than silently under-counting a live duty.
+ */
+const STATUTORY_STANDING_LIMIT = 500;
 
 /** Programme record kinds whose expiry stops work rather than merely dating a file. */
 const CRITICAL_RECORD_KINDS = new Set(["permit_to_work", "competency_card", "temporary_works_design"]);
@@ -390,6 +415,13 @@ const notifyRegulatorSchema = z.object({
 const incidentCloseSchema = z.object({
   note: z.string().min(1).max(8000),
   lessonId: z.string().max(64).nullable().optional(),
+  /**
+   * The only way past a duty whose deadline cannot be established from the
+   * record (a row written before the rules engine, carrying a regime and no
+   * `reportDueAt`). It never opens a duty with a real, unmet clock — those are
+   * refused whatever is sent — and it is stored on the incident and ledgered.
+   */
+  statutoryOverrideReason: z.string().min(20).max(4000).optional(),
 });
 
 /* --- corrective actions --- */
@@ -634,6 +666,25 @@ const recordCreateSchema = z.object({
   regulatoryReference: z.string().max(500).nullable().optional(),
   categories: z.array(z.enum(SAFETY_CATEGORIES)).max(20).optional(),
   requiredAcknowledgementCount: z.number().int().min(0).max(10000).nullable().optional(),
+  /**
+   * A drug or alcohol test is a programme record with two facts an appeal
+   * turns on: WHY it was carried out and WHAT it found. They are validated
+   * rather than left to a free-form detail blob, because a test result whose
+   * reason nobody recorded is the one an employment tribunal discounts, and a
+   * "positive" with no confirmation stage recorded is the one that gets a
+   * dismissal overturned.
+   */
+  drugAlcoholResult: z.enum(DRUG_ALCOHOL_TEST_RESULTS).optional(),
+  drugAlcoholReason: z.enum(DRUG_ALCOHOL_TEST_REASONS).optional(),
+  /**
+   * The live permit-to-work this document belongs to (`site_permits`, owned by
+   * the site-operations module). A safety programme record is the DOCUMENT — a
+   * hot-work permit form, a confined-space RAMS; the site permit is the live
+   * authorisation with entries, exits and an exclusion zone. They are two
+   * different objects and the register that binds them is the one an inspector
+   * follows: "show me the document this permit was issued against".
+   */
+  sitePermitId: z.string().max(64).nullable().optional(),
   detail: z.record(z.string(), z.unknown()).optional(),
 });
 
@@ -831,15 +882,82 @@ const PRIORITY_TO_SIGNAL_SEVERITY: Record<string, string> = {
  * dashboard, as a missed clause-notice. A missed deadline, an overdue
  * corrective action, an overdue statutory re-inspection, an expired permit
  * and an uninvestigated incident are **Signals** raised by an idempotent lazy
- * sweep on list and detail reads: never a cron, because the read is the
- * moment the answer has to be true, and `evidenceRefs.key` is what stops the
- * same finding being raised twice.
+ * sweep on list reads AND by scheduled jobs, and `evidenceRefs.key` is what
+ * stops the same finding being raised twice.
  *
  * The one thing it does build is `reportability.ts` — a code-resident,
  * unit-tested rules file for RIDDOR 2013 and 29 CFR Part 1904, each rule
  * carrying its citation, its clock start and its deadline, and each capable
  * of returning "I cannot tell you" rather than a guess. That file is the
  * module. Everything else is a register around it.
+ *
+ * ---------------------------------------------------------------------------
+ * PLATFORM UPGRADE WAVE — what this file gained, and the defects it removed
+ *
+ * ONE DUTY PER REGIME (`notifications.ts`). An incident can be answerable to
+ * two authorities at once, on two clocks, on two forms. The register used to
+ * carry a single `regulator_notified_at`; filing the F2508 stamped it and the
+ * OSHA eight-hour duty stopped being tracked — the sweep skipped it, the
+ * drawer said "notified", and the incident could be closed with a live
+ * statutory duty undischarged. Every consumer now reads one shared
+ * per-regime state.
+ *
+ * ONE OBLIGATION, THREE WAYS BACK. The statutory deadline lives in the
+ * `obligations` register, so the safety screen and that register must never be
+ * able to disagree about whether a duty is live. A reassessment that finds
+ * nothing reportable WITHDRAWS the obligation (`waived`, ledgered, kept
+ * reachable); a reassessment that puts the incident back in scope REINSTATES
+ * the withdrawn one on the new deadline; and a reassessment that adds a duty
+ * to an incident whose obligation was already `satisfied` REOPENS it, because
+ * a second authority nobody has told is not a discharged duty. A `breached`
+ * obligation is never rewritten — a deadline that was missed stays missed.
+ *
+ * STATUTORY FORMS (`regulatory.ts`, spec #652). OSHA 300 / 300A / 301 and a
+ * RIDDOR F2508 prefill, generated from the determination, frozen, hashed and
+ * stored — because a 300A is an assertion made ON A DATE from records as they
+ * stood then, and a field the platform cannot establish is null with its
+ * reason beside it rather than a zero on a legal document.
+ *
+ * LEADING INDICATORS (`riskindex.ts`). A predictive index built only from
+ * things a site can change this week, withheld below 40% coverage rather than
+ * published thin; and an under-reporting read that states what would REFUTE
+ * each finding, because under-reporting is the one safety failure that makes
+ * every other number on the project look better.
+ *
+ * SUPPLIER RECORD (`scorecard.ts`, #646/#661/#1100). What a subcontractor's
+ * record on your sites shows, as against what their questionnaire says about
+ * themselves — with rates computed on the supplier's OWN hours or not at all.
+ *
+ * DEVICE ALARMS (#1070–1073). Wearables and lone-worker devices, kept
+ * deliberately OUT of the incident register: a man-down alarm is an
+ * accelerometer reading, and what this register owns is the response clock.
+ *
+ * THE ASSISTANT (`assist.ts`). A reader, not an investigator: it assembles
+ * the records around an incident and cites the id behind every suggestion,
+ * dropping any citation that was not in the prompt. Nothing it returns is
+ * written until a human accepts it, and acceptance is a separate ledgered act
+ * carrying the run id — which is CHECKED against `ai_runs` for this company
+ * and this incident, because provenance nobody can resolve is worse than no
+ * provenance at all. The assembly and the model are split across two routes:
+ * `GET .../assist/context` is deterministic and always answers, and `POST
+ * .../assist` refuses with 503 AiDisabled when no key is configured, exactly
+ * like every other AI endpoint on the platform.
+ *
+ * WHO MAY READ THE PROGRAMME. The register is company-scoped but most of what
+ * is in it belongs to a project — a RAMS, a permit, a named worker's drug and
+ * alcohol test result. `requireTool` cannot gate a route with no `:projectId`
+ * in its path, so those routes resolve the record's project and enforce the
+ * safety tool level on it (PLAN §6.3); the list filters to the projects the
+ * caller is on, and a record with no project (the policy, the training
+ * matrix) stays visible to the whole company.
+ *
+ * AND THE SWEEPS MOVED. They used to run on every list AND every detail read,
+ * each loading every signal the company had ever raised for a detector. They
+ * now run on list reads only, throttled per project, bounded to the project
+ * being swept — and the guarantee that they run at all belongs to the
+ * scheduler (`safety.sweeps`, `safety.risk-index`, `safety.under-reporting`),
+ * because a module whose product is "the statutory deadline passed and here
+ * is the record" cannot depend on a browser tab to notice the deadline.
  */
 export const safetyModule: FastifyPluginAsync = async (app) => {
   const readGate = [app.authenticate, app.requireCompany, app.requireTool("safety", "read")];
@@ -850,6 +968,12 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     app.authenticate,
     app.requireCompany,
     app.requireCompanyRole(["owner", "admin", "member"]),
+  ];
+  /** Writing a supplier's observed safety record onto their prequalification. */
+  const companyAdmin = [
+    app.authenticate,
+    app.requireCompany,
+    app.requireCompanyRole(["owner", "admin"]),
   ];
 
   /* ---------------------------------------------------------------- */
@@ -958,6 +1082,161 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       .limit(1);
     if (!rows[0]) throw notFound("Programme record not found");
     return rows[0];
+  }
+
+  /**
+   * Fetch one programme record from a COMPANY-scoped route and enforce the
+   * safety tool level on the project it belongs to.
+   *
+   * `/companies/current/safety/programme-records/:recordId` carries no
+   * `:projectId`, so `requireTool` cannot fire on it; company membership alone
+   * would let any member — a guest included — read a named worker's drug and
+   * alcohol test result, or approve a RAMS on a job they have never been on.
+   */
+  async function fetchRecordScoped(
+    recordId: string,
+    req: FastifyRequest,
+    level: PermissionLevel,
+  ) {
+    const row = await fetchRecord(recordId, req.companyId!);
+    if (row.projectId) {
+      await assertProjectSafetyLevel(row.projectId, req, level, `Record ${row.reference}`);
+    }
+    return row;
+  }
+
+  /**
+   * The projects a company-level read may aggregate over.
+   *
+   * A company-scoped route that rolls up project data must not show a member
+   * the projects they are not on: the safety record of a job somebody has no
+   * part in is not theirs to read, and a vendor scorecard is the most
+   * consequential roll-up here because it is what a bid evaluation relies on.
+   * Owners and admins see the whole company, which is what makes the roll-up
+   * useful to the people who act on it.
+   */
+  async function visibleProjectIds(
+    companyId: string,
+    userId: string,
+    role: string | null | undefined,
+    level: PermissionLevel = "read",
+  ): Promise<{ all: boolean; ids: string[] }> {
+    if (role === "owner" || role === "admin") return { all: true, ids: [] };
+    const nowMs = Date.now();
+    const [memberRows, grantRows, templateRows] = await Promise.all([
+      app.db
+        .select({
+          projectId: projectMemberships.projectId,
+          templateKey: projectMemberships.templateKey,
+          overrides: projectMemberships.overrides,
+        })
+        .from(projectMemberships)
+        .where(
+          and(eq(projectMemberships.companyId, companyId), eq(projectMemberships.userId, userId)),
+        ),
+      app.db
+        .select({ projectId: assuranceGrants.projectId, expiresAt: assuranceGrants.expiresAt })
+        .from(assuranceGrants)
+        .where(and(eq(assuranceGrants.companyId, companyId), eq(assuranceGrants.userId, userId))),
+      app.db
+        .select({ key: permissionTemplates.key, tools: permissionTemplates.tools })
+        .from(permissionTemplates)
+        .where(eq(permissionTemplates.companyId, companyId)),
+    ]);
+    const stored = new Map(templateRows.map((t) => [t.key, t.tools as ToolPermissionMap]));
+    const ids = new Set<string>();
+    for (const m of memberRows) {
+      if (meetsLevel(effectiveSafetyLevel(m.templateKey, m.overrides, stored), level)) {
+        ids.add(m.projectId);
+      }
+    }
+    /* An assurance grant widens what may be SEEN, never what may be done. A
+     * company-wide grant is the whole company. */
+    if (level === "read") {
+      for (const g of grantRows) {
+        if (isExpired(g.expiresAt, nowMs)) continue;
+        if (g.projectId === null) return { all: true, ids: [] };
+        ids.add(g.projectId);
+      }
+    }
+    return { all: false, ids: [...ids] };
+  }
+
+  /** The `safety` level one membership row confers, builtin merged underneath. */
+  function effectiveSafetyLevel(
+    templateKey: string,
+    overrides: unknown,
+    stored: Map<string, ToolPermissionMap>,
+  ): PermissionLevel {
+    const builtin = BUILTIN_PERMISSION_TEMPLATES.find((t) => t.key === templateKey)?.tools;
+    const merged: ToolPermissionMap | undefined = stored.has(templateKey)
+      ? { ...(builtin ?? {}), ...(stored.get(templateKey) ?? {}) }
+      : builtin;
+    return resolveLevel("safety", merged, overrides as ToolPermissionMap);
+  }
+
+  /**
+   * Enforce the safety tool level on ONE project from a company-scoped route.
+   *
+   * `requireTool` resolves the project from `:projectId` in the path, so it
+   * cannot gate `/companies/current/safety/programme-records/:recordId` — and
+   * bare company membership is not the right gate for a row that belongs to a
+   * project. A drug-and-alcohol test result names a worker and carries the
+   * result and the reason for testing; a RAMS is approved by whoever the
+   * project trusts to approve it. Neither is readable, let alone signable, by
+   * a guest who happens to be in the tenant.
+   */
+  async function assertProjectSafetyLevel(
+    projectId: string,
+    req: { companyId?: string; companyRole?: string | null; user?: { id: string } | null },
+    level: PermissionLevel,
+    what: string,
+  ): Promise<void> {
+    const role = req.companyRole;
+    if (role === "owner" || role === "admin") return;
+    const userId = req.user?.id;
+    if (!userId) throw forbidden("Company context not resolved");
+    const [memberRows, grantRows, templateRows] = await Promise.all([
+      app.db
+        .select({
+          templateKey: projectMemberships.templateKey,
+          overrides: projectMemberships.overrides,
+        })
+        .from(projectMemberships)
+        .where(
+          and(
+            eq(projectMemberships.projectId, projectId),
+            eq(projectMemberships.userId, userId),
+          ),
+        )
+        .limit(1),
+      level === "read"
+        ? app.db
+            .select({ projectId: assuranceGrants.projectId, expiresAt: assuranceGrants.expiresAt })
+            .from(assuranceGrants)
+            .where(
+              and(
+                eq(assuranceGrants.companyId, req.companyId!),
+                eq(assuranceGrants.userId, userId),
+                or(isNull(assuranceGrants.projectId), eq(assuranceGrants.projectId, projectId))!,
+              ),
+            )
+        : Promise.resolve([] as Array<{ projectId: string | null; expiresAt: string | null }>),
+      app.db
+        .select({ key: permissionTemplates.key, tools: permissionTemplates.tools })
+        .from(permissionTemplates)
+        .where(eq(permissionTemplates.companyId, req.companyId!)),
+    ]);
+    const stored = new Map(templateRows.map((t) => [t.key, t.tools as ToolPermissionMap]));
+    const m = memberRows[0];
+    if (m && meetsLevel(effectiveSafetyLevel(m.templateKey, m.overrides, stored), level)) return;
+    const nowMs = Date.now();
+    if (grantRows.some((g) => !isExpired(g.expiresAt, nowMs))) return;
+    throw forbidden(
+      `${what} belongs to a project you do not hold \`${level}\` access to \`safety\` on. ` +
+        `Company membership alone does not open a project's safety register: the programme carries ` +
+        `named workers' test results and the documents a site is measured against.`,
+    );
   }
 
   async function projectCountry(projectId: string, companyId: string): Promise<string | null> {
@@ -1082,10 +1361,114 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
         `${OBLIGATION_PREFIX} ${determination.governingRuleId ?? "statutory notification"} — ` +
         `${governing?.citation ?? "statutory reporting duty"}`;
       if (obligationId) {
-        await app.db
+        const touched = await app.db
           .update(obligations)
           .set({ deadline: due, trigger, sourceClause, warnDaysBefore: warnDays })
-          .where(and(eq(obligations.id, obligationId), eq(obligations.status, "open")));
+          .where(and(eq(obligations.id, obligationId), eq(obligations.status, "open")))
+          .returning({ id: obligations.id });
+        if (touched.length === 0) {
+          /* The duty was WITHDRAWN by an earlier reassessment (the else branch
+           * below) and the facts have now changed back — nine days off
+           * corrected to five and then corrected back to nine. Updating a
+           * waived row's deadline touches nothing, so without this the
+           * incident would be reportable, carry a live `reportDueAt`, and have
+           * NO open obligation: the statutory deadline would be missing from
+           * the register the rest of the platform reads while the safety
+           * screen showed it. A withdrawn duty that applies again is
+           * reinstated on the new deadline; a `satisfied` or `breached` one is
+           * left exactly as it is, because those record what actually happened
+           * to a duty that was answered or missed. */
+          const reinstated = await app.db
+            .update(obligations)
+            .set({ status: "open", deadline: due, trigger, sourceClause, warnDaysBefore: warnDays })
+            .where(and(eq(obligations.id, obligationId), eq(obligations.status, "waived")))
+            .returning({ id: obligations.id });
+          if (reinstated.length > 0) {
+            await appendLedger(app.db, {
+              companyId: row.companyId,
+              projectId: row.projectId,
+              actorId,
+              action: "state_change",
+              objectType: "obligation",
+              objectId: obligationId,
+              payload: {
+                act: "reinstate",
+                from: "waived",
+                to: "open",
+                source: "safety_incident",
+                incidentId: row.id,
+                reference: row.reference,
+                reason: "reportability_reassessed_reportable",
+                deadline: due,
+                ruleId: determination.governingRuleId,
+                regimes: determination.regimes,
+              },
+              storePayload: true,
+            });
+          } else {
+            /* Neither open nor waived: the duty was recorded SATISFIED when
+             * every regime then known had been notified, and the reassessment
+             * has just added one that has not been. A GB incident reported to
+             * the HSE and later reassessed under RIDDOR *and* OSHA owes an
+             * eight-hour notification nobody has made, while the obligations
+             * register still says the duty was answered — the same
+             * contradiction as a withdrawn duty that applies again, from the
+             * other end. It is reopened on the new deadline, and only when a
+             * duty really is undischarged.
+             *
+             * A `breached` obligation is left alone deliberately: a deadline
+             * that was missed stays missed, and reopening it would erase the
+             * breach. The safety register keeps naming the undischarged duty
+             * and the close gate keeps refusing on it. */
+            const state = notificationState({
+              determination,
+              storedRegimes: determination.regimes,
+              reportDueAt: due,
+              notifications: ((row.notifications ?? []) as unknown[]).filter(
+                (n): n is NotificationEntry => !!n && typeof n === "object",
+              ),
+              isReportable: determination.isReportable,
+              asOfISO: new Date().toISOString(),
+            });
+            if (!state.allDischarged) {
+              const reopened = await app.db
+                .update(obligations)
+                .set({
+                  status: "open",
+                  deadline: due,
+                  trigger,
+                  sourceClause,
+                  warnDaysBefore: warnDays,
+                })
+                .where(and(eq(obligations.id, obligationId), eq(obligations.status, "satisfied")))
+                .returning({ id: obligations.id });
+              if (reopened.length > 0) {
+                await appendLedger(app.db, {
+                  companyId: row.companyId,
+                  projectId: row.projectId,
+                  actorId,
+                  action: "state_change",
+                  objectType: "obligation",
+                  objectId: obligationId,
+                  payload: {
+                    act: "reopen",
+                    from: "satisfied",
+                    to: "open",
+                    source: "safety_incident",
+                    incidentId: row.id,
+                    reference: row.reference,
+                    reason: "reportability_reassessed_new_duty_undischarged",
+                    deadline: due,
+                    undischargedRegimes: [...state.outstanding, ...state.missed],
+                    ruleId: determination.governingRuleId,
+                    regimes: determination.regimes,
+                  },
+                  storePayload: true,
+                });
+              }
+            }
+          }
+        }
       } else {
         obligationId = newId("obl");
         await app.db.insert(obligations).values({
@@ -1240,7 +1623,8 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
   async function sweepSafety(
     companyId: string,
     projectId: string | null,
-    actorId: string,
+    /** null when the scheduler runs it — the system actor (see lib/scheduler.ts) */
+    actorId: string | null,
   ): Promise<void> {
     const asOf = todayISO();
     const nowISO = new Date().toISOString();
@@ -1744,17 +2128,27 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
    * column an inspector reads first. Names come from the worker register
    * itself, resolved once per response rather than per row.
    */
-  async function resolveInjuredNames(
-    rows: readonly IncidentRow[],
+  async function resolveWorkerNames(
+    workerIds: readonly (string | null | undefined)[],
     companyId: string,
   ): Promise<Map<string, string>> {
-    const ids = [...new Set(rows.map((r) => r.workerId).filter((id): id is string => !!id))];
+    const ids = [...new Set(workerIds.filter((id): id is string => !!id))];
     if (ids.length === 0) return new Map();
     const found = await app.db
       .select({ id: workers.id, fullName: workers.fullName })
       .from(workers)
       .where(and(eq(workers.companyId, companyId), inArray(workers.id, ids)));
     return new Map(found.map((w) => [w.id, w.fullName]));
+  }
+
+  async function resolveInjuredNames(
+    rows: readonly IncidentRow[],
+    companyId: string,
+  ): Promise<Map<string, string>> {
+    return resolveWorkerNames(
+      rows.map((r) => r.workerId),
+      companyId,
+    );
   }
 
   function decorateIncident(i: IncidentRow, asOf: string, workerNames?: Map<string, string>) {
@@ -1810,6 +2204,8 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
         duties: notification.duties,
         outstandingRegimes: notification.outstanding,
         missedRegimes: notification.missed,
+        /** regimes owed but with no establishable deadline — reassess them */
+        needsReviewRegimes: notification.needsReview,
         allDischarged: notification.allDischarged,
         reasons: notification.reasons,
       },
@@ -1872,23 +2268,74 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
           ? Math.max(0, r.requiredAcknowledgementCount - r.acknowledgementCount)
           : null,
       isCriticalKind: CRITICAL_RECORD_KINDS.has(r.recordKind),
+      /** the live permit-to-work in site operations this document authorises */
+      sitePermitId:
+        typeof (r.detail as Record<string, unknown>)["sitePermitId"] === "string"
+          ? ((r.detail as Record<string, unknown>)["sitePermitId"] as string)
+          : null,
     };
   }
 
   /** Keep `openActionCount` on the parent register honest after any action move. */
+  /**
+   * The observation lifecycle, derived from the actions raised off it.
+   *
+   * `SAFETY_OBSERVATION_STATUSES` documents raised → assigned → actioned →
+   * verified → closed, and the board draws a lane for each. Nothing ever set
+   * `actioned` or `verified`: create set open/action_assigned, assign set
+   * action_assigned and close set closed, so the two middle lanes of the
+   * primary view were permanently empty and the documented lifecycle did not
+   * exist. Completing the corrective actions IS what moves an observation, so
+   * the status is derived from them here rather than invented by a button
+   * somebody has to remember to press.
+   *
+   *   every live action verified/closed  → `verified`
+   *   every live action at least completed → `actioned`
+   *   any action still open/in progress   → `action_assigned`
+   *   no live action at all               → `open`
+   *
+   * `closed` and `void` are terminal human decisions and are never overwritten.
+   */
+  function deriveObservationStatus(
+    current: string,
+    statuses: readonly string[],
+  ): { status: string; basis: string } | null {
+    if (current === "closed" || current === "void") return null;
+    const live = statuses.filter((st) => st !== "cancelled");
+    let next: string;
+    let basis: string;
+    if (live.length === 0) {
+      /* Every action was cancelled, or none was ever raised. The status is
+       * left exactly as the humans set it: an observation assigned to
+       * somebody without a formal corrective action is a legitimate state,
+       * and resetting it to `open` here would silently undo an assignment. */
+      return null;
+    } else if (live.some((st) => st === "open" || st === "in_progress")) {
+      next = "action_assigned";
+      basis = `${live.filter((st) => st === "open" || st === "in_progress").length} of ${live.length} corrective action(s) are still open`;
+    } else if (live.every((st) => st === "verified" || st === "closed")) {
+      next = "verified";
+      basis = `all ${live.length} corrective action(s) have been verified by somebody other than the person who did the work`;
+    } else {
+      next = "actioned";
+      basis = `all ${live.length} corrective action(s) are complete but not yet verified`;
+    }
+    return next === current ? null : { status: next, basis };
+  }
+
   async function refreshOpenActionCount(sourceType: string, sourceId: string, companyId: string) {
-    const rows = await app.db
-      .select({ n: count() })
+    const actionRows = await app.db
+      .select({ status: safetyCorrectiveActions.status })
       .from(safetyCorrectiveActions)
       .where(
         and(
           eq(safetyCorrectiveActions.companyId, companyId),
           eq(safetyCorrectiveActions.sourceType, sourceType),
           eq(safetyCorrectiveActions.sourceId, sourceId),
-          inArray(safetyCorrectiveActions.status, [...OPEN_ACTION_STATUSES]),
         ),
       );
-    const n = Number(rows[0]?.n ?? 0);
+    const statuses = actionRows.map((r) => r.status);
+    const n = statuses.filter((st) => (OPEN_ACTION_STATUSES as readonly string[]).includes(st)).length;
     const now = new Date().toISOString();
     if (sourceType === "incident") {
       await app.db
@@ -1896,10 +2343,42 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
         .set({ openActionCount: n, updatedAt: now })
         .where(eq(safetyIncidents.id, sourceId));
     } else if (sourceType === "observation") {
+      const existing = await app.db
+        .select({
+          id: safetyObservations.id,
+          companyId: safetyObservations.companyId,
+          projectId: safetyObservations.projectId,
+          reference: safetyObservations.reference,
+          status: safetyObservations.status,
+        })
+        .from(safetyObservations)
+        .where(and(eq(safetyObservations.id, sourceId), eq(safetyObservations.companyId, companyId)))
+        .limit(1);
+      const obs = existing[0];
+      const move = obs ? deriveObservationStatus(obs.status, statuses) : null;
       await app.db
         .update(safetyObservations)
-        .set({ openActionCount: n, updatedAt: now })
+        .set({ openActionCount: n, ...(move ? { status: move.status } : {}), updatedAt: now })
         .where(eq(safetyObservations.id, sourceId));
+      if (obs && move) {
+        await appendLedger(app.db, {
+          companyId,
+          projectId: obs.projectId,
+          actorId: null,
+          action: "state_change",
+          objectType: "safety_observation",
+          objectId: sourceId,
+          payload: {
+            act: "derive_status",
+            reference: obs.reference,
+            from: obs.status,
+            to: move.status,
+            basis: move.basis,
+            actionStatuses: statuses,
+            derived: true,
+          },
+        });
+      }
     } else if (sourceType === "inspection") {
       await app.db
         .update(safetyInspections)
@@ -2806,90 +3285,130 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       const { incidentId } = req.params as { incidentId: string };
       const body = notifyRegulatorSchema.parse(req.body);
       const row = await fetchIncident(incidentId, req.companyId!, req.projectId!);
-      const existing = (row.notifications ?? []) as Array<Record<string, unknown>>;
-      if (existing.some((n) => n["regime"] === body.regime)) {
-        throw conflict(
-          `Incident ${row.reference} has already been notified under ${body.regime}. A second entry ` +
-            `would rewrite the record of when the regulator was actually told, which is the one fact ` +
-            `the whole notification duty turns on.`,
-        );
-      }
       const notifiedAt = body.notifiedAt ?? new Date().toISOString();
       if (Date.parse(notifiedAt) < Date.parse(row.occurredAt)) {
         throw badRequest(`notifiedAt ${notifiedAt} falls before the incident occurred.`);
       }
-      /* The deadline this notification is measured against is THIS REGIME'S,
-       * not the incident's earliest across all regimes. A RIDDOR F2508 filed
-       * on day 12 of a 15-day clock is in time even where an OSHA eight-hour
-       * duty on the same event was missed on the first day. */
-      const before = incidentNotificationState(row, notifiedAt);
-      const duty = before.duties.find((d) => d.regime === body.regime) ?? null;
-      const dutyDueAt = duty?.dueAt ?? row.reportDueAt;
-      const late = isNotificationMissed(dutyDueAt, notifiedAt, notifiedAt);
-      const hoursLate =
-        late && dutyDueAt
-          ? Math.round(((Date.parse(notifiedAt) - Date.parse(dutyDueAt)) / 3_600_000) * 10) / 10
-          : null;
-      const notifications = [
-        ...existing,
-        {
-          regime: body.regime,
-          notifiedAt,
-          reference: body.reference ?? null,
-          method: body.method ?? "unspecified",
-          notifiedBy: req.user!.id,
-          fileId: body.fileId ?? null,
-          late,
-          hoursLate,
-        },
-      ];
       const now = new Date().toISOString();
 
-      /* `regulator_notified_at` is a DERIVED summary of the per-regime
-       * entries, and it is the single column the old code set on the first
-       * notification. That is what let the second duty of a dual-regime
-       * incident disappear: the sweep, the drawer and the close gate all read
-       * this column. It is now set only once EVERY notifiable regime has been
-       * notified, and it carries the last of those timestamps — the moment the
-       * incident's statutory duties were actually discharged. */
-      const after = notificationState({
-        determination: storedDetermination(row),
-        storedRegimes: (row.reportableRegimes ?? []) as string[],
-        reportDueAt: row.reportDueAt,
-        notifications: notifications as unknown as NotificationEntry[],
-        isReportable: asBool(row.isReportable),
-        asOfISO: now,
-      });
-      const derivedNotifiedAt = derivedRegulatorNotifiedAt(after);
-
-      await app.db
-        .update(safetyIncidents)
-        .set({
-          notifications,
-          regulatorNotifiedAt: derivedNotifiedAt,
-          regulatorNotifiedBy: derivedNotifiedAt ? (row.regulatorNotifiedBy ?? req.user!.id) : null,
-          regulatorReference: body.reference ?? row.regulatorReference,
-          regulatorNotificationFileId: body.fileId ?? row.regulatorNotificationFileId,
-          updatedAt: now,
-        })
-        .where(eq(safetyIncidents.id, incidentId));
-
-      /* The obligation carries the whole incident's statutory duty, so it is
-       * satisfied only when every regime has been discharged — and breached
-       * the moment ANY duty was missed, whether or not this one was. */
-      if (row.obligationId) {
-        const obligationStatus = after.anyMissed
-          ? "breached"
-          : after.allDischarged
-            ? "satisfied"
-            : null;
-        if (obligationStatus) {
-          await app.db
-            .update(obligations)
-            .set({ status: obligationStatus })
-            .where(and(eq(obligations.id, row.obligationId), eq(obligations.status, "open")));
+      /* READ-MODIFY-WRITE OF A STATUTORY RECORD, UNDER A ROW LOCK.
+       *
+       * `notifications` is a jsonb array appended to in place. Two people
+       * recording the RIDDOR and the OSHA notification in the same second
+       * would otherwise produce a last-write-wins overwrite, and the entry
+       * that vanished is the fact the whole duty turns on — the moment an
+       * authority was told. `allDischarged` would then read false forever, or
+       * true on a duty nobody filed, depending on the order. */
+      const {
+        after,
+        duty,
+        dutyDueAt,
+        late,
+        hoursLate,
+      } = await app.db.transaction(async (tx) => {
+        const locked = (
+          await tx
+            .select()
+            .from(safetyIncidents)
+            .where(
+              and(
+                eq(safetyIncidents.id, incidentId),
+                eq(safetyIncidents.companyId, req.companyId!),
+                eq(safetyIncidents.projectId, req.projectId!),
+              ),
+            )
+            .for("update")
+        )[0];
+        if (!locked) throw notFound("Incident not found");
+        const existing = (locked.notifications ?? []) as Array<Record<string, unknown>>;
+        if (existing.some((n) => n["regime"] === body.regime)) {
+          throw conflict(
+            `Incident ${locked.reference} has already been notified under ${body.regime}. A second ` +
+              `entry would rewrite the record of when the regulator was actually told, which is the ` +
+              `one fact the whole notification duty turns on.`,
+          );
         }
-      }
+        /* The deadline this notification is measured against is THIS REGIME'S,
+         * not the incident's earliest across all regimes. A RIDDOR F2508 filed
+         * on day 12 of a 15-day clock is in time even where an OSHA eight-hour
+         * duty on the same event was missed on the first day. */
+        const before = incidentNotificationState(locked, notifiedAt);
+        const thisDuty = before.duties.find((d) => d.regime === body.regime) ?? null;
+        const dueAt = thisDuty?.dueAt ?? locked.reportDueAt;
+        const isLate = isNotificationMissed(dueAt, notifiedAt, notifiedAt);
+        const lateHours =
+          isLate && dueAt
+            ? Math.round(((Date.parse(notifiedAt) - Date.parse(dueAt)) / 3_600_000) * 10) / 10
+            : null;
+        const notifications = [
+          ...existing,
+          {
+            regime: body.regime,
+            notifiedAt,
+            reference: body.reference ?? null,
+            method: body.method ?? "unspecified",
+            notifiedBy: req.user!.id,
+            fileId: body.fileId ?? null,
+            late: isLate,
+            hoursLate: lateHours,
+          },
+        ];
+
+        /* `regulator_notified_at` is a DERIVED summary of the per-regime
+         * entries, and it is the single column the old code set on the first
+         * notification. That is what let the second duty of a dual-regime
+         * incident disappear: the sweep, the drawer and the close gate all read
+         * this column. It is now set only once EVERY notifiable regime has been
+         * notified, and it carries the last of those timestamps — the moment the
+         * incident's statutory duties were actually discharged. */
+        const state = notificationState({
+          determination: storedDetermination(locked),
+          storedRegimes: (locked.reportableRegimes ?? []) as string[],
+          reportDueAt: locked.reportDueAt,
+          notifications: notifications as unknown as NotificationEntry[],
+          isReportable: asBool(locked.isReportable),
+          asOfISO: now,
+        });
+        const derivedNotifiedAt = derivedRegulatorNotifiedAt(state);
+
+        await tx
+          .update(safetyIncidents)
+          .set({
+            notifications,
+            regulatorNotifiedAt: derivedNotifiedAt,
+            regulatorNotifiedBy: derivedNotifiedAt
+              ? (locked.regulatorNotifiedBy ?? req.user!.id)
+              : null,
+            regulatorReference: body.reference ?? locked.regulatorReference,
+            regulatorNotificationFileId: body.fileId ?? locked.regulatorNotificationFileId,
+            updatedAt: now,
+          })
+          .where(eq(safetyIncidents.id, incidentId));
+
+        /* The obligation carries the whole incident's statutory duty, so it is
+         * satisfied only when every regime has been discharged — and breached
+         * the moment ANY duty was missed, whether or not this one was. */
+        if (locked.obligationId) {
+          const obligationStatus = state.anyMissed
+            ? "breached"
+            : state.allDischarged
+              ? "satisfied"
+              : null;
+          if (obligationStatus) {
+            await tx
+              .update(obligations)
+              .set({ status: obligationStatus })
+              .where(and(eq(obligations.id, locked.obligationId), eq(obligations.status, "open")));
+          }
+        }
+        return {
+          after: state,
+          duty: thisDuty,
+          dutyDueAt: dueAt,
+          late: isLate,
+          hoursLate: lateHours,
+        };
+      });
 
       if (late) {
         const det = storedDetermination(row);
@@ -3218,6 +3737,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
        * `regulator_notified_at` column. An incident assessed under both RIDDOR
        * and OSHA whose F2508 was filed still owes the OSHA notification, and
        * closing it would take that live duty off the register. */
+      let statutoryOverride: { reason: string; regimes: string[] } | null = null;
       if (asBool(row.isReportable)) {
         const state = incidentNotificationState(row, new Date().toISOString());
         const owed = state.duties.filter(
@@ -3238,6 +3758,30 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
               `and record it, or reassess the classification if it is wrong.`,
           );
         }
+        /* A duty whose deadline cannot be established from the record is not a
+         * live clock and never becomes one, so refusing on it forever would
+         * make an old row unclosable. It is let through only on an explicit
+         * reason, which is stored and ledgered — the same standard as any
+         * other override of a statutory gate. */
+        const unknown = state.duties.filter((d) => d.state === "deadline_unknown");
+        if (unknown.length > 0) {
+          if (!body.statutoryOverrideReason) {
+            throw conflict(
+              `Incident ${row.reference} carries ${unknown.length} statutory duty/duties ` +
+                `(${unknown.map((d) => d.regime).join(", ")}) whose deadline cannot be established ` +
+                `from the record: the regime is stored but no \`reportDueAt\` is. That is what a row ` +
+                `written before the reportability engine looks like, and it is not a clock that will ` +
+                `ever expire. Reassess the incident to get the real deadline and the rule behind it — ` +
+                `or, if the duty genuinely does not apply or has been discharged outside the ` +
+                `platform, close it with \`statutoryOverrideReason\` saying which and why. The reason ` +
+                `is stored on the incident and in the ledger.`,
+            );
+          }
+          statutoryOverride = {
+            reason: body.statutoryOverrideReason,
+            regimes: unknown.map((d) => d.regime),
+          };
+        }
       }
       const liveActions = await app.db
         .select({ n: count() })
@@ -3257,7 +3801,12 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       }
       const now = new Date().toISOString();
       const detail = { ...row.detail } as Record<string, unknown>;
-      detail["closure"] = { note: body.note, closedBy: req.user!.id, closedAt: now };
+      detail["closure"] = {
+        note: body.note,
+        closedBy: req.user!.id,
+        closedAt: now,
+        statutoryOverride,
+      };
       await app.db
         .update(safetyIncidents)
         .set({
@@ -3283,6 +3832,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
           to: "closed",
           note: body.note,
           lessonId: body.lessonId ?? row.lessonId,
+          statutoryOverride,
         },
         storePayload: true,
       });
@@ -3743,6 +4293,10 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
           updatedAt: now,
         })
         .where(eq(safetyCorrectiveActions.id, actionId));
+      /* The source record's derived state moves with its actions: an
+       * observation whose every action has been verified is `verified`, which
+       * is a lane the board draws and nothing used to reach. */
+      await refreshOpenActionCount(row.sourceType, row.sourceId, req.companyId!);
       await appendLedger(app.db, {
         companyId: req.companyId!,
         projectId: req.projectId!,
@@ -5000,6 +5554,63 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
   );
 
   /**
+   * The project's worker register, as much of it as a safety form needs.
+   *
+   * Every personal record this module holds — an injury, a briefing
+   * attendance, a competency card, a drug or alcohol test result — names a
+   * worker from `workforce.workers`, and a form that asks for a `wkr_` id in a
+   * text box is a form that will be filled in wrongly. This is deliberately a
+   * SAFETY route rather than a link to the workforce register: a safety
+   * co-ordinator who may record an injury must be able to name the injured
+   * person without also holding the workforce tool.
+   */
+  app.get("/projects/:projectId/safety/workers", { preHandler: readGate }, async (req) => {
+    const q = z
+      .object({
+        search: z.string().max(120).optional(),
+        vendorId: z.string().max(64).optional(),
+        includeInactive: z.coerce.boolean().optional(),
+      })
+      .parse(req.query);
+    const filters = [
+      eq(workers.companyId, req.companyId!),
+      eq(workers.projectId, req.projectId!),
+    ];
+    if (q.vendorId) filters.push(eq(workers.vendorId, q.vendorId));
+    if (!q.includeInactive) filters.push(eq(workers.status, "active"));
+    const rows = await app.db
+      .select({
+        id: workers.id,
+        reference: workers.reference,
+        fullName: workers.fullName,
+        trade: workers.trade,
+        vendorId: workers.vendorId,
+        status: workers.status,
+      })
+      .from(workers)
+      .where(and(...filters))
+      .orderBy(asc(workers.fullName))
+      .limit(500);
+    const needle = q.search?.trim().toLowerCase();
+    const items = needle
+      ? rows.filter(
+          (r) =>
+            r.fullName.toLowerCase().includes(needle) ||
+            (r.reference ?? "").toLowerCase().includes(needle),
+        )
+      : rows;
+    return {
+      items,
+      total: items.length,
+      truncated: rows.length === 500,
+      note:
+        "The project's worker register, active workers only unless `includeInactive` is set, " +
+        "capped at 500 names. It is the same register that carries induction, identity " +
+        "verification and site access — a safety record names a PERSON, not a free-text name.",
+    };
+  });
+
+  /**
    * The inverse query, and the reason attendance is a table rather than a
    * jsonb array: "has this worker been briefed on confined spaces this
    * month" is asked about a PERSON, by a supervisor at a gate, not about a
@@ -5074,6 +5685,12 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     companyId: string,
     projectId: string | null,
     q: z.infer<typeof recordListQuery>,
+    /**
+     * The projects a company-level caller may see. `null` on a project-scoped
+     * route (requireTool has already resolved that project) and on a caller
+     * who sees the whole company.
+     */
+    scope: { all: boolean; ids: string[] } | null = null,
   ) {
     const asOf = todayISO();
     const filters = [eq(safetyProgrammeRecords.companyId, companyId)];
@@ -5089,10 +5706,34 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     } else if (q.projectId) {
       filters.push(eq(safetyProgrammeRecords.projectId, q.projectId));
     }
+    /* §6.3 — a company-level roll-up over PROJECT data is filtered to the
+     * projects the caller is on. A record with no projectId is the company
+     * programme (the policy, the training matrix) and stays visible to
+     * everyone; a project-scoped one — a RAMS, a permit, a named worker's
+     * drug-and-alcohol test result — does not. */
+    if (scope && !scope.all) {
+      filters.push(
+        scope.ids.length === 0
+          ? isNull(safetyProgrammeRecords.projectId)
+          : or(
+              isNull(safetyProgrammeRecords.projectId),
+              inArray(safetyProgrammeRecords.projectId, scope.ids),
+            )!,
+      );
+    }
     if (q.recordKind) filters.push(eq(safetyProgrammeRecords.recordKind, q.recordKind));
     if (q.status) filters.push(eq(safetyProgrammeRecords.status, q.status));
     if (q.workerId) filters.push(eq(safetyProgrammeRecords.workerId, q.workerId));
     if (q.vendorId) filters.push(eq(safetyProgrammeRecords.vendorId, q.vendorId));
+    /* The expiry horizon is a WHERE clause, not a filter over the page that
+     * came back: filtering after paging makes `total` describe a different set
+     * from the rows, so a pager says "1-3 of 400" and the matching records on
+     * later pages are only reachable through pages that look empty. */
+    if (q.expiringWithinDays !== undefined) {
+      const horizon = addDaysISO(asOf, q.expiringWithinDays);
+      filters.push(isNotNull(safetyProgrammeRecords.expiresAt));
+      filters.push(lte(safetyProgrammeRecords.expiresAt, horizon));
+    }
     const where = and(...filters);
     const rows = await app.db
       .select()
@@ -5105,18 +5746,22 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       .select({ n: count() })
       .from(safetyProgrammeRecords)
       .where(where);
-    let items = rows.map((r) => decorateRecord(r, asOf));
-    if (q.expiringWithinDays !== undefined) {
-      const horizon = addDaysISO(asOf, q.expiringWithinDays);
-      items = items.filter((i) => i.expiresAt != null && i.expiresAt <= horizon);
-    }
+    const items = rows.map((r) => decorateRecord(r, asOf));
     return paginate(items, Number(totalRows[0]?.n ?? 0), q);
   }
 
   app.get("/companies/current/safety/programme-records", { preHandler: companyRead }, async (req) => {
     const q = recordListQuery.parse(req.query);
     await sweepThrottled(req.companyId!, null, req.user!.id);
-    return listRecords(req.companyId!, null, q);
+    const scope = await visibleProjectIds(req.companyId!, req.user!.id, req.companyRole);
+    if (q.projectId && !scope.all && !scope.ids.includes(q.projectId)) {
+      throw forbidden(
+        `You are not a member of project ${q.projectId} at \`read\` on \`safety\`, so its ` +
+          `programme register is not yours to read. The company-wide programme (records with no ` +
+          `project) is returned without a \`projectId\` filter.`,
+      );
+    }
+    return listRecords(req.companyId!, null, q, scope);
   });
 
   app.get("/projects/:projectId/safety/programme-records", { preHandler: readGate }, async (req) => {
@@ -5130,6 +5775,14 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     { preHandler: companyWrite },
     async (req, reply) => {
       const body = recordCreateSchema.parse(req.body);
+      if (body.projectId) {
+        await assertProjectSafetyLevel(
+          body.projectId,
+          req,
+          "standard",
+          `A record filed against project ${body.projectId}`,
+        );
+      }
       if (body.vendorId) await assertVendor(body.vendorId, req.companyId!);
       if (body.workerId) {
         if (!body.projectId) {
@@ -5146,6 +5799,47 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
             `expire and something has to be watching the date; one without an expiry is invisible to ` +
             `the sweep and will be relied on indefinitely.`,
         );
+      }
+      /* A drug or alcohol test is the one programme record whose CONTENT is a
+       * determination about a named person, and the two facts an appeal turns
+       * on are why the test was carried out and what it found. A result with
+       * no recorded reason is the one a tribunal discounts. */
+      if (body.sitePermitId) {
+        const permit = await app.db
+          .select({ id: sitePermits.id, reference: sitePermits.reference })
+          .from(sitePermits)
+          .where(
+            and(
+              eq(sitePermits.id, body.sitePermitId),
+              eq(sitePermits.companyId, req.companyId!),
+              ...(body.projectId ? [eq(sitePermits.projectId, body.projectId)] : []),
+            ),
+          )
+          .limit(1);
+        if (!permit[0]) {
+          throw badRequest(
+            `Permit-to-work ${body.sitePermitId} is not in this project's site permit register. ` +
+              `The live authorisation lives in site operations; this record is the document it was ` +
+              `issued against, and a link to a permit that does not exist is worse than no link.`,
+          );
+        }
+      }
+      if (body.recordKind === "drug_alcohol_test") {
+        if (!body.drugAlcoholResult || !body.drugAlcoholReason) {
+          throw badRequest(
+            "A drug or alcohol test record needs `drugAlcoholResult` and `drugAlcoholReason`. Both " +
+              "are the facts an appeal turns on: a result with no recorded reason for testing is " +
+              "the one an employment tribunal discounts, and a bare `positive` with no confirmation " +
+              "stage recorded is the one that gets a dismissal overturned. Use " +
+              "`non_negative_pending_confirmation` where the screening test is all that has been done.",
+          );
+        }
+        if (!body.workerId) {
+          throw badRequest(
+            "A drug or alcohol test record must name the worker it concerns — a personal result " +
+              "filed against nobody is a record that cannot be produced, challenged or deleted.",
+          );
+        }
       }
       const seq = await nextRecordNumber(app.db, req.companyId!, "safety_programme_record");
       const reference = body.reference ?? `SPR-${pad(seq)}`;
@@ -5180,7 +5874,19 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
         regulatoryReference: body.regulatoryReference ?? null,
         categories: body.categories ?? [],
         requiredAcknowledgementCount: body.requiredAcknowledgementCount ?? null,
-        detail: body.detail ?? {},
+        detail: {
+          ...(body.detail ?? {}),
+          ...(body.drugAlcoholResult
+            ? {
+                drugAlcohol: {
+                  result: body.drugAlcoholResult,
+                  reason: body.drugAlcoholReason,
+                  recordedBy: req.user!.id,
+                },
+              }
+            : {}),
+          ...(body.sitePermitId ? { sitePermitId: body.sitePermitId } : {}),
+        },
         createdBy: req.user!.id,
       });
       await appendLedger(app.db, {
@@ -5213,7 +5919,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     { preHandler: companyRead },
     async (req) => {
       const { recordId } = req.params as { recordId: string };
-      return decorateRecord(await fetchRecord(recordId, req.companyId!), todayISO());
+      return decorateRecord(await fetchRecordScoped(recordId, req, "read"), todayISO());
     },
   );
 
@@ -5223,7 +5929,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     async (req) => {
       const { recordId } = req.params as { recordId: string };
       const body = recordPatchSchema.parse(req.body);
-      const row = await fetchRecord(recordId, req.companyId!);
+      const row = await fetchRecordScoped(recordId, req, "standard");
       if (row.status === "superseded" || row.status === "withdrawn") {
         throw conflict(
           `Record ${row.reference} is ${row.status} and is now historical. Amend the record that ` +
@@ -5281,7 +5987,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     { preHandler: companyWrite },
     async (req) => {
       const { recordId } = req.params as { recordId: string };
-      const row = await fetchRecord(recordId, req.companyId!);
+      const row = await fetchRecordScoped(recordId, req, "standard");
       if (row.status !== "draft" && row.status !== "in_review") {
         throw conflict(`Record ${row.reference} is \`${row.status}\` and is not awaiting approval.`);
       }
@@ -5335,7 +6041,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     async (req, reply) => {
       const { recordId } = req.params as { recordId: string };
       const body = acknowledgementSchema.parse(req.body ?? {});
-      const row = await fetchRecord(recordId, req.companyId!);
+      const row = await fetchRecordScoped(recordId, req, "read");
       if (row.status !== "active" && row.status !== "approved") {
         throw conflict(
           `Record ${row.reference} is \`${row.status}\`. Acknowledging a draft or an expired document ` +
@@ -5392,31 +6098,54 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
         }
       }
 
-      const acks = [...(row.acknowledgements ?? [])] as Array<Record<string, unknown>>;
       const subject = body.workerId ?? body.userId ?? req.user!.id;
-      if (acks.some((a) => (a["workerId"] ?? a["userId"]) === subject)) {
-        throw conflict(`${subject} has already acknowledged ${row.reference}.`);
-      }
       const selfRecorded = !body.workerId && (!body.userId || body.userId === req.user!.id);
-      acks.push({
-        workerId: body.workerId ?? null,
-        userId: body.workerId ? null : (body.userId ?? req.user!.id),
-        acknowledgedAt: body.acknowledgedAt ?? new Date().toISOString(),
-        method: body.method ?? "on_device_signature",
-        recordedBy: req.user!.id,
-        /** false when somebody recorded this for somebody else */
-        selfRecorded,
-        recordedOnBehalf: selfRecorded ? null : { by: req.user!.id, role: req.companyRole ?? null },
-        attestation: body.attestation ?? null,
+
+      /* Read-modify-write of a jsonb array under a row lock. A briefing where
+       * forty people sign in on forty phones at the gate is exactly the case
+       * that loses entries to last-write-wins, and the count this feeds is the
+       * evidence an inspector asks for. */
+      const acks = await app.db.transaction(async (tx) => {
+        const locked = (
+          await tx
+            .select()
+            .from(safetyProgrammeRecords)
+            .where(
+              and(
+                eq(safetyProgrammeRecords.id, recordId),
+                eq(safetyProgrammeRecords.companyId, req.companyId!),
+              ),
+            )
+            .for("update")
+        )[0];
+        if (!locked) throw notFound("Programme record not found");
+        const next = [...(locked.acknowledgements ?? [])] as Array<Record<string, unknown>>;
+        if (next.some((a) => (a["workerId"] ?? a["userId"]) === subject)) {
+          throw conflict(`${subject} has already acknowledged ${locked.reference}.`);
+        }
+        next.push({
+          workerId: body.workerId ?? null,
+          userId: body.workerId ? null : (body.userId ?? req.user!.id),
+          acknowledgedAt: body.acknowledgedAt ?? new Date().toISOString(),
+          method: body.method ?? "on_device_signature",
+          recordedBy: req.user!.id,
+          /** false when somebody recorded this for somebody else */
+          selfRecorded,
+          recordedOnBehalf: selfRecorded
+            ? null
+            : { by: req.user!.id, role: req.companyRole ?? null },
+          attestation: body.attestation ?? null,
+        });
+        await tx
+          .update(safetyProgrammeRecords)
+          .set({
+            acknowledgements: next,
+            acknowledgementCount: next.length,
+            updatedAt: new Date().toISOString(),
+          })
+          .where(eq(safetyProgrammeRecords.id, recordId));
+        return next;
       });
-      await app.db
-        .update(safetyProgrammeRecords)
-        .set({
-          acknowledgements: acks,
-          acknowledgementCount: acks.length,
-          updatedAt: new Date().toISOString(),
-        })
-        .where(eq(safetyProgrammeRecords.id, recordId));
       await appendLedger(app.db, {
         companyId: req.companyId!,
         projectId: row.projectId,
@@ -5449,7 +6178,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     async (req, reply) => {
       const { recordId } = req.params as { recordId: string };
       const body = supersedeSchema.parse(req.body);
-      const row = await fetchRecord(recordId, req.companyId!);
+      const row = await fetchRecordScoped(recordId, req, "standard");
       if (row.supersededById) {
         throw conflict(
           `Record ${row.reference} has already been superseded by ${row.supersededById}. A document ` +
@@ -5539,6 +6268,75 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
   /* ================================================================ */
   /* STATISTICS — rates with a real denominator or none at all         */
   /* ================================================================ */
+
+  /**
+   * How the statutory duties on a set of incidents actually stand.
+   *
+   * Counted per DUTY rather than per incident, because an incident answerable
+   * to two authorities can have one duty discharged and one missed, and the
+   * header of the safety workspace has to be able to say so. The old shape
+   * counted `regulator_notified_at == null`, which is a single derived column.
+   */
+  function statutoryStanding(rows: readonly IncidentRow[]) {
+    const nowISO = new Date().toISOString();
+    let awaiting = 0;
+    let missed = 0;
+    let outstandingDuties = 0;
+    let missedDuties = 0;
+    let deadlineUnknownDuties = 0;
+    const missedRefs: Array<{ id: string; reference: string; regimes: string[] }> = [];
+    const awaitingRefs: Array<{ id: string; reference: string; regimes: string[] }> = [];
+    const reviewRefs: Array<{ id: string; reference: string }> = [];
+    for (const row of rows) {
+      if (storedDetermination(row)?.needsHumanReview === true) {
+        reviewRefs.push({ id: row.id, reference: row.reference });
+      }
+      if (!asBool(row.isReportable)) continue;
+      const state = incidentNotificationState(row, nowISO);
+      const rowMissed = state.duties.filter((d) => d.state === "missed");
+      const rowOutstanding = state.duties.filter((d) => d.state === "outstanding");
+      missedDuties += rowMissed.length;
+      outstandingDuties += rowOutstanding.length;
+      deadlineUnknownDuties += state.duties.filter((d) => d.state === "deadline_unknown").length;
+      if (state.needsReview.length > 0 && !reviewRefs.some((r) => r.id === row.id)) {
+        reviewRefs.push({ id: row.id, reference: row.reference });
+      }
+      if (rowMissed.length > 0) {
+        missed += 1;
+        missedRefs.push({
+          id: row.id,
+          reference: row.reference,
+          regimes: rowMissed.map((d) => d.regime),
+        });
+      } else if (rowOutstanding.length > 0) {
+        awaiting += 1;
+        awaitingRefs.push({
+          id: row.id,
+          reference: row.reference,
+          regimes: rowOutstanding.map((d) => d.regime),
+        });
+      }
+    }
+    return {
+      reportableCount: rows.filter((r) => asBool(r.isReportable)).length,
+      notifiedCount: rows.filter((r) => r.regulatorNotifiedAt != null).length,
+      /** incidents with at least one live, unexpired duty */
+      awaitingNotification: awaiting,
+      /** incidents with at least one deadline already passed and nothing filed */
+      missedNotification: missed,
+      outstandingDuties,
+      missedDuties,
+      /** duties owed whose deadline the record cannot establish — reassess */
+      deadlineUnknownDuties,
+      needsHumanReview: reviewRefs.length,
+      missedRefs,
+      awaitingRefs,
+      reviewRefs,
+      note:
+        "Counted per DUTY, not per incident. An incident answerable under two regimes owes two " +
+        "notifications on two clocks; discharging one discharges nothing of the other.",
+    };
+  }
 
   /** Timecard states that represent hours actually worked and stood behind. */
   const COUNTED_TIMECARD_STATUSES = ["submitted", "approved", "revised", "locked", "exported"];
@@ -5652,15 +6450,7 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
     return {
       projectId: req.projectId!,
       ...rates,
-      reportable: {
-        reportableCount: incidents.filter((i) => asBool(i.isReportable)).length,
-        notifiedCount: incidents.filter((i) => i.regulatorNotifiedAt != null).length,
-        awaitingNotification: incidents.filter(
-          (i) => asBool(i.isReportable) && i.regulatorNotifiedAt == null,
-        ).length,
-        needsHumanReview: incidents.filter((i) => storedDetermination(i)?.needsHumanReview === true)
-          .length,
-      },
+      reportable: statutoryStanding(incidents),
       leadingIndicators: {
         observationsPositive: positive,
         observationsNegative: negative,
@@ -5830,9 +6620,53 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       if (r.disposition === "new" || r.disposition === "under_review") signalsOpen += Number(r.n);
     }
 
+    /* The statutory standing of the WHOLE register, unwindowed and unfiltered.
+     *
+     * The workspace header used to derive its red banner from the incident
+     * list on screen — the current tab's filtered first page — so applying any
+     * filter that excluded the offending incident, or holding more incidents
+     * than one page, removed the "a statutory deadline has passed" warning
+     * from the whole workspace while the duty was live. The banner is driven
+     * from here instead.
+     *
+     * BOUNDED, because this runs on the first call of every visit to the
+     * workspace and parses each row's stored determination. A CLOSED incident
+     * cannot carry a live duty — closure is itself gated on every duty being
+     * discharged — and a void one never could, so both are excluded; what
+     * remains is capped at the most recent `STATUTORY_STANDING_LIMIT` and the
+     * response says so rather than quietly under-counting. */
+    const statutoryWhere = and(
+      eq(safetyIncidents.companyId, companyId),
+      eq(safetyIncidents.projectId, projectId),
+      eq(safetyIncidents.isReportable, 1),
+      ne(safetyIncidents.status, "void"),
+      ne(safetyIncidents.status, "closed"),
+    );
+    const [liveReportable, liveReportableTotal] = await Promise.all([
+      app.db
+        .select()
+        .from(safetyIncidents)
+        .where(statutoryWhere)
+        .orderBy(desc(safetyIncidents.occurredAt))
+        .limit(STATUTORY_STANDING_LIMIT),
+      app.db.select({ n: count() }).from(safetyIncidents).where(statutoryWhere),
+    ]);
+    const statutoryTotal = Number(liveReportableTotal[0]?.n ?? 0);
+    const statutory = {
+      ...statutoryStanding(liveReportable),
+      scanned: liveReportable.length,
+      openReportableTotal: statutoryTotal,
+      truncated: statutoryTotal > liveReportable.length,
+      scope:
+        `Open (not closed, not void) reportable incidents, most recent first, capped at ` +
+        `${STATUTORY_STANDING_LIMIT}. A closed incident cannot hold a live duty: closure is ` +
+        `itself gated on every regime's duty being discharged.`,
+    };
+
     return {
       projectId,
       asOf,
+      statutory,
       observations: tally(obsByStatus),
       incidents: tally(incByStatus),
       correctiveActions: {
@@ -5859,4 +6693,3320 @@ export const safetyModule: FastifyPluginAsync = async (app) => {
       },
     };
   });
+
+  /* ================================================================ */
+  /* DEVICE AND LONE-WORKER ALARMS (#1070-1073)                        */
+  /* ================================================================ */
+
+  /**
+   * A wearable, a lone-worker device, a gas detector or a proximity tag,
+   * reporting what it measured.
+   *
+   * These are NOT incidents and are deliberately not filed as them. A man-down
+   * alarm is an accelerometer reading; whether an incident occurred is a
+   * human's determination made afterwards, and a platform that converts every
+   * alarm into an incident produces a register nobody can close and a rate
+   * nobody believes. What this register owns instead is the RESPONSE CLOCK:
+   * the only thing that can be proved afterwards about a device alarm is
+   * whether somebody answered it and how long that took.
+   */
+  const sensorEventSchema = z.object({
+    kind: z.enum(SAFETY_SENSOR_EVENT_KINDS),
+    source: z.enum(SAFETY_SENSOR_SOURCES).optional(),
+    severity: z.enum(SAFETY_SEVERITIES).optional(),
+    deviceId: z.string().max(120).nullable().optional(),
+    deviceModel: z.string().max(120).nullable().optional(),
+    workerId: z.string().max(64).nullable().optional(),
+    reportedPersonName: z.string().max(200).nullable().optional(),
+    vendorId: z.string().max(64).nullable().optional(),
+    occurredAt: isoTimestamp,
+    receivedAt: isoTimestamp.optional(),
+    locationId: z.string().max(64).nullable().optional(),
+    locationText: z.string().max(300).nullable().optional(),
+    latitude: z.number().min(-90).max(90).nullable().optional(),
+    longitude: z.number().min(-180).max(180).nullable().optional(),
+    measurementValue: z.number().nullable().optional(),
+    measurementUnit: z.string().max(30).nullable().optional(),
+    thresholdValue: z.number().nullable().optional(),
+    rawPayload: z.record(z.string(), z.unknown()).optional(),
+    /** the device's own event id — a retry with the same one is not a new alarm */
+    externalId: z.string().max(160).nullable().optional(),
+  });
+
+  const sensorIngestSchema = z.union([
+    sensorEventSchema,
+    z.object({ events: z.array(sensorEventSchema).min(1).max(200) }),
+  ]);
+
+  const sensorListQuery = pageQuerySchema.extend({
+    status: z.string().max(30).optional(),
+    kind: z.enum(SAFETY_SENSOR_EVENT_KINDS).optional(),
+    source: z.enum(SAFETY_SENSOR_SOURCES).optional(),
+    workerId: z.string().max(64).optional(),
+    deviceId: z.string().max(120).optional(),
+    unacknowledged: z.enum(["true", "false"]).optional(),
+    from: isoDateSchema.optional(),
+    to: isoDateSchema.optional(),
+  });
+
+  const sensorAcknowledgeSchema = z.object({
+    note: z.string().min(1).max(2000),
+    acknowledgedAt: isoTimestamp.optional(),
+  });
+
+  const sensorResolveSchema = z.object({
+    status: z.enum(["resolved", "false_alarm", "auto_resolved", "escalated"]),
+    outcome: z.string().min(1).max(2000),
+    resolvedAt: isoTimestamp.optional(),
+  });
+
+  const sensorLinkSchema = z
+    .object({
+      incidentId: z.string().max(64).optional(),
+      observationId: z.string().max(64).optional(),
+    })
+    .refine((v) => v.incidentId != null || v.observationId != null, {
+      message: "Supply incidentId or observationId — a link to nothing is not a link.",
+    });
+
+  const sensorRaiseObservationSchema = z.object({
+    title: z.string().min(1).max(300),
+    description: z.string().max(8000).nullable().optional(),
+    category: z.enum(SAFETY_CATEGORIES).optional(),
+    severity: z.enum(SAFETY_SEVERITIES).optional(),
+    riskLikelihood: z.number().int().min(1).max(5).nullable().optional(),
+    riskSeverity: z.number().int().min(1).max(5).nullable().optional(),
+    immediateActionTaken: z.string().max(4000).nullable().optional(),
+  });
+
+  /** The response deadline one alarm class carries, from the moment received. */
+  function alarmDeadline(kind: string, receivedAt: string): string {
+    const minutes = ALARM_RESPONSE_MINUTES[kind] ?? 240;
+    return new Date(Date.parse(receivedAt) + minutes * 60_000).toISOString();
+  }
+
+  function defaultAlarmSeverity(kind: string): string {
+    if (LIFE_SAFETY_ALARMS.has(kind)) return "critical";
+    if (kind === "impact" || kind === "exclusion_zone_breach") return "high";
+    if (kind === "panic_test" || kind === "device_offline") return "low";
+    return "medium";
+  }
+
+  async function fetchSensorEvent(id: string, companyId: string, projectId: string) {
+    const rows = await app.db
+      .select()
+      .from(safetySensorEvents)
+      .where(
+        and(
+          eq(safetySensorEvents.id, id),
+          eq(safetySensorEvents.companyId, companyId),
+          eq(safetySensorEvents.projectId, projectId),
+        ),
+      )
+      .limit(1);
+    if (!rows[0]) throw notFound("Device alarm not found");
+    return rows[0];
+  }
+
+  type SensorRow = Awaited<ReturnType<typeof fetchSensorEvent>>;
+
+  function decorateSensorEvent(row: SensorRow, nowISO: string) {
+    const overdue =
+      row.status === "open" &&
+      row.acknowledgeDueAt != null &&
+      Date.parse(row.acknowledgeDueAt) < Date.parse(nowISO);
+    const minutesLate =
+      overdue && row.acknowledgeDueAt
+        ? Math.round((Date.parse(nowISO) - Date.parse(row.acknowledgeDueAt)) / 60_000)
+        : null;
+    return {
+      ...row,
+      isLifeSafety: LIFE_SAFETY_ALARMS.has(row.kind),
+      responseDeadlineMinutes: ALARM_RESPONSE_MINUTES[row.kind] ?? 240,
+      acknowledgementOverdue: overdue,
+      minutesLate,
+      responseMinutes:
+        row.responseSeconds != null ? Math.round((row.responseSeconds / 60) * 10) / 10 : null,
+      /** what a reader must know before treating this row as reassurance */
+      note: LIFE_SAFETY_ALARMS.has(row.kind)
+        ? "A life-safety alarm is the device asserting that the person wearing it may be " +
+          "unconscious, immobile or in an atmosphere that will kill them. Only somebody physically " +
+          "confirming otherwise closes it; an acknowledgement recorded from an office is a record " +
+          "that the alarm was seen, not that the person was found."
+        : null,
+    };
+  }
+
+  app.post(
+    "/projects/:projectId/safety/sensor-events",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const parsed = sensorIngestSchema.parse(req.body);
+      const incoming = "events" in parsed ? parsed.events : [parsed];
+      const nowISO = new Date().toISOString();
+      const accepted: unknown[] = [];
+      const duplicates: Array<{ externalId: string; id: string }> = [];
+
+      /* PASS ONE — CHECK THE WHOLE BATCH BEFORE WRITING ANY OF IT.
+       *
+       * A gateway posts what it buffered while it was offline: fifty alarms in
+       * one request. Validating and inserting in the same loop meant a bad
+       * fourteenth event left thirteen alarms written and returned an error,
+       * so the gateway's retry either duplicated them (no `externalId`) or the
+       * operator had to work out which half of a rejected batch had landed.
+       * Every reference, clock and idempotency key is resolved first; only
+       * then is anything written. */
+      type Incoming = (typeof incoming)[number];
+      /** what an externalId already resolved to inside this batch */
+      const seen = new Map<string, { existing: SensorRow | null; body: Incoming }>();
+      const plan: Array<{
+        body: Incoming;
+        /** a row already in the register carrying this event's id */
+        existing: SensorRow | null;
+        /** the id of an earlier NEW event in this batch that this repeats */
+        repeatOf: string | null;
+      }> = [];
+      /* Two entries carrying one device event id are the same alarm only if
+       * they say the same thing. A gateway that resends what it already sent
+       * in the same request is a retry and is collapsed; two DIFFERENT alarms
+       * sharing an id would mean one of them silently disappearing, so that is
+       * refused instead. */
+      const sameEvent = (a: Incoming, b: Incoming): boolean =>
+        a.kind === b.kind &&
+        a.occurredAt === b.occurredAt &&
+        (a.deviceId ?? null) === (b.deviceId ?? null) &&
+        (a.workerId ?? null) === (b.workerId ?? null);
+      for (const [index, body] of incoming.entries()) {
+        const where = incoming.length > 1 ? ` (event ${index + 1} of ${incoming.length})` : "";
+        if (body.workerId) await assertWorker(body.workerId, req.companyId!, req.projectId!);
+        if (body.vendorId) await assertVendor(body.vendorId, req.companyId!);
+        if (Date.parse(body.occurredAt) > Date.parse(nowISO) + 60_000) {
+          throw badRequest(
+            `Alarm occurredAt ${body.occurredAt} is in the future${where}. A device clock ahead of ` +
+              `the platform's makes every response time it produces meaningless, and the response ` +
+              `time is the only thing this register can prove. Nothing in this batch was written.`,
+          );
+        }
+        /* A device that loses its uplink retries. The device's own event id is
+         * the idempotency key: the same alarm arriving twice is one alarm, and
+         * a duplicate row would double-count the fleet's alarm load and reset
+         * a response clock somebody has already answered. A batch that repeats
+         * an id inside itself is the same retry, so it is resolved once. */
+        let existing: SensorRow | null = null;
+        let repeatOf: string | null = null;
+        if (body.externalId) {
+          const already = seen.get(body.externalId);
+          if (already) {
+            if (!sameEvent(already.body, body)) {
+              throw badRequest(
+                `externalId \`${body.externalId}\` appears twice in this batch${where} against two ` +
+                  `different alarms. A device event id identifies ONE event: keeping both would ` +
+                  `leave the register unable to say which alarm was answered, and keeping one ` +
+                  `would drop an alarm nobody ever sees. Nothing was written — give each event its ` +
+                  `own id.`,
+              );
+            }
+            existing = already.existing;
+            if (!existing) repeatOf = body.externalId;
+          } else {
+            const rows = await app.db
+              .select()
+              .from(safetySensorEvents)
+              .where(
+                and(
+                  eq(safetySensorEvents.companyId, req.companyId!),
+                  eq(safetySensorEvents.externalId, body.externalId),
+                ),
+              )
+              .limit(1);
+            existing = rows[0] ?? null;
+            /* The idempotency key is unique per COMPANY (a device fleet moves
+             * between sites), so the row already holding it may belong to a
+             * project this caller has no access to. Returning it would hand a
+             * member of one project another project's alarm — location,
+             * worker and raw device payload — for the price of guessing an
+             * external id. The collision is reported without the row. */
+            if (existing && existing.projectId !== req.projectId!) {
+              throw conflict(
+                `externalId \`${body.externalId}\` is already held by a device alarm on another ` +
+                  `project in this company${where}. Device event ids are unique per company — send ` +
+                  `the device's own event id, which no other device shares. Nothing in this batch ` +
+                  `was written.`,
+              );
+            }
+            seen.set(body.externalId, { existing, body });
+          }
+        }
+        plan.push({ body, existing, repeatOf });
+      }
+
+      /* PASS TWO — write it. Nothing here can fail on the data: everything the
+       * batch asserts about workers, vendors, clocks and event ids was
+       * resolved above. */
+      const writtenInBatch = new Map<string, { id: string; decorated: unknown }>();
+      for (const { body, existing, repeatOf } of plan) {
+        if (existing) {
+          duplicates.push({ externalId: existing.externalId!, id: existing.id });
+          accepted.push(decorateSensorEvent(existing, nowISO));
+          continue;
+        }
+        if (repeatOf) {
+          const prior = writtenInBatch.get(repeatOf);
+          if (prior) {
+            duplicates.push({ externalId: repeatOf, id: prior.id });
+            accepted.push(prior.decorated);
+            continue;
+          }
+        }
+        const receivedAt = body.receivedAt ?? nowISO;
+        const seq = await nextRecordNumber(app.db, req.projectId!, "safety_sensor_event");
+        const id = newId("sev");
+        const kind = body.kind;
+        await app.db.insert(safetySensorEvents).values({
+          id,
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          number: seq,
+          reference: `SE-${pad(seq)}`,
+          source: body.source ?? "wearable",
+          kind,
+          severity: body.severity ?? defaultAlarmSeverity(kind),
+          deviceId: body.deviceId ?? null,
+          deviceModel: body.deviceModel ?? null,
+          workerId: body.workerId ?? null,
+          reportedPersonName: body.reportedPersonName ?? null,
+          vendorId: body.vendorId ?? null,
+          occurredAt: body.occurredAt,
+          receivedAt,
+          locationId: body.locationId ?? null,
+          locationText: body.locationText ?? null,
+          latitude: body.latitude ?? null,
+          longitude: body.longitude ?? null,
+          measurementValue: body.measurementValue ?? null,
+          measurementUnit: body.measurementUnit ?? null,
+          thresholdValue: body.thresholdValue ?? null,
+          rawPayload: body.rawPayload ?? {},
+          status: "open",
+          acknowledgeDueAt: alarmDeadline(kind, receivedAt),
+          externalId: body.externalId ?? null,
+          createdBy: req.user!.id,
+        });
+        await appendLedger(app.db, {
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          actorId: req.user!.id,
+          action: "create",
+          objectType: "safety_sensor_event",
+          objectId: id,
+          payload: {
+            reference: `SE-${pad(seq)}`,
+            kind,
+            source: body.source ?? "wearable",
+            deviceId: body.deviceId ?? null,
+            workerId: body.workerId ?? null,
+            occurredAt: body.occurredAt,
+            receivedAt,
+            acknowledgeDueAt: alarmDeadline(kind, receivedAt),
+            lifeSafety: LIFE_SAFETY_ALARMS.has(kind),
+          },
+          storePayload: true,
+        });
+        const decorated = decorateSensorEvent(
+          await fetchSensorEvent(id, req.companyId!, req.projectId!),
+          nowISO,
+        );
+        accepted.push(decorated);
+        if (body.externalId) writtenInBatch.set(body.externalId, { id, decorated });
+      }
+
+      reply.code(201);
+      return {
+        accepted: accepted.length,
+        duplicates,
+        events: accepted,
+        note:
+          duplicates.length > 0
+            ? `${duplicates.length} event(s) carried an externalId already held and were treated as ` +
+              `retries rather than new alarms.`
+            : null,
+      };
+    },
+  );
+
+  app.get("/projects/:projectId/safety/sensor-events", { preHandler: readGate }, async (req) => {
+    const q = sensorListQuery.parse(req.query);
+    await sweepThrottled(req.companyId!, req.projectId!, req.user!.id);
+    const nowISO = new Date().toISOString();
+    const filters = [
+      eq(safetySensorEvents.companyId, req.companyId!),
+      eq(safetySensorEvents.projectId, req.projectId!),
+    ];
+    if (q.status) filters.push(eq(safetySensorEvents.status, q.status));
+    if (q.kind) filters.push(eq(safetySensorEvents.kind, q.kind));
+    if (q.source) filters.push(eq(safetySensorEvents.source, q.source));
+    if (q.workerId) filters.push(eq(safetySensorEvents.workerId, q.workerId));
+    if (q.deviceId) filters.push(eq(safetySensorEvents.deviceId, q.deviceId));
+    if (q.unacknowledged === "true") filters.push(isNull(safetySensorEvents.acknowledgedAt));
+    if (q.from) filters.push(gte(safetySensorEvents.occurredAt, `${q.from}T00:00:00Z`));
+    if (q.to) filters.push(lte(safetySensorEvents.occurredAt, `${q.to}T23:59:59Z`));
+    const where = and(...filters);
+    const rows = await app.db
+      .select()
+      .from(safetySensorEvents)
+      .where(where)
+      .orderBy(desc(safetySensorEvents.occurredAt))
+      .limit(q.pageSize)
+      .offset(pageOffset(q));
+    const totalRows = await app.db.select({ n: count() }).from(safetySensorEvents).where(where);
+    return paginate(
+      rows.map((r) => decorateSensorEvent(r, nowISO)),
+      Number(totalRows[0]?.n ?? 0),
+      q,
+    );
+  });
+
+  app.get(
+    "/projects/:projectId/safety/sensor-events/:eventId",
+    { preHandler: readGate },
+    async (req) => {
+      const { eventId } = req.params as { eventId: string };
+      const row = await fetchSensorEvent(eventId, req.companyId!, req.projectId!);
+      const names = await resolveWorkerNames([row.workerId], req.companyId!);
+      const workerName = row.workerId ? (names.get(row.workerId) ?? null) : null;
+      return {
+        ...decorateSensorEvent(row, new Date().toISOString()),
+        workerName: workerName ?? row.reportedPersonName,
+      };
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/safety/sensor-events/:eventId/acknowledge",
+    { preHandler: standardGate },
+    async (req) => {
+      const { eventId } = req.params as { eventId: string };
+      const body = sensorAcknowledgeSchema.parse(req.body);
+      const row = await fetchSensorEvent(eventId, req.companyId!, req.projectId!);
+      if (row.acknowledgedAt) {
+        throw conflict(
+          `Alarm ${row.reference} was acknowledged at ${row.acknowledgedAt}. The first response is ` +
+            `the one the record turns on; re-acknowledging it would overwrite the response time.`,
+        );
+      }
+      if (row.status === "void") throw conflict(`Alarm ${row.reference} is void.`);
+      const acknowledgedAt = body.acknowledgedAt ?? new Date().toISOString();
+      if (Date.parse(acknowledgedAt) < Date.parse(row.receivedAt)) {
+        throw badRequest(
+          `An acknowledgement at ${acknowledgedAt} predates the alarm's arrival at ${row.receivedAt}.`,
+        );
+      }
+      const responseSeconds =
+        Math.round(((Date.parse(acknowledgedAt) - Date.parse(row.receivedAt)) / 1000) * 10) / 10;
+      const late =
+        row.acknowledgeDueAt != null && Date.parse(acknowledgedAt) > Date.parse(row.acknowledgeDueAt);
+      const now = new Date().toISOString();
+      await app.db
+        .update(safetySensorEvents)
+        .set({
+          status: "acknowledged",
+          acknowledgedAt,
+          acknowledgedBy: req.user!.id,
+          responseSeconds,
+          responseNote: body.note,
+          updatedAt: now,
+        })
+        .where(eq(safetySensorEvents.id, eventId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "safety_sensor_event",
+        objectId: eventId,
+        payload: {
+          act: "acknowledge",
+          reference: row.reference,
+          from: row.status,
+          to: "acknowledged",
+          acknowledgedAt,
+          responseSeconds,
+          deadline: row.acknowledgeDueAt,
+          late,
+          note: body.note,
+        },
+        storePayload: true,
+      });
+      return {
+        ...decorateSensorEvent(
+          await fetchSensorEvent(eventId, req.companyId!, req.projectId!),
+          now,
+        ),
+        response: {
+          responseSeconds,
+          deadline: row.acknowledgeDueAt,
+          late,
+          note: late
+            ? `This alarm was answered ${Math.round(((Date.parse(acknowledgedAt) - Date.parse(row.acknowledgeDueAt!)) / 60_000) * 10) / 10} minute(s) after its ` +
+              `deadline. The lateness stays on the record: a fleet whose alarms are answered late is ` +
+              `a fleet the workforce will stop relying on, and the response time is the only thing ` +
+              `about a device programme that can be audited.`
+            : null,
+        },
+      };
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/safety/sensor-events/:eventId/resolve",
+    { preHandler: standardGate },
+    async (req) => {
+      const { eventId } = req.params as { eventId: string };
+      const body = sensorResolveSchema.parse(req.body);
+      const row = await fetchSensorEvent(eventId, req.companyId!, req.projectId!);
+      if (row.resolvedAt) throw conflict(`Alarm ${row.reference} was resolved at ${row.resolvedAt}.`);
+      if (row.status === "void") throw conflict(`Alarm ${row.reference} is void.`);
+      if (body.status === "false_alarm" && LIFE_SAFETY_ALARMS.has(row.kind) && !row.acknowledgedAt) {
+        throw conflict(
+          `Alarm ${row.reference} is a life-safety class (${row.kind.replace(/_/g, " ")}) and has ` +
+            `never been acknowledged. Marking it a false alarm without anybody having gone to look ` +
+            `is a determination about a person's condition made from a screen. Acknowledge it with ` +
+            `what was found first.`,
+        );
+      }
+      const resolvedAt = body.resolvedAt ?? new Date().toISOString();
+      const now = new Date().toISOString();
+      await app.db
+        .update(safetySensorEvents)
+        .set({
+          status: body.status,
+          resolvedAt,
+          resolvedBy: req.user!.id,
+          outcome: body.outcome,
+          updatedAt: now,
+        })
+        .where(eq(safetySensorEvents.id, eventId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "safety_sensor_event",
+        objectId: eventId,
+        payload: {
+          act: "resolve",
+          reference: row.reference,
+          from: row.status,
+          to: body.status,
+          resolvedAt,
+          outcome: body.outcome,
+          wasAcknowledged: row.acknowledgedAt != null,
+        },
+        storePayload: true,
+      });
+      return decorateSensorEvent(
+        await fetchSensorEvent(eventId, req.companyId!, req.projectId!),
+        now,
+      );
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/safety/sensor-events/:eventId/link",
+    { preHandler: standardGate },
+    async (req) => {
+      const { eventId } = req.params as { eventId: string };
+      const body = sensorLinkSchema.parse(req.body);
+      const row = await fetchSensorEvent(eventId, req.companyId!, req.projectId!);
+      if (body.incidentId) await fetchIncident(body.incidentId, req.companyId!, req.projectId!);
+      if (body.observationId) {
+        await fetchObservation(body.observationId, req.companyId!, req.projectId!);
+      }
+      const now = new Date().toISOString();
+      await app.db
+        .update(safetySensorEvents)
+        .set({
+          incidentId: body.incidentId ?? row.incidentId,
+          observationId: body.observationId ?? row.observationId,
+          updatedAt: now,
+        })
+        .where(eq(safetySensorEvents.id, eventId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "safety_sensor_event",
+        objectId: eventId,
+        payload: {
+          act: "link",
+          reference: row.reference,
+          incidentId: body.incidentId ?? null,
+          observationId: body.observationId ?? null,
+        },
+        storePayload: true,
+      });
+      return decorateSensorEvent(
+        await fetchSensorEvent(eventId, req.companyId!, req.projectId!),
+        now,
+      );
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/safety/sensor-events/:eventId/raise-observation",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const { eventId } = req.params as { eventId: string };
+      const body = sensorRaiseObservationSchema.parse(req.body);
+      const row = await fetchSensorEvent(eventId, req.companyId!, req.projectId!);
+      if (row.observationId) {
+        throw conflict(
+          `Alarm ${row.reference} already raised observation ${row.observationId}. Raising a second ` +
+            `one would double-count a single event on the leading indicators.`,
+        );
+      }
+      const risk = optionalRiskScore(body.riskLikelihood, body.riskSeverity);
+      const seq = await nextRecordNumber(app.db, req.projectId!, "safety_observation");
+      const obsId = newId("sobs");
+      const reference = `OBS-${pad(seq)}`;
+      const now = new Date().toISOString();
+      await app.db.insert(safetyObservations).values({
+        id: obsId,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        number: seq,
+        reference,
+        kind: "negative",
+        category: body.category ?? "other",
+        severity: body.severity ?? row.severity,
+        title: body.title,
+        description: body.description ?? null,
+        observedAt: row.occurredAt,
+        locationId: row.locationId,
+        locationText: row.locationText,
+        latitude: row.latitude,
+        longitude: row.longitude,
+        vendorId: row.vendorId,
+        workerId: row.workerId,
+        riskLikelihood: body.riskLikelihood ?? null,
+        riskSeverity: body.riskSeverity ?? null,
+        riskScore: risk.score?.score ?? null,
+        immediateActionTaken: body.immediateActionTaken ?? null,
+        status: "open",
+        detail: {
+          raisedFromSensorEvent: {
+            id: row.id,
+            reference: row.reference,
+            kind: row.kind,
+            deviceId: row.deviceId,
+            measurementValue: row.measurementValue,
+            measurementUnit: row.measurementUnit,
+            thresholdValue: row.thresholdValue,
+          },
+        },
+        createdBy: req.user!.id,
+      });
+      await app.db
+        .update(safetySensorEvents)
+        .set({ observationId: obsId, updatedAt: now })
+        .where(eq(safetySensorEvents.id, eventId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "safety_observation",
+        objectId: obsId,
+        payload: {
+          reference,
+          title: body.title,
+          raisedFrom: "safety_sensor_event",
+          sensorEventId: row.id,
+          sensorEventReference: row.reference,
+          kind: row.kind,
+        },
+        storePayload: true,
+      });
+      reply.code(201);
+      return {
+        observation: decorateObservation(
+          await fetchObservation(obsId, req.companyId!, req.projectId!),
+          todayISO(),
+        ),
+        sensorEvent: decorateSensorEvent(
+          await fetchSensorEvent(eventId, req.companyId!, req.projectId!),
+          now,
+        ),
+        riskAssessment: risk,
+      };
+    },
+  );
+
+  /* ================================================================ */
+  /* STATUTORY FORM GENERATION (#652)                                  */
+  /* ================================================================ */
+
+  const regulatoryGenerateSchema = z
+    .object({
+      form: z.enum(SAFETY_REGULATORY_FORMS),
+      /** the calendar year an establishment log covers */
+      year: z.number().int().min(1970).max(2200).optional(),
+      /** the incident a per-case form is about */
+      incidentId: z.string().max(64).optional(),
+      note: z.string().max(2000).optional(),
+    })
+    .refine((v) => (v.form === "osha_300" || v.form === "osha_300a" ? v.year != null : true), {
+      message: "The OSHA 300 log and its 300A summary cover a calendar year — supply `year`.",
+    })
+    .refine(
+      (v) =>
+        v.form === "osha_301" || v.form === "riddor_f2508" || v.form === "riddor_f2508a"
+          ? v.incidentId != null
+          : true,
+      { message: "A 301 or an F2508 is about one case — supply `incidentId`." },
+    );
+
+  const regulatoryListQuery = pageQuerySchema.extend({
+    form: z.enum(SAFETY_REGULATORY_FORMS).optional(),
+    status: z.enum(SAFETY_REGULATORY_REPORT_STATUSES).optional(),
+    year: z.coerce.number().int().min(1970).max(2200).optional(),
+    incidentId: z.string().max(64).optional(),
+  });
+
+  const regulatoryCertifySchema = z.object({
+    certifierTitle: z.string().min(1).max(200),
+    certifiedAt: isoTimestamp.optional(),
+    statement: z.string().max(4000).optional(),
+  });
+
+  const regulatorySubmitSchema = z.object({
+    submissionReference: z.string().max(200).nullable().optional(),
+    submittedAt: isoTimestamp.optional(),
+    note: z.string().max(2000).optional(),
+  });
+
+  /**
+   * The names and addresses the forms ask for, resolved once.
+   *
+   * Everything here is looked up rather than typed by whoever asked for the
+   * form: an establishment address retyped onto a 300A each year is an
+   * establishment address that will eventually differ from the project's.
+   */
+  async function buildFormContext(
+    companyId: string,
+    projectId: string,
+    incidents: readonly FormIncident[],
+  ): Promise<FormContext> {
+    const projectRows = await app.db
+      .select({
+        id: projects.id,
+        name: projects.name,
+        address: projects.address,
+        city: projects.city,
+        country: projects.country,
+      })
+      .from(projects)
+      .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
+      .limit(1);
+    const project = projectRows[0];
+    if (!project) throw notFound("Project not found");
+    const companyRows = await app.db
+      .select({ name: companies.name })
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .limit(1);
+
+    const ctx = emptyFormContext(project.name, project.id);
+    ctx.companyName = companyRows[0]?.name ?? null;
+    ctx.street = project.address;
+    ctx.city = project.city;
+    ctx.country = project.country;
+
+    const workerIds = [
+      ...new Set(incidents.map((i) => i.workerId).filter((id): id is string => !!id)),
+    ];
+    if (workerIds.length > 0) {
+      const rows = await app.db
+        .select({ id: workers.id, fullName: workers.fullName, trade: workers.trade })
+        .from(workers)
+        .where(and(eq(workers.companyId, companyId), inArray(workers.id, workerIds)));
+      for (const w of rows) {
+        ctx.workerNames.set(w.id, w.fullName);
+        ctx.workerTrades.set(w.id, w.trade);
+      }
+    }
+    const vendorIds = [
+      ...new Set(incidents.map((i) => i.vendorId).filter((id): id is string => !!id)),
+    ];
+    if (vendorIds.length > 0) {
+      const rows = await app.db
+        .select({ id: vendors.id, name: vendors.name })
+        .from(vendors)
+        .where(and(eq(vendors.companyId, companyId), inArray(vendors.id, vendorIds)));
+      for (const v of rows) ctx.vendorNames.set(v.id, v.name);
+    }
+    const locationIds = [
+      ...new Set(incidents.map((i) => i.locationId).filter((id): id is string => !!id)),
+    ];
+    if (locationIds.length > 0) {
+      const rows = await app.db
+        .select({ id: locations.id, name: locations.name })
+        .from(locations)
+        .where(and(eq(locations.companyId, companyId), inArray(locations.id, locationIds)));
+      for (const l of rows) ctx.locationNames.set(l.id, l.name);
+    }
+    return ctx;
+  }
+
+  /** Non-void incidents whose occurrence falls in the window. */
+  async function loadFormIncidents(
+    companyId: string,
+    projectId: string,
+    from: string,
+    to: string,
+  ): Promise<IncidentRow[]> {
+    return app.db
+      .select()
+      .from(safetyIncidents)
+      .where(
+        and(
+          eq(safetyIncidents.companyId, companyId),
+          eq(safetyIncidents.projectId, projectId),
+          gte(safetyIncidents.occurredAt, `${from}T00:00:00Z`),
+          lte(safetyIncidents.occurredAt, `${to}T23:59:59Z`),
+          ne(safetyIncidents.status, "void"),
+        ),
+      )
+      .orderBy(asc(safetyIncidents.occurredAt));
+  }
+
+  /**
+   * The annual average number of employees, derived — never estimated.
+   *
+   * OSHA defines this over PAY PERIODS, and this platform holds no payroll
+   * periods. What it does hold is the site-access register, so the figure is
+   * the mean of the distinct people on site per month across the months that
+   * register actually covers, and the derivation is printed on the form beside
+   * the number. Where there is no access data the field is null with the
+   * reason: a made-up denominator on a 300A is a misstatement of a rate a
+   * client will rely on, not a rounding.
+   */
+  async function annualAverageEmployees(
+    companyId: string,
+    projectId: string,
+    year: number,
+  ): Promise<{ value: number | null; basis: string | null; reasons: string[] }> {
+    const rows = await app.db
+      .select({
+        month: sql<string>`substr(${siteAccessRecords.accessDate}, 1, 7)`,
+        people: sql<number>`count(distinct ${siteAccessRecords.workerId})`,
+      })
+      .from(siteAccessRecords)
+      .where(
+        and(
+          eq(siteAccessRecords.companyId, companyId),
+          eq(siteAccessRecords.projectId, projectId),
+          gte(siteAccessRecords.accessDate, `${year}-01-01`),
+          lte(siteAccessRecords.accessDate, `${year}-12-31`),
+        ),
+      )
+      .groupBy(sql`substr(${siteAccessRecords.accessDate}, 1, 7)`);
+    if (rows.length === 0) {
+      return {
+        value: null,
+        basis: null,
+        reasons: [
+          `The site-access register holds no record for ${year} on this project, and the platform ` +
+            `holds no payroll pay periods, so the annual average number of employees cannot be ` +
+            `derived from anything. Leave the box for the person who holds the payroll to complete.`,
+        ],
+      };
+    }
+    const total = rows.reduce((sum, r) => sum + Number(r.people ?? 0), 0);
+    const value = Math.round(total / rows.length);
+    return {
+      value,
+      basis:
+        `Derived: the mean of the distinct people recorded on site per month across the ` +
+        `${rows.length} month(s) of ${year} the site-access register covers (${rows
+          .map((r) => `${r.month}: ${Number(r.people ?? 0)}`)
+          .join(", ")}). OSHA defines this figure over payroll pay periods, which this platform does ` +
+        `not hold — check it against payroll before the summary is signed.`,
+      reasons: [],
+    };
+  }
+
+  /** Everything a form needs about exposure hours for one window. */
+  async function exposureForWindow(
+    companyId: string,
+    projectId: string,
+    from: string,
+    to: string,
+  ): Promise<ExposureHours> {
+    const tcAgg = await app.db
+      .select({ hours: sql<number>`coalesce(sum(${timecards.totalHours}), 0)`, n: count() })
+      .from(timecards)
+      .where(
+        and(
+          eq(timecards.companyId, companyId),
+          eq(timecards.projectId, projectId),
+          gte(timecards.workDate, from),
+          lte(timecards.workDate, to),
+          inArray(timecards.status, COUNTED_TIMECARD_STATUSES),
+        ),
+      );
+    const saAgg = await app.db
+      .select({
+        hours: sql<number>`coalesce(sum(${siteAccessRecords.hoursOnSite}), 0)`,
+        n: count(),
+      })
+      .from(siteAccessRecords)
+      .where(
+        and(
+          eq(siteAccessRecords.companyId, companyId),
+          eq(siteAccessRecords.projectId, projectId),
+          gte(siteAccessRecords.accessDate, from),
+          lte(siteAccessRecords.accessDate, to),
+        ),
+      );
+    const timecardCount = Number(tcAgg[0]?.n ?? 0);
+    const siteAccessCount = Number(saAgg[0]?.n ?? 0);
+    return resolveExposureHours({
+      timecardHours: timecardCount > 0 ? Number(tcAgg[0]?.hours ?? 0) : null,
+      timecardCount,
+      siteAccessHours: siteAccessCount > 0 ? Number(saAgg[0]?.hours ?? 0) : null,
+      siteAccessCount,
+      from,
+      to,
+    });
+  }
+
+  interface BuiltForm {
+    payload: Record<string, unknown>;
+    rowCount: number;
+    caveats: string[];
+    periodYear: number | null;
+    periodFrom: string | null;
+    periodTo: string | null;
+    incidentId: string | null;
+  }
+
+  /**
+   * Build one statutory artefact. Pure assembly on top of `regulatory.ts` —
+   * the only thing this adds is reading the records.
+   */
+  async function buildRegulatoryForm(
+    companyId: string,
+    projectId: string,
+    input: { form: string; year?: number; incidentId?: string },
+    generatedAt: string,
+  ): Promise<BuiltForm> {
+    if (input.form === "osha_300" || input.form === "osha_300a") {
+      const year = input.year!;
+      const from = `${year}-01-01`;
+      const to = `${year}-12-31`;
+      const rows = await loadFormIncidents(companyId, projectId, from, to);
+      const ctx = await buildFormContext(companyId, projectId, rows);
+      const log = buildOsha300(rows, ctx, year, generatedAt);
+      if (input.form === "osha_300") {
+        return {
+          payload: log as unknown as Record<string, unknown>,
+          rowCount: log.rows.length,
+          caveats: log.caveats,
+          periodYear: year,
+          periodFrom: from,
+          periodTo: to,
+          incidentId: null,
+        };
+      }
+      const exposure = await exposureForWindow(companyId, projectId, from, to);
+      const employees = await annualAverageEmployees(companyId, projectId, year);
+      const summary = buildOsha300A(
+        {
+          log,
+          totalHoursWorked: exposure.hours,
+          hoursReasons: exposure.reasons,
+          hoursSource: exposure.source,
+          annualAverageEmployees: employees.value,
+          employeeReasons: employees.reasons,
+          employeesBasis: employees.basis,
+          generatedAt,
+        },
+        ctx,
+      );
+      return {
+        payload: summary as unknown as Record<string, unknown>,
+        rowCount: log.rows.length,
+        caveats: summary.caveats,
+        periodYear: year,
+        periodFrom: from,
+        periodTo: to,
+        incidentId: null,
+      };
+    }
+
+    const incident = await fetchIncident(input.incidentId!, companyId, projectId);
+    const ctx = await buildFormContext(companyId, projectId, [incident]);
+    if (input.form === "osha_301") {
+      const report = buildOsha301(incident, ctx, generatedAt);
+      return {
+        payload: report as unknown as Record<string, unknown>,
+        rowCount: 1,
+        caveats: report.caveats,
+        periodYear: Number(incident.occurredAt.slice(0, 4)),
+        periodFrom: incident.occurredAt.slice(0, 10),
+        periodTo: incident.occurredAt.slice(0, 10),
+        incidentId: incident.id,
+      };
+    }
+    const report = buildRiddorF2508(incident, ctx, storedDetermination(incident), generatedAt);
+    if (input.form === "riddor_f2508a" && report.form !== "riddor_f2508a") {
+      throw badRequest(
+        `Incident ${incident.reference} is not classified as a reportable occupational disease, so ` +
+          `the F2508A (the disease form) is not the form it goes on. Its RIDDOR category is ` +
+          `\`${incident.riddorCategory ?? "not assessed"}\` — reassess it, or generate the F2508.`,
+      );
+    }
+    if (input.form === "riddor_f2508" && report.form === "riddor_f2508a") {
+      throw badRequest(
+        `Incident ${incident.reference} is classified as a reportable occupational disease, which is ` +
+          `reported on the F2508A rather than the F2508.`,
+      );
+    }
+    return {
+      payload: report as unknown as Record<string, unknown>,
+      rowCount: 1,
+      caveats: report.caveats,
+      periodYear: Number(incident.occurredAt.slice(0, 4)),
+      periodFrom: incident.occurredAt.slice(0, 10),
+      periodTo: incident.occurredAt.slice(0, 10),
+      incidentId: incident.id,
+    };
+  }
+
+  app.get(
+    "/projects/:projectId/safety/regulatory/preview",
+    { preHandler: readGate },
+    async (req) => {
+      const q = z
+        .object({
+          form: z.enum(SAFETY_REGULATORY_FORMS),
+          year: z.coerce.number().int().min(1970).max(2200).optional(),
+          incidentId: z.string().max(64).optional(),
+        })
+        /* Same requirement as the generate route: a 301 or an F2508 is about
+         * one case. Without this the missing id reached the fetcher as
+         * `undefined`, which drizzle renders as `= NULL`, and the caller was
+         * told "Incident not found" — a false statement about a case they
+         * never named. */
+        .refine(
+          (v) =>
+            v.form === "osha_301" || v.form === "riddor_f2508" || v.form === "riddor_f2508a"
+              ? v.incidentId != null
+              : true,
+          { message: "A 301 or an F2508 is about one case — supply `incidentId`." },
+        )
+        .parse(req.query);
+      const generatedAt = new Date().toISOString();
+      const built = await buildRegulatoryForm(
+        req.companyId!,
+        req.projectId!,
+        { form: q.form, year: q.year ?? Number(todayISO().slice(0, 4)), incidentId: q.incidentId },
+        generatedAt,
+      );
+      return {
+        form: q.form,
+        stored: false,
+        note:
+          "This is a preview computed from the register as it stands right now. Nothing has been " +
+          "stored and nothing has been hashed — generate the artefact when the figures are the ones " +
+          "you intend to stand behind, because a form is an assertion made on a date.",
+        ...built,
+      };
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/safety/regulatory/reports",
+    { preHandler: standardGate },
+    async (req, reply) => {
+      const body = regulatoryGenerateSchema.parse(req.body);
+      const generatedAt = new Date().toISOString();
+      const built = await buildRegulatoryForm(
+        req.companyId!,
+        req.projectId!,
+        body,
+        generatedAt,
+      );
+
+      /* The artefact is frozen HERE. A 300A is posted on a wall for three
+       * months and signed by an executive; an F2508 is what was actually said
+       * to the authority. Regenerating either later from a register that has
+       * since been corrected produces a different document with the same name,
+       * which is precisely what an inspector is entitled to ask about. So the
+       * payload is canonicalised, hashed and written to the file store, and a
+       * correction is a NEW artefact that supersedes this one. */
+      const canonical = canonicalJson(built.payload);
+      const sha256 = createHash("sha256").update(canonical).digest("hex");
+      const saved = await app.storage.saveBuffer(req.companyId!, Buffer.from(canonical, "utf8"));
+
+      const seq = await nextRecordNumber(app.db, req.companyId!, "safety_regulatory_report");
+      const reference = `REG-${pad(seq)}`;
+      const fileId = newId("fil");
+      await app.db.insert(files).values({
+        id: fileId,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        folderId: null,
+        name: `${reference}-${body.form}.json`,
+        contentType: "application/json",
+        sizeBytes: saved.sizeBytes,
+        sha256: saved.sha256,
+        storageKey: saved.storageKey,
+        documentType: "safety",
+        metadata: {
+          safetyRegulatoryForm: body.form,
+          periodYear: built.periodYear,
+          incidentId: built.incidentId,
+        },
+        uploadedBy: req.user!.id,
+      });
+
+      /* Only one live artefact per (form, period or case): the previous one is
+       * superseded rather than deleted, because "what we filed then" and "what
+       * we would file now" are both facts. */
+      const priorFilters = [
+        eq(safetyRegulatoryReports.companyId, req.companyId!),
+        eq(safetyRegulatoryReports.form, body.form),
+        inArray(safetyRegulatoryReports.status, ["generated", "submitted"]),
+      ];
+      if (built.incidentId) {
+        priorFilters.push(eq(safetyRegulatoryReports.incidentId, built.incidentId));
+      } else {
+        priorFilters.push(eq(safetyRegulatoryReports.projectId, req.projectId!));
+        priorFilters.push(eq(safetyRegulatoryReports.periodYear, built.periodYear!));
+      }
+      const prior = await app.db
+        .select({ id: safetyRegulatoryReports.id, reference: safetyRegulatoryReports.reference })
+        .from(safetyRegulatoryReports)
+        .where(and(...priorFilters));
+
+      const id = newId("sreg");
+      await app.db.insert(safetyRegulatoryReports).values({
+        id,
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        number: seq,
+        reference,
+        form: body.form,
+        status: "generated",
+        periodYear: built.periodYear,
+        periodFrom: built.periodFrom,
+        periodTo: built.periodTo,
+        incidentId: built.incidentId,
+        payload: built.payload,
+        sha256,
+        fileId,
+        rowCount: built.rowCount,
+        caveats: built.caveats,
+        supersedesId: prior[0]?.id ?? null,
+        detail: { note: body.note ?? null, storageKey: saved.storageKey },
+        generatedBy: req.user!.id,
+      });
+      for (const p of prior) {
+        await app.db
+          .update(safetyRegulatoryReports)
+          .set({
+            status: "superseded",
+            supersededById: id,
+            updatedAt: new Date().toISOString(),
+          })
+          .where(eq(safetyRegulatoryReports.id, p.id));
+      }
+
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        actorId: req.user!.id,
+        action: "create",
+        objectType: "safety_regulatory_report",
+        objectId: id,
+        payload: {
+          reference,
+          form: body.form,
+          periodYear: built.periodYear,
+          incidentId: built.incidentId,
+          sha256,
+          fileId,
+          rowCount: built.rowCount,
+          caveatCount: built.caveats.length,
+          supersedes: prior.map((p) => p.reference),
+        },
+        storePayload: true,
+      });
+
+      reply.code(201);
+      return {
+        id,
+        reference,
+        form: body.form,
+        sha256,
+        fileId,
+        rowCount: built.rowCount,
+        caveats: built.caveats,
+        payload: built.payload,
+        supersedes: prior.map((p) => ({ id: p.id, reference: p.reference })),
+        note:
+          "The artefact is frozen and hashed. Nothing here has been transmitted to any authority — " +
+          "this platform produces the document a competent person checks and files.",
+      };
+    },
+  );
+
+  app.get(
+    "/projects/:projectId/safety/regulatory/reports",
+    { preHandler: readGate },
+    async (req) => {
+      const q = regulatoryListQuery.parse(req.query);
+      const filters = [
+        eq(safetyRegulatoryReports.companyId, req.companyId!),
+        eq(safetyRegulatoryReports.projectId, req.projectId!),
+      ];
+      if (q.form) filters.push(eq(safetyRegulatoryReports.form, q.form));
+      if (q.status) filters.push(eq(safetyRegulatoryReports.status, q.status));
+      if (q.year != null) filters.push(eq(safetyRegulatoryReports.periodYear, q.year));
+      if (q.incidentId) filters.push(eq(safetyRegulatoryReports.incidentId, q.incidentId));
+      const where = and(...filters);
+      const rows = await app.db
+        .select({
+          id: safetyRegulatoryReports.id,
+          reference: safetyRegulatoryReports.reference,
+          form: safetyRegulatoryReports.form,
+          status: safetyRegulatoryReports.status,
+          periodYear: safetyRegulatoryReports.periodYear,
+          periodFrom: safetyRegulatoryReports.periodFrom,
+          periodTo: safetyRegulatoryReports.periodTo,
+          incidentId: safetyRegulatoryReports.incidentId,
+          sha256: safetyRegulatoryReports.sha256,
+          fileId: safetyRegulatoryReports.fileId,
+          rowCount: safetyRegulatoryReports.rowCount,
+          caveats: safetyRegulatoryReports.caveats,
+          certifiedBy: safetyRegulatoryReports.certifiedBy,
+          certifiedAt: safetyRegulatoryReports.certifiedAt,
+          certifierTitle: safetyRegulatoryReports.certifierTitle,
+          submittedAt: safetyRegulatoryReports.submittedAt,
+          submissionReference: safetyRegulatoryReports.submissionReference,
+          supersedesId: safetyRegulatoryReports.supersedesId,
+          supersededById: safetyRegulatoryReports.supersededById,
+          generatedBy: safetyRegulatoryReports.generatedBy,
+          createdAt: safetyRegulatoryReports.createdAt,
+        })
+        .from(safetyRegulatoryReports)
+        .where(where)
+        .orderBy(desc(safetyRegulatoryReports.createdAt))
+        .limit(q.pageSize)
+        .offset(pageOffset(q));
+      const totalRows = await app.db
+        .select({ n: count() })
+        .from(safetyRegulatoryReports)
+        .where(where);
+      return paginate(rows, Number(totalRows[0]?.n ?? 0), q);
+    },
+  );
+
+  async function fetchRegulatoryReport(id: string, companyId: string, projectId: string) {
+    const rows = await app.db
+      .select()
+      .from(safetyRegulatoryReports)
+      .where(
+        and(
+          eq(safetyRegulatoryReports.id, id),
+          eq(safetyRegulatoryReports.companyId, companyId),
+          eq(safetyRegulatoryReports.projectId, projectId),
+        ),
+      )
+      .limit(1);
+    if (!rows[0]) throw notFound("Regulatory report not found");
+    return rows[0];
+  }
+
+  app.get(
+    "/projects/:projectId/safety/regulatory/reports/:reportId",
+    { preHandler: readGate },
+    async (req) => {
+      const { reportId } = req.params as { reportId: string };
+      const row = await fetchRegulatoryReport(reportId, req.companyId!, req.projectId!);
+      return {
+        ...row,
+        integrity: {
+          sha256: row.sha256,
+          recomputed: createHash("sha256").update(canonicalJson(row.payload)).digest("hex"),
+          note:
+            "`recomputed` is the hash of the stored payload as it sits in the row. It must equal " +
+            "`sha256`; if it does not, the row has been altered since it was generated and the " +
+            "artefact should not be relied on.",
+        },
+      };
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/safety/regulatory/reports/:reportId/certify",
+    { preHandler: adminGate },
+    async (req) => {
+      const { reportId } = req.params as { reportId: string };
+      const body = regulatoryCertifySchema.parse(req.body);
+      const row = await fetchRegulatoryReport(reportId, req.companyId!, req.projectId!);
+      if (row.form !== "osha_300a") {
+        throw badRequest(
+          `Only the 300A carries an executive certification (29 CFR 1904.32(b)(3)). ` +
+            `${row.reference} is a ${row.form.replace(/_/g, " ")}.`,
+        );
+      }
+      if (row.status === "superseded" || row.status === "void") {
+        throw conflict(
+          `${row.reference} is ${row.status}. Certifying a superseded summary would put an ` +
+            `executive's name against figures that have since been replaced.`,
+        );
+      }
+      if (row.certifiedAt) {
+        throw conflict(
+          `${row.reference} was certified by ${row.certifiedBy} at ${row.certifiedAt}. A second ` +
+            `certification on the same document would leave two people answerable for one statement.`,
+        );
+      }
+      const certifiedAt = body.certifiedAt ?? new Date().toISOString();
+      await app.db
+        .update(safetyRegulatoryReports)
+        .set({
+          certifiedBy: req.user!.id,
+          certifiedAt,
+          certifierTitle: body.certifierTitle,
+          detail: {
+            ...(row.detail as Record<string, unknown>),
+            certificationStatement: body.statement ?? null,
+          },
+          updatedAt: new Date().toISOString(),
+        })
+        .where(eq(safetyRegulatoryReports.id, reportId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "safety_regulatory_report",
+        objectId: reportId,
+        payload: {
+          act: "certify",
+          reference: row.reference,
+          certifierTitle: body.certifierTitle,
+          certifiedAt,
+          sha256: row.sha256,
+          caveatCount: (row.caveats as string[]).length,
+        },
+        storePayload: true,
+      });
+      return {
+        ...(await fetchRegulatoryReport(reportId, req.companyId!, req.projectId!)),
+        note:
+          "1904.32(b)(3) makes the certifier personally responsible for having examined the 300 " +
+          "log and reasonably believing the summary correct and complete. The caveats on this " +
+          "artefact are part of what was certified — they are stored with it.",
+      };
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/safety/regulatory/reports/:reportId/submit",
+    { preHandler: standardGate },
+    async (req) => {
+      const { reportId } = req.params as { reportId: string };
+      const body = regulatorySubmitSchema.parse(req.body);
+      const row = await fetchRegulatoryReport(reportId, req.companyId!, req.projectId!);
+      if (row.status !== "generated") {
+        throw conflict(`${row.reference} is \`${row.status}\` and cannot be marked submitted.`);
+      }
+      const submittedAt = body.submittedAt ?? new Date().toISOString();
+      await app.db
+        .update(safetyRegulatoryReports)
+        .set({
+          status: "submitted",
+          submittedAt,
+          submittedBy: req.user!.id,
+          submissionReference: body.submissionReference ?? null,
+          detail: {
+            ...(row.detail as Record<string, unknown>),
+            submissionNote: body.note ?? null,
+          },
+          updatedAt: new Date().toISOString(),
+        })
+        .where(eq(safetyRegulatoryReports.id, reportId));
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        actorId: req.user!.id,
+        action: "state_change",
+        objectType: "safety_regulatory_report",
+        objectId: reportId,
+        payload: {
+          act: "submit",
+          reference: row.reference,
+          form: row.form,
+          submittedAt,
+          submissionReference: body.submissionReference ?? null,
+          incidentId: row.incidentId,
+        },
+        storePayload: true,
+      });
+      return {
+        ...(await fetchRegulatoryReport(reportId, req.companyId!, req.projectId!)),
+        note:
+          "Marking an artefact submitted records that a human filed it with the authority. It does " +
+          "not, on its own, discharge the incident's notification duty — record that against the " +
+          "incident with POST .../notify-regulator so the per-regime clock is closed.",
+      };
+    },
+  );
+
+  /* ================================================================ */
+  /* VENDOR SAFETY SCORECARD (#646, #661, #1100)                       */
+  /* ================================================================ */
+
+  const scorecardQuery = z.object({
+    vendorId: z.string().max(64).optional(),
+    from: isoDateSchema.optional(),
+    to: isoDateSchema.optional(),
+  });
+
+  const WEAK_CONTROLS: ReadonlySet<string> = new Set(["administrative", "ppe"]);
+
+  /**
+   * Every figure on one vendor's scorecard, read from the registers they are
+   * actually in.
+   *
+   * `projectId === null` rolls the company up across projects. The exposure
+   * denominator is the vendor's OWN hours, never the project's: dividing a
+   * subcontractor's injuries by everybody's hours produces a flattering rate
+   * for the small firm and a punishing one for the large, and both are wrong.
+   */
+  async function collectVendorScorecardInput(
+    companyId: string,
+    projectId: string | null,
+    vendorId: string,
+    vendorName: string | null,
+    from: string,
+    to: string,
+  ): Promise<VendorScorecardInput> {
+    const incidentRows = await app.db
+      .select()
+      .from(safetyIncidents)
+      .where(
+        and(
+          eq(safetyIncidents.companyId, companyId),
+          ...(projectId ? [eq(safetyIncidents.projectId, projectId)] : []),
+          eq(safetyIncidents.vendorId, vendorId),
+          gte(safetyIncidents.occurredAt, `${from}T00:00:00Z`),
+          lte(safetyIncidents.occurredAt, `${to}T23:59:59Z`),
+          ne(safetyIncidents.status, "void"),
+        ),
+      );
+    const bySeverity: Record<string, number> = {};
+    for (const i of incidentRows) bySeverity[i.severity] = (bySeverity[i.severity] ?? 0) + 1;
+    const RECORDABLE = [
+      "death",
+      "days_away_from_work",
+      "job_transfer_or_restriction",
+      "other_recordable",
+    ];
+
+    const observationRows = await app.db
+      .select({
+        kind: safetyObservations.kind,
+        severity: safetyObservations.severity,
+        workStopped: safetyObservations.workStopped,
+      })
+      .from(safetyObservations)
+      .where(
+        and(
+          eq(safetyObservations.companyId, companyId),
+          ...(projectId ? [eq(safetyObservations.projectId, projectId)] : []),
+          eq(safetyObservations.vendorId, vendorId),
+          gte(safetyObservations.observedAt, `${from}T00:00:00Z`),
+          lte(safetyObservations.observedAt, `${to}T23:59:59Z`),
+        ),
+      );
+
+    const actionRows = await app.db
+      .select({
+        status: safetyCorrectiveActions.status,
+        dueDate: safetyCorrectiveActions.dueDate,
+        closedAt: safetyCorrectiveActions.closedAt,
+        hierarchyOfControl: safetyCorrectiveActions.hierarchyOfControl,
+        effectivenessVerdict: safetyCorrectiveActions.effectivenessVerdict,
+      })
+      .from(safetyCorrectiveActions)
+      .where(
+        and(
+          eq(safetyCorrectiveActions.companyId, companyId),
+          ...(projectId ? [eq(safetyCorrectiveActions.projectId, projectId)] : []),
+          eq(safetyCorrectiveActions.ownerVendorId, vendorId),
+          gte(safetyCorrectiveActions.dueDate, from),
+          lte(safetyCorrectiveActions.dueDate, to),
+        ),
+      );
+    const asOf = todayISO();
+    const closedOnTime = actionRows.filter(
+      (a) =>
+        (a.status === "closed" || a.status === "verified") &&
+        a.closedAt != null &&
+        a.closedAt.slice(0, 10) <= a.dueDate,
+    ).length;
+    const closedLate = actionRows.filter(
+      (a) =>
+        (a.status === "closed" || a.status === "verified") &&
+        (a.closedAt == null || a.closedAt.slice(0, 10) > a.dueDate),
+    ).length;
+
+    const inspectionRows = await app.db
+      .select({
+        status: safetyInspections.status,
+        result: safetyInspections.result,
+        criticalDefectCount: safetyInspections.criticalDefectCount,
+      })
+      .from(safetyInspections)
+      .where(
+        and(
+          eq(safetyInspections.companyId, companyId),
+          ...(projectId ? [eq(safetyInspections.projectId, projectId)] : []),
+          eq(safetyInspections.vendorId, vendorId),
+          gte(safetyInspections.performedAt, `${from}T00:00:00Z`),
+          lte(safetyInspections.performedAt, `${to}T23:59:59Z`),
+        ),
+      );
+
+    const ncrRows = await app.db
+      .select({
+        severity: nonConformanceReports.severity,
+        status: nonConformanceReports.status,
+        isBackcharged: nonConformanceReports.isBackcharged,
+        costImpact: nonConformanceReports.costImpact,
+        currency: nonConformanceReports.currency,
+      })
+      .from(nonConformanceReports)
+      .where(
+        and(
+          eq(nonConformanceReports.companyId, companyId),
+          ...(projectId ? [eq(nonConformanceReports.projectId, projectId)] : []),
+          eq(nonConformanceReports.raisedAgainstVendorId, vendorId),
+          gte(nonConformanceReports.createdAt, `${from}T00:00:00Z`),
+          lte(nonConformanceReports.createdAt, `${to}T23:59:59Z`),
+        ),
+      );
+    const ncrSeverity: Record<string, number> = {};
+    const costByCurrency: Record<string, number> = {};
+    for (const n of ncrRows) {
+      ncrSeverity[n.severity] = (ncrSeverity[n.severity] ?? 0) + 1;
+      if (n.costImpact != null && n.costImpact !== 0) {
+        costByCurrency[n.currency] = (costByCurrency[n.currency] ?? 0) + n.costImpact;
+      }
+    }
+
+    const programmeRows = await app.db
+      .select({ status: safetyProgrammeRecords.status, expiresAt: safetyProgrammeRecords.expiresAt })
+      .from(safetyProgrammeRecords)
+      .where(
+        and(
+          eq(safetyProgrammeRecords.companyId, companyId),
+          ...(projectId ? [eq(safetyProgrammeRecords.projectId, projectId)] : []),
+          eq(safetyProgrammeRecords.vendorId, vendorId),
+        ),
+      );
+    const soon = addDaysISO(asOf, 30);
+
+    const talkRows = await app.db
+      .select({ n: count() })
+      .from(toolboxTalks)
+      .where(
+        and(
+          eq(toolboxTalks.companyId, companyId),
+          ...(projectId ? [eq(toolboxTalks.projectId, projectId)] : []),
+          eq(toolboxTalks.vendorId, vendorId),
+          gte(toolboxTalks.talkDate, from),
+          lte(toolboxTalks.talkDate, to),
+          inArray(toolboxTalks.status, ["delivered", "verified"]),
+        ),
+      );
+
+    const alarmRows = await app.db
+      .select({ n: count() })
+      .from(safetySensorEvents)
+      .where(
+        and(
+          eq(safetySensorEvents.companyId, companyId),
+          ...(projectId ? [eq(safetySensorEvents.projectId, projectId)] : []),
+          eq(safetySensorEvents.vendorId, vendorId),
+          eq(safetySensorEvents.status, "open"),
+          gte(safetySensorEvents.occurredAt, `${from}T00:00:00Z`),
+          lte(safetySensorEvents.occurredAt, `${to}T23:59:59Z`),
+        ),
+      );
+
+    /* The vendor's own exposure hours. Timecards carry vendorId, so this is
+     * the one denominator that belongs to this supplier rather than to the
+     * site they happened to be on. */
+    const tcAgg = await app.db
+      .select({ hours: sql<number>`coalesce(sum(${timecards.totalHours}), 0)`, n: count() })
+      .from(timecards)
+      .where(
+        and(
+          eq(timecards.companyId, companyId),
+          ...(projectId ? [eq(timecards.projectId, projectId)] : []),
+          eq(timecards.vendorId, vendorId),
+          gte(timecards.workDate, from),
+          lte(timecards.workDate, to),
+          inArray(timecards.status, COUNTED_TIMECARD_STATUSES),
+        ),
+      );
+    const timecardCount = Number(tcAgg[0]?.n ?? 0);
+    const exposure = resolveExposureHours({
+      timecardHours: timecardCount > 0 ? Number(tcAgg[0]?.hours ?? 0) : null,
+      timecardCount,
+      siteAccessHours: null,
+      siteAccessCount: 0,
+      from,
+      to,
+    });
+
+    return {
+      vendorId,
+      vendorName,
+      projectId,
+      from,
+      to,
+      incidents: {
+        total: incidentRows.length,
+        bySeverity,
+        fatalities: incidentRows.filter((i) => asBool(i.isFatality)).length,
+        lostTimeCases: incidentRows.filter((i) => asBool(i.isLostTime)).length,
+        recordableCases: incidentRows.filter((i) => RECORDABLE.includes(i.oshaCaseType ?? "")).length,
+        oshaAssessedAll:
+          incidentRows.length > 0 && incidentRows.every((i) => assessedUnderOsha(i)),
+        underAssessment: incidentRows.filter(
+          (i) => (storedDetermination(i)?.indeterminateRuleIds ?? []).length > 0,
+        ).length,
+        nearMisses: incidentRows.filter((i) => i.incidentType === "near_miss").length,
+      },
+      observations: {
+        positive: observationRows.filter((o) => o.kind === "positive").length,
+        negative: observationRows.filter((o) => o.kind === "negative").length,
+        workStopped: observationRows.filter((o) => asBool(o.workStopped)).length,
+        highRisk: observationRows.filter((o) => o.severity === "high" || o.severity === "critical")
+          .length,
+      },
+      actions: {
+        total: actionRows.length,
+        open: actionRows.filter((a) => a.status === "open" || a.status === "in_progress").length,
+        overdue: actionRows.filter(
+          (a) => (a.status === "open" || a.status === "in_progress") && a.dueDate < asOf,
+        ).length,
+        closedOnTime,
+        closedLate,
+        weakControl: actionRows.filter((a) => WEAK_CONTROLS.has(a.hierarchyOfControl ?? "")).length,
+        ineffective: actionRows.filter((a) => a.effectivenessVerdict === "not_effective").length,
+      },
+      inspections: {
+        completed: inspectionRows.length,
+        passed: inspectionRows.filter((i) => i.result === "pass").length,
+        passedWithObservations: inspectionRows.filter((i) => i.result === "pass_with_observations")
+          .length,
+        failed: inspectionRows.filter((i) => i.result === "fail").length,
+        criticalDefects: inspectionRows.reduce((s, i) => s + (i.criticalDefectCount ?? 0), 0),
+      },
+      ncrs: {
+        total: ncrRows.length,
+        bySeverity: ncrSeverity,
+        open: ncrRows.filter((n) => n.status !== "closed" && n.status !== "void").length,
+        backcharged: ncrRows.filter((n) => asBool(n.isBackcharged)).length,
+        costByCurrency,
+      },
+      programme: {
+        expired: programmeRows.filter((r) => r.status === "expired").length,
+        expiringSoon: programmeRows.filter(
+          (r) => r.status !== "expired" && r.expiresAt != null && r.expiresAt <= soon && r.expiresAt >= asOf,
+        ).length,
+        active: programmeRows.filter((r) => r.status === "active" || r.status === "approved").length,
+      },
+      exposure,
+      toolboxTalksAttended: Number(talkRows[0]?.n ?? 0),
+      deviceAlarmsUnacknowledged: Number(alarmRows[0]?.n ?? 0),
+    };
+  }
+
+  /** Vendors that appear anywhere in the safety or quality registers in the window. */
+  async function vendorsWithSafetyRecords(
+    companyId: string,
+    projectId: string | null,
+    from: string,
+    to: string,
+  ): Promise<string[]> {
+    const ids = new Set<string>();
+    const incidentVendors = await app.db
+      .selectDistinct({ id: safetyIncidents.vendorId })
+      .from(safetyIncidents)
+      .where(
+        and(
+          eq(safetyIncidents.companyId, companyId),
+          ...(projectId ? [eq(safetyIncidents.projectId, projectId)] : []),
+          gte(safetyIncidents.occurredAt, `${from}T00:00:00Z`),
+          lte(safetyIncidents.occurredAt, `${to}T23:59:59Z`),
+        ),
+      );
+    const observationVendors = await app.db
+      .selectDistinct({ id: safetyObservations.vendorId })
+      .from(safetyObservations)
+      .where(
+        and(
+          eq(safetyObservations.companyId, companyId),
+          ...(projectId ? [eq(safetyObservations.projectId, projectId)] : []),
+          gte(safetyObservations.observedAt, `${from}T00:00:00Z`),
+          lte(safetyObservations.observedAt, `${to}T23:59:59Z`),
+        ),
+      );
+    const actionVendors = await app.db
+      .selectDistinct({ id: safetyCorrectiveActions.ownerVendorId })
+      .from(safetyCorrectiveActions)
+      .where(
+        and(
+          eq(safetyCorrectiveActions.companyId, companyId),
+          ...(projectId ? [eq(safetyCorrectiveActions.projectId, projectId)] : []),
+          gte(safetyCorrectiveActions.dueDate, from),
+          lte(safetyCorrectiveActions.dueDate, to),
+        ),
+      );
+    for (const row of [...incidentVendors, ...observationVendors, ...actionVendors]) {
+      if (row.id) ids.add(row.id);
+    }
+    return [...ids];
+  }
+
+  async function scorecardsFor(
+    companyId: string,
+    projectId: string | null,
+    from: string,
+    to: string,
+    onlyVendorId: string | null,
+  ): Promise<{ scorecards: VendorScorecard[]; reasons: string[] }> {
+    const ids = onlyVendorId
+      ? [onlyVendorId]
+      : await vendorsWithSafetyRecords(companyId, projectId, from, to);
+    if (ids.length === 0) {
+      return {
+        scorecards: [],
+        reasons: [
+          `No vendor appears in the safety registers for ${from} to ${to}${projectId ? " on this project" : ""}. ` +
+            `A scorecard is a reading of records; with no records there is nothing to read, and a ` +
+            `grade invented from that would be the worst possible input to a bid evaluation.`,
+        ],
+      };
+    }
+    const names = new Map<string, string>();
+    const vendorRows = await app.db
+      .select({ id: vendors.id, name: vendors.name })
+      .from(vendors)
+      .where(and(eq(vendors.companyId, companyId), inArray(vendors.id, ids)));
+    for (const v of vendorRows) names.set(v.id, v.name);
+    const computedAt = new Date().toISOString();
+    const scorecards: VendorScorecard[] = [];
+    for (const id of ids) {
+      if (!names.has(id)) continue;
+      const input = await collectVendorScorecardInput(
+        companyId,
+        projectId,
+        id,
+        names.get(id) ?? null,
+        from,
+        to,
+      );
+      scorecards.push(buildVendorScorecard(input, computedAt));
+    }
+    scorecards.sort((a, b) => (a.score ?? 101) - (b.score ?? 101));
+    return { scorecards, reasons: [] };
+  }
+
+  app.get(
+    "/projects/:projectId/safety/vendor-scorecard",
+    { preHandler: readGate },
+    async (req) => {
+      const q = scorecardQuery.parse(req.query);
+      const to = q.to ?? todayISO();
+      const from = q.from ?? addDaysISO(to, -365);
+      if (from > to) throw badRequest(`from ${from} falls after to ${to}.`);
+      if (q.vendorId) await assertVendor(q.vendorId, req.companyId!);
+      const result = await scorecardsFor(
+        req.companyId!,
+        req.projectId!,
+        from,
+        to,
+        q.vendorId ?? null,
+      );
+      return {
+        projectId: req.projectId!,
+        from,
+        to,
+        ...result,
+        note:
+          "Every metric is null where the platform does not hold what it divides by — a supplier " +
+          "with no timecards on this project gets no rate, not a zero. The composite is weighted " +
+          "towards leading behaviour (action closure) rather than outcomes, because outcomes are " +
+          "small-sample and lagging on any single project.",
+      };
+    },
+  );
+
+  app.get(
+    "/companies/current/safety/vendor-scorecard",
+    { preHandler: companyRead },
+    async (req) => {
+      const q = scorecardQuery.parse(req.query);
+      const to = q.to ?? todayISO();
+      const from = q.from ?? addDaysISO(to, -365);
+      if (from > to) throw badRequest(`from ${from} falls after to ${to}.`);
+      if (q.vendorId) await assertVendor(q.vendorId, req.companyId!);
+
+      /* A member sees the supplier's record on the projects they are on; an
+       * owner or admin sees the company. Rolling somebody else's project into
+       * a member's view would leak that project's safety record through a
+       * supplier page. */
+      const scope = await visibleProjectIds(req.companyId!, req.user!.id, req.companyRole);
+      if (!scope.all && scope.ids.length === 0) {
+        return {
+          companyId: req.companyId!,
+          from,
+          to,
+          scope: { all: false, projects: 0 },
+          scorecards: [],
+          reasons: [
+            "You are not a member of any project in this company, so there is no supplier record " +
+              "you may read. An owner or admin sees the whole company roll-up.",
+          ],
+          note: "Scoped to the projects you are a member of.",
+        };
+      }
+
+      const perProject = scope.all
+        ? [await scorecardsFor(req.companyId!, null, from, to, q.vendorId ?? null)]
+        : await Promise.all(
+            scope.ids.map((projectId) =>
+              scorecardsFor(req.companyId!, projectId, from, to, q.vendorId ?? null),
+            ),
+          );
+      const scorecards = perProject.flatMap((r) => r.scorecards);
+      const reasons = [...new Set(perProject.flatMap((r) => r.reasons))];
+      scorecards.sort((a, b) => (a.score ?? 101) - (b.score ?? 101));
+
+      return {
+        companyId: req.companyId!,
+        from,
+        to,
+        scope: { all: scope.all, projects: scope.all ? null : scope.ids.length },
+        scorecards,
+        reasons,
+        note:
+          (scope.all
+            ? "The company roll-up reads every project's registers. "
+            : `Scoped to the ${scope.ids.length} project(s) you are a member of — one scorecard per project, not a company total. `) +
+          "It is the figure a prequalification team should hold beside the questionnaire answers — " +
+          "one is what the supplier says about itself, the other is what its record on your sites " +
+          "actually shows.",
+      };
+    },
+  );
+
+  /**
+   * Publish the roll-up onto the vendor's live prequalification submission.
+   *
+   * A prequalification questionnaire is what a supplier says about itself. The
+   * scorecard is what their record on this company's sites shows, and the
+   * whole value of computing it is lost if a bid evaluator has to know it
+   * exists. It is written onto the submission's `detail` as an OBSERVED
+   * record, clearly separated from the assessed answers, never overwriting a
+   * score somebody assigned.
+   */
+  /**
+   * The observed record as it is written onto a submission: the figures, the
+   * coverage that produced them, and a note saying what it is NOT. It never
+   * carries a bare number — a metric the registers could not compute is null
+   * with its reason beside it, because a blank on a prequalification screen is
+   * read as a zero.
+   */
+  function buildObservedRecord(
+    card: VendorScorecard,
+    from: string,
+    to: string,
+  ): Record<string, unknown> {
+    return {
+      source: "safety_vendor_scorecard",
+      from,
+      to,
+      score: card.score,
+      grade: card.grade,
+      coverage: card.coverage,
+      recordCount: card.recordCount,
+      flags: card.flags,
+      reasons: card.reasons,
+      metrics: card.metrics.map((m) => ({
+        key: m.key,
+        name: m.name,
+        value: m.value,
+        unit: m.unit,
+        reasons: m.reasons,
+      })),
+      computedAt: card.computedAt,
+      note:
+        "Observed from this company's own registers. It does not replace the assessed " +
+        "questionnaire score and no assessor's figure has been altered.",
+    };
+  }
+
+  app.post(
+    "/companies/current/safety/vendor-scorecard/publish",
+    { preHandler: companyAdmin },
+    async (req) => {
+      const body = z
+        .object({
+          vendorId: z.string().max(64).optional(),
+          from: isoDateSchema.optional(),
+          to: isoDateSchema.optional(),
+        })
+        .parse(req.body ?? {});
+      const to = body.to ?? todayISO();
+      const from = body.from ?? addDaysISO(to, -365);
+      const { scorecards } = await scorecardsFor(
+        req.companyId!,
+        null,
+        from,
+        to,
+        body.vendorId ?? null,
+      );
+      const published: Array<{ vendorId: string; submissionId: string; score: number | null }> = [];
+      const skipped: Array<{ vendorId: string; reason: string }> = [];
+      const now = new Date().toISOString();
+      for (const card of scorecards) {
+        /* READ-MODIFY-WRITE OF ANOTHER MODULE'S JSONB, UNDER A ROW LOCK.
+         *
+         * `detail` carries the assessor's answers. Publishing merges one key
+         * into it, so an unlocked read-then-write would silently drop whatever
+         * an assessor saved between the two — on the record a bid evaluation
+         * reads. The row is locked, re-read and written in one transaction,
+         * and the lock is taken on the submission rather than the vendor
+         * because that is the row being changed. */
+        const submission = await app.db.transaction(async (tx) => {
+          const rows = await tx
+            .select({
+              id: prequalificationSubmissions.id,
+              reference: prequalificationSubmissions.reference,
+              detail: prequalificationSubmissions.detail,
+              projectId: prequalificationSubmissions.projectId,
+            })
+            .from(prequalificationSubmissions)
+            .where(
+              and(
+                eq(prequalificationSubmissions.companyId, req.companyId!),
+                eq(prequalificationSubmissions.vendorId, card.vendorId),
+                inArray(prequalificationSubmissions.status, [
+                  "assessed",
+                  "under_review",
+                  "submitted",
+                ]),
+              ),
+            )
+            .orderBy(desc(prequalificationSubmissions.createdAt))
+            .limit(1)
+            .for("update");
+          const found = rows[0];
+          if (!found) return null;
+          await tx
+            .update(prequalificationSubmissions)
+            .set({
+              detail: {
+                ...(found.detail as Record<string, unknown>),
+                observedSafetyRecord: buildObservedRecord(card, from, to),
+              },
+              updatedAt: now,
+            })
+            .where(eq(prequalificationSubmissions.id, found.id));
+          return found;
+        });
+        if (!submission) {
+          skipped.push({
+            vendorId: card.vendorId,
+            reason:
+              "No live prequalification submission holds this vendor, so there is nothing to publish " +
+              "onto. The scorecard remains available on the company endpoint.",
+          });
+          continue;
+        }
+        await appendLedger(app.db, {
+          companyId: req.companyId!,
+          projectId: submission.projectId,
+          actorId: req.user!.id,
+          action: "update",
+          objectType: "prequalification_submission",
+          objectId: submission.id,
+          payload: {
+            act: "publish_observed_safety_record",
+            reference: submission.reference,
+            vendorId: card.vendorId,
+            from,
+            to,
+            score: card.score,
+            grade: card.grade,
+            coverage: card.coverage,
+            flags: card.flags,
+          },
+          storePayload: true,
+        });
+        published.push({
+          vendorId: card.vendorId,
+          submissionId: submission.id,
+          score: card.score,
+        });
+      }
+      return { from, to, published, skipped, scorecards };
+    },
+  );
+
+  /* ================================================================ */
+  /* PREDICTIVE SAFETY RISK INDEX                                      */
+  /* ================================================================ */
+
+  const riskIndexQuery = z.object({
+    from: isoDateSchema.optional(),
+    to: isoDateSchema.optional(),
+    trendDays: z.coerce.number().int().min(7).max(365).optional(),
+  });
+
+  /** Every input the leading-indicator index reads, for one project's window. */
+  async function collectRiskIndexInput(
+    companyId: string,
+    projectId: string,
+    from: string,
+    to: string,
+    asOf: string,
+  ): Promise<RiskIndexInput> {
+    const actionRows = await app.db
+      .select({
+        status: safetyCorrectiveActions.status,
+        dueDate: safetyCorrectiveActions.dueDate,
+        hierarchyOfControl: safetyCorrectiveActions.hierarchyOfControl,
+        effectivenessVerdict: safetyCorrectiveActions.effectivenessVerdict,
+      })
+      .from(safetyCorrectiveActions)
+      .where(
+        and(
+          eq(safetyCorrectiveActions.companyId, companyId),
+          eq(safetyCorrectiveActions.projectId, projectId),
+        ),
+      );
+    const observationRows = await app.db
+      .select({ kind: safetyObservations.kind, severity: safetyObservations.severity })
+      .from(safetyObservations)
+      .where(
+        and(
+          eq(safetyObservations.companyId, companyId),
+          eq(safetyObservations.projectId, projectId),
+          gte(safetyObservations.observedAt, `${from}T00:00:00Z`),
+          lte(safetyObservations.observedAt, `${to}T23:59:59Z`),
+        ),
+      );
+    const inspectionRows = await app.db
+      .select({
+        result: safetyInspections.result,
+        criticalDefectCount: safetyInspections.criticalDefectCount,
+      })
+      .from(safetyInspections)
+      .where(
+        and(
+          eq(safetyInspections.companyId, companyId),
+          eq(safetyInspections.projectId, projectId),
+          gte(safetyInspections.performedAt, `${from}T00:00:00Z`),
+          lte(safetyInspections.performedAt, `${to}T23:59:59Z`),
+        ),
+      );
+    const talkRows = await app.db
+      .select({ id: toolboxTalks.id })
+      .from(toolboxTalks)
+      .where(
+        and(
+          eq(toolboxTalks.companyId, companyId),
+          eq(toolboxTalks.projectId, projectId),
+          gte(toolboxTalks.talkDate, from),
+          lte(toolboxTalks.talkDate, to),
+          inArray(toolboxTalks.status, ["delivered", "verified"]),
+        ),
+      );
+    const briefedRows = await app.db
+      .selectDistinct({ workerId: toolboxTalkAttendees.workerId })
+      .from(toolboxTalkAttendees)
+      .where(
+        and(
+          eq(toolboxTalkAttendees.companyId, companyId),
+          eq(toolboxTalkAttendees.projectId, projectId),
+          inArray(
+            toolboxTalkAttendees.talkId,
+            talkRows.length > 0 ? talkRows.map((t) => t.id) : ["__none__"],
+          ),
+        ),
+      );
+    const onSiteRows = await app.db
+      .select({ n: count() })
+      .from(workers)
+      .where(
+        and(
+          eq(workers.companyId, companyId),
+          eq(workers.projectId, projectId),
+          eq(workers.status, "active"),
+        ),
+      );
+    const programmeRows = await app.db
+      .select({
+        status: safetyProgrammeRecords.status,
+        expiresAt: safetyProgrammeRecords.expiresAt,
+        recordKind: safetyProgrammeRecords.recordKind,
+      })
+      .from(safetyProgrammeRecords)
+      .where(
+        and(
+          eq(safetyProgrammeRecords.companyId, companyId),
+          eq(safetyProgrammeRecords.projectId, projectId),
+        ),
+      );
+    const incidentRows = await app.db
+      .select()
+      .from(safetyIncidents)
+      .where(
+        and(
+          eq(safetyIncidents.companyId, companyId),
+          eq(safetyIncidents.projectId, projectId),
+          gte(safetyIncidents.occurredAt, `${from}T00:00:00Z`),
+          lte(safetyIncidents.occurredAt, `${to}T23:59:59Z`),
+          ne(safetyIncidents.status, "void"),
+        ),
+      );
+
+    const nowISO = `${asOf}T23:59:59Z`;
+    let notificationsMissed = 0;
+    let notificationsLate = 0;
+    let outstandingDuties = 0;
+    for (const inc of incidentRows) {
+      if (!asBool(inc.isReportable)) continue;
+      const state = incidentNotificationState(inc, nowISO);
+      for (const duty of state.duties) {
+        if (duty.state === "missed") notificationsMissed += 1;
+        else if (duty.state === "notified_late") notificationsLate += 1;
+        else if (duty.state === "outstanding") outstandingDuties += 1;
+      }
+    }
+
+    const alarmRows = await app.db
+      .select({
+        status: safetySensorEvents.status,
+        acknowledgedAt: safetySensorEvents.acknowledgedAt,
+        acknowledgeDueAt: safetySensorEvents.acknowledgeDueAt,
+      })
+      .from(safetySensorEvents)
+      .where(
+        and(
+          eq(safetySensorEvents.companyId, companyId),
+          eq(safetySensorEvents.projectId, projectId),
+          gte(safetySensorEvents.occurredAt, `${from}T00:00:00Z`),
+          lte(safetySensorEvents.occurredAt, `${to}T23:59:59Z`),
+        ),
+      );
+
+    const soon = addDaysISO(asOf, 30);
+    const lastIncident = incidentRows
+      .map((i) => i.occurredAt)
+      .sort()
+      .at(-1);
+    const weeks = Math.max(
+      1,
+      Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / (7 * 86_400_000)),
+    );
+
+    return {
+      projectId,
+      from,
+      to,
+      asOf,
+      actions: {
+        open: actionRows.filter((a) => a.status === "open" || a.status === "in_progress").length,
+        overdue: actionRows.filter(
+          (a) => (a.status === "open" || a.status === "in_progress") && a.dueDate < asOf,
+        ).length,
+        total: actionRows.length,
+        weakControl: actionRows.filter((a) => WEAK_CONTROLS.has(a.hierarchyOfControl ?? "")).length,
+        ineffective: actionRows.filter((a) => a.effectivenessVerdict === "not_effective").length,
+      },
+      observations: {
+        positive: observationRows.filter((o) => o.kind === "positive").length,
+        negative: observationRows.filter((o) => o.kind === "negative").length,
+        total: observationRows.length,
+        highRisk: observationRows.filter((o) => o.severity === "high" || o.severity === "critical")
+          .length,
+      },
+      inspections: {
+        completed: inspectionRows.length,
+        failed: inspectionRows.filter((i) => i.result === "fail").length,
+        criticalDefects: inspectionRows.reduce((s, i) => s + (i.criticalDefectCount ?? 0), 0),
+      },
+      briefings: {
+        talksDelivered: talkRows.length,
+        weeksInWindow: weeks,
+        workersBriefed: briefedRows.filter((r) => r.workerId != null).length,
+        workersOnSite: Number(onSiteRows[0]?.n ?? 0),
+      },
+      programme: {
+        expired: programmeRows.filter((r) => r.status === "expired").length,
+        expiringSoon: programmeRows.filter(
+          (r) =>
+            r.status !== "expired" && r.expiresAt != null && r.expiresAt >= asOf && r.expiresAt <= soon,
+        ).length,
+        criticalExpired: programmeRows.filter(
+          (r) => r.status === "expired" && CRITICAL_RECORD_KINDS.has(r.recordKind),
+        ).length,
+        active: programmeRows.filter((r) => r.status === "active" || r.status === "approved").length,
+      },
+      incidents: {
+        total: incidentRows.length,
+        lostTime: incidentRows.filter((i) => asBool(i.isLostTime)).length,
+        recordableOrReportable: incidentRows.filter(
+          (i) =>
+            asBool(i.isReportable) ||
+            ["death", "days_away_from_work", "job_transfer_or_restriction", "other_recordable"].includes(
+              i.oshaCaseType ?? "",
+            ),
+        ).length,
+        daysSinceLast:
+          lastIncident != null
+            ? Math.max(
+                0,
+                Math.floor(
+                  (Date.parse(`${asOf}T00:00:00Z`) - Date.parse(lastIncident)) / 86_400_000,
+                ),
+              )
+            : null,
+        investigationsOverdue: incidentRows.filter(
+          (i) =>
+            i.investigationDueDate != null &&
+            i.investigationDueDate < asOf &&
+            i.investigationStatus !== "complete" &&
+            i.investigationStatus !== "approved",
+        ).length,
+      },
+      statutory: { notificationsMissed, notificationsLate, outstandingDuties },
+      devices: {
+        alarms: alarmRows.length,
+        unacknowledged: alarmRows.filter((a) => a.acknowledgedAt == null).length,
+        overdueAcknowledgement: alarmRows.filter(
+          (a) =>
+            a.acknowledgedAt == null &&
+            a.acknowledgeDueAt != null &&
+            Date.parse(a.acknowledgeDueAt) < Date.parse(nowISO),
+        ).length,
+      },
+    };
+  }
+
+  /**
+   * Compute the index and, when asked, store the reading.
+   *
+   * The snapshot is what makes the index useful: an index of 62 means nothing,
+   * an index that has moved 38 → 62 in three weeks is a conversation. The
+   * upsert is keyed on the day, so recomputing twice in one day replaces the
+   * reading rather than creating a second one.
+   */
+  async function computeAndMaybeStoreRiskIndex(
+    companyId: string,
+    projectId: string,
+    from: string,
+    to: string,
+    asOf: string,
+    store: boolean,
+    actorId: string | null,
+  ): Promise<{ result: RiskIndexResult; snapshotId: string | null; signalId: string | null }> {
+    const input = await collectRiskIndexInput(companyId, projectId, from, to, asOf);
+    const result = computeRiskIndex(input);
+    if (!store) return { result, snapshotId: null, signalId: null };
+
+    const computedAt = new Date().toISOString();
+    const existing = await app.db
+      .select({ id: safetyRiskSnapshots.id, signalId: safetyRiskSnapshots.signalId })
+      .from(safetyRiskSnapshots)
+      .where(
+        and(eq(safetyRiskSnapshots.projectId, projectId), eq(safetyRiskSnapshots.asOfDate, asOf)),
+      )
+      .limit(1);
+    const snapshotId = existing[0]?.id ?? newId("srisk");
+
+    /* A signal only where the band is one a project director must act on, and
+     * only once per project per band per day — the sweep is idempotent on the
+     * snapshot key, so a second run the same day replaces the reading rather
+     * than raising the finding again. */
+    let signalId = existing[0]?.signalId ?? null;
+    if ((result.band === "high" || result.band === "severe") && signalId == null) {
+      const seen = await alreadySignalled(companyId, "safety_risk_index_elevated", projectId);
+      const key = `${projectId}:${asOf}`;
+      if (!seen.has(key)) {
+        signalId = newId("sig");
+        await app.db.insert(signals).values({
+          id: signalId,
+          companyId,
+          projectId,
+          detector: "safety_risk_index_elevated",
+          severity: result.band === "severe" ? "critical" : "high",
+          confidence: Math.min(1, Math.max(0, result.coverage)),
+          title: `Leading-indicator safety risk index is ${result.band} (${result.score}) — ${projectId}`,
+          explanation:
+            `${result.explanation}\n\nThe drivers, in order of how much they contribute: ` +
+            result.drivers
+              .map((d) => `${d.name} (${d.contribution} points) — ${d.advice}`)
+              .join("\n\n") +
+            `\n\nThis is a LEADING index: nothing here has hurt anybody yet, which is the entire ` +
+            `point of raising it. Every component is a number the site can change this week. ` +
+            `Coverage of the index's weight was ${Math.round(result.coverage * 100)}% — the components that could not ` +
+            `be computed are listed on the snapshot rather than being scored as zero.`,
+          evidenceRefs: {
+            key,
+            projectId,
+            asOfDate: asOf,
+            score: result.score,
+            band: result.band,
+            coverage: result.coverage,
+            drivers: result.drivers,
+            snapshotId,
+          },
+        });
+      }
+    }
+
+    const values = {
+      id: snapshotId,
+      companyId,
+      projectId,
+      computedAt,
+      asOfDate: asOf,
+      windowFrom: from,
+      windowTo: to,
+      score: result.score,
+      band: result.band,
+      components: result.components as unknown[],
+      reasons: result.reasons,
+      coverage: result.coverage,
+      signalId,
+      detail: { drivers: result.drivers, explanation: result.explanation },
+    };
+    if (existing[0]) {
+      await app.db
+        .update(safetyRiskSnapshots)
+        .set(values)
+        .where(eq(safetyRiskSnapshots.id, snapshotId));
+    } else {
+      await app.db.insert(safetyRiskSnapshots).values(values);
+    }
+    await appendLedger(app.db, {
+      companyId,
+      projectId,
+      actorId,
+      action: "create",
+      objectType: "safety_risk_snapshot",
+      objectId: snapshotId,
+      payload: {
+        asOfDate: asOf,
+        windowFrom: from,
+        windowTo: to,
+        score: result.score,
+        band: result.band,
+        coverage: result.coverage,
+        drivers: result.drivers.map((d) => d.key),
+        signalId,
+      },
+    });
+    return { result, snapshotId, signalId };
+  }
+
+  app.get("/projects/:projectId/safety/risk-index", { preHandler: readGate }, async (req) => {
+    const q = riskIndexQuery.parse(req.query);
+    const asOf = q.to ?? todayISO();
+    const from = q.from ?? addDaysISO(asOf, -90);
+    if (from > asOf) throw badRequest(`from ${from} falls after to ${asOf}.`);
+    const { result } = await computeAndMaybeStoreRiskIndex(
+      req.companyId!,
+      req.projectId!,
+      from,
+      asOf,
+      asOf,
+      false,
+      req.user!.id,
+    );
+    const trendFrom = addDaysISO(asOf, -(q.trendDays ?? 90));
+    const trend = await app.db
+      .select({
+        asOfDate: safetyRiskSnapshots.asOfDate,
+        score: safetyRiskSnapshots.score,
+        band: safetyRiskSnapshots.band,
+        coverage: safetyRiskSnapshots.coverage,
+      })
+      .from(safetyRiskSnapshots)
+      .where(
+        and(
+          eq(safetyRiskSnapshots.companyId, req.companyId!),
+          eq(safetyRiskSnapshots.projectId, req.projectId!),
+          gte(safetyRiskSnapshots.asOfDate, trendFrom),
+        ),
+      )
+      .orderBy(asc(safetyRiskSnapshots.asOfDate));
+    return {
+      ...result,
+      trend,
+      note:
+        "This is a LEADING index built only from things a site can change this week. It is not a " +
+        "prediction of an accident and it is not a rate — a project with a low index and no " +
+        "exposure hours still has no publishable TRIR. Where fewer than 40% of the index's weight " +
+        "could be computed the score is withheld rather than published thin.",
+    };
+  });
+
+  app.post(
+    "/projects/:projectId/safety/risk-index/recompute",
+    { preHandler: standardGate },
+    async (req) => {
+      const body = riskIndexQuery.parse(req.body ?? {});
+      const asOf = body.to ?? todayISO();
+      const from = body.from ?? addDaysISO(asOf, -90);
+      if (from > asOf) throw badRequest(`from ${from} falls after to ${asOf}.`);
+      const out = await computeAndMaybeStoreRiskIndex(
+        req.companyId!,
+        req.projectId!,
+        from,
+        asOf,
+        asOf,
+        true,
+        req.user!.id,
+      );
+      return { ...out.result, snapshotId: out.snapshotId, signalId: out.signalId };
+    },
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* Under-reporting (Vol II M #701-702)                               */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * The counts an under-reporting read is made from, for one project.
+   *
+   * This is the module's most consequential output and it is stated as
+   * EVIDENCE, never as a finding: the honest answer to most of these is "the
+   * site really was that quiet", so every finding carries what would refute it.
+   */
+  /**
+   * The company's per-project incident counts and exposure for one window.
+   *
+   * Computed ONCE per company rather than once per project: the peer read is
+   * identical for every project in the company, and recomputing it inside a
+   * per-project loop turns a daily sweep of fifty projects into two and a half
+   * thousand queries for the same answer.
+   */
+  async function companyPeerCounts(
+    companyId: string,
+    from: string,
+    to: string,
+  ): Promise<Array<{ projectId: string; incidents: number; exposureHours: number | null }>> {
+    const projectRows = await app.db
+      .select({ id: projects.id })
+      .from(projects)
+      .where(eq(projects.companyId, companyId));
+    const counted = await app.db
+      .select({ projectId: safetyIncidents.projectId, n: count() })
+      .from(safetyIncidents)
+      .where(
+        and(
+          eq(safetyIncidents.companyId, companyId),
+          gte(safetyIncidents.occurredAt, `${from}T00:00:00Z`),
+          lte(safetyIncidents.occurredAt, `${to}T23:59:59Z`),
+          ne(safetyIncidents.status, "void"),
+        ),
+      )
+      .groupBy(safetyIncidents.projectId);
+    const byProject = new Map(counted.map((r) => [r.projectId, Number(r.n)]));
+    const out: Array<{ projectId: string; incidents: number; exposureHours: number | null }> = [];
+    /* Bounded: the exposure read is per project and there is one query per
+     * project that HAS a safety record, not per project in the company. */
+    for (const row of projectRows.slice(0, 200)) {
+      /* The exposure is read for EVERY project, including the ones with no
+       * incidents at all — those are precisely the ones the silent-register
+       * finding turns on, and skipping them as an optimisation would make the
+       * detector blind to the case it exists for. */
+      const exposure = await exposureForWindow(companyId, row.id, from, to);
+      out.push({
+        projectId: row.id,
+        incidents: byProject.get(row.id) ?? 0,
+        exposureHours: exposure.hours,
+      });
+    }
+    return out;
+  }
+
+  async function collectUnderReporting(
+    companyId: string,
+    projectId: string,
+    projectName: string,
+    from: string,
+    to: string,
+    precomputedPeers?: Array<{ projectId: string; incidents: number; exposureHours: number | null }>,
+  ) {
+    const rows = await app.db
+      .select()
+      .from(safetyIncidents)
+      .where(
+        and(
+          eq(safetyIncidents.companyId, companyId),
+          eq(safetyIncidents.projectId, projectId),
+          gte(safetyIncidents.occurredAt, `${from}T00:00:00Z`),
+          lte(safetyIncidents.occurredAt, `${to}T23:59:59Z`),
+          ne(safetyIncidents.status, "void"),
+        ),
+      );
+    const observationCount = await app.db
+      .select({ n: count() })
+      .from(safetyObservations)
+      .where(
+        and(
+          eq(safetyObservations.companyId, companyId),
+          eq(safetyObservations.projectId, projectId),
+          gte(safetyObservations.observedAt, `${from}T00:00:00Z`),
+          lte(safetyObservations.observedAt, `${to}T23:59:59Z`),
+        ),
+      );
+    const exposure = await exposureForWindow(companyId, projectId, from, to);
+
+    /* The peer read: the company's other projects over the same window. A
+     * project quiet on its own is ambiguous; a project quiet while its
+     * siblings are not is a question. */
+    const allPeers = precomputedPeers ?? (await companyPeerCounts(companyId, from, to));
+    const peers = allPeers.filter((p) => p.projectId !== projectId);
+
+    return assessUnderReporting({
+      projectId,
+      projectName,
+      from,
+      to,
+      exposureHours: exposure.hours,
+      exposureSource: exposure.source,
+      counts: {
+        incidents: rows.length,
+        injuries: rows.filter(
+          (i) => i.incidentType === "injury" || i.incidentType === "occupational_illness",
+        ).length,
+        nearMisses: rows.filter((i) => i.incidentType === "near_miss").length,
+        observations: Number(observationCount[0]?.n ?? 0),
+        fatalities: rows.filter((i) => asBool(i.isFatality)).length,
+        lostTime: rows.filter((i) => asBool(i.isLostTime)).length,
+      },
+      peers,
+    });
+  }
+
+  app.get("/projects/:projectId/safety/under-reporting", { preHandler: readGate }, async (req) => {
+    const q = z
+      .object({ from: isoDateSchema.optional(), to: isoDateSchema.optional() })
+      .parse(req.query);
+    const to = q.to ?? todayISO();
+    const from = q.from ?? addDaysISO(to, -365);
+    if (from > to) throw badRequest(`from ${from} falls after to ${to}.`);
+    const projectRows = await app.db
+      .select({ name: projects.name })
+      .from(projects)
+      .where(and(eq(projects.id, req.projectId!), eq(projects.companyId, req.companyId!)))
+      .limit(1);
+    const result = await collectUnderReporting(
+      req.companyId!,
+      req.projectId!,
+      projectRows[0]?.name ?? req.projectId!,
+      from,
+      to,
+    );
+    return {
+      ...result,
+      note:
+        "These are readings about the REGISTER, not about the site. Each states what was expected " +
+        "and on what basis, what was observed, and what would refute it — because the honest answer " +
+        "to most of them is that the site really was that quiet, and a register that cannot say so " +
+        "is worse than one that never asked.",
+    };
+  });
+
+  /* ================================================================ */
+  /* INVESTIGATION ASSISTANT (AI, cited)                               */
+  /* ================================================================ */
+
+  const assistAcceptSchema = z.object({
+    runId: z.string().max(64),
+    contributingFactors: z
+      .array(
+        z.object({
+          factor: z.string().min(1).max(500),
+          category: z.enum(["immediate", "underlying", "organisational"]),
+          note: z.string().max(2000).optional(),
+          sourceIds: z.array(z.string().max(64)).max(20).optional(),
+        }),
+      )
+      .max(30)
+      .optional(),
+    actions: z
+      .array(
+        z.object({
+          title: z.string().min(1).max(300),
+          description: z.string().max(4000).nullable().optional(),
+          hierarchyOfControl: z.enum(HIERARCHY_OF_CONTROLS),
+          dueDate: isoDateSchema,
+          ownerId: z.string().max(64).nullable().optional(),
+          ownerVendorId: z.string().max(64).nullable().optional(),
+          priority: z.enum(["low", "medium", "high", "critical"]).optional(),
+          sourceIds: z.array(z.string().max(64)).max(20).optional(),
+        }),
+      )
+      .max(20)
+      .optional(),
+  });
+
+  const summarise = (text: string | null | undefined, max = 240): string =>
+    (text ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+
+  /** Assemble the records around one incident — everything the model may cite. */
+  async function buildAssistContext(
+    companyId: string,
+    projectId: string,
+    incident: IncidentRow,
+  ): Promise<AssistContext> {
+    const windowStart = new Date(Date.parse(incident.occurredAt) - 90 * 86_400_000).toISOString();
+    const vendorName = incident.vendorId
+      ? ((
+          await app.db
+            .select({ name: vendors.name })
+            .from(vendors)
+            .where(and(eq(vendors.companyId, companyId), eq(vendors.id, incident.vendorId)))
+            .limit(1)
+        )[0]?.name ?? null)
+      : null;
+
+    const priorObservationRows = await app.db
+      .select()
+      .from(safetyObservations)
+      .where(
+        and(
+          eq(safetyObservations.companyId, companyId),
+          eq(safetyObservations.projectId, projectId),
+          gte(safetyObservations.observedAt, windowStart),
+          lte(safetyObservations.observedAt, incident.occurredAt),
+          or(
+            ...[
+              incident.vendorId ? eq(safetyObservations.vendorId, incident.vendorId) : undefined,
+              incident.locationId ? eq(safetyObservations.locationId, incident.locationId) : undefined,
+              incident.locationText
+                ? eq(safetyObservations.locationText, incident.locationText)
+                : undefined,
+            ].filter((c): c is NonNullable<typeof c> => c !== undefined),
+          ),
+        ),
+      )
+      .orderBy(desc(safetyObservations.observedAt))
+      .limit(25);
+
+    const priorIncidentRows = await app.db
+      .select()
+      .from(safetyIncidents)
+      .where(
+        and(
+          eq(safetyIncidents.companyId, companyId),
+          eq(safetyIncidents.projectId, projectId),
+          ne(safetyIncidents.id, incident.id),
+          ne(safetyIncidents.status, "void"),
+          lte(safetyIncidents.occurredAt, incident.occurredAt),
+          ...(incident.mechanism ? [eq(safetyIncidents.mechanism, incident.mechanism)] : []),
+        ),
+      )
+      .orderBy(desc(safetyIncidents.occurredAt))
+      .limit(15);
+
+    const inspectionRows = await app.db
+      .select()
+      .from(safetyInspections)
+      .where(
+        and(
+          eq(safetyInspections.companyId, companyId),
+          eq(safetyInspections.projectId, projectId),
+          gte(safetyInspections.performedAt, windowStart),
+          lte(safetyInspections.performedAt, incident.occurredAt),
+          ...(incident.vendorId ? [eq(safetyInspections.vendorId, incident.vendorId)] : []),
+        ),
+      )
+      .orderBy(desc(safetyInspections.performedAt))
+      .limit(15);
+
+    const briefingRows = await app.db
+      .select()
+      .from(toolboxTalks)
+      .where(
+        and(
+          eq(toolboxTalks.companyId, companyId),
+          eq(toolboxTalks.projectId, projectId),
+          gte(toolboxTalks.talkDate, windowStart.slice(0, 10)),
+          lte(toolboxTalks.talkDate, incident.occurredAt.slice(0, 10)),
+          ...(incident.vendorId ? [eq(toolboxTalks.vendorId, incident.vendorId)] : []),
+        ),
+      )
+      .orderBy(desc(toolboxTalks.talkDate))
+      .limit(15);
+
+    const openActionRows = await app.db
+      .select()
+      .from(safetyCorrectiveActions)
+      .where(
+        and(
+          eq(safetyCorrectiveActions.companyId, companyId),
+          eq(safetyCorrectiveActions.projectId, projectId),
+          inArray(safetyCorrectiveActions.status, [...OPEN_ACTION_STATUSES]),
+        ),
+      )
+      .orderBy(asc(safetyCorrectiveActions.dueDate))
+      .limit(25);
+
+    const programmeRows = await app.db
+      .select()
+      .from(safetyProgrammeRecords)
+      .where(
+        and(
+          eq(safetyProgrammeRecords.companyId, companyId),
+          or(
+            eq(safetyProgrammeRecords.projectId, projectId),
+            isNull(safetyProgrammeRecords.projectId),
+          ),
+          ...(incident.vendorId ? [eq(safetyProgrammeRecords.vendorId, incident.vendorId)] : []),
+        ),
+      )
+      .orderBy(desc(safetyProgrammeRecords.updatedAt))
+      .limit(20);
+
+    const ref = (
+      type: string,
+      id: string,
+      reference: string,
+      label: string,
+      summary: string,
+      occurredAt: string | null,
+    ): AssistRecordRef => ({ type, id, reference, label, summary, occurredAt });
+
+    const witnessList = (incident.witnesses as unknown[])
+      .filter((w): w is Record<string, unknown> => !!w && typeof w === "object")
+      .map((w) => ({
+        name: typeof w["name"] === "string" ? w["name"] : "unnamed witness",
+        organisation: typeof w["organisation"] === "string" ? w["organisation"] : null,
+        statement:
+          typeof w["statement"] === "string"
+            ? w["statement"]
+            : typeof w["statementFileId"] === "string"
+              ? "(a statement file is attached; its text is not held in the record)"
+              : null,
+      }));
+
+    return {
+      incident: {
+        id: incident.id,
+        reference: incident.reference,
+        incidentType: incident.incidentType,
+        severity: incident.severity,
+        title: incident.title,
+        description: incident.description,
+        occurredAt: incident.occurredAt,
+        locationText: incident.locationText,
+        mechanism: incident.mechanism,
+        injuryNature: incident.injuryNature,
+        bodyPart: incident.bodyPart,
+        activityAtTime: incident.activityAtTime,
+        immediateCause: incident.immediateCause,
+        hoursIntoShift: incident.hoursIntoShift,
+        shift: incident.shift,
+        vendorName,
+        injuredPersonType: incident.injuredPersonType,
+        daysSinceInduction: incident.daysSinceInduction,
+        yearsExperience: incident.yearsExperience,
+        witnesses: witnessList,
+      },
+      determination: storedDetermination(incident),
+      priorObservations: priorObservationRows.map((o) =>
+        ref(
+          "safety_observation",
+          o.id,
+          o.reference,
+          `${o.kind} observation — ${o.title}`,
+          `${summarise(o.description)} (severity ${o.severity}, category ${o.category}${
+            asBool(o.workStopped) ? ", work stopped" : ""
+          }, status ${o.status})`,
+          o.observedAt,
+        ),
+      ),
+      priorIncidents: priorIncidentRows.map((i) =>
+        ref(
+          "safety_incident",
+          i.id,
+          i.reference,
+          `${i.incidentType} — ${i.title}`,
+          `${summarise(i.description)} (mechanism ${i.mechanism ?? "not coded"}, severity ${i.severity})`,
+          i.occurredAt,
+        ),
+      ),
+      inspections: inspectionRows.map((i) =>
+        ref(
+          "safety_inspection",
+          i.id,
+          i.reference,
+          `${i.inspectionType} inspection — ${i.title}`,
+          `result ${i.result ?? "not scored"}, ${i.defectCount} defect(s), ${i.criticalDefectCount} critical`,
+          i.performedAt,
+        ),
+      ),
+      briefings: briefingRows.map((t) =>
+        ref(
+          "toolbox_talk",
+          t.id,
+          t.reference,
+          `toolbox talk — ${t.title}`,
+          `${summarise(t.contentSummary)} (${t.attendeeCount} attended, status ${t.status})`,
+          `${t.talkDate}T00:00:00Z`,
+        ),
+      ),
+      openActions: openActionRows.map((a) =>
+        ref(
+          "safety_corrective_action",
+          a.id,
+          a.reference,
+          `open action — ${a.title}`,
+          `due ${a.dueDate}, control level ${a.hierarchyOfControl ?? "not stated"}, status ${a.status}`,
+          null,
+        ),
+      ),
+      programmeRecords: programmeRows.map((r) =>
+        ref(
+          "safety_programme_record",
+          r.id,
+          r.reference,
+          `${r.recordKind} — ${r.title}`,
+          `status ${r.status}${r.expiresAt ? `, expires ${r.expiresAt}` : ""}`,
+          null,
+        ),
+      ),
+    };
+  }
+
+  /**
+   * The DETERMINISTIC half of the assistant, with no model in it at all.
+   *
+   * The assembly — every observation raised on this location or against this
+   * subcontractor in the ninety days before, the inspections of that work, the
+   * briefings the crew received, the prior incidents sharing the mechanism —
+   * is the half an investigator actually needs, and it is the half that must
+   * never depend on an API key. The model's reading of the pattern is the
+   * extra, and it lives on the POST route which refuses with 503 AiDisabled
+   * when there is no key, exactly like every other AI endpoint on the
+   * platform.
+   */
+  app.get(
+    "/projects/:projectId/safety/incidents/:incidentId/assist/context",
+    { preHandler: readGate },
+    async (req) => {
+      const { incidentId } = req.params as { incidentId: string };
+      const incident = await fetchIncident(incidentId, req.companyId!, req.projectId!);
+      const ctx = await buildAssistContext(req.companyId!, req.projectId!, incident);
+      return {
+        incidentId,
+        reference: incident.reference,
+        aiAvailable: aiEnabled(app),
+        context: {
+          priorObservations: ctx.priorObservations,
+          priorIncidents: ctx.priorIncidents,
+          inspections: ctx.inspections,
+          briefings: ctx.briefings,
+          openActions: ctx.openActions,
+          programmeRecords: ctx.programmeRecords,
+          witnesses: ctx.incident.witnesses,
+          openQuestions: ctx.determination?.openQuestions ?? [],
+        },
+        note:
+          "The records around this incident, gathered by location, subcontractor and mechanism. " +
+          "Nothing here is inferred and nothing here is written to the incident. " +
+          (aiEnabled(app)
+            ? "Ask the assistant to read the pattern behind them."
+            : "The AI layer is not configured, so no reading of the pattern is available; this " +
+              "assembly is unaffected."),
+      };
+    },
+  );
+
+  app.post(
+    "/projects/:projectId/safety/incidents/:incidentId/assist",
+    { preHandler: standardGate },
+    async (req) => {
+      const { incidentId } = req.params as { incidentId: string };
+      /* 503 AiDisabled, the platform convention, rather than a 200 carrying
+       * `available: false` that a client written against that convention would
+       * read as a successful AI answer. The deterministic assembly has its own
+       * route and is unaffected by the key. */
+      if (!aiEnabled(app)) throw aiDisabledError();
+      const incident = await fetchIncident(incidentId, req.companyId!, req.projectId!);
+      const ctx = await buildAssistContext(req.companyId!, req.projectId!, incident);
+      const prompt = buildAssistPrompt(ctx);
+
+      try {
+        const result = await runAgent({
+          app,
+          req,
+          agentKind: "incident_investigation_assistant",
+          projectId: req.projectId!,
+          system: prompt.system,
+          user: prompt.user,
+          inputRefs: prompt.inputRefs,
+          schema: assistOutputSchema,
+          contextChars: prompt.contextChars,
+          maxTokens: 4000,
+        });
+        const assist = result.json
+          ? reconcileAssist(result.json, prompt.allowedIds)
+          : null;
+        await appendLedger(app.db, {
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          actorId: req.user!.id,
+          action: "access",
+          objectType: "safety_incident",
+          objectId: incidentId,
+          payload: {
+            act: "investigation_assist",
+            reference: incident.reference,
+            runId: result.runId,
+            recordsOffered: prompt.inputRefs.length,
+            droppedCitations: assist?.droppedCitations ?? null,
+            onlyWeakControls: assist?.onlyWeakControls ?? null,
+          },
+          storePayload: true,
+        });
+        return {
+          available: true,
+          runId: result.runId,
+          incidentId,
+          reference: incident.reference,
+          assist,
+          grounding: result.grounding,
+          context: {
+            recordsOffered: prompt.inputRefs.length,
+            openQuestions: ctx.determination?.openQuestions ?? [],
+          },
+          note:
+            "NOTHING here has been written to the incident. Every suggestion is a proposal a human " +
+            "accepts or discards, and acceptance is a separate ledgered act carrying this run id. " +
+            "Citations to records that were not in the prompt have been dropped rather than shown.",
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          available: false,
+          reason: `The AI layer was configured but the call did not succeed: ${message.slice(0, 300)}.`,
+          context: {
+            priorObservations: ctx.priorObservations,
+            priorIncidents: ctx.priorIncidents,
+            inspections: ctx.inspections,
+            briefings: ctx.briefings,
+            openActions: ctx.openActions,
+            programmeRecords: ctx.programmeRecords,
+            witnesses: ctx.incident.witnesses,
+            openQuestions: ctx.determination?.openQuestions ?? [],
+          },
+          assist: null,
+        };
+      }
+    },
+  );
+
+  /**
+   * Accept some of what the assistant proposed.
+   *
+   * This is the ONLY route that writes anything the assistant produced, and it
+   * writes what the HUMAN sent back — not what the model returned. The run id
+   * is recorded against every row created so that, a year later, an
+   * investigation's contributing factors can be traced to the run that
+   * suggested them and the person who accepted them.
+   */
+  app.post(
+    "/projects/:projectId/safety/incidents/:incidentId/assist/accept",
+    { preHandler: standardGate },
+    async (req) => {
+      const { incidentId } = req.params as { incidentId: string };
+      const body = assistAcceptSchema.parse(req.body);
+      const row = await fetchIncident(incidentId, req.companyId!, req.projectId!);
+      /* PROVENANCE HAS TO BE TRUE TO BE WORTH STORING.
+       *
+       * `runId` is written into every contributing factor and into the
+       * acceptance ledger entry as "accepted from run X". Taken on trust it is
+       * caller-asserted, so a year later the audit trail says a model proposed
+       * something no model ever saw. It must name a real assistant run, on this
+       * company and this incident. */
+      const runs = await app.db
+        .select({
+          id: aiRuns.id,
+          agentKind: aiRuns.agentKind,
+          projectId: aiRuns.projectId,
+          inputRefs: aiRuns.inputRefs,
+        })
+        .from(aiRuns)
+        .where(and(eq(aiRuns.id, body.runId), eq(aiRuns.companyId, req.companyId!)))
+        .limit(1);
+      const run = runs[0];
+      const runCoversIncident =
+        run != null &&
+        Array.isArray(run.inputRefs) &&
+        (run.inputRefs as Array<{ type?: unknown; id?: unknown }>).some(
+          (r) => r?.type === "safety_incident" && r?.id === incidentId,
+        );
+      if (!run || run.agentKind !== "incident_investigation_assistant" || !runCoversIncident) {
+        throw badRequest(
+          `\`runId\` ${body.runId} does not name an investigation-assistant run on ${row.reference} ` +
+            `in this company. It is stored against every contributing factor accepted and in the ` +
+            `ledger entry as the provenance of the suggestion, so a value nobody can resolve is ` +
+            `worse than none: it reads as a model proposal that no model made. Run the assistant ` +
+            `first and send back the run id it returned.`,
+        );
+      }
+      if (row.status === "closed" || row.status === "void") {
+        throw conflict(
+          `Incident ${row.reference} is ${row.status}. Accepting suggestions onto it would change ` +
+            `an investigation that has been signed off.`,
+        );
+      }
+      const factors = body.contributingFactors ?? [];
+      const actions = body.actions ?? [];
+      if (factors.length === 0 && actions.length === 0) {
+        throw badRequest(
+          "Nothing was accepted. Send the contributing factors and/or the corrective actions you " +
+            "want written; an empty acceptance would leave a ledger entry claiming a human agreed " +
+            "with something.",
+        );
+      }
+      const now = new Date().toISOString();
+      /* Read-modify-write of a jsonb array under a row lock: two investigators
+       * accepting from two runs at once would otherwise leave one set of
+       * contributing factors — and its provenance — overwritten. */
+      if (factors.length > 0) {
+        await app.db.transaction(async (tx) => {
+          const locked = (
+            await tx
+              .select({ contributingFactors: safetyIncidents.contributingFactors })
+              .from(safetyIncidents)
+              .where(
+                and(
+                  eq(safetyIncidents.id, incidentId),
+                  eq(safetyIncidents.companyId, req.companyId!),
+                  eq(safetyIncidents.projectId, req.projectId!),
+                ),
+              )
+              .for("update")
+          )[0];
+          if (!locked) throw notFound("Incident not found");
+          const next = [...((locked.contributingFactors ?? []) as unknown[])];
+          for (const f of factors) {
+            next.push({
+              factor: f.factor,
+              category: f.category,
+              note: f.note ?? null,
+              sourceIds: f.sourceIds ?? [],
+              proposedBy: "incident_investigation_assistant",
+              agentRunId: body.runId,
+              acceptedBy: req.user!.id,
+              acceptedAt: now,
+            });
+          }
+          await tx
+            .update(safetyIncidents)
+            .set({ contributingFactors: next, updatedAt: now })
+            .where(eq(safetyIncidents.id, incidentId));
+        });
+      }
+
+      const created: Array<{ id: string; title: string; hierarchyOfControl: string }> = [];
+      for (const a of actions) {
+        if (a.ownerVendorId) await assertVendor(a.ownerVendorId, req.companyId!);
+        const actionId = await createAction({
+          companyId: req.companyId!,
+          projectId: req.projectId!,
+          actorId: req.user!.id,
+          sourceType: "incident",
+          sourceId: incidentId,
+          sourceReference: row.reference,
+          title: a.title,
+          description: a.description ?? null,
+          actionKind: "corrective",
+          hierarchyOfControl: a.hierarchyOfControl,
+          category: null,
+          priority: a.priority ?? "medium",
+          ownerId: a.ownerId ?? null,
+          ownerVendorId: a.ownerVendorId ?? null,
+          ownerName: null,
+          dueDate: a.dueDate,
+          costToImplement: null,
+          currency: null,
+          detail: {
+            proposedBy: "incident_investigation_assistant",
+            agentRunId: body.runId,
+            sourceIds: a.sourceIds ?? [],
+            acceptedBy: req.user!.id,
+          },
+        });
+        created.push({ id: actionId, title: a.title, hierarchyOfControl: a.hierarchyOfControl });
+      }
+
+      const weakOnly =
+        created.length > 0 &&
+        created.every((c) => WEAK_CONTROLS.has(c.hierarchyOfControl));
+
+      await appendLedger(app.db, {
+        companyId: req.companyId!,
+        projectId: req.projectId!,
+        actorId: req.user!.id,
+        action: "update",
+        objectType: "safety_incident",
+        objectId: incidentId,
+        payload: {
+          act: "accept_investigation_assist",
+          reference: row.reference,
+          agentRunId: body.runId,
+          contributingFactorsAccepted: factors.length,
+          actionsCreated: created.map((c) => c.id),
+          onlyWeakControlsAccepted: weakOnly,
+          acceptedBy: req.user!.id,
+        },
+        storePayload: true,
+      });
+
+      return {
+        incidentId,
+        reference: row.reference,
+        runId: body.runId,
+        contributingFactorsAccepted: factors.length,
+        actionsCreated: created,
+        warning: weakOnly
+          ? "Every action accepted sits at the administrative or PPE end of the hierarchy of " +
+            "control. Those depend on a person at the sharp end doing the right thing every time " +
+            "under production pressure; a register full of them will see this event again. Before " +
+            "closing the investigation, record why the hazard could not be designed out, guarded " +
+            "or isolated."
+          : null,
+      };
+    },
+  );
+
+  /* ================================================================ */
+  /* HEALTH INPUTS (contract 3.5)                                      */
+  /* ================================================================ */
+
+  app.get("/projects/:projectId/safety/health-inputs", { preHandler: readGate }, async (req) => {
+    const to = todayISO();
+    const from = addDaysISO(to, -90);
+    const companyId = req.companyId!;
+    const projectId = req.projectId!;
+    const input = await collectRiskIndexInput(companyId, projectId, from, to, to);
+    const index = computeRiskIndex(input);
+    const exposure = await exposureForWindow(companyId, projectId, addDaysISO(to, -365), to);
+    const reasons: string[] = [...index.reasons];
+    if (exposure.hours == null) {
+      reasons.push(
+        "No exposure hours are held for the last 12 months, so no incident RATE is offered here — " +
+          "only counts. A rate computed against an estimated denominator would be relied on.",
+      );
+    }
+    return {
+      metrics: {
+        safetyRiskIndex: index.score,
+        safetyRiskCoverage: index.coverage,
+        openCorrectiveActions: input.actions.open,
+        overdueCorrectiveActions: input.actions.overdue,
+        weakControlActions: input.actions.weakControl,
+        incidents90d: input.incidents.total,
+        lostTimeIncidents90d: input.incidents.lostTime,
+        reportableIncidents90d: input.incidents.recordableOrReportable,
+        daysSinceLastIncident: input.incidents.daysSinceLast,
+        investigationsOverdue: input.incidents.investigationsOverdue,
+        statutoryNotificationsMissed: input.statutory.notificationsMissed,
+        statutoryDutiesOutstanding: input.statutory.outstandingDuties,
+        expiredProgrammeRecords: input.programme.expired,
+        criticalExpiredProgrammeRecords: input.programme.criticalExpired,
+        failedInspections90d: input.inspections.failed,
+        observationsPositive90d: input.observations.positive,
+        observationsNegative90d: input.observations.negative,
+        unacknowledgedDeviceAlarms: input.devices.unacknowledged,
+        exposureHours365d: exposure.hours,
+      },
+      reasons,
+      window: { from, to },
+      band: index.band,
+    };
+  });
+
+  /* ================================================================ */
+  /* SCHEDULED JOBS                                                    */
+  /* ================================================================ */
+
+  /**
+   * The sweeps used to run only when somebody opened a page. A module whose
+   * product is "the statutory deadline passed and here is the record" cannot
+   * depend on a browser tab to notice the deadline, so the guarantee lives
+   * here and the read path only ever hurries it along.
+   */
+  app.scheduler.register({
+    name: "safety.sweeps",
+    description:
+      "Statutory notification deadlines per regime, overdue investigations and corrective actions, statutory inspections past their date, expired programme records and unanswered device alarms — over every company",
+    everyMs: 15 * 60_000,
+    runOnBoot: true,
+    run: async () =>
+      forEachCompany(app.db, async (companyId) => {
+        await sweepSafety(companyId, null, null);
+        return { companyId };
+      }),
+  });
+
+  app.scheduler.register({
+    name: "safety.risk-index",
+    description:
+      "Compute and store the leading-indicator safety risk index for every project holding safety records, and raise a signal where the band is high or severe",
+    everyMs: 6 * 60 * 60_000,
+    runOnBoot: true,
+    run: async () => {
+      const asOf = todayISO();
+      const from = addDaysISO(asOf, -90);
+      let scored = 0;
+      let elevated = 0;
+      const outcome = await forEachCompany(app.db, async (companyId) => {
+        const projectIds = await projectsWithSafetyRecords(companyId);
+        for (const projectId of projectIds) {
+          const out = await computeAndMaybeStoreRiskIndex(
+            companyId,
+            projectId,
+            from,
+            asOf,
+            asOf,
+            true,
+            null,
+          );
+          scored += 1;
+          if (out.result.band === "high" || out.result.band === "severe") elevated += 1;
+        }
+        return { projects: projectIds.length };
+      });
+      return { ...outcome, scored, elevated };
+    },
+  });
+
+  app.scheduler.register({
+    name: "safety.under-reporting",
+    description:
+      "Compare each project's incident, injury and near-miss counts against its exposure and its sibling projects, and raise a signal where the register has gone quiet",
+    everyMs: 24 * 60 * 60_000,
+    runOnBoot: true,
+    run: async () => {
+      const to = todayISO();
+      const from = addDaysISO(to, -365);
+      let raised = 0;
+      const outcome = await forEachCompany(app.db, async (companyId) => {
+        const projectIds = await projectsWithSafetyRecords(companyId);
+        const peers = await companyPeerCounts(companyId, from, to);
+        const names = new Map<string, string>();
+        if (projectIds.length > 0) {
+          const rows = await app.db
+            .select({ id: projects.id, name: projects.name })
+            .from(projects)
+            .where(and(eq(projects.companyId, companyId), inArray(projects.id, projectIds)));
+          for (const r of rows) names.set(r.id, r.name);
+        }
+        for (const projectId of projectIds) {
+          const result = await collectUnderReporting(
+            companyId,
+            projectId,
+            names.get(projectId) ?? projectId,
+            from,
+            to,
+            peers,
+          );
+          if (result.findings.length === 0) continue;
+          const seen = await alreadySignalled(
+            companyId,
+            "safety_under_reporting_suspected",
+            projectId,
+          );
+          for (const finding of result.findings) {
+            const key = `${projectId}:${finding.key}:${to.slice(0, 7)}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            raised += 1;
+            await app.db.insert(signals).values({
+              id: newId("sig"),
+              companyId,
+              projectId,
+              detector: "safety_under_reporting_suspected",
+              severity: finding.severity,
+              confidence: finding.confidence,
+              title: `${finding.title} — ${names.get(projectId) ?? projectId}`,
+              explanation:
+                `${finding.explanation}\n\nExpected: ${finding.expected}\n\nObserved: ${finding.observed}` +
+                `\n\nWHAT WOULD REFUTE THIS: ${finding.refutedBy}\n\nThis is a reading about the ` +
+                `REGISTER, not a finding about the site, and it is deliberately raised at a ` +
+                `confidence below one. Under-reporting is the one safety failure that makes every ` +
+                `other number on the project look better, which is exactly why nobody notices it ` +
+                `from inside.`,
+              evidenceRefs: {
+                key,
+                projectId,
+                findingKey: finding.key,
+                from,
+                to,
+                inputs: finding.inputs,
+              },
+            });
+          }
+        }
+        return { projects: projectIds.length };
+      });
+      return { ...outcome, raised };
+    },
+  });
+
+  /** Projects that hold any safety record at all — the sweep's bounded scope. */
+  async function projectsWithSafetyRecords(companyId: string): Promise<string[]> {
+    const ids = new Set<string>();
+    const fromIncidents = await app.db
+      .selectDistinct({ id: safetyIncidents.projectId })
+      .from(safetyIncidents)
+      .where(eq(safetyIncidents.companyId, companyId));
+    const fromObservations = await app.db
+      .selectDistinct({ id: safetyObservations.projectId })
+      .from(safetyObservations)
+      .where(eq(safetyObservations.companyId, companyId));
+    const fromActions = await app.db
+      .selectDistinct({ id: safetyCorrectiveActions.projectId })
+      .from(safetyCorrectiveActions)
+      .where(eq(safetyCorrectiveActions.companyId, companyId));
+    for (const row of [...fromIncidents, ...fromObservations, ...fromActions]) {
+      if (row.id) ids.add(row.id);
+    }
+    return [...ids];
+  }
+
 };

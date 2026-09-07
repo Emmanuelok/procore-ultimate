@@ -194,6 +194,8 @@ export type StatutoryLienKind = (typeof STATUTORY_LIEN_KINDS)[number];
 
 export const STATUTORY_LIEN_STATUSES = [
   "noticed",
+  /** the notice has been served on the owner/lender — the step before filing */
+  "served",
   "filed",
   "disputed",
   "bonded_off",

@@ -17,6 +17,7 @@ import {
   type DisputeDetail,
   type TimetableStep,
 } from "./disputesShared";
+import RegimePanel from "./RegimePanel";
 
 /* ------------------------------ Status stepper ------------------------------ */
 
@@ -285,6 +286,9 @@ export default function TimelineTab({
         </form>
       ) : null}
 
+      {/* -------------- regime, nomination and outcome (#322-333, #356) ------------- */}
+      <RegimePanel projectId={projectId} dispute={dispute} onChanged={onChanged} />
+
       {/* ------------------------------ decide modal ------------------------------ */}
       <Modal open={decideOpen} title="Record the decision" onClose={() => setDecideOpen(false)}>
         <p className="mb-3 text-sm text-ink-500">
@@ -338,8 +342,9 @@ export default function TimelineTab({
       {/* ----------------------------- withdraw modal ----------------------------- */}
       <Modal open={withdrawOpen} title="Withdraw the referral" onClose={() => setWithdrawOpen(false)}>
         <p className="mb-4 text-sm text-ink-700">
-          Withdrawing closes the dispute file permanently — it cannot be reopened, and open
-          timetable obligations stay on the assurance register until waived.
+          Withdrawing closes the dispute file permanently — it cannot be reopened. Every open
+          timetable obligation is waived automatically so nothing is left dangling on the assurance
+          register.
         </p>
         <div className="flex justify-end gap-2">
           <Button variant="secondary" onClick={() => setWithdrawOpen(false)}>

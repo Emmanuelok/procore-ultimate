@@ -315,6 +315,17 @@ export interface CompanyUser {
   email: string;
 }
 
+/**
+ * Someone this project may actually name on a record — a project member, or a
+ * company owner/admin (who can open every project). The API validates writes
+ * against exactly this set, so the picker reads it rather than the whole
+ * company directory: offering a colleague the server will refuse turns a
+ * dropdown into a 400 after the form has been filled in.
+ */
+export interface AssignablePerson extends CompanyUser {
+  basis: "project_member" | "company_admin";
+}
+
 export interface ListResponse<T> {
   items: T[];
   total: number;

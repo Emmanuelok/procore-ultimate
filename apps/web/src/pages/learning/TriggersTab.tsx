@@ -47,7 +47,15 @@ import {
   label,
   triggerStatusTone,
 } from "./learningShared";
-import type { Lesson, ProjectRow, SweepResult, TriggerRow, TriggerRule, TriggerListResponse } from "./learningShared";
+import type {
+  Lesson,
+  LessonDraft,
+  ProjectRow,
+  SweepResult,
+  TriggerListResponse,
+  TriggerRow,
+  TriggerRule,
+} from "./learningShared";
 
 const MIN_REASON = 10;
 
@@ -130,6 +138,10 @@ export default function TriggersTab({
   const [rulesError, setRulesError] = useState<string | null>(null);
 
   const [captureFor, setCaptureFor] = useState<TriggerRow | null>(null);
+  /** an AI proposal for the open capture modal — a draft, never a lesson */
+  const [draft, setDraft] = useState<LessonDraft | null>(null);
+  const [drafting, setDrafting] = useState(false);
+  const [draftError, setDraftError] = useState<string | null>(null);
   const [dismissFor, setDismissFor] = useState<TriggerRow | null>(null);
   const [dismissReason, setDismissReason] = useState("");
   const [dismissing, setDismissing] = useState(false);
@@ -189,6 +201,33 @@ export default function TriggersTab({
       setActionError(errorMessage(err, "The sweep did not run"));
     } finally {
       setSweeping(false);
+    }
+  }
+
+  /**
+   * Ask the AI layer for a starting point.
+   *
+   * A PROPOSAL, never a lesson: nothing is written, the trigger stays open,
+   * and the form is simply pre-filled. When no key is configured the API
+   * answers 503 and the message is shown as-is — capture works without it,
+   * and the blank page is the only thing the AI is here to solve.
+   */
+  async function requestDraft(trigger: TriggerRow) {
+    setDrafting(true);
+    setDraftError(null);
+    try {
+      const res = await api.post<LessonDraft>(
+        `/api/v1/projects/${projectId}/learning/triggers/${trigger.id}/draft`,
+        {},
+      );
+      setDraft(res);
+      setCaptureFor(trigger);
+    } catch (err) {
+      setDraft(null);
+      setDraftError(errorMessage(err, "The draft could not be generated"));
+      setCaptureFor(trigger);
+    } finally {
+      setDrafting(false);
     }
   }
 
@@ -362,8 +401,24 @@ export default function TriggersTab({
                   <Td className="whitespace-nowrap">
                     {t.status === "open" ? (
                       <div className="flex gap-2">
-                        <Button size="sm" onClick={() => setCaptureFor(t)}>
+                        <Button
+                          size="sm"
+                          onClick={() => {
+                            setDraft(null);
+                            setDraftError(null);
+                            setCaptureFor(t);
+                          }}
+                        >
                           Capture lesson
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          disabled={drafting}
+                          onClick={() => void requestDraft(t)}
+                          title="Ask the AI layer for a starting point, cited to the record that obliged this capture. Nothing is written until you save."
+                        >
+                          {drafting ? "Drafting…" : "Draft it"}
                         </Button>
                         <Button
                           size="sm"
@@ -469,7 +524,46 @@ export default function TriggersTab({
                 satisfies its obligation.
               </p>
             </div>
+            {draftError ? (
+              <div className="mb-3 rounded-md bg-ink-50 px-3 py-2 text-xs leading-relaxed text-ink-700 ring-1 ring-ink-200">
+                <span className="font-medium">No draft was generated. </span>
+                {draftError}
+              </div>
+            ) : null}
+            {draft?.proposal ? (
+              <div className="mb-3 rounded-md bg-brand-50 px-3 py-2 text-xs leading-relaxed text-brand-900 ring-1 ring-brand-100">
+                <span className="block font-medium">
+                  Pre-filled from an AI draft
+                  {draft.confidence !== null
+                    ? ` (confidence ${(draft.confidence * 100).toFixed(0)}%)`
+                    : ""}
+                </span>
+                {draft.note}
+                {draft.citations.length > 0 ? (
+                  <ul className="mt-1 space-y-0.5">
+                    {draft.citations.map((c, i) => (
+                      <li key={i} className="text-[11px] text-brand-800">
+                        cited: {c.excerpt ?? c.recordId}
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+              </div>
+            ) : null}
             <LessonForm
+              key={draft?.runId ?? captureFor.id}
+              {...(draft?.proposal
+                ? {
+                    initial: {
+                      title: draft.proposal.title ?? "",
+                      category: draft.proposal.category ?? "",
+                      whatHappened: draft.proposal.whatHappened ?? "",
+                      rootCause: draft.proposal.rootCause ?? "",
+                      recommendation: draft.proposal.recommendation ?? "",
+                      tags: draft.proposal.tags,
+                    } as unknown as Lesson,
+                  }
+                : {})}
               submitLabel="Capture lesson"
               lockedEvidenceNote={
                 captureFor.sourceRef

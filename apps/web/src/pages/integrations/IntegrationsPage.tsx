@@ -6,6 +6,12 @@
  *   · OAuth clients      — inbound: machine callers with tool:level scopes (#120)
  *   · Signature reference— the receiver-side contract, in full
  *   · Sources            — inbound: vendor connectors and their pull
+ *   · ERP export         — canonical AP/AR and job-cost extracts, rendered
+ *     through per-system mapping profiles (#130-133, #582)
+ *
+ * Above the tabs sits the developer-sandbox flag (#123): a tenant-level claim
+ * that everything leaving here is an exercise, which the exports, the webhook
+ * envelopes and the benchmark pool all honour.
  *
  * Company scope, no project. The event catalogue and the scope vocabulary are
  * loaded once here and shared with every tab, as is the delivery-health read —
@@ -22,8 +28,10 @@ import { useCallback, useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api";
 import { PageHeader } from "../../ui";
+import ErpTab from "./ErpTab";
 import HealthTab from "./HealthTab";
 import OAuthTab from "./OAuthTab";
+import SandboxCard from "./SandboxCard";
 import SignatureTab from "./SignatureTab";
 import SourcesTab from "./SourcesTab";
 import WebhooksTab from "./WebhooksTab";
@@ -47,6 +55,7 @@ const TABS = [
   { key: "oauth", label: "OAuth clients" },
   { key: "signature", label: "Signature reference" },
   { key: "sources", label: "Sources" },
+  { key: "erp", label: "ERP export" },
 ];
 
 export default function IntegrationsPage() {
@@ -165,6 +174,8 @@ export default function IntegrationsPage() {
         </div>
       ) : null}
 
+      <SandboxCard isAdmin={isAdmin} />
+
       <TabBar tabs={TABS} active={tab} onSelect={selectTab} />
 
       {tab === "webhooks" ? (
@@ -188,6 +199,8 @@ export default function IntegrationsPage() {
       ) : null}
 
       {tab === "signature" ? <SignatureTab status={status} /> : null}
+
+      {tab === "erp" ? <ErpTab isAdmin={isAdmin} projects={projects} /> : null}
 
       {tab === "sources" ? (
         <SourcesTab

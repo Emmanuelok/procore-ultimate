@@ -13,7 +13,7 @@
  * (164 days ago) — the vendor is uninsured for this cover today" into
  * "Compliance failed" would throw away the only part of it anyone can act on.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "../../lib/api";
 import {
   Alert,
@@ -87,6 +87,8 @@ export default function PaymentsPanel({
   const [issuing, setIssuing] = useState<CommitmentPayment | null>(null);
   /** The compliance result the API returned alongside the last successful act. */
   const [lastCompliance, setLastCompliance] = useState<ComplianceResult | null>(null);
+  /** The payment whose remittance advice is open (#592). */
+  const [remittance, setRemittance] = useState<CommitmentPayment | null>(null);
 
   const currency = payments.data?.currency ?? commitment.currency;
   const rows = payments.data?.items ?? [];
@@ -259,6 +261,57 @@ export default function PaymentsPanel({
                 Release hold
               </Button>
             ) : null}
+            {row.status === "scheduled" ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                disabled={busy !== null}
+                onClick={async () => {
+                  const reason = await ask({
+                    title: `Hold ${row.reference}?`,
+                    description:
+                      "A held payment stays on the register with its reason visible. Holding is how a dispute, a missing waiver or an expired certificate stops money without erasing the obligation.",
+                    label: "Why is this payment being held?",
+                    confirmLabel: "Hold the payment",
+                  });
+                  if (!reason) return;
+                  await act(row, "hold", "hold", { reason });
+                }}
+              >
+                Hold
+              </Button>
+            ) : null}
+            {row.status === "issued" ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                disabled={busy !== null}
+                onClick={async () => {
+                  const reason = await ask({
+                    title: `Mark ${row.reference} failed?`,
+                    description:
+                      "A bounced cheque or a rejected transfer never left. Marking it failed puts back the retainage it released, takes the direct cost off the budget and re-opens the invoice it settled.",
+                    label: "What happened?",
+                    confirmLabel: "Mark it failed",
+                    destructive: true,
+                  });
+                  if (!reason) return;
+                  await act(row, "fail", "fail", { reason });
+                }}
+              >
+                Mark failed
+              </Button>
+            ) : null}
+            {row.status === "issued" || row.status === "cleared" ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                disabled={busy !== null}
+                onClick={() => setRemittance(row)}
+              >
+                Remittance
+              </Button>
+            ) : null}
             {row.status !== "cleared" && row.status !== "voided" ? (
               <Button
                 size="xs"
@@ -383,6 +436,8 @@ export default function PaymentsPanel({
         }}
       />
 
+      <RemittanceAdvice payment={remittance} onClose={() => setRemittance(null)} />
+
       <SchedulePayment
         open={scheduling}
         commitment={commitment}
@@ -397,6 +452,80 @@ export default function PaymentsPanel({
         }}
       />
     </div>
+  );
+}
+
+/**
+ * THE REMITTANCE ADVICE — what the vendor receives with the money (#592).
+ *
+ * The API renders it, not the client: the advice a subcontractor is sent and
+ * the advice the platform can show an auditor two years later have to be the
+ * same document, and the only way to guarantee that is for one place to build
+ * it. This shows exactly what was returned and offers it for printing.
+ */
+function RemittanceAdvice({
+  payment,
+  onClose,
+}: {
+  payment: CommitmentPayment | null;
+  onClose: () => void;
+}) {
+  const [html, setHtml] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!payment) {
+      setHtml(null);
+      setNote(null);
+      setError(null);
+      return;
+    }
+    let live = true;
+    void (async () => {
+      try {
+        const res = await api.get<{ html: string; advice: { note: string | null } }>(
+          `/api/v1/commitment-payments/${payment.id}/remittance`,
+        );
+        if (!live) return;
+        setHtml(res.html);
+        setNote(res.advice.note);
+      } catch (err) {
+        if (!live) return;
+        setError(err instanceof Error ? err.message : "The remittance advice could not be loaded.");
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [payment]);
+
+  return (
+    <Modal
+      open={payment !== null}
+      onClose={onClose}
+      title={payment ? `Remittance advice — ${payment.reference}` : "Remittance advice"}
+      size="lg"
+    >
+      <div className="space-y-3">
+        {error ? <Alert tone="danger" title="Not available">{error}</Alert> : null}
+        {note ? (
+          <Alert tone="warning" title="This is a preview, not a remittance">
+            {note}
+          </Alert>
+        ) : null}
+        {html === null && error === null ? (
+          <p className="text-meta text-content-muted">Loading the advice…</p>
+        ) : null}
+        {html !== null ? (
+          <div
+            className="overflow-x-auto rounded-md border border-border p-3 text-2xs"
+            // eslint-disable-next-line react/no-danger
+            dangerouslySetInnerHTML={{ __html: html }}
+          />
+        ) : null}
+      </div>
+    </Modal>
   );
 }
 

@@ -19,12 +19,10 @@ import {
   bimModelVersions,
   bimModels,
   clashResults,
-  companyMemberships,
   coordinationIssueComments,
   coordinationIssues,
   recordLinks,
   rfis,
-  users,
 } from "@constructos/db";
 import {
   COORDINATION_ISSUE_STATUSES,
@@ -36,7 +34,17 @@ import { badRequest, conflict } from "../../../lib/errors.js";
 import { nextRecordNumber } from "../../../lib/numbering.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
 import { pushNotifications } from "../../notifications/service.js";
-import { buildBimGates, buildLoaders, isoDateSchema, ledger, nowISO, todayISO } from "../shared.js";
+import {
+  assertAssignable,
+  buildBimGates,
+  buildLoaders,
+  isoDateSchema,
+  ledger,
+  nowISO,
+  listAssignable,
+  resolvePeople,
+  todayISO,
+} from "../shared.js";
 
 /** open -> assigned -> resolved -> verified, void from anywhere */
 const ISSUE_TRANSITIONS: Record<CoordinationIssueStatus, CoordinationIssueStatus[]> = {
@@ -89,23 +97,17 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
   const gates = buildBimGates(app);
   const { getIssue } = buildLoaders(app);
 
-  /** Every referenced user must be a member of the tenant (#241 assignment). */
-  async function assertCompanyMembers(companyId: string, ids: Array<string | null | undefined>) {
-    const wanted = [...new Set(ids.filter((v): v is string => Boolean(v)))];
-    if (wanted.length === 0) return;
-    const rows = await app.db
-      .select({ userId: companyMemberships.userId })
-      .from(companyMemberships)
-      .where(
-        and(
-          eq(companyMemberships.companyId, companyId),
-          inArray(companyMemberships.userId, wanted),
-        ),
-      );
-    const found = new Set(rows.map((r) => r.userId));
-    const missing = wanted.find((id) => !found.has(id));
-    if (missing) throw badRequest(`User "${missing}" is not a member of this company`);
-  }
+  /**
+   * Every referenced user must be a member of the tenant AND of the project
+   * (#241 assignment). Company-level alone was not enough: assignment
+   * notifies, and a colleague with no access to the project would be told an
+   * issue number and title for a record they cannot open.
+   */
+  const assertMembers = (
+    companyId: string,
+    projectId: string,
+    ids: Array<string | null | undefined>,
+  ) => assertAssignable(app.db, companyId, projectId, ids);
 
   async function assertVersionInProject(
     companyId: string,
@@ -128,15 +130,28 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
     if (!rows[0]) throw badRequest("Model version not found in this project");
   }
 
-  async function peopleMap(ids: Array<string | null | undefined>) {
-    const wanted = [...new Set(ids.filter((v): v is string => Boolean(v)))];
-    if (wanted.length === 0) return {} as Record<string, { id: string; name: string; email: string }>;
-    const rows = await app.db
-      .select({ id: users.id, name: users.name, email: users.email })
-      .from(users)
-      .where(inArray(users.id, wanted));
-    return Object.fromEntries(rows.map((r) => [r.id, r]));
-  }
+  /**
+   * Tenant-scoped name resolution. Filtering by company membership here is
+   * belt-and-braces: even if an unvalidated id ever reached a record through
+   * a future writer path, it can never resolve to another tenant's user.
+   */
+  const peopleMap = (companyId: string, ids: Array<string | null | undefined>) =>
+    resolvePeople(app.db, companyId, ids);
+
+  /**
+   * The people this project's coordination records may name. The picker in
+   * the UI reads this rather than the whole company directory, so it can only
+   * offer someone `assertMembers` will accept — the alternative is a dropdown
+   * that produces a 400 after the issue has been typed out.
+   */
+  app.get(
+    "/projects/:projectId/bim/assignable-people",
+    { preHandler: gates.readGate },
+    async (req) => {
+      const items = await listAssignable(app.db, req.companyId!, req.projectId!);
+      return { items, total: items.length };
+    },
+  );
 
   /* ---------------------------------------------------------------- */
   /* Register                                                          */
@@ -172,7 +187,7 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
       .orderBy(desc(coordinationIssues.number))
       .limit(q.pageSize)
       .offset(pageOffset(q));
-    const people = await peopleMap(items.flatMap((i) => [i.assigneeId, i.createdBy]));
+    const people = await peopleMap(req.companyId!, items.flatMap((i) => [i.assigneeId, i.createdBy]));
     const today = todayISO();
     return {
       ...paginate(
@@ -206,7 +221,7 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
         )
         .orderBy(asc(coordinationIssues.number))
         .limit(5000);
-      const people = await peopleMap(rows.flatMap((r) => [r.assigneeId, r.createdBy]));
+      const people = await peopleMap(req.companyId!, rows.flatMap((r) => [r.assigneeId, r.createdBy]));
       const header = [
         "Number",
         "Title",
@@ -251,7 +266,7 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
     { preHandler: gates.standardGate },
     async (req, reply) => {
       const body = issueCreateSchema.parse(req.body);
-      await assertCompanyMembers(req.companyId!, [body.assigneeId]);
+      await assertMembers(req.companyId!, req.projectId!, [body.assigneeId]);
       await assertVersionInProject(req.companyId!, req.projectId!, body.modelVersionId);
       const number = await nextRecordNumber(app.db, req.projectId!, "coordination_issue");
       const id = newId("cis");
@@ -322,7 +337,7 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
             .limit(1)
         : Promise.resolve([]),
     ]);
-    const people = await peopleMap([
+    const people = await peopleMap(req.companyId!, [
       issue.assigneeId,
       issue.createdBy,
       ...comments.map((c) => c.authorId),
@@ -368,7 +383,7 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
         );
       }
     }
-    await assertCompanyMembers(req.companyId!, [body.assigneeId]);
+    await assertMembers(req.companyId!, existing.projectId, [body.assigneeId]);
     await assertVersionInProject(req.companyId!, existing.projectId, body.modelVersionId);
 
     const patch: Record<string, unknown> = { updatedAt: nowISO() };
@@ -452,7 +467,7 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
       .where(eq(coordinationIssueComments.issueId, issueId))
       .orderBy(asc(coordinationIssueComments.createdAt))
       .limit(500);
-    const people = await peopleMap(items.map((c) => c.authorId));
+    const people = await peopleMap(req.companyId!, items.map((c) => c.authorId));
     return {
       items: items.map((c) => ({ ...c, authorName: people[c.authorId]?.name ?? null })),
       total: items.length,
@@ -467,7 +482,7 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
       const body = commentSchema.parse(req.body);
       const issue = await getIssue(issueId, req.companyId!);
       await gates.requireToolFor(req, reply, issue.projectId, "standard");
-      await assertCompanyMembers(req.companyId!, body.mentions ?? []);
+      await assertMembers(req.companyId!, issue.projectId, body.mentions ?? []);
       const id = newId("cic");
       const [created] = await app.db
         .insert(coordinationIssueComments)
@@ -524,7 +539,7 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
     await gates.requireToolFor(req, reply, issue.projectId, "standard");
     if (issue.rfiId) throw conflict("This issue has already been escalated to an RFI");
     if (issue.status === "void") throw conflict("A void issue cannot be escalated");
-    await assertCompanyMembers(req.companyId!, [body.assigneeId ?? issue.assigneeId]);
+    await assertMembers(req.companyId!, issue.projectId, [body.assigneeId ?? issue.assigneeId]);
 
     const number = await nextRecordNumber(app.db, issue.projectId, "rfi");
     const rfiId = newId("rfi");
@@ -619,7 +634,7 @@ export const issueRoutes: FastifyPluginAsync = async (app) => {
       .where(eq(coordinationIssueComments.issueId, issueId))
       .orderBy(asc(coordinationIssueComments.createdAt))
       .limit(500);
-    const people = await peopleMap([issue.createdBy, ...comments.map((c) => c.authorId)]);
+    const people = await peopleMap(req.companyId!, [issue.createdBy, ...comments.map((c) => c.authorId)]);
     let modelName: string | null = null;
     if (issue.modelVersionId) {
       const rows = await app.db

@@ -33,6 +33,10 @@ import Heatmap, { cellScores, type HeatCell } from "./Heatmap";
 import RiskModal from "./RiskModal";
 import RiskDrawer from "./RiskDrawer";
 import { DrawdownCurve, SCurve, Tornado, type TornadoRow } from "./SimulationCharts";
+import AppetiteTab from "./AppetiteTab";
+import ReferenceClassTab from "./ReferenceClassTab";
+import ContingencyGovernance from "./ContingencyGovernance";
+import SimulationJobs from "./SimulationJobs";
 import {
   bandChipClass,
   bandTone,
@@ -234,6 +238,7 @@ function RegisterTab({
                       <Th>Category</Th>
                       <Th>Score</Th>
                       <Th>Owner</Th>
+                      <Th>Response</Th>
                       <Th className="text-center">Quantified</Th>
                       <Th>Status</Th>
                     </tr>
@@ -280,6 +285,20 @@ function RegisterTab({
                             ) : null}
                           </Td>
                           <Td className="whitespace-nowrap text-xs">{ownerName(r.ownerId)}</Td>
+                          <Td className="whitespace-nowrap">
+                            {r.responseStrategy ? (
+                              <Badge tone={r.responseStrategy === "accept" ? "amber" : "blue"}>
+                                {humanize(r.responseStrategy)}
+                              </Badge>
+                            ) : (
+                              <span
+                                className="text-xs text-ink-400"
+                                title="No response strategy chosen — the risk is listed, not managed"
+                              >
+                                none
+                              </span>
+                            )}
+                          </Td>
                           <Td className="text-center">
                             {isQuantified(r) ? (
                               <span className="font-semibold text-emerald-600" title="Occurrence probability and cost impact are set — included in QCRA">
@@ -376,10 +395,16 @@ function SimulationTab({
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
   const [view, setView] = useState<SimView | null>(null);
+  /** queue the run instead of waiting for it — the honest option for a big
+   *  model, and the only one that does not hold a request open for minutes */
+  const [background, setBackground] = useState(false);
+  const [queueNonce, setQueueNonce] = useState(0);
 
   const [history, setHistory] = useState<SimListItem[] | null>(null);
   const [histError, setHistError] = useState<string | null>(null);
-  const [verify, setVerify] = useState<Record<string, "running" | "yes" | "no">>({});
+  const [verify, setVerify] = useState<
+    Record<string, "running" | "yes" | "no" | "denied" | "error">
+  >({});
 
   const loadHistory = useCallback(async () => {
     setHistError(null);
@@ -410,6 +435,14 @@ function SimulationTab({
       const body: Record<string, unknown> = { iterations: Number(iterations) || undefined };
       if (seed.trim() !== "") body["seed"] = Number(seed);
       if (kind === "qsra" && scheduleId) body["scheduleId"] = scheduleId;
+      if (background) {
+        body["async"] = true;
+        await api.post<{ job: { id: string } }>(`${base}/risk/simulations/${kind}`, body);
+        // The jobs panel takes it from here: it polls, shows convergence and
+        // opens the result when the run lands.
+        setQueueNonce((n) => n + 1);
+        return;
+      }
       const res = await api.post<SimView & Record<string, unknown>>(
         `${base}/risk/simulations/${kind}`,
         body,
@@ -435,13 +468,20 @@ function SimulationTab({
     }
   }
 
+  /**
+   * A rerun replays the whole simulation, so it is a standard-level action
+   * queued behind the same runner as a fresh run. A refusal is NOT a
+   * mismatch — reporting "MISMATCH" because the caller lacked permission
+   * would accuse a clean record of tampering.
+   */
   async function onVerify(id: string) {
     setVerify((m) => ({ ...m, [id]: "running" }));
     try {
       const res = await api.post<RerunResult>(`${base}/risk-simulations/${id}/rerun`);
       setVerify((m) => ({ ...m, [id]: res.reproduced ? "yes" : "no" }));
-    } catch {
-      setVerify((m) => ({ ...m, [id]: "no" }));
+    } catch (err) {
+      const denied = err instanceof ApiClientError && (err.status === 403 || err.status === 401);
+      setVerify((m) => ({ ...m, [id]: denied ? "denied" : "error" }));
     }
   }
 
@@ -540,13 +580,32 @@ function SimulationTab({
                 </Select>
               </Field>
             ) : null}
+            <label className="mb-2 flex items-center gap-2 text-xs text-ink-700">
+              <input
+                type="checkbox"
+                className="h-4 w-4 accent-brand-600"
+                checked={background}
+                onChange={(e) => setBackground(e.target.checked)}
+              />
+              Run in the background
+            </label>
             <Button onClick={() => void onRun()} disabled={running}>
-              {running ? "Simulating…" : "Run simulation"}
+              {running ? "Simulating…" : background ? "Queue simulation" : "Run simulation"}
             </Button>
           </div>
           <ErrorAlert message={runError} />
+          <p className="mt-1 text-xs text-ink-400">
+            A queued run executes in batches off the request path and records its convergence, so a
+            20,000-iteration model does not hold a request open or block other users.
+          </p>
         </CardBody>
       </Card>
+
+      <SimulationJobs
+        key={queueNonce}
+        base={base}
+        onOpenSimulation={(simulationId) => void onView(simulationId)}
+      />
 
       {/* results */}
       {view ? (
@@ -729,6 +788,15 @@ function SimulationTab({
                             <Badge tone="green">Reproduced exactly</Badge>
                           ) : v === "no" ? (
                             <Badge tone="red">MISMATCH</Badge>
+                          ) : v === "denied" ? (
+                            <span
+                              className="text-xs text-ink-400"
+                              title="A rerun re-runs the simulation, so it needs standard access to the risk tool."
+                            >
+                              Not permitted
+                            </span>
+                          ) : v === "error" ? (
+                            <span className="text-xs text-ink-400">Verification unavailable</span>
                           ) : v === "running" ? (
                             <span className="text-xs text-ink-400">Verifying…</span>
                           ) : (
@@ -768,6 +836,7 @@ function ContingencyTab({ base }: { base: string }) {
   const [error, setError] = useState<string | null>(null);
   const [curves, setCurves] = useState<Record<string, DrawdownCurveData | "loading">>({});
   const [openCurves, setOpenCurves] = useState<Record<string, boolean>>({});
+  const [openGovernance, setOpenGovernance] = useState<Record<string, boolean>>({});
 
   const load = useCallback(async () => {
     setError(null);
@@ -979,14 +1048,33 @@ function ContingencyTab({ base }: { base: string }) {
                     {/* 20% threshold tick */}
                     <div className="absolute inset-y-0 left-[20%] w-px bg-ink-400/60" />
                   </div>
-                  <div className="flex gap-2">
+                  <div className="flex flex-wrap gap-2">
                     <Button variant="secondary" size="sm" onClick={() => void openDraw(c)}>
                       Draw down
                     </Button>
                     <Button variant="ghost" size="sm" onClick={() => toggleCurve(c.id)}>
                       {openCurves[c.id] ? "Hide drawdown curve" : "Drawdown curve"}
                     </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setOpenGovernance((m) => ({ ...m, [c.id]: !m[c.id] }))}
+                    >
+                      {openGovernance[c.id] ? "Hide releases & plan" : "Releases & plan"}
+                    </Button>
                   </div>
+                  {openGovernance[c.id] ? (
+                    <div className="mt-3 border-t border-ink-100 pt-3">
+                      <ContingencyGovernance
+                        base={base}
+                        contingency={c}
+                        onChanged={() => {
+                          void load();
+                          if (openCurves[c.id]) void loadCurve(c.id);
+                        }}
+                      />
+                    </div>
+                  ) : null}
                   {openCurves[c.id] ? (
                     <div className="mt-3 border-t border-ink-100 pt-3">
                       {curve === "loading" || !curve ? (
@@ -1168,6 +1256,8 @@ const TABS = [
   { id: "register", label: "Register" },
   { id: "simulation", label: "Simulation" },
   { id: "contingency", label: "Contingency" },
+  { id: "appetite", label: "Appetite" },
+  { id: "reference", label: "Reference class" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
@@ -1258,6 +1348,10 @@ export default function RiskPage() {
         <RegisterTab base={base} projectId={projectId} users={users} tasks={tasks} />
       ) : tab === "simulation" ? (
         <SimulationTab base={base} schedules={schedules} taskNames={taskNames} />
+      ) : tab === "appetite" ? (
+        <AppetiteTab base={base} />
+      ) : tab === "reference" ? (
+        <ReferenceClassTab />
       ) : (
         <ContingencyTab base={base} />
       )}

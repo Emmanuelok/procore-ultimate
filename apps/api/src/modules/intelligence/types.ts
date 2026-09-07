@@ -56,6 +56,12 @@ export interface AttentionItem {
   status?: string;
   firstSeenAt?: string;
   lastSeenAt?: string;
+  /**
+   * May the caller set this item aside / reopen it? Seeing is not acting
+   * (plan §6.3), so the API says which of the two the reader has rather than
+   * letting the page offer a button that 403s.
+   */
+  canAct?: boolean;
 }
 
 export interface PortfolioRollup {
@@ -101,6 +107,11 @@ export interface PulseResponse {
   scores: ProjectHealth[];
   briefing: BriefingSummary;
   changes: PulseChanges;
+  /**
+   * Source types whose sweep hit its row cap: the feed holds the most urgent
+   * items of more, and the page says so instead of implying completeness.
+   */
+  attentionTruncated: string[];
   /** true when the snapshot was built on this request rather than read from cache */
   computedOnRead: boolean;
 }

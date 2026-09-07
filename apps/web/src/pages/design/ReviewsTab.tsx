@@ -24,6 +24,7 @@ import {
   CODE_TONE,
   COMMENT_STATUS_TONE,
   EM_DASH,
+  EditPanel,
   KeyValue,
   LoadError,
   PRIORITY_TONE,
@@ -425,6 +426,21 @@ function ReviewDrawer({
     }
   }
 
+  /**
+   * Cancelling is for a cycle that should never have been issued. It is an
+   * admin act and the API says so; a standard user gets the refusal here
+   * rather than a button that silently is not there.
+   */
+  async function cancelCycle() {
+    const reason = window.prompt("Why should this cycle never have been issued?");
+    if (!reason) return;
+    const r = await action.run("cancel", () => api.post(`${base}/reviews/${reviewId}/cancel`, { reason }));
+    if (r) {
+      toast.success("Cycle cancelled");
+      onChanged();
+    }
+  }
+
   const open = row ? row.status !== "closed" && row.status !== "cancelled" : false;
 
   return (
@@ -483,6 +499,33 @@ function ReviewDrawer({
               ) : null}
               {!row.canClose.canClose && open ? <ReasonList reasons={row.canClose.blockers} className="mt-2" /> : null}
             </div>
+
+            <EditPanel
+              title="Correct this cycle"
+              hint="A live cycle can be retitled or re-dated. A closed cycle is a record: open a resubmission instead."
+              path={`${base}/reviews/${row.id}`}
+              initial={row as unknown as Record<string, unknown>}
+              disabled={!open}
+              disabledReason={`This cycle is ${labelize(row.status).toLowerCase()} and is now a record. A further comment belongs on a resubmission.`}
+              onSaved={onChanged}
+              fields={[
+                { key: "title", label: "Title", kind: "text", maxLength: 200, nullable: false, wide: true },
+                { key: "revision", label: "Revision", kind: "text", maxLength: 20, placeholder: "P02" },
+                { key: "dueAt", label: "Due", kind: "date", hint: "The turnaround this cycle is measured against." },
+                { key: "notes", label: "Notes", kind: "textarea" },
+              ]}
+            />
+
+            {open ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <Button size="xs" variant="ghost" loading={action.busy === "cancel"} onClick={() => void cancelCycle()}>
+                  Cancel this cycle
+                </Button>
+                <span className="text-2xs text-content-subtle">
+                  Withdraws a cycle that should never have been issued. Design admin only, and it is ledgered with your reason.
+                </span>
+              </div>
+            ) : null}
 
             <div>
               <SectionHeading title="Reviewers" hint="A review code is a professional opinion: only the named reviewer may return it." />

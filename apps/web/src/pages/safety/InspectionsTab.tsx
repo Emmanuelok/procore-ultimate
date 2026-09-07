@@ -18,6 +18,7 @@
 import { useMemo, useState } from "react";
 import {
   Badge,
+  Button,
   Card,
   CardBody,
   DataTable,
@@ -37,7 +38,9 @@ import {
   INSPECTION_STATUS_TONE,
   LoadError,
   SectionHeading,
+  RegisterPager,
   count,
+  pageParams,
   dateTime,
   decimal,
   isoDate,
@@ -50,6 +53,8 @@ import {
 } from "./safetyShared";
 
 export interface InspectionFilters {
+  /** 1-based; the register is paged rather than silently truncated */
+  page: string;
   status: string;
   inspectionType: string;
   result: string;
@@ -57,7 +62,7 @@ export interface InspectionFilters {
   overdue: string;
 }
 
-export const EMPTY_INSPECTION_FILTERS: InspectionFilters = {
+export const EMPTY_INSPECTION_FILTERS: InspectionFilters = { page: "1",
   status: "",
   inspectionType: "",
   result: "",
@@ -118,6 +123,8 @@ export default function InspectionsTab({
   onFilters,
   users,
   onOpen,
+  onNew,
+  onNewTemplate,
 }: {
   inspections: Resource<Paged<SafetyInspection>>;
   templates: Resource<Paged<InspectionTemplate>>;
@@ -125,6 +132,8 @@ export default function InspectionsTab({
   onFilters: (next: InspectionFilters) => void;
   users: Map<string, string>;
   onOpen: (id: string) => void;
+  onNew: () => void;
+  onNewTemplate: () => void;
 }) {
   const [pane, setPane] = useState<"performed" | "templates">("performed");
   const rows = inspections.data?.items ?? [];
@@ -341,17 +350,27 @@ export default function InspectionsTab({
         />
       ) : null}
 
-      <Tabs
-        items={[
-          { value: "performed", label: "Performed" },
-          { value: "templates", label: "Templates", count: templateRows.length },
-        ]}
-        value={pane}
-        onChange={setPane}
-        size="sm"
-        variant="pill"
-        aria-label="Inspection views"
-      />
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <Tabs
+          items={[
+            { value: "performed", label: "Performed" },
+            { value: "templates", label: "Templates", count: templateRows.length },
+          ]}
+          value={pane}
+          onChange={setPane}
+          size="sm"
+          variant="pill"
+          aria-label="Inspection views"
+        />
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Button size="xs" variant="outline" onClick={onNewTemplate}>
+            New template
+          </Button>
+          <Button size="xs" onClick={onNew}>
+            Schedule an inspection
+          </Button>
+        </div>
+      </div>
 
       {pane === "performed" ? (
         <>
@@ -447,6 +466,14 @@ export default function InspectionsTab({
               description: "Widen the type, status or result filter.",
             }}
             aria-label="Inspection register"
+          />
+          <RegisterPager
+            page={filters.page}
+            loaded={rows.length}
+            total={inspections.data?.total ?? null}
+            noun="inspection"
+            loading={inspections.loading}
+            onPage={(page) => onFilters({ ...filters, page })}
           />
         </>
       ) : (
@@ -554,7 +581,7 @@ function TemplateList({ templates }: { templates: Resource<Paged<InspectionTempl
 }
 
 export function inspectionQueryString(filters: InspectionFilters): string {
-  const params = new URLSearchParams({ page: "1", pageSize: "200" });
+  const params = pageParams(filters.page);
   if (filters.status) params.set("status", filters.status);
   if (filters.inspectionType) params.set("inspectionType", filters.inspectionType);
   if (filters.result) params.set("result", filters.result);

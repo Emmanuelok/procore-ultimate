@@ -19,7 +19,6 @@ import {
   assetElementLinks,
   assets,
   bimElements,
-  companyMemberships,
   locations,
   sensorAlerts,
   sensors,
@@ -31,10 +30,12 @@ import { newId } from "../../../lib/ids.js";
 import { badRequest, conflict, notFound } from "../../../lib/errors.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
 import {
+  assertAssignable,
   buildTwinGates,
   buildTwinLoaders,
   isoDateSchema,
   ledger,
+  listAssignable,
   nowISO,
 } from "../shared.js";
 
@@ -122,17 +123,16 @@ export const assetRoutes: FastifyPluginAsync = async (app) => {
     if (dupe[0]) throw conflict(`Tag code "${tagCode}" already exists in this project`);
   }
 
-  async function assertCompanyMember(companyId: string, userId: string | null | undefined) {
-    if (!userId) return;
-    const rows = await app.db
-      .select({ userId: companyMemberships.userId })
-      .from(companyMemberships)
-      .where(
-        and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.userId, userId)),
-      )
-      .limit(1);
-    if (!rows[0]) throw badRequest("Owner must be a member of this company");
-  }
+  /**
+   * An owner is notified about this asset's warranties and its sensors'
+   * breaches, and the notification names the project — so the owner has to be
+   * someone who can open the project, not merely someone in the tenant.
+   */
+  const assertOwner = (
+    companyId: string,
+    projectId: string,
+    userId: string | null | undefined,
+  ) => assertAssignable(app.db, companyId, projectId, [userId]);
 
   async function assertLocation(projectId: string, locationId: string | null | undefined) {
     if (!locationId) return;
@@ -297,12 +297,26 @@ export const assetRoutes: FastifyPluginAsync = async (app) => {
     return { items: build("", 0), total: rows.length };
   });
 
+  /**
+   * The people who may own an asset or a sensor on this project. The owner
+   * picker reads this instead of the company directory, so it cannot offer
+   * someone `assertOwner` will reject.
+   */
+  app.get(
+    "/projects/:projectId/twin/assignable-people",
+    { preHandler: gates.readGate },
+    async (req) => {
+      const items = await listAssignable(app.db, req.companyId!, req.projectId!);
+      return { items, total: items.length };
+    },
+  );
+
   app.post("/projects/:projectId/assets", { preHandler: gates.standardGate }, async (req, reply) => {
     const body = assetCreateSchema.parse(req.body);
     await assertTagCodeFree(req.projectId!, body.tagCode);
     await assertParent(req.projectId!, body.parentId);
     await assertLocation(req.projectId!, body.locationId);
-    await assertCompanyMember(req.companyId!, body.ownerId);
+    await assertOwner(req.companyId!, req.projectId!, body.ownerId);
     const id = newId("ast");
     const [created] = await app.db
       .insert(assets)
@@ -414,7 +428,9 @@ export const assetRoutes: FastifyPluginAsync = async (app) => {
     }
     if (body.parentId !== undefined) await assertParent(existing.projectId, body.parentId, assetId);
     if (body.locationId !== undefined) await assertLocation(existing.projectId, body.locationId);
-    if (body.ownerId !== undefined) await assertCompanyMember(req.companyId!, body.ownerId);
+    if (body.ownerId !== undefined) {
+      await assertOwner(req.companyId!, existing.projectId, body.ownerId);
+    }
 
     const patch: Record<string, unknown> = { updatedAt: nowISO() };
     for (const key of [
@@ -541,7 +557,7 @@ export const assetRoutes: FastifyPluginAsync = async (app) => {
       const element = elementRows[0];
       if (!element) throw notFound("BIM element not found in this project");
       await assertTagCodeFree(req.projectId!, body.tagCode);
-      await assertCompanyMember(req.companyId!, body.ownerId);
+      await assertOwner(req.companyId!, req.projectId!, body.ownerId);
 
       const assetId = newId("ast");
       const linkId = newId("ael");
@@ -645,24 +661,30 @@ export const assetRoutes: FastifyPluginAsync = async (app) => {
 
       const created: Array<{ id: string; tagCode: string; globalId: string }> = [];
       const skipped: string[] = [];
+      // A pattern that does not contain {seq} renders the same string for
+      // every element, so bumping seq and re-rendering could never break a
+      // collision: the loop below would spin forever and wedge the event
+      // loop for every tenant. When the pattern cannot vary, disambiguate
+      // with a numeric suffix instead.
+      const patternVariesWithSeq = body.tagPattern.includes("{seq}");
       let seq = 1;
       for (const element of elements) {
         if (linkedSet.has(element.globalId)) {
           skipped.push(element.globalId);
           continue;
         }
-        let tagCode = body.tagPattern
-          .replace(/\{storey\}/g, (element.storey ?? "NA").replace(/\s+/g, ""))
-          .replace(/\{type\}/g, element.ifcType.replace(/^IFC/, ""))
-          .replace(/\{name\}/g, (element.name ?? "").replace(/\s+/g, ""))
-          .replace(/\{seq\}/g, String(seq).padStart(3, "0"));
-        while (existingTags.has(tagCode)) {
-          seq += 1;
-          tagCode = body.tagPattern
+        const renderTag = (n: number) =>
+          body.tagPattern
             .replace(/\{storey\}/g, (element.storey ?? "NA").replace(/\s+/g, ""))
             .replace(/\{type\}/g, element.ifcType.replace(/^IFC/, ""))
             .replace(/\{name\}/g, (element.name ?? "").replace(/\s+/g, ""))
-            .replace(/\{seq\}/g, String(seq).padStart(3, "0"));
+            .replace(/\{seq\}/g, String(n).padStart(3, "0"));
+        let tagCode = renderTag(seq);
+        while (existingTags.has(tagCode)) {
+          seq += 1;
+          tagCode = patternVariesWithSeq
+            ? renderTag(seq)
+            : `${renderTag(seq)}-${String(seq).padStart(3, "0")}`;
         }
         existingTags.add(tagCode);
         seq += 1;

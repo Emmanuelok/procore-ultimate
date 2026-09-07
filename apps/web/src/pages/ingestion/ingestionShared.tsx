@@ -68,6 +68,10 @@ export interface RunRow {
   fileName: string | null;
   fileSha256: string | null;
   columnMap: Record<string, string>;
+  /** insert (default) rejects a re-presented externalId; reconcile diffs it */
+  mode?: string | null;
+  parser?: string | null;
+  updatedCount?: number;
   totalRows: number;
   stagedCount: number;
   committedCount: number;
@@ -93,6 +97,25 @@ export interface RecordRow {
   status: string; // staged | committed | rejected | skipped
   reason: string | null;
   committedRecordId: string | null;
+  /** reconcile mode: the committed record this row restates */
+  matchedRecordId?: string | null;
+  /** field-by-field difference against that record; {} means unchanged */
+  diff?: Record<string, unknown> | null;
+  /** the operator's decision for a matched row: insert | update | skip */
+  resolution?: string | null;
+  createdAt: string;
+}
+
+/** ingestion_mapping_templates row — a saved column map for one dataset. */
+export interface MappingTemplate {
+  id: string;
+  companyId: string;
+  sourceId: string | null;
+  dataset: string;
+  name: string;
+  columnMap: Record<string, string>;
+  useCount: number;
+  createdBy: string;
   createdAt: string;
 }
 
@@ -497,5 +520,36 @@ export function PayloadCell({ payload }: { payload: Record<string, unknown> }) {
     <span className="block max-w-md truncate font-mono text-[11px] text-ink-600" title={JSON.stringify(payload, null, 2)}>
       {text}
     </span>
+  );
+}
+
+/**
+ * The field-by-field difference a reconcile match produced. `{}` means the
+ * restatement changes nothing, which is worth saying plainly: it is the case
+ * where "update" and "skip" have the same effect.
+ */
+export function DiffCell({ diff }: { diff: Record<string, unknown> | null }) {
+  if (!diff) return <span className="text-ink-300">— (no diff recorded)</span>;
+  const entries = Object.entries(diff);
+  if (entries.length === 0) {
+    return <span className="text-[11px] text-ink-500">No field differs from the committed record.</span>;
+  }
+  return (
+    <ul className="space-y-0.5" title={JSON.stringify(diff, null, 2)}>
+      {entries.slice(0, 6).map(([field, change]) => {
+        const c = (change ?? {}) as { from?: unknown; to?: unknown };
+        return (
+          <li key={field} className="font-mono text-[11px] leading-tight text-ink-600">
+            <span className="text-ink-400">{field}: </span>
+            <span className="text-red-700 line-through">{String(c.from ?? "—")}</span>
+            <span className="text-ink-400"> → </span>
+            <span className="text-emerald-700">{String(c.to ?? "—")}</span>
+          </li>
+        );
+      })}
+      {entries.length > 6 ? (
+        <li className="text-[11px] text-ink-400">+{entries.length - 6} more field(s)</li>
+      ) : null}
+    </ul>
   );
 }

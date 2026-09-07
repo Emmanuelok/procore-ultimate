@@ -563,6 +563,9 @@ export default function ReviewDrawer({
 
           {item.status === "pending" ? (
             <div className="space-y-2">
+              <Alert tone="info" title="What approving this does">
+                {approvalEffect(item.targetType)}
+              </Alert>
               {rejecting ? (
                 <Field
                   label="Why are you rejecting this?"
@@ -623,4 +626,27 @@ export default function ReviewDrawer({
       ) : null}
     </Drawer>
   );
+}
+
+/**
+ * What an approval actually changes, stated before the button rather than
+ * discovered afterwards. The advisory types genuinely move nothing in another
+ * module, and saying so is the difference between a reviewer accepting a memo
+ * and a reviewer thinking they have just answered an RFI.
+ */
+function approvalEffect(targetType: string): string {
+  switch (targetType) {
+    case "rfi_response":
+      return "Writes the official response onto the RFI, marks it answered, returns ball-in-court to the requester and notifies the distribution. The RFI must still be open. Reversible.";
+    case "daily_log":
+      return "Creates or updates YOUR draft daily log for that date. It refuses if the log has been submitted or approved. Reversible.";
+    case "drawing_sheet":
+      return "Renames the sheet (number, title, discipline) and clears its needs-review flag. Reversible.";
+    case "signal_explanation":
+      return "Appends the benign and concerning readings to the signal's explanation. It does NOT disposition the signal — that stays with an independent reviewer. Reversible.";
+    case "submittal_review":
+      return "Writes the recommendation and findings as an advisory review comment on the submittal. It does NOT set a response code: that is your determination, taken through the submittal's own response route. Reversible.";
+    default:
+      return "Records that a person accepted this advisory artefact. Nothing in another module moves, so there is nothing to roll back — the memo, narrative, forecast or assessment is itself the deliverable.";
+  }
 }

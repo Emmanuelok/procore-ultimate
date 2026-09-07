@@ -1159,7 +1159,7 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         }
       }
       const now = nowIso();
-      await app.db
+      const claimedStatus = await app.db
         .update(primeContracts)
         .set({
           status: body.status,
@@ -1173,7 +1173,14 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
               : {}),
           updatedAt: now,
         })
-        .where(eq(primeContracts.id, contract.id));
+        .where(and(eq(primeContracts.id, contract.id), eq(primeContracts.status, contract.status)))
+        .returning({ id: primeContracts.id });
+      if (claimedStatus.length !== 1) {
+        throw conflict(
+          `Prime contract ${contract.reference} is no longer ${contract.status} — another ` +
+            "request moved it first. Reload before acting on it again.",
+        );
+      }
       await appendLedger(app.db, {
         companyId: req.companyId!,
         projectId: contract.projectId,
@@ -1969,6 +1976,24 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
                 "back to revise_and_resubmit (or void it) and raise the corrected figure."),
         );
       }
+      // Same check the create route makes: a package id is a tenant-scoped
+      // reference, and execute later WRITES to the package row it names.
+      if (body.changeOrderPackageId) {
+        const pkg = await app.db
+          .select({ id: changeOrderPackages.id })
+          .from(changeOrderPackages)
+          .where(
+            and(
+              eq(changeOrderPackages.id, body.changeOrderPackageId),
+              eq(changeOrderPackages.companyId, contract.companyId),
+              eq(changeOrderPackages.projectId, contract.projectId),
+            ),
+          )
+          .limit(1);
+        if (!pkg[0]) {
+          throw badRequest("changeOrderPackageId does not reference a package on this project");
+        }
+      }
       const lines = (body.lines ?? (change.lines as Array<{ amount: number }>)) as Array<{
         amount: number;
       }>;
@@ -2092,7 +2117,9 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
             recordedAt: now,
           }
         : null;
-      await app.db
+      // Claimed on the status this route read, so two approvers acting at
+      // once cannot both stamp their own approval on the same change order.
+      const claimedApproval = await app.db
         .update(primeContractChanges)
         .set({
           status: "approved",
@@ -2103,7 +2130,19 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
             ? { detail: { ...((change.detail as Record<string, unknown> | null) ?? {}), ownerApproval } }
             : {}),
         })
-        .where(eq(primeContractChanges.id, change.id));
+        .where(
+          and(
+            eq(primeContractChanges.id, change.id),
+            eq(primeContractChanges.status, change.status),
+          ),
+        )
+        .returning({ id: primeContractChanges.id });
+      if (claimedApproval.length !== 1) {
+        throw conflict(
+          `${change.reference} is no longer ${change.status} — another request moved it first. ` +
+            "Reload the change register before acting on it again.",
+        );
+      }
       await recalcContract(contract.id, req.companyId!);
       await appendLedger(app.db, {
         companyId: req.companyId!,
@@ -2199,12 +2238,38 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         throw conflict(`${change.reference} is already void.`);
       }
       const now = nowIso();
-      await app.db
+      // The void reason lives in `detail`, not in `rejectionReason`: a
+      // rejected change order carries the reviewer's reason for refusing it,
+      // and that is exactly the audit trail this register exists to keep.
+      // The UPDATE is claimed on the status we read, and a claim that matches
+      // nothing means someone executed it in between — refuse rather than
+      // report a void that did not happen.
+      const claimed = await app.db
         .update(primeContractChanges)
-        .set({ status: "void", rejectionReason: body.reason, updatedAt: now })
+        .set({
+          status: "void",
+          detail: {
+            ...((change.detail as Record<string, unknown> | null) ?? {}),
+            voidReason: body.reason,
+            voidedBy: req.user!.id,
+            voidedAt: now,
+            statusBeforeVoid: change.status,
+          },
+          updatedAt: now,
+        })
         .where(
-          and(eq(primeContractChanges.id, change.id), ne(primeContractChanges.status, "executed")),
+          and(
+            eq(primeContractChanges.id, change.id),
+            eq(primeContractChanges.status, change.status),
+          ),
+        )
+        .returning({ id: primeContractChanges.id });
+      if (claimed.length !== 1) {
+        throw conflict(
+          `${change.reference} is no longer ${change.status} — another request moved it first. ` +
+            "Reload the change register before acting on it again.",
         );
+      }
       await recalcContract(contract.id, req.companyId!);
       await appendLedger(app.db, {
         companyId: req.companyId!,
@@ -2224,7 +2289,6 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
     budgetId: string;
     budgetStatus: string;
     legs: Array<{ lineItemId: string; costCode: string; costType: string; amount: number }>;
-    rows: Map<string, typeof budgetLineItems.$inferSelect>;
   }
 
   /** Why the last plan produced nothing — set by planOwnerChange, read by the ledger. */
@@ -2303,7 +2367,7 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         );
       }
     }
-    return { budgetId: budget.id, budgetStatus: budget.status, legs: [...merged.values()], rows: byId };
+    return { budgetId: budget.id, budgetStatus: budget.status, legs: [...merged.values()] };
   }
 
   /** Re-derive the budget's materialized rollups after an owner change lands. */
@@ -2446,7 +2510,13 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
         const pkg = await app.db
           .select({ id: changeOrderPackages.id, reference: changeOrderPackages.reference, primeContractChangeId: changeOrderPackages.primeContractChangeId, status: changeOrderPackages.status })
           .from(changeOrderPackages)
-          .where(eq(changeOrderPackages.id, change.changeOrderPackageId))
+          .where(
+            and(
+              eq(changeOrderPackages.id, change.changeOrderPackageId),
+              eq(changeOrderPackages.companyId, contract.companyId),
+              eq(changeOrderPackages.projectId, contract.projectId),
+            ),
+          )
           .limit(1);
         if (pkg[0]?.primeContractChangeId && pkg[0].primeContractChangeId !== change.id) {
           throw conflict(
@@ -2506,8 +2576,12 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
       const now = nowIso();
       let budgetLinesMoved = 0;
       await app.db.transaction(async (tx) => {
-        for (const row of appended) await tx.insert(primeContractSovLines).values(row);
-        await tx
+        // Claim the transition first: UPDATE ... WHERE status = 'approved'.
+        // Two concurrent executions would otherwise both pass the status read
+        // above and each append its own SOV lines and its own owner_change —
+        // the contract sum funded once but the schedule of values and the
+        // budget moved twice, which no later write can reconcile.
+        const claimed = await tx
           .update(primeContractChanges)
           .set({
             status: "executed",
@@ -2523,7 +2597,20 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
             },
             updatedAt: now,
           })
-          .where(eq(primeContractChanges.id, change.id));
+          .where(
+            and(
+              eq(primeContractChanges.id, change.id),
+              eq(primeContractChanges.status, "approved"),
+            ),
+          )
+          .returning({ id: primeContractChanges.id });
+        if (claimed.length !== 1) {
+          throw conflict(
+            `${change.reference} is no longer approved — another request executed it first. ` +
+              "Reload the change register before acting on it again.",
+          );
+        }
+        for (const row of appended) await tx.insert(primeContractSovLines).values(row);
         if (plan && budgetChangeId && budgetChangeNumber !== null) {
           const requestedBy = change.submittedBy ?? change.createdBy;
           const approvedBy = change.approvedBy ?? req.user!.id;
@@ -2567,9 +2654,36 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
             detail: { primeContractChangeId: change.id, changeOrderPackageId: change.changeOrderPackageId },
             createdBy: change.createdBy,
           });
+          // The lines were planned outside this transaction; they are RE-READ
+          // here under a row lock (in a stable id order so two executions
+          // queue rather than deadlock), because the write below stores an
+          // absolute figure — a change order executed a millisecond earlier on
+          // the same line would otherwise be overwritten instead of added to.
+          const lockedRows = new Map<string, typeof budgetLineItems.$inferSelect>();
+          for (const lineItemId of plan.legs.map((l) => l.lineItemId).sort()) {
+            const fresh = await tx
+              .select()
+              .from(budgetLineItems)
+              .where(eq(budgetLineItems.id, lineItemId))
+              .for("update");
+            if (fresh[0]) lockedRows.set(lineItemId, fresh[0]);
+          }
           for (const leg of plan.legs) {
-            const row = plan.rows.get(leg.lineItemId)!;
+            const row = lockedRows.get(leg.lineItemId);
+            if (!row || row.budgetId !== plan.budgetId || row.status === "void") {
+              throw conflict(
+                `Budget line ${leg.costCode} / ${leg.costType} is no longer available on this ` +
+                  "budget — it was removed or voided while this change order was being executed. " +
+                  "Re-point the change order's lines and execute again.",
+              );
+            }
             const approvedChanges = round2(row.approvedChanges + leg.amount);
+            if (round2(row.originalBudget + row.budgetModifications + approvedChanges) < 0) {
+              throw conflict(
+                `Executing this change would take budget line ${row.costCode} / ${row.costType} ` +
+                  "to a negative revised budget. A budget line cannot hold one.",
+              );
+            }
             const derived = deriveBudgetColumns({
               originalBudget: row.originalBudget,
               budgetModifications: row.budgetModifications,
@@ -2599,7 +2713,13 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
           await tx
             .update(changeOrderPackages)
             .set({ primeContractChangeId: change.id, budgetChangeId, updatedAt: now })
-            .where(eq(changeOrderPackages.id, change.changeOrderPackageId));
+            .where(
+              and(
+                eq(changeOrderPackages.id, change.changeOrderPackageId),
+                eq(changeOrderPackages.companyId, contract.companyId),
+                eq(changeOrderPackages.projectId, contract.projectId),
+              ),
+            );
         }
       });
       if (plan) await recomputeBudgetTotals(plan.budgetId);
@@ -3461,7 +3581,10 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
             .set({ ...rolled, updatedAt: now })
             .where(eq(primeContractSovLines.id, line.id));
         }
-        await tx
+        // Claimed on the status this route read: two certifiers acting at
+        // once would otherwise both roll the schedule of values forward and
+        // the second certification would silently overwrite the first.
+        const claimed = await tx
           .update(paymentApplications)
           .set({
             status: partial ? "partially_certified" : "certified",
@@ -3475,7 +3598,16 @@ export const primeContractsModule: FastifyPluginAsync = async (app) => {
               : {}),
             updatedAt: now,
           })
-          .where(eq(paymentApplications.id, a.id));
+          .where(
+            and(eq(paymentApplications.id, a.id), eq(paymentApplications.status, "submitted")),
+          )
+          .returning({ id: paymentApplications.id });
+        if (claimed.length !== 1) {
+          throw conflict(
+            `Application ${a.reference} is no longer submitted — another request certified, ` +
+              "rejected or voided it first. Reload before acting on it again.",
+          );
+        }
         await tx
           .update(invoices)
           .set({

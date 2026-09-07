@@ -29,7 +29,11 @@ import { useParams, useSearchParams } from "react-router-dom";
 import { Alert, Badge, Button, EmptyState, PageHeader, Select, Skeleton, Tabs } from "../../ui";
 import { IconProcurement, IconLock, IconRefresh } from "../../ui/icons";
 import AwardTab from "./AwardTab";
+import EngagementTab from "./EngagementTab";
+import IntegrityTab from "./IntegrityTab";
 import InvitationsTab from "./InvitationsTab";
+import MarketTab from "./MarketTab";
+import PipelineTab from "./PipelineTab";
 import LevellingTab from "./LevellingTab";
 import PackagesTab from "./PackagesTab";
 import PrequalificationTab from "./PrequalificationTab";
@@ -49,10 +53,14 @@ import type { BidPackage, PackageDetail, Paginated } from "./types";
 type TabKey =
   | "packages"
   | "invitations"
+  | "engagement"
   | "bids"
   | "levelling"
+  | "integrity"
   | "scoring"
   | "award"
+  | "pipeline"
+  | "market"
   | "prequalification"
   | "screening";
 
@@ -64,12 +72,16 @@ interface TabSpec {
 }
 
 const TABS: readonly TabSpec[] = [
+  { value: "pipeline", label: "Pipeline", needsPackage: false },
   { value: "packages", label: "Packages", needsPackage: false },
   { value: "invitations", label: "Invitations", needsPackage: true },
+  { value: "engagement", label: "Queries & meetings", needsPackage: true },
   { value: "bids", label: "Bids & seal", needsPackage: true },
   { value: "levelling", label: "Levelling", needsPackage: true },
+  { value: "integrity", label: "Integrity", needsPackage: true },
   { value: "scoring", label: "Scoring", needsPackage: true },
   { value: "award", label: "Award", needsPackage: true },
+  { value: "market", label: "Market", needsPackage: false },
   { value: "prequalification", label: "Prequalification", needsPackage: false },
   { value: "screening", label: "Financial screening", needsPackage: false },
 ];
@@ -146,7 +158,7 @@ export default function BiddingPage() {
       <PageHeader
         icon={IconProcurement}
         title="Bidding & prequalification"
-        subtitle="Sealed bids stay sealed until the time passes and two named people open them; bids are compared on their levelled amounts, never as bid; and an award that is not the lowest carries the lowest amount and the reason it was not taken."
+        subtitle="Sealed bids stay sealed until the time passes and two named people open them; bids are compared on their levelled amounts, never as bid; an award that is not the lowest carries the lowest amount and the reason it was not taken; and the shape of the bids themselves is examined for the patterns a single package can never show."
         meta={
           packages.data ? (
             <span>
@@ -186,6 +198,9 @@ export default function BiddingPage() {
               ...(t.value === "invitations" && pkg ? { count: pkg.counts.invitations } : {}),
               ...(t.value === "bids" && pkg ? { count: pkg.counts.submissions } : {}),
               ...(t.value === "levelling" && pkg ? { count: pkg.counts.levellingItems } : {}),
+              ...(t.value === "engagement" && pkg && pkg.counts.addendaOutstanding
+                ? { count: pkg.counts.addendaOutstanding }
+                : {}),
             }))}
             value={tab}
             onChange={selectTab}
@@ -347,6 +362,28 @@ function TabBody({
       return (
         <AwardTab projectId={projectId} packageId={packageId} pkg={pkg} onMutated={onRefresh} />
       );
+    case "engagement":
+      return (
+        <EngagementTab
+          projectId={projectId}
+          packageId={packageId}
+          pkg={pkg}
+          onMutated={onRefresh}
+        />
+      );
+    case "integrity":
+      return (
+        <IntegrityTab
+          projectId={projectId}
+          packageId={packageId}
+          pkg={pkg}
+          onMutated={onRefresh}
+        />
+      );
+    case "pipeline":
+      return <PipelineTab />;
+    case "market":
+      return <MarketTab />;
     case "prequalification":
       return <PrequalificationTab />;
     case "screening":

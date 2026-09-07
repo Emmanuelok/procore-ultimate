@@ -98,6 +98,8 @@ export interface BatchRollup {
   exceptionCount: number;
   uncostedCards: string[];
   unallocatedCards: string[];
+  /** coded, but the coding no longer reconciles with the card's hours */
+  misallocatedCards: string[];
   unexplainedVarianceCards: string[];
   cardsWithoutAccessRecord: string[];
   reasons: string[];
@@ -130,6 +132,7 @@ export async function computeBatchRollup(db: Db, batchId: string): Promise<Batch
       exceptionCount: 0,
       uncostedCards: [],
       unallocatedCards: [],
+      misallocatedCards: [],
       unexplainedVarianceCards: [],
       cardsWithoutAccessRecord: [],
       reasons: ["This batch holds no timecards yet, so it has no totals to state."],
@@ -141,14 +144,47 @@ export async function computeBatchRollup(db: Db, batchId: string): Promise<Batch
     `Batch rollup`,
   );
 
-  const allocated = await db
-    .selectDistinct({ timecardId: timecardAllocations.timecardId })
+  /*
+   * ALLOCATIONS MUST STILL RECONCILE AT BATCH LEVEL.
+   *
+   * PATCH is allowed on a submitted card and rewrites the hour split without
+   * touching its allocations, so a card can be submitted with 8h coded, edited
+   * to 10h, and approved through the batch — exported to payroll at 10h with
+   * 8h on the cost report. The single-card approve route refuses exactly this;
+   * the batch path, which is where approval actually happens, did not check it
+   * at all. One read of the allocations answers both "is it coded" and "does
+   * the coding still add up".
+   */
+  const allocationRows = await db
+    .select()
     .from(timecardAllocations)
-    .where(inArray(timecardAllocations.timecardId, cards.map((c) => c.id)));
-  const allocatedIds = new Set(allocated.map((a) => a.timecardId));
+    .where(
+      inArray(
+        timecardAllocations.timecardId,
+        cards.map((c) => c.id),
+      ),
+    );
+  const allocatedIds = new Set(allocationRows.map((a) => a.timecardId));
 
   const uncosted = cards.filter((c) => c.totalCost === null).map((c) => c.reference);
   const unallocated = cards.filter((c) => !allocatedIds.has(c.id)).map((c) => c.reference);
+
+  const misallocated: string[] = [];
+  for (const card of cards) {
+    if (!allocatedIds.has(card.id)) continue;
+    const check = reconcileAllocations(
+      splitOf(card),
+      allocationRows.filter((a) => a.timecardId === card.id),
+    );
+    if (!check.ok) misallocated.push(card.reference);
+  }
+  if (misallocated.length > 0) {
+    reasons.push(
+      `${misallocated.length} card(s) carry cost coding that no longer adds up to the hours on ` +
+        `the card (${misallocated.slice(0, 5).join(", ")}${misallocated.length > 5 ? ", …" : ""}). ` +
+        "Hours coded twice, or hours nobody can code — both reach the cost report looking like fact.",
+    );
+  }
   const unexplained = cards
     .filter(
       (c) =>
@@ -184,6 +220,7 @@ export async function computeBatchRollup(db: Db, batchId: string): Promise<Batch
     exceptionCount: unexplained.length,
     uncostedCards: uncosted,
     unallocatedCards: unallocated,
+    misallocatedCards: misallocated,
     unexplainedVarianceCards: unexplained,
     cardsWithoutAccessRecord: noAccess,
     reasons,
@@ -203,7 +240,12 @@ export async function recomputeBatch(db: Db, batchId: string): Promise<BatchRoll
       doubleTimeHours: rollup.doubleTimeHours,
       premiumHours: rollup.premiumHours,
       totalHours: rollup.totalHours,
-      totalCost: rollup.totalCost ?? 0,
+      // NULL, not 0. `timecard_batches.total_cost` is nullable on purpose:
+      // a week with one unpriced overtime rate showed $0.00 in the register
+      // and in the CSV export while the detail view — which recomputes —
+      // said the cost was unknown. The list and the detail must not disagree
+      // about whether a number exists.
+      totalCost: rollup.totalCost,
       currency: rollup.currency,
       varianceHours: rollup.varianceHours,
       exceptionCount: rollup.exceptionCount,
@@ -317,7 +359,41 @@ export const batchRoutes: FastifyPluginAsync = async (app) => {
       .orderBy(desc(timecardBatches.periodEnd), desc(timecardBatches.number))
       .limit(q.pageSize)
       .offset(pageOffset(q));
-    return paginate(rows, Number(totalRow?.n ?? 0), q);
+
+    // Why the cost is unknown, on the LIST — the register and the detail view
+    // used to disagree, because the detail recomputed and the list showed a
+    // materialised 0.
+    const uncosted =
+      rows.length > 0
+        ? await app.db
+            .select({ batchId: timecards.batchId, n: count() })
+            .from(timecards)
+            .where(
+              and(
+                inArray(
+                  timecards.batchId,
+                  rows.map((r) => r.id),
+                ),
+                isNull(timecards.totalCost),
+              ),
+            )
+            .groupBy(timecards.batchId)
+        : [];
+    const uncostedByBatch = new Map(uncosted.map((u) => [u.batchId, Number(u.n)]));
+    return paginate(
+      rows.map((r) => ({
+        ...r,
+        uncostedCardCount: uncostedByBatch.get(r.id) ?? 0,
+        totalCostIsKnown: r.totalCost !== null,
+        costNote:
+          r.totalCost === null
+            ? `${uncostedByBatch.get(r.id) ?? 0} card(s) in this week carry hours the platform ` +
+              "holds no rate for, so the week's cost is unknown rather than the sum of the rest"
+            : null,
+      })),
+      Number(totalRow?.n ?? 0),
+      q,
+    );
   });
 
   app.get(
@@ -381,6 +457,15 @@ export const batchRoutes: FastifyPluginAsync = async (app) => {
             "report, so they are refused here rather than discovered at month end.",
         );
       }
+      if (rollup.misallocatedCards.length > 0) {
+        throw conflict(
+          `Batch ${batch.reference} cannot be submitted: ${rollup.misallocatedCards.length} card(s) ` +
+            `carry cost coding that no longer adds up to the hours on the card — ` +
+            `${rollup.misallocatedCards.slice(0, 8).join(", ")}` +
+            `${rollup.misallocatedCards.length > 8 ? ", …" : ""}. A card edited after it was coded ` +
+            "goes to payroll at the new hours and to the cost report at the old ones. Re-code them.",
+        );
+      }
       const cards = await app.db.select().from(timecards).where(eq(timecards.batchId, batchId));
       const now = nowIso();
       await app.db
@@ -429,13 +514,127 @@ export const batchRoutes: FastifyPluginAsync = async (app) => {
       const batch = await fetchBatch(app.db, batchId, companyId, projectId);
       assertBatchEditable(batch, "approve");
       assertTransition(batch.status, ["submitted", "partially_approved"], "batch", "approve");
-      const level = body.level ?? 1;
+
+      /*
+       * THE LEVEL IS DERIVED, not defaulted to 1.
+       *
+       * The UI never sent one, so on a crew configured for two approval tiers
+       * two different approvers both landed on level 1, `approvedLevels.size`
+       * stayed at 1, and the batch sat in partially_approved for ever with
+       * nothing on screen explaining why. The next required tier is one above
+       * the highest already approved.
+       */
+      const priorApprovals = await app.db
+        .select()
+        .from(timecardApprovals)
+        .where(eq(timecardApprovals.batchId, batchId));
+      const priorLevels = priorApprovals
+        .filter((a) => a.decision === "approved" && a.isSelfApproval === 0)
+        .map((a) => a.level);
+      const level = body.level ?? Math.min(3, Math.max(0, ...priorLevels, 0) + 1);
+
+      /*
+       * SEGREGATION IS CHECKED AT CARD LEVEL TOO.
+       *
+       * The batch check only looked at who submitted and who created the
+       * BATCH. A foreman who raised forty cards, had a colleague batch and
+       * submit them, and then approved the batch, approved forty of his own
+       * timecards — every one of which the card-level route would have refused
+       * and recorded as an attempted self-approval.
+       */
+      const batchCards = await app.db
+        .select({
+          id: timecards.id,
+          reference: timecards.reference,
+          createdBy: timecards.createdBy,
+          submittedBy: timecards.submittedBy,
+        })
+        .from(timecards)
+        .where(eq(timecards.batchId, batchId));
+      const ownCards = batchCards.filter(
+        (c) => c.createdBy === actorId || c.submittedBy === actorId,
+      );
 
       const self = checkSelfApproval(
         actorId,
         { submittedBy: batch.submittedBy, createdBy: batch.createdBy },
         "timecard batch",
       );
+      if (!self.isSelfApproval && ownCards.length > 0 && body.decision === "approved") {
+        const approvalId = newId("tap");
+        await app.db.insert(timecardApprovals).values({
+          id: approvalId,
+          companyId,
+          projectId,
+          timecardId: null,
+          batchId,
+          level,
+          approverId: actorId,
+          approverRole: body.approverRole ?? null,
+          decision: body.decision,
+          decidedAt: nowIso(),
+          comment: body.comment ?? null,
+          subjectWorkerId: null,
+          isSelfApproval: 1,
+          delegatedFromId: null,
+          escalatedToId: null,
+          signatureFileId: body.signatureFileId ?? null,
+          detail: {
+            outcome: "refused",
+            control: "no_self_approval",
+            breachedRelationship: "raised_cards_in_batch",
+            attemptedDecision: body.decision,
+            batchReference: batch.reference,
+            ownCards: ownCards.map((c) => c.reference).slice(0, 40),
+          },
+        });
+        await app.db.insert(signals).values({
+          id: newId("sig"),
+          companyId,
+          projectId,
+          detector: "timecard_self_approval",
+          severity: "high",
+          confidence: 1,
+          title: `Self-approval refused on timecard batch ${batch.reference} (own cards)`,
+          explanation:
+            `A user attempted to approve timecard batch ${batch.reference}, which contains ` +
+            `${ownCards.length} card(s) they raised or submitted themselves ` +
+            `(${ownCards.map((c) => c.reference).slice(0, 8).join(", ")}). Approving the batch ` +
+            "would have flipped every one of those cards to approved with this user recorded as " +
+            "the approver — which the card-level route refuses. Batching hours is not a way round " +
+            "segregation of duties.",
+          evidenceRefs: {
+            batchId,
+            reference: batch.reference,
+            approvalId,
+            approverId: actorId,
+            breachedRelationship: "raised_cards_in_batch",
+            ownCardCount: ownCards.length,
+            ownCards: ownCards.map((c) => c.reference).slice(0, 40),
+          },
+        });
+        await ledgerTimecards(app.db, req, "state_change", "timecard_approval", approvalId, {
+          control: "no_self_approval",
+          outcome: "refused",
+          batchId,
+          reference: batch.reference,
+          breachedRelationship: "raised_cards_in_batch",
+          ownCardCount: ownCards.length,
+        });
+        throw selfApprovalRefusal(
+          "timecard batch",
+          batch.reference,
+          {
+            isSelfApproval: true,
+            role: "created_by",
+            message:
+              `${ownCards.length} card(s) in this batch were raised or submitted by the approver ` +
+              `(${ownCards.map((c) => c.reference).slice(0, 8).join(", ")}). Approving the batch ` +
+              "would approve the approver's own claimed hours.",
+          },
+          approvalId,
+        );
+      }
       if (self.isSelfApproval) {
         const approvalId = newId("tap");
         await app.db.insert(timecardApprovals).values({
@@ -500,6 +699,20 @@ export const batchRoutes: FastifyPluginAsync = async (app) => {
       }
 
       const rollup = await recomputeBatch(app.db, batchId);
+      if (body.decision === "approved" && rollup.misallocatedCards.length > 0) {
+        throw conflict(
+          `Batch ${batch.reference} carries ${rollup.misallocatedCards.length} card(s) whose cost ` +
+            `coding no longer reconciles with the hours on the card — ` +
+            `${rollup.misallocatedCards.slice(0, 8).join(", ")}. Approving would send those hours ` +
+            "to payroll at one figure and to the cost report at another.",
+        );
+      }
+      if (body.decision === "approved" && rollup.unallocatedCards.length > 0) {
+        throw conflict(
+          `Batch ${batch.reference} carries ${rollup.unallocatedCards.length} card(s) with no cost ` +
+            `coding at all — ${rollup.unallocatedCards.slice(0, 8).join(", ")}.`,
+        );
+      }
       if (body.decision === "approved" && rollup.exceptionCount > 0) {
         throw conflict(
           `Batch ${batch.reference} carries ${rollup.exceptionCount} card(s) whose claimed hours ` +
@@ -510,6 +723,29 @@ export const batchRoutes: FastifyPluginAsync = async (app) => {
       }
       if (body.decision === "rejected" && !(body.comment ?? "").trim()) {
         throw badRequest("A rejection needs a reason — the crew has to know what to fix.");
+      }
+
+      /*
+       * ONE PERSON IS ONE TIER — the same control the card route carries.
+       *
+       * The level is DERIVED as "one above the highest already approved", so
+       * without this an approver on a two-tier crew simply pressed Approve
+       * twice: the first click took tier 1, the second took tier 2,
+       * `approvedLevels.size` reached the required count and the whole week
+       * flipped to approved with a single signature. The card route refuses
+       * exactly this (cards.ts); the batch route is where approval actually
+       * happens, so it has to refuse it harder.
+       */
+      const alreadyApprovedByMe = priorApprovals.find(
+        (a) => a.approverId === actorId && a.decision === "approved" && a.isSelfApproval === 0,
+      );
+      if (alreadyApprovedByMe && body.decision === "approved") {
+        throw conflict(
+          `Batch ${batch.reference} already carries an approval from you at level ` +
+            `${alreadyApprovedByMe.level}. One person is one tier: a second signature from the ` +
+            "same hand adds no independence, and a crew configured for two tiers asks for two " +
+            "people, not two clicks.",
+        );
       }
 
       const approvalId = newId("tap");
@@ -542,7 +778,9 @@ export const batchRoutes: FastifyPluginAsync = async (app) => {
         .from(timecardApprovals)
         .where(eq(timecardApprovals.batchId, batchId));
       const approvedLevels = new Set(
-        approvals.filter((a) => a.decision === "approved" && a.isSelfApproval === 0).map((a) => a.level),
+        approvals
+          .filter((a) => a.decision === "approved" && a.isSelfApproval === 0)
+          .map((a) => a.level),
       );
 
       const now = nowIso();
@@ -590,8 +828,16 @@ export const batchRoutes: FastifyPluginAsync = async (app) => {
       return {
         ...(await batchView(batchId, companyId, projectId)),
         approvalId,
+        level,
         approvedLevels: [...approvedLevels].sort(),
         requiredLevels: required,
+        approvalProgress:
+          body.decision === "approved"
+            ? `approved ${approvedLevels.size} of ${required} tier(s)` +
+              (approvedLevels.size < required
+                ? ` — tier ${Math.min(3, approvedLevels.size + 1)} still has to sign`
+                : "")
+            : null,
       };
     },
   );

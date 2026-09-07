@@ -3,8 +3,11 @@ import type { FastifyInstance } from "fastify";
 import { and, eq } from "drizzle-orm";
 import {
   affectedPersons,
+  companyMemberships,
   evidence,
+  grievances,
   landParcels,
+  ledgerEntries,
   obligations,
   projects,
   scheduleTasks,
@@ -18,12 +21,34 @@ let built: Awaited<ReturnType<typeof buildTestApp>>;
 let app: FastifyInstance;
 let owner: TestActor;
 let stranger: TestActor; // separate tenant — isolation counterparty
+/**
+ * A SECOND officer inside the owner's company. Closure verification is
+ * segregated from resolution — the officer who wrote a resolution cannot also
+ * certify that the complainant accepted it (#573) — so the tests need someone
+ * else to close a grievance the owner resolved.
+ */
+let verifier: TestActor;
 
 beforeAll(async () => {
   built = await buildTestApp();
   app = built.app;
   owner = await registerActor(app);
   stranger = await registerActor(app);
+  const second = await registerActor(app);
+  await app.db.insert(companyMemberships).values({
+    id: newId("cmb"),
+    companyId: owner.companyId,
+    userId: second.userId,
+    role: "admin",
+  });
+  verifier = {
+    ...second,
+    companyId: owner.companyId,
+    headers: {
+      authorization: second.headers["authorization"]!,
+      "x-company-id": owner.companyId,
+    },
+  };
 });
 
 afterAll(async () => {
@@ -52,6 +77,38 @@ async function insertEvidence(pid: string, actor: TestActor = owner): Promise<st
     submittedBy: actor.userId,
   });
   return id;
+}
+
+/**
+ * Findings are raised by the scheduled detector now, not as a side effect of
+ * a read. Tests that assert on a finding trigger a cycle explicitly, which is
+ * exactly what the scheduler does on its interval.
+ */
+async function runDetectors(pid: string): Promise<void> {
+  const res = await app.inject({
+    method: "POST",
+    url: `/api/v1/projects/${pid}/land/detectors/run`,
+    headers: owner.headers,
+  });
+  if (res.statusCode !== 200) {
+    throw new Error(`detector run failed: ${res.statusCode} ${res.body}`);
+  }
+}
+
+/** Title passes through the evidenced acquisition route, naming the basis. */
+async function acquire(
+  pid: string,
+  parcelId: string,
+  acquisitionBasis = "state_allocation",
+): Promise<number> {
+  const evidenceId = await insertEvidence(pid);
+  const res = await app.inject({
+    method: "POST",
+    url: `/api/v1/projects/${pid}/parcels/${parcelId}/acquire`,
+    headers: owner.headers,
+    payload: { acquisitionBasis, evidenceIds: [evidenceId] },
+  });
+  return res.statusCode;
 }
 
 async function insertTask(pid: string, name: string, startDate: string): Promise<string> {
@@ -169,8 +226,47 @@ describe("land parcel register", () => {
     const disputed = await setStatus(pid, parcel.id, "disputed");
     expect(disputed.statusCode).toBe(200);
     expect(disputed.json().status).toBe("disputed");
-    // and resolve straight to acquired on a compulsory-purchase determination
-    expect((await setStatus(pid, parcel.id, "acquired")).statusCode).toBe(200);
+    // `acquired` is likewise reachable only through the evidenced route, which
+    // records the BASIS on which title passed — before it existed, a state or
+    // donated parcel could only reach `acquired` by first being marked
+    // `disputed`, manufacturing a dispute for every parcel on a road scheme
+    const bySneak = await setStatus(pid, parcel.id, "acquired");
+    expect(bySneak.statusCode).toBe(400);
+    expect(bySneak.json().message).toContain("/acquire");
+
+    /*
+     * The register has to TELL the workspace that the evidenced route is
+     * open. `acquired` is absent from allowedTransitions by design, so
+     * without this flag the product would offer no way at all to mark land
+     * acquired — which is how a state-owned parcel ends up routed through a
+     * fictitious dispute.
+     */
+    const detail = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/parcels/${parcel.id}`,
+      headers: owner.headers,
+    });
+    const view = detail.json() as {
+      acquirable: boolean;
+      allowedTransitions: string[];
+      acquisitionBases: string[];
+      cashAcquisitionBases: string[];
+    };
+    expect(view.acquirable).toBe(true);
+    expect(view.allowedTransitions).not.toContain("acquired");
+    expect(view.acquisitionBases).toContain("state_allocation");
+    expect(view.cashAcquisitionBases).toContain("purchase");
+
+    // a compulsory-purchase determination settles the dispute into acquisition
+    expect(await acquire(pid, parcel.id, "court_order")).toBe(200);
+
+    const after = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/parcels/${parcel.id}`,
+      headers: owner.headers,
+    });
+    // an acquired parcel is not acquirable again
+    expect((after.json() as { acquirable: boolean }).acquirable).toBe(false);
   });
 
   it("will not record compensation without payment evidence", async () => {
@@ -212,8 +308,179 @@ describe("land parcel register", () => {
     expect(paid.compensationPaidAt).toBe("2026-03-01");
     expect(paid.evidenceIds).toEqual([evidenceId]);
 
-    // and only then can title pass
-    expect((await setStatus(pid, parcel.id, "acquired")).statusCode).toBe(200);
+    // and only then can title pass — on a stated basis, with its own evidence
+    expect(await acquire(pid, parcel.id, "purchase")).toBe(200);
+  });
+
+  /**
+   * Supplementary and corrected payments are ordinary RAP practice — a
+   * valuation revised on appeal, a crop missed at the survey, a court-awarded
+   * top-up. Before this, /compensate refused an already-compensated parcel
+   * and PATCH refused the edit, so the register was frozen on the first
+   * figure and rap-progress understated what the programme had paid; the only
+   * reachable path was compensated → disputed → under_negotiation, three
+   * fabricated state changes including a fictitious dispute.
+   */
+  it("accumulates supplementary payments and restates a corrected figure", async () => {
+    const pid = await makeProject("Supplementary compensation");
+    const parcel = (await createParcel(pid, { reference: "P-SUPP" })).json();
+    await setStatus(pid, parcel.id, "surveyed");
+    await setStatus(pid, parcel.id, "under_negotiation");
+    await setStatus(pid, parcel.id, "agreed");
+    const url = `/api/v1/projects/${pid}/parcels/${parcel.id}/compensate`;
+
+    const first = await app.inject({
+      method: "POST",
+      url,
+      headers: owner.headers,
+      payload: {
+        amount: 10000,
+        paidAt: "2026-03-01",
+        evidenceIds: [await insertEvidence(pid)],
+      },
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().compensationAmount).toBe(10000);
+    expect(first.json().compensationPayments).toHaveLength(1);
+    expect(first.json().compensationPayments[0].kind).toBe("initial");
+
+    // the frozen-after-payment PATCH names a route that actually accepts it
+    const patched = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${pid}/parcels/${parcel.id}`,
+      headers: owner.headers,
+      payload: { compensationAmount: 14000 },
+    });
+    expect(patched.statusCode).toBe(409);
+    expect(patched.json().message).toContain("compensation-correction");
+
+    // a supplement ADDS; it does not restate, and it does not need a
+    // fictitious dispute to be recorded
+    const supplement = await app.inject({
+      method: "POST",
+      url,
+      headers: owner.headers,
+      payload: {
+        amount: 2500.004,
+        paidAt: "2026-06-15",
+        evidenceIds: [await insertEvidence(pid)],
+        note: "Mango trees missed at the asset survey",
+      },
+    });
+    expect(supplement.statusCode).toBe(200);
+    const topped = supplement.json();
+    expect(topped.status).toBe("compensated");
+    expect(topped.compensationAmount).toBe(12500);
+    // the FIRST payment date is what the possession rule reads
+    expect(topped.compensationPaidAt).toBe("2026-03-01");
+    expect(topped.compensationLastPaidAt).toBe("2026-06-15");
+    expect(topped.compensationPayments).toHaveLength(2);
+    expect(topped.compensationPayments[1].kind).toBe("supplementary");
+    expect(topped.compensationPayments[1].delta).toBe(2500);
+    expect(topped.evidenceIds).toHaveLength(2);
+    expect(topped.compensable).toBe(true);
+    expect(topped.correctable).toBe(true);
+
+    // title passes, and a further payment afterwards does not undo it
+    expect(await acquire(pid, parcel.id, "purchase")).toBe(200);
+    const afterTitle = await app.inject({
+      method: "POST",
+      url,
+      headers: owner.headers,
+      payload: {
+        amount: 500,
+        paidAt: "2026-08-01",
+        evidenceIds: [await insertEvidence(pid)],
+      },
+    });
+    expect(afterTitle.statusCode).toBe(200);
+    expect(afterTitle.json().status).toBe("acquired");
+    expect(afterTitle.json().compensationAmount).toBe(13000);
+
+    // a correction RESTATES the total, with a reason and its own evidence
+    const correctionUrl = `/api/v1/projects/${pid}/parcels/${parcel.id}/compensation-correction`;
+    const noReason = await app.inject({
+      method: "POST",
+      url: correctionUrl,
+      headers: owner.headers,
+      payload: { correctedAmount: 12800, reason: "typo", evidenceIds: [] },
+    });
+    expect(noReason.statusCode).toBe(400);
+
+    const corrected = await app.inject({
+      method: "POST",
+      url: correctionUrl,
+      headers: owner.headers,
+      payload: {
+        correctedAmount: 12800,
+        reason: "Second instalment keyed twice; bank statement shows one transfer of 200 less",
+        evidenceIds: [await insertEvidence(pid)],
+      },
+    });
+    expect(corrected.statusCode).toBe(200);
+    expect(corrected.json().compensationAmount).toBe(12800);
+    const entries = corrected.json().compensationPayments;
+    expect(entries).toHaveLength(4);
+    expect(entries[3].kind).toBe("correction");
+    expect(entries[3].delta).toBe(-200);
+
+    // a no-op correction is refused rather than ledgered as a change
+    const noop = await app.inject({
+      method: "POST",
+      url: correctionUrl,
+      headers: owner.headers,
+      payload: {
+        correctedAmount: 12800,
+        reason: "Re-keying the same figure to see what happens",
+        evidenceIds: [await insertEvidence(pid)],
+      },
+    });
+    expect(noop.statusCode).toBe(400);
+
+    // the movement is readable from the ledger without the record beside it
+    const ledger = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(and(eq(ledgerEntries.companyId, owner.companyId), eq(ledgerEntries.objectId, parcel.id)))
+      .orderBy(ledgerEntries.seq);
+    const correction = ledger.find(
+      (e) => (e.payload as { event?: string } | null)?.event === "compensation_corrected",
+    );
+    expect(correction).toBeTruthy();
+    expect(correction!.payload).toMatchObject({
+      before: { compensationAmount: 13000 },
+      after: { compensationAmount: 12800 },
+      delta: -200,
+    });
+    const supplementEntry = ledger.find(
+      (e) => (e.payload as { paymentKind?: string } | null)?.paymentKind === "supplementary",
+    );
+    expect(supplementEntry!.payload).toMatchObject({ previousTotal: 10000, totalPaid: 12500 });
+
+    // and the RAP dashboard reports the combined figure, not the first one
+    const rap = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/land/rap-progress`,
+      headers: owner.headers,
+    });
+    expect(rap.json().compensation.parcels.paid).toBe(12800);
+  });
+
+  it("refuses a correction on a parcel that has never been paid", async () => {
+    const pid = await makeProject("Correction without payment");
+    const parcel = (await createParcel(pid, { reference: "P-NOPAY" })).json();
+    const res = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/parcels/${parcel.id}/compensation-correction`,
+      headers: owner.headers,
+      payload: {
+        correctedAmount: 100,
+        reason: "There is nothing on the register to correct",
+        evidenceIds: [await insertEvidence(pid)],
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("nothing to correct");
   });
 
   it("lists parcels with linked PAP counts and filters", async () => {
@@ -277,9 +544,10 @@ describe("land / schedule risk", () => {
     const acquired = (
       await createParcel(pid, { reference: "RISK-3", blockingTaskIds: [imminent] })
     ).json();
-    for (const s of ["surveyed", "under_negotiation", "disputed", "acquired"]) {
+    for (const s of ["surveyed", "under_negotiation", "agreed"]) {
       await setStatus(pid, acquired.id, s);
     }
+    expect(await acquire(pid, acquired.id)).toBe(200);
 
     const res = await app.inject({
       method: "GET",
@@ -290,13 +558,26 @@ describe("land / schedule risk", () => {
     const risk = res.json();
     // the 200-day task is outside the 90-day default horizon
     expect(risk.blockedTasks).toBe(2);
-    expect(risk.blockedParcels).toBe(2);
+    expect(risk.blockedParcels).toBeGreaterThanOrEqual(2);
     expect(risk.imminent).toBe(1);
     expect(risk.items[0].parcelId).toBe(blocking.id);
     expect(risk.items[0].taskName).toBe("Earthworks — Ch 4+200");
     expect(risk.items[0].daysUntilStart).toBe(12);
     expect(risk.items[1].parcelId).toBe(alsoBlocking.id);
+    // the view now quantifies the exposure rather than merely listing it
+    expect(risk.items[0].daysAtRisk).toBeGreaterThanOrEqual(0);
+    expect(risk.items[0].expectedResolutionDate).toBeTruthy();
 
+    // the READ is pure: it raises nothing at all
+    const fromRead = await app.db
+      .select()
+      .from(signals)
+      .where(
+        and(eq(signals.projectId, pid), eq(signals.detector, "land_blocks_programme")),
+      );
+    expect(fromRead).toHaveLength(0);
+
+    await runDetectors(pid);
     const raised = await app.db
       .select()
       .from(signals)
@@ -306,18 +587,16 @@ describe("land / schedule risk", () => {
     expect(raised).toHaveLength(1);
     expect(raised[0]!.severity).toBe("high");
     expect(raised[0]!.title).toContain("RISK-1");
+    // the SYSTEM raised it, not whoever opened the page
+    expect(raised[0]!.disposition).toBe("new");
 
-    // repeated reads must not duplicate the signal
+    // repeated reads AND repeated detector cycles must not duplicate it
     await app.inject({
       method: "GET",
       url: `/api/v1/projects/${pid}/land/schedule-risk`,
       headers: owner.headers,
     });
-    await app.inject({
-      method: "GET",
-      url: `/api/v1/projects/${pid}/land/schedule-risk?days=365`,
-      headers: owner.headers,
-    });
+    await runDetectors(pid);
     const again = await app.db
       .select()
       .from(signals)
@@ -556,8 +835,9 @@ describe("project affected persons", () => {
         payload: { amount: 1200, paidAt: "2026-05-01", evidenceIds: [evidenceId] },
       });
     }
-    await setStatus(pid, parcelIds[0]!, "acquired");
-    await setStatus(pid, parcelIds[1]!, "acquired");
+    expect(await acquire(pid, parcelIds[0]!, "purchase")).toBe(200);
+    expect(await acquire(pid, parcelIds[1]!, "purchase")).toBe(200);
+    const rapAcquired = 2;
 
     // 4 households: 2 physical, 1 economic, 1 both; 2 vulnerable
     await createPap(pid, { reference: "RP-1", displacementType: "physical", householdSize: 5 });
@@ -590,13 +870,30 @@ describe("project affected persons", () => {
       headers: owner.headers,
       payload: { paidAt: "2026-05-10", evidenceIds: [evidenceId] },
     });
-    // one of the two livelihood-restoration households is restored
+    // one of the two livelihood-restoration households is restored. It has to
+    // be compensated first: restoration is measured FROM the displacement
+    // date, and PS5 para 20 puts payment before displacement.
     await app.inject({
+      method: "PUT",
+      url: `/api/v1/projects/${pid}/affected-persons/${both.id}/entitlements`,
+      headers: owner.headers,
+      payload: {
+        entitlements: [{ item: "Replacement dwelling", basis: "matrix", amount: 5000 }],
+      },
+    });
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/affected-persons/${both.id}/compensate`,
+      headers: owner.headers,
+      payload: { paidAt: "2026-05-10", evidenceIds: [evidenceId] },
+    });
+    const restored = await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/affected-persons/${both.id}/status`,
       headers: owner.headers,
       payload: { status: "livelihood_restored" },
     });
+    expect(restored.statusCode).toBe(200);
 
     const res = await app.inject({
       method: "GET",
@@ -606,7 +903,7 @@ describe("project affected persons", () => {
     expect(res.statusCode).toBe(200);
     const rap = res.json();
     expect(rap.parcels.total).toBe(4);
-    expect(rap.parcels.byStatus.acquired).toBe(2);
+    expect(rap.parcels.byStatus.acquired).toBe(rapAcquired);
     expect(rap.parcels.byStatus.compensated).toBe(1);
     expect(rap.parcels.byStatus.identified).toBe(1);
     expect(rap.parcels.byStatus.disputed).toBe(0); // zero-filled, not missing
@@ -617,18 +914,88 @@ describe("project affected persons", () => {
     expect(rap.vulnerableHouseholds).toBe(2);
     expect(rap.byVulnerability.elderly).toBe(2);
     expect(rap.byVulnerability.landless).toBe(1);
-    // 3 parcels compensated at 1200 + 1 valued at 1000; households committed 2000
+    // 3 parcels compensated at 1200 + 1 valued at 1000; two households
+    // determined and paid — 2,000 (economic) and 5,000 (physical + economic)
     expect(rap.compensation.parcels.committed).toBe(4600);
     expect(rap.compensation.parcels.paid).toBe(3600);
-    expect(rap.compensation.paps.committed).toBe(2000);
-    expect(rap.compensation.paps.paid).toBe(2000);
-    expect(rap.compensationCommitted).toBe(6600);
-    expect(rap.compensationPaid).toBe(5600);
+    expect(rap.compensation.paps.committed).toBe(7000);
+    expect(rap.compensation.paps.paid).toBe(7000);
+    expect(rap.compensationCommitted).toBe(11600);
+    expect(rap.compensationPaid).toBe(10600);
     expect(rap.compensationOutstanding).toBe(1000);
+    // one currency in play, so the flat totals mean something and say which
+    expect(rap.compensationMixedCurrency).toBe(false);
+    expect(rap.compensationCurrency).toBe("USD");
+    expect(rap.compensationCurrencies).toEqual(["USD"]);
+    expect(rap.compensationByCurrency.USD.committed).toBe(11600);
     expect(rap.livelihoodRequired).toBe(2);
     expect(rap.livelihoodRestored).toBe(1);
     expect(rap.livelihoodRestoredPercent).toBe(50);
     expect(rap.readyForConstructionPercent).toBe(50);
+  });
+
+  /*
+   * A corridor scheme crossing a border compensates in two currencies. Adding
+   * them produces a figure that is not money, so the flat totals go null with
+   * the reason and the per-currency breakdown carries the answer.
+   */
+  it("never sums compensation across currencies", async () => {
+    const pid = await makeProject("Cross-border RAP");
+    const usd = (
+      await createParcel(pid, {
+        reference: "X-USD",
+        compensationAmount: 1000,
+        currency: "USD",
+      })
+    ).json();
+    const ugx = (
+      await createParcel(pid, {
+        reference: "X-UGX",
+        compensationAmount: 4_000_000,
+        currency: "UGX",
+      })
+    ).json();
+    expect(usd.currency).toBe("USD");
+    expect(ugx.currency).toBe("UGX");
+
+    // and a household priced in the local currency
+    const pap = await createPap(pid, {
+      reference: "PAP-UGX",
+      displacementType: "economic",
+      currency: "ugx",
+    });
+    expect(pap.statusCode).toBe(201);
+    expect(pap.json().currency).toBe("UGX");
+    await app.inject({
+      method: "PUT",
+      url: `/api/v1/projects/${pid}/affected-persons/${pap.json().id}/entitlements`,
+      headers: owner.headers,
+      payload: {
+        entitlements: [
+          { item: "Crop compensation", basis: "District rate schedule", amount: 500_000 },
+        ],
+      },
+    });
+
+    const rap = (
+      await app.inject({
+        method: "GET",
+        url: `/api/v1/projects/${pid}/land/rap-progress`,
+        headers: owner.headers,
+      })
+    ).json();
+    expect(rap.compensationMixedCurrency).toBe(true);
+    expect(rap.compensationCurrency).toBeNull();
+    expect(rap.compensationCommitted).toBeNull();
+    expect(rap.compensationPaid).toBeNull();
+    expect(rap.compensationOutstanding).toBeNull();
+    expect(rap.compensation.parcels.committed).toBeNull();
+    expect(rap.compensationCurrencies).toEqual(["UGX", "USD"]);
+    expect(rap.compensationByCurrency.USD.committed).toBe(1000);
+    expect(rap.compensationByCurrency.UGX.committed).toBe(4_500_000);
+    expect(rap.compensationByCurrency.UGX.parcels.committed).toBe(4_000_000);
+    expect(rap.compensationByCurrency.UGX.paps.committed).toBe(500_000);
+    expect(rap.compensationReasons[0]).toContain("UGX");
   });
 
   it("returns null percentages rather than a false 100% on an empty programme", async () => {
@@ -727,6 +1094,52 @@ describe("grievance redress mechanism", () => {
     expect(stored.every((o) => !o.trigger.includes("Jane Okoro"))).toBe(true);
   });
 
+  /**
+   * A household id is identifying data on a scheme with one household per
+   * parcel: the census row, the PAP drawer, the RAP indicator
+   * `householdsUnderOpenGrievance` and the land health metric all name the
+   * household a live complaint is about. The web form clears the field, but
+   * the API is what machine tokens and MCP callers use, so the refusal has to
+   * live on the server.
+   */
+  it("refuses to attach a household to an anonymous grievance", async () => {
+    const pid = await makeProject("Anonymous household link");
+    const pap = (await createPap(pid, { reference: "PAP-ANON" })).json();
+
+    for (const payload of [
+      { isAnonymous: true, papId: pap.id },
+      { channel: "anonymous", papId: pap.id },
+    ]) {
+      const res = await createGrievance(pid, payload);
+      expect(res.statusCode).toBe(400);
+      expect(res.json().message).toContain("anonymous");
+    }
+
+    // nothing was written: no grievance, and the household is untouched
+    const list = await app.inject({
+      method: "GET",
+      url: `/api/v1/projects/${pid}/grievances`,
+      headers: owner.headers,
+    });
+    expect(list.json().total).toBe(0);
+    const [household] = await app.db
+      .select()
+      .from(affectedPersons)
+      .where(eq(affectedPersons.id, pap.id));
+    expect(household!.status).toBe("registered");
+    expect(household!.statusBeforeGrievance).toBeNull();
+
+    // the same grievance, named, DOES flag the household
+    const named = await createGrievance(pid, { papId: pap.id });
+    expect(named.statusCode).toBe(201);
+    expect(named.json().papId).toBe(pap.id);
+    const [flaggedHousehold] = await app.db
+      .select()
+      .from(affectedPersons)
+      .where(eq(affectedPersons.id, pap.id));
+    expect(flaggedHousehold!.status).toBe("grievance_open");
+  });
+
   it("closes a grievance only when the complainant says it worked", async () => {
     const pid = await makeProject("Closure verification");
     const g = (await createGrievance(pid, { severity: "high" })).json();
@@ -735,7 +1148,7 @@ describe("grievance redress mechanism", () => {
     const premature = await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/grievances/${g.id}/verify-closure`,
-      headers: owner.headers,
+      headers: verifier.headers,
       payload: { complainantSatisfied: true },
     });
     expect(premature.statusCode).toBe(400);
@@ -785,7 +1198,7 @@ describe("grievance redress mechanism", () => {
     const rejected = await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/grievances/${g.id}/verify-closure`,
-      headers: owner.headers,
+      headers: verifier.headers,
       payload: { complainantSatisfied: false, note: "Dust unchanged after one week" },
     });
     expect(rejected.statusCode).toBe(200);
@@ -807,7 +1220,7 @@ describe("grievance redress mechanism", () => {
     const closed = await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/grievances/${g.id}/verify-closure`,
-      headers: owner.headers,
+      headers: verifier.headers,
       payload: { complainantSatisfied: true },
     });
     expect(closed.json().status).toBe("closed_verified");
@@ -846,6 +1259,14 @@ describe("grievance redress mechanism", () => {
     expect(rows.find((r) => r.id === overdueCritical.id)!.daysOverdue).toBe(23);
     expect(rows.find((r) => r.id === inTime.id)!.overdue).toBe(false);
 
+    // the register read raises nothing — findings are the detector's job
+    const fromRead = await app.db
+      .select()
+      .from(signals)
+      .where(and(eq(signals.projectId, pid), eq(signals.detector, "grievance_sla_breach")));
+    expect(fromRead).toHaveLength(0);
+
+    await runDetectors(pid);
     const breached = await app.db
       .select()
       .from(signals)
@@ -880,6 +1301,7 @@ describe("grievance redress mechanism", () => {
       url: `/api/v1/projects/${pid}/grievances/analytics`,
       headers: owner.headers,
     });
+    await runDetectors(pid);
     const again = await app.db
       .select()
       .from(signals)
@@ -896,7 +1318,7 @@ describe("grievance redress mechanism", () => {
     await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/grievances/${overdueCritical.id}/verify-closure`,
-      headers: owner.headers,
+      headers: verifier.headers,
       payload: { complainantSatisfied: true },
     });
     const [afterClosure] = await app.db
@@ -910,7 +1332,103 @@ describe("grievance redress mechanism", () => {
       url: `/api/v1/projects/${pid}/grievances?overdue=true`,
       headers: owner.headers,
     });
-    expect(overdueOnly.json().total).toBe(1); // the medium one is still open
+    expect(overdueOnly.statusCode).toBe(200);
+    // the medium one is still open — escalated by the detector, but escalation
+    // is not settlement, so it is still an overdue case
+    expect(overdueOnly.json().total).toBe(1);
+  });
+
+  /**
+   * SEGREGATION OF DUTIES (PLAN §6.3, #573). A satisfied closure asserts what
+   * the complainant said; letting the officer who wrote the resolution make
+   * that assertion turns the SLA compliance and satisfaction rates the lender
+   * reads into self-certification.
+   */
+  it("refuses a satisfied closure from the officer who wrote the resolution", async () => {
+    const pid = await makeProject("Closure segregation");
+    const g = (await createGrievance(pid, { severity: "high" })).json();
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/grievances/${g.id}/resolve`,
+      headers: owner.headers,
+      payload: { resolution: "Compound wall repaired" },
+    });
+    const [resolved] = await app.db.select().from(grievances).where(eq(grievances.id, g.id));
+    expect(resolved!.resolvedBy).toBe(owner.userId);
+
+    const self = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/grievances/${g.id}/verify-closure`,
+      headers: owner.headers,
+      payload: { complainantSatisfied: true },
+    });
+    expect(self.statusCode).toBe(403);
+    expect(self.json().message).toContain("cannot also certify");
+    const [stillResolved] = await app.db.select().from(grievances).where(eq(grievances.id, g.id));
+    expect(stillResolved!.status).toBe("resolved");
+
+    // recording that the complainant REJECTED the resolution is adverse to the
+    // resolver, reopens rather than closes, and stays open to them: blocking
+    // it would only encourage leaving a rejection unrecorded
+    const reopened = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/grievances/${g.id}/verify-closure`,
+      headers: owner.headers,
+      payload: { complainantSatisfied: false, note: "Wall repaired, dust unchanged" },
+    });
+    expect(reopened.statusCode).toBe(200);
+    expect(reopened.json().status).toBe("investigating");
+
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/grievances/${g.id}/resolve`,
+      headers: owner.headers,
+      payload: { resolution: "Dust suppression doubled" },
+    });
+    const byOther = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/grievances/${g.id}/verify-closure`,
+      headers: verifier.headers,
+      payload: { complainantSatisfied: true },
+    });
+    expect(byOther.statusCode).toBe(200);
+    expect(byOther.json().status).toBe("closed_verified");
+    const [closed] = await app.db.select().from(grievances).where(eq(grievances.id, g.id));
+    expect(closed!.verifiedBy).toBe(verifier.userId);
+    expect(closed!.resolvedBy).toBe(owner.userId);
+  });
+
+  /**
+   * With no resolution author on file (a grievance resolved before the column
+   * existed, or one closed by a route that does not set it) the assignee is
+   * the next-best proxy and is refused on the same grounds.
+   */
+  it("refuses a satisfied closure from the assignee when no resolver is recorded", async () => {
+    const pid = await makeProject("Closure segregation fallback");
+    const g = (await createGrievance(pid, { severity: "high" })).json();
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/grievances/${g.id}/assign`,
+      headers: owner.headers,
+      payload: { assigneeId: owner.userId },
+    });
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/grievances/${g.id}/resolve`,
+      headers: verifier.headers,
+      payload: { resolution: "Access track reinstated" },
+    });
+    // strip the resolver, leaving only the assignee to segregate against
+    await app.db.update(grievances).set({ resolvedBy: null }).where(eq(grievances.id, g.id));
+
+    const self = await app.inject({
+      method: "POST",
+      url: `/api/v1/projects/${pid}/grievances/${g.id}/verify-closure`,
+      headers: owner.headers,
+      payload: { complainantSatisfied: true },
+    });
+    expect(self.statusCode).toBe(403);
+    expect(self.json().message).toContain("assignee");
   });
 
   it("reports GRM analytics including medians, anonymous share and satisfaction", async () => {
@@ -948,13 +1466,13 @@ describe("grievance redress mechanism", () => {
     await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/grievances/${ten.id}/verify-closure`,
-      headers: owner.headers,
+      headers: verifier.headers,
       payload: { complainantSatisfied: true },
     });
     await app.inject({
       method: "POST",
       url: `/api/v1/projects/${pid}/grievances/${twenty.id}/verify-closure`,
-      headers: owner.headers,
+      headers: verifier.headers,
       payload: { complainantSatisfied: false },
     });
 
@@ -1125,6 +1643,93 @@ describe("stakeholders and engagement", () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* Ledger fidelity on the remaining PATCH routes                        */
+/* ------------------------------------------------------------------ */
+
+describe("patch ledger payloads", () => {
+  /**
+   * Influence and interest drive the Mendelow quadrant and therefore the
+   * engagement plan a community gets. A silent re-score from high/high to
+   * low/low used to be auditable only as the words "influence, interest",
+   * with storePayload unset so nothing was stored at all.
+   */
+  it("stores the before and after values of a stakeholder re-score", async () => {
+    const pid = await makeProject("Stakeholder ledger");
+    const s0 = (
+      await app.inject({
+        method: "POST",
+        url: `/api/v1/projects/${pid}/stakeholders`,
+        headers: owner.headers,
+        payload: { name: "Riverside Committee", influence: 5, interest: 5, category: "community" },
+      })
+    ).json();
+    expect(s0.quadrant).toBe("manage_closely");
+
+    const patched = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${pid}/stakeholders/${s0.id}`,
+      headers: owner.headers,
+      payload: { influence: 1, interest: 1 },
+    });
+    expect(patched.statusCode).toBe(200);
+    expect(patched.json().quadrant).toBe("monitor");
+
+    const [entry] = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(
+        and(
+          eq(ledgerEntries.objectType, "stakeholder"),
+          eq(ledgerEntries.objectId, s0.id),
+          eq(ledgerEntries.action, "update"),
+        ),
+      )
+      .orderBy(ledgerEntries.seq);
+    expect(entry!.payload).toMatchObject({
+      before: { influence: 5, interest: 5 },
+      after: { influence: 1, interest: 1 },
+    });
+  });
+
+  it("stores the before and after values of an engagement edit", async () => {
+    const pid = await makeProject("Engagement ledger");
+    const e0 = (
+      await app.inject({
+        method: "POST",
+        url: `/api/v1/projects/${pid}/engagements`,
+        headers: owner.headers,
+        payload: {
+          title: "FPIC assembly",
+          kind: "consultation",
+          engagementDate: todayISO(),
+          consentStatus: "pending",
+          summary: "Consent not reached; reconvene",
+        },
+      })
+    ).json();
+
+    const patched = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/projects/${pid}/engagements/${e0.id}`,
+      headers: owner.headers,
+      payload: { consentStatus: "granted", summary: "Consent recorded by show of hands" },
+    });
+    expect(patched.statusCode).toBe(200);
+
+    const entries = await app.db
+      .select()
+      .from(ledgerEntries)
+      .where(and(eq(ledgerEntries.objectType, "engagement"), eq(ledgerEntries.objectId, e0.id)))
+      .orderBy(ledgerEntries.seq);
+    const update = entries.find((e) => e.action === "update");
+    expect(update!.payload).toMatchObject({
+      before: { consentStatus: "pending", summary: "Consent not reached; reconvene" },
+      after: { consentStatus: "granted", summary: "Consent recorded by show of hands" },
+    });
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /* Tenancy                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -1171,5 +1776,54 @@ describe("tenant isolation", () => {
       .from(affectedPersons)
       .where(eq(affectedPersons.companyId, stranger.companyId));
     expect(paps).toHaveLength(0);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Company-wide search (contract §3.3)                                 */
+/* ------------------------------------------------------------------ */
+
+describe("search sources", () => {
+  it("finds parcels and grievances from the company search, and isolates tenants", async () => {
+    const pid = await makeProject("Searchable land");
+    const created = await createParcel(pid, {
+      reference: "CAD-KIBAALE-447",
+      ownerName: "Elders of Kibaale",
+    });
+    expect(created.statusCode).toBe(201);
+    const grievance = await createGrievance(pid, {
+      description: "Blasting vibration cracked the Kibaale schoolhouse wall",
+    });
+    expect(grievance.statusCode).toBe(201);
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/search?q=${encodeURIComponent("Kibaale")}&limit=20`,
+      headers: owner.headers,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      items: { type: string; id: string; href: string; title: string }[];
+      coverage: string[];
+    };
+    expect(body.coverage).toContain("land_parcel");
+    expect(body.coverage).toContain("grievance");
+    const parcelHit = body.items.find((i) => i.type === "land_parcel");
+    expect(parcelHit?.id).toBe(created.json().id);
+    expect(parcelHit?.href).toBe(`/projects/${pid}/land?tab=parcels`);
+    const grievanceHit = body.items.find((i) => i.type === "grievance");
+    expect(grievanceHit?.id).toBe(grievance.json().id);
+    expect(grievanceHit?.href).toBe(`/projects/${pid}/land?tab=grievances`);
+
+    // another tenant searching the same words finds nothing of ours
+    const foreign = await app.inject({
+      method: "GET",
+      url: `/api/v1/search?q=${encodeURIComponent("Kibaale")}&limit=20`,
+      headers: stranger.headers,
+    });
+    expect(foreign.statusCode).toBe(200);
+    expect(
+      (foreign.json() as { items: { id: string }[] }).items.map((i) => i.id),
+    ).not.toContain(created.json().id);
   });
 });

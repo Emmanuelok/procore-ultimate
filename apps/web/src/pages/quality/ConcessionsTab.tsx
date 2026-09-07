@@ -33,6 +33,7 @@ import {
   nameOf,
   plural,
   useAction,
+  useReason,
   type Resource,
 } from "./qualityShared";
 import type { Concession, ConcessionSummary, Paged } from "./types";
@@ -430,12 +431,68 @@ function ConcessionModal({
   onMutated: () => void;
 }) {
   const { busy, refusal, clear, run } = useAction();
+  const { ask, dialog } = useReason();
   const [authority, setAuthority] = useState("");
   const [conditions, setConditions] = useState("");
   const [expiry, setExpiry] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [editTitle, setEditTitle] = useState("");
+  const [editDeparture, setEditDeparture] = useState("");
+  const [editJustification, setEditJustification] = useState("");
+  const [editExpiry, setEditExpiry] = useState("");
   if (!concession) return null;
   const base = `/api/v1/projects/${projectId}/concessions/${concession.id}`;
   const days = concession.standing.daysToExpiry;
+
+  /**
+   * WITHDRAWING is what happens to a concession that should not have been
+   * asked for; CLOSING is what happens to one whose work is finished. They are
+   * different facts and the register keeps them apart — a withdrawn concession
+   * never covered anything, a closed one did and no longer needs to.
+   */
+  async function withdraw() {
+    const reason = await ask({
+      title: `Withdraw ${concession!.reference}`,
+      description:
+        "A withdrawn concession covers nothing: any work recorded against it is back to being a departure from the specification with nothing behind it. Say why it is being withdrawn.",
+      label: "Why?",
+      confirmLabel: "Withdraw it",
+      destructive: true,
+    });
+    if (!reason) return;
+    const done = await run("withdraw", () => api.post(`${base}/withdraw`, { reason }));
+    if (done) onMutated();
+  }
+
+  async function closeOut() {
+    const done = await run("close", () => api.post(`${base}/close`, {}));
+    if (done) onMutated();
+  }
+
+  async function saveEdit() {
+    const done = await run("edit", () =>
+      api.patch(base, {
+        title: editTitle.trim(),
+        departureFromRequirement: editDeparture.trim() === "" ? null : editDeparture.trim(),
+        justification: editJustification.trim() === "" ? null : editJustification.trim(),
+        expiryDate: editExpiry === "" ? null : editExpiry,
+      }),
+    );
+    if (done) {
+      setEditing(false);
+      onMutated();
+    }
+  }
+
+  function startEdit() {
+    setEditTitle(concession!.title);
+    setEditDeparture(concession!.departureFromRequirement ?? "");
+    setEditJustification(concession!.justification ?? "");
+    setEditExpiry(concession!.expiryDate ?? "");
+    setEditing(true);
+  }
+
+  const editable = ["draft", "submitted", "under_review"].includes(concession.status);
 
   async function decide(decision: "approve" | "approve_with_conditions" | "reject") {
     const done = await run(decision, () =>
@@ -461,6 +518,21 @@ function ConcessionModal({
           <Button variant="ghost" onClick={onClose}>
             Close
           </Button>
+          {editable && !editing ? (
+            <Button variant="ghost" onClick={startEdit}>
+              Edit
+            </Button>
+          ) : null}
+          {concession.status !== "withdrawn" && concession.status !== "closed" ? (
+            <Button variant="ghost" loading={busy === "withdraw"} onClick={withdraw}>
+              Withdraw
+            </Button>
+          ) : null}
+          {concession.status === "approved" || concession.status === "approved_with_conditions" ? (
+            <Button variant="secondary" loading={busy === "close"} onClick={closeOut}>
+              Close it out
+            </Button>
+          ) : null}
           {concession.status === "draft" ? (
             <Button
               variant="secondary"
@@ -494,7 +566,59 @@ function ConcessionModal({
       }
     >
       <div className="space-y-3 text-meta">
+        {dialog}
         <RefusalNotice refusal={refusal} onDismiss={clear} />
+        {editing ? (
+          <div className="rounded-md border border-accent/40 bg-accent/5 p-2.5">
+            <div className="text-label uppercase tracking-wide text-content-subtle">
+              Edit the request
+            </div>
+            <p className="mt-0.5 text-2xs text-content-subtle">
+              Only while it is still a request. Once a designer has accepted it, the terms somebody
+              accepted are the terms on the record — the API refuses the edit and says so.
+            </p>
+            <div className="mt-2 space-y-2">
+              <Field label="Title" required>
+                <Input value={editTitle} onChange={(e) => setEditTitle(e.target.value)} />
+              </Field>
+              <Field label="Departure from the requirement">
+                <Textarea
+                  rows={2}
+                  value={editDeparture}
+                  onChange={(e) => setEditDeparture(e.target.value)}
+                />
+              </Field>
+              <Field label="Justification">
+                <Textarea
+                  rows={2}
+                  value={editJustification}
+                  onChange={(e) => setEditJustification(e.target.value)}
+                />
+              </Field>
+              <Field label="Expiry" hint="A concession with no expiry never stops covering work.">
+                <Input
+                  type="date"
+                  value={editExpiry}
+                  onChange={(e) => setEditExpiry(e.target.value)}
+                />
+              </Field>
+            </div>
+            <div className="mt-2 flex justify-end gap-2">
+              <Button size="sm" variant="ghost" onClick={() => setEditing(false)}>
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                variant="primary"
+                loading={busy === "edit"}
+                disabled={editTitle.trim() === ""}
+                onClick={saveEdit}
+              >
+                Save the changes
+              </Button>
+            </div>
+          </div>
+        ) : null}
         <div className="flex flex-wrap gap-1.5">
           <Badge tone={STATUS_TONE[concession.status] ?? "neutral"} size="xs" dot>
             {labelize(concession.status)}

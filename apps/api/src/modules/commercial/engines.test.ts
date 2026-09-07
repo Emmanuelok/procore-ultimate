@@ -6,6 +6,7 @@ import {
   tokenOverlap,
 } from "./rates.js";
 import {
+  computeCertificate,
   computeLdExposure,
   computeValuationTotals,
   paymentDueRule,
@@ -471,5 +472,106 @@ describe("final account statement", () => {
     expect(st.balanceDue).toBe(-200_000);
     expect(st.overCertified).toBe(true);
     expect(st.gaps).toHaveLength(1);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Certification                                                       */
+/* ------------------------------------------------------------------ */
+
+describe("certificate build-up", () => {
+  const totals = computeValuationTotals({
+    workDoneToDate: 100_000,
+    materialsOnSite: 10_000,
+    materialsOffSite: 0,
+    sections: [
+      { kind: "variation", amountToDate: 250_000, retentionApplies: true },
+      { kind: "contra_charge", amountToDate: -10_000, retentionApplies: false },
+    ],
+    retentionPercent: 5,
+    retentionCap: null,
+    retentionReleased: 0,
+    previousNet: 20_000,
+  });
+
+  it("certifies the applied position when the certifier cuts nothing", () => {
+    const c = computeCertificate({
+      totals,
+      retentionPercent: 5,
+      retentionCap: null,
+    });
+    // gross 350,000; retention base excludes the contra charge (360,000)
+    expect(c.certifiedGross).toBe(350_000);
+    expect(c.certifiedSections).toBe(240_000);
+    expect(c.retentionHeld).toBe(18_000);
+    expect(c.netCertified).toBe(312_000);
+    expect(c.varianceFromApplication).toBe(0);
+  });
+
+  it("carries the sections when only the BQ work is cut", () => {
+    const c = computeCertificate({
+      totals,
+      certifiedWorkDone: 80_000,
+      retentionPercent: 5,
+      retentionCap: null,
+    });
+    expect(c.certifiedSections).toBe(240_000);
+    expect(c.certifiedGross).toBe(330_000);
+    // the cut lands on retainable value: base 340,000 → 17,000
+    expect(c.retentionHeld).toBe(17_000);
+    expect(c.netCertified).toBe(293_000);
+    expect(c.varianceFromApplication).toBe(-19_000);
+  });
+
+  it("applies the contract's retention cap", () => {
+    const c = computeCertificate({
+      totals,
+      retentionPercent: 5,
+      retentionCap: 5_000,
+    });
+    expect(c.retentionCapped).toBe(true);
+    expect(c.retentionHeld).toBe(5_000);
+    expect(c.netCertified).toBe(325_000);
+  });
+
+  it("nets off retention already released instead of holding it twice", () => {
+    const withRelease = computeValuationTotals({
+      workDoneToDate: 100_000,
+      materialsOnSite: 0,
+      materialsOffSite: 0,
+      sections: [],
+      retentionPercent: 5,
+      retentionCap: null,
+      retentionReleased: 2_000,
+      previousNet: 0,
+    });
+    const c = computeCertificate({
+      totals: withRelease,
+      retentionPercent: 5,
+      retentionCap: null,
+    });
+    expect(c.retentionReleased).toBe(2_000);
+    expect(c.retentionHeld).toBe(3_000);
+    expect(c.netCertified).toBe(97_000);
+  });
+
+  it("never retains against a deduction-only application", () => {
+    const deductionOnly = computeValuationTotals({
+      workDoneToDate: 0,
+      materialsOnSite: 0,
+      materialsOffSite: 0,
+      sections: [{ kind: "contra_charge", amountToDate: -5_000, retentionApplies: false }],
+      retentionPercent: 5,
+      retentionCap: null,
+      retentionReleased: 0,
+      previousNet: 0,
+    });
+    const c = computeCertificate({
+      totals: deductionOnly,
+      retentionPercent: 5,
+      retentionCap: null,
+    });
+    expect(c.retentionHeld).toBe(0);
+    expect(c.netCertified).toBe(-5_000);
   });
 });

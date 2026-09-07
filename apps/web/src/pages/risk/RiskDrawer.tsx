@@ -9,6 +9,7 @@ import { api, ApiClientError } from "../../lib/api";
 import { Badge, Button, Card, CardBody, ErrorAlert, Input, Spinner } from "../../ui";
 import { formatDate, humanize } from "../format";
 import {
+  RESPONSE_STRATEGY_HINT,
   bandChipClass,
   bandTone,
   categoryTone,
@@ -21,6 +22,7 @@ import {
   riskStatusTone,
   rskLabel,
   type MitigationAction,
+  type RiskDetail,
   type RiskRow,
   type UserLite,
 } from "./riskShared";
@@ -82,12 +84,17 @@ export default function RiskDrawer({
   const [mvHint, setMvHint] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [newAction, setNewAction] = useState("");
+  const [chain, setChain] = useState<{ primary: RiskRow | null; secondaries: RiskRow[] }>({
+    primary: null,
+    secondaries: [],
+  });
 
   const load = useCallback(async () => {
     setError(null);
     try {
-      const r = await api.get<RiskRow>(`${base}/risks/${riskId}`);
+      const r = await api.get<RiskDetail>(`${base}/risks/${riskId}`);
       setRisk(r);
+      setChain({ primary: r.primary ?? null, secondaries: r.secondaries ?? [] });
       try {
         setMv(await api.get<MitigationValue>(`${base}/risks/${riskId}/mitigation-value`));
         setMvHint(null);
@@ -241,6 +248,116 @@ export default function RiskDrawer({
               <p className="mb-4 whitespace-pre-wrap text-sm leading-6 text-ink-600">
                 {risk.description}
               </p>
+            ) : null}
+
+            {/* the risk statement read as a chain (#447-450) */}
+            <div className="mb-4">
+              <SectionTitle>Risk statement</SectionTitle>
+              <Card>
+                <CardBody className="space-y-3 py-3 text-sm">
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    <div>
+                      <span className="text-xs text-ink-400">Because (cause)</span>
+                      <div className="whitespace-pre-wrap text-ink-800">
+                        {risk.cause ?? <span className="text-ink-400">Not recorded</span>}
+                      </div>
+                    </div>
+                    <div>
+                      <span className="text-xs text-ink-400">Resulting in (effect)</span>
+                      <div className="whitespace-pre-wrap text-ink-800">
+                        {risk.effect ?? <span className="text-ink-400">Not recorded</span>}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    <div>
+                      <span className="text-xs text-ink-400">Response strategy</span>
+                      <div className="mt-0.5">
+                        {risk.responseStrategy ? (
+                          <>
+                            <Badge tone={risk.responseStrategy === "accept" ? "amber" : "blue"}>
+                              {humanize(risk.responseStrategy)}
+                            </Badge>
+                            <div className="mt-1 text-xs text-ink-500">
+                              {RESPONSE_STRATEGY_HINT[risk.responseStrategy]}
+                            </div>
+                          </>
+                        ) : (
+                          <span className="text-xs text-ink-400">
+                            No response chosen — this is a listed risk, not a managed one.
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <div>
+                      <span className="text-xs text-ink-400">Proximity</span>
+                      <div className="text-ink-800">
+                        {risk.proximityDate ? (
+                          formatDate(risk.proximityDate)
+                        ) : (
+                          <span className="text-ink-400">Not recorded</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                  <div>
+                    <span className="text-xs text-ink-400">Early warning triggers</span>
+                    {(risk.triggers ?? []).length > 0 ? (
+                      <ul className="mt-1 list-disc space-y-0.5 pl-5 text-ink-700">
+                        {(risk.triggers ?? []).map((t, i) => (
+                          <li key={`${t}-${i}`}>{t}</li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <div className="text-xs text-ink-400">
+                        None recorded — nothing will tell you this risk is maturing.
+                      </div>
+                    )}
+                  </div>
+                </CardBody>
+              </Card>
+            </div>
+
+            {/* the secondary-risk chain: what the response created, and where this came from */}
+            {chain.primary || chain.secondaries.length > 0 ? (
+              <div className="mb-4">
+                <SectionTitle>Risk chain</SectionTitle>
+                <Card>
+                  <CardBody className="space-y-2 py-3 text-sm">
+                    {chain.primary ? (
+                      <div>
+                        <span className="text-xs text-ink-400">
+                          Created by the response to
+                        </span>
+                        <div className="text-ink-800">
+                          <span className="font-mono text-xs text-ink-400">
+                            {rskLabel(chain.primary.number)}
+                          </span>{" "}
+                          {chain.primary.title}
+                        </div>
+                      </div>
+                    ) : null}
+                    {chain.secondaries.length > 0 ? (
+                      <div>
+                        <span className="text-xs text-ink-400">
+                          Secondary risks this response created
+                        </span>
+                        <ul className="mt-1 space-y-1">
+                          {chain.secondaries.map((s) => (
+                            <li key={s.id} className="text-ink-800">
+                              <span className="font-mono text-xs text-ink-400">
+                                {rskLabel(s.number)}
+                              </span>{" "}
+                              {s.title}{" "}
+                              <Badge tone={riskStatusTone(s.status)}>{humanize(s.status)}</Badge>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+                  </CardBody>
+                </Card>
+              </div>
             ) : null}
 
             {/* quantification */}

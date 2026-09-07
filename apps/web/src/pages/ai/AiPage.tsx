@@ -251,21 +251,33 @@ export default function AiPage() {
     setActionMessage(null);
     setActionError(null);
     try {
+      // Every one of these agents reads tables other tools own. When your
+      // permissions deny one, the source is left out of the prompt rather
+      // than laundered into it — and the answer says which, so nobody reads
+      // a confident draft without knowing what it could not see.
+      const omission = (sources: string[] | undefined) =>
+        sources && sources.length > 0 ? ` Not supplied to the agent: ${sources.join("; ")}.` : "";
       if (kind === "daily") {
-        await api.post(`${base}/daily-log-draft`, { date: logDate });
-        setActionMessage(`Daily log draft for ${logDate} queued for review.`);
-      } else if (kind === "rfi") {
-        await api.post(`${base}/rfi-evaluate`, { rfiId });
-        setActionMessage("RFI evaluation queued for review.");
-      } else {
-        const res = await api.post<{ contentReviewed: boolean; documentsAttached: number }>(
-          `${base}/submittal-review`,
-          { submittalId },
-        );
+        const res = await api.post<{ omittedSources?: string[] }>(`${base}/daily-log-draft`, {
+          date: logDate,
+        });
         setActionMessage(
-          res.contentReviewed
+          `Daily log draft for ${logDate} queued for review.${omission(res.omittedSources)}`,
+        );
+      } else if (kind === "rfi") {
+        const res = await api.post<{ omittedSources?: string[] }>(`${base}/rfi-evaluate`, { rfiId });
+        setActionMessage(`RFI evaluation queued for review.${omission(res.omittedSources)}`);
+      } else {
+        const res = await api.post<{
+          contentReviewed: boolean;
+          documentsAttached: number;
+          omittedSources?: string[];
+        }>(`${base}/submittal-review`, { submittalId });
+        setActionMessage(
+          (res.contentReviewed
             ? `Submittal reviewed against ${num(res.documentsAttached)} document(s) and the specification text.`
-            : "Queued — but NO specification text or readable attachment was available, so the recommendation is not grounded in content.",
+            : "Queued — but NO specification text or readable attachment was available, so the recommendation is not grounded in content.") +
+            omission(res.omittedSources),
         );
       }
       refresh();

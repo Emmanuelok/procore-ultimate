@@ -36,7 +36,7 @@ import { badRequest, conflict, forbidden, notFound } from "../../../lib/errors.j
 import { newId } from "../../../lib/ids.js";
 import { pageOffset, pageQuerySchema, paginate } from "../../../lib/pagination.js";
 import { pushNotifications } from "../../notifications/service.js";
-import { addDaysISO } from "../engines/dates.js";
+import { responseDueOn } from "../engines/dates.js";
 import { parseInboundEmail, routeInbound, type RoutingCandidate } from "../engines/email.js";
 import { assessLetter } from "../engines/tracking.js";
 import { syncTransmittal, toLetterInput } from "../service.js";
@@ -54,6 +54,7 @@ import {
   loadType,
   nowISO,
   openObligation,
+  raiseSignal,
   settleObligation,
   todayISO,
 } from "../shared.js";
@@ -391,7 +392,7 @@ export const letterRoutes: FastifyPluginAsync = async (app) => {
       body.responseDueDate !== undefined
         ? body.responseDueDate
         : responseRequired && type.responseDays !== null
-          ? addDaysISO(letterDate, type.responseDays)
+          ? responseDueOn(letterDate, type.responseDays, type.responseDaysBasis)
           : null;
 
     const [row] = await app.db
@@ -603,6 +604,17 @@ export const letterRoutes: FastifyPluginAsync = async (app) => {
           "This recipient has acknowledged receipt; removing them would erase that acknowledgement from the record.",
         );
       }
+      // A LETTER's distribution list is frozen in both directions once it is
+      // issued. Adding is already refused after issue; deleting somebody the
+      // record says was SENT the letter would erase who was told what, which
+      // is exactly the fact a dispute turns on. Correct it by voiding and
+      // reissuing. (A transmittal is deliberately different: its recipient
+      // list stays editable after issue and the counters resync.)
+      if (recipient.recordType === "letter" && recipient.sentAt !== null) {
+        throw conflict(
+          `${recipient.name} was already sent ${recipient.recordId}; an issued letter's distribution list is frozen. Void and reissue if it was wrong.`,
+        );
+      }
       await app.db.delete(correspondenceRecipients).where(eq(correspondenceRecipients.id, recipientId));
       await ledger(app.db, {
         companyId,
@@ -774,12 +786,24 @@ export const letterRoutes: FastifyPluginAsync = async (app) => {
           `The type "${type.name}" has no approval workflow configured, so there is nothing to submit to. Issue the letter directly.`,
         );
       }
+      // A rejected letter comes back to draft with its decided steps still on
+      // the record (the ledger and the drawer both read them). Numbering the
+      // new round from 1 would collide with those rows on
+      // correspondence_approvals_seq_uq, so a resubmission continues the
+      // sequence instead of repeating it: the history stays, and the "is an
+      // earlier step still pending?" check is unaffected because every older
+      // row is already decided.
+      const [{ maxSeq = 0 } = { maxSeq: 0 }] = await app.db
+        .select({ maxSeq: sql<number>`coalesce(max(${correspondenceApprovals.seq}), 0)::int` })
+        .from(correspondenceApprovals)
+        .where(eq(correspondenceApprovals.letterId, letterId));
+      const base = Number(maxSeq);
       const rows = steps.map((step, index) => ({
         id: newId("cap"),
         companyId,
         projectId,
         letterId,
-        seq: index + 1,
+        seq: base + index + 1,
         name: step.name,
         role: step.role ?? null,
         userId: step.userId ?? null,
@@ -1001,7 +1025,7 @@ export const letterRoutes: FastifyPluginAsync = async (app) => {
           ? body.responseDueDate
           : (letter.responseDueDate ??
             (letter.responseRequired === 1 && type.responseDays !== null
-              ? addDaysISO(issueDate, type.responseDays)
+              ? responseDueOn(issueDate, type.responseDays, type.responseDaysBasis)
               : null));
 
       let obligationId = letter.obligationId;
@@ -1016,7 +1040,7 @@ export const letterRoutes: FastifyPluginAsync = async (app) => {
           projectId,
           actorId: req.user!.id,
           sourceClause: `${letter.reference} — ${type.name}`,
-          trigger: `A response to ${letter.reference} ("${letter.subject}") is due by ${responseDueDate}.${type.isContractual === 1 ? " This is a contractual record; an unanswered notice is relied on." : ""}`,
+          trigger: `A response to ${letter.reference} ("${letter.subject}") is due by ${responseDueDate}${type.responseDays !== null ? ` (${type.responseDays} ${type.responseDaysBasis} day${type.responseDays === 1 ? "" : "s"} from issue)` : ""}.${type.isContractual === 1 ? " This is a contractual record; an unanswered notice is relied on." : ""}`,
           deadlineDate: responseDueDate,
           warnDaysBefore: 3,
           evidenceRequirement: `The response recorded against ${letter.reference}, or the reply letter that answers it.`,
@@ -1060,6 +1084,11 @@ export const letterRoutes: FastifyPluginAsync = async (app) => {
           to: "issued",
           issueDate,
           responseDueDate,
+          // the derivation, so the deadline can be argued about later
+          responseBasis:
+            responseDueDate === null
+              ? null
+              : `${type.responseDays ?? "?"} ${type.responseDaysBasis} day(s) from ${issueDate}`,
           recipients: recipients.length,
           obligationId,
         },
@@ -1281,7 +1310,7 @@ export const letterRoutes: FastifyPluginAsync = async (app) => {
           responseRequired: responseRequired ? 1 : 0,
           responseDueDate:
             responseRequired && type.responseDays !== null
-              ? addDaysISO(letterDate, type.responseDays)
+              ? responseDueOn(letterDate, type.responseDays, type.responseDaysBasis)
               : null,
           createdBy: req.user!.id,
         })
@@ -1550,7 +1579,9 @@ export const letterRoutes: FastifyPluginAsync = async (app) => {
       issuedBy: senderUser?.id ?? null,
       responseRequired: responseRequired ? 1 : 0,
       responseDueDate:
-        responseRequired && type.responseDays !== null ? addDaysISO(letterDate, type.responseDays) : null,
+        responseRequired && type.responseDays !== null
+          ? responseDueOn(letterDate, type.responseDays, type.responseDaysBasis)
+          : null,
       fileIds: attachedFileIds,
       inboundMessageId: messageId,
       createdBy: req.user!.id,
@@ -1642,6 +1673,34 @@ export const letterRoutes: FastifyPluginAsync = async (app) => {
       }
     }
 
+    // An email the router could not file is a hole in the register: it quoted a
+    // reference nobody can resolve, or answered a record that was withdrawn.
+    // Somebody has to look at it, so it is raised rather than left as a count
+    // on a tab badge. The dedupe key names the captured message, and the
+    // idempotency guard above means one message is captured exactly once.
+    let signalId: string | null = null;
+    if (decision.action === "unmatched") {
+      signalId = await raiseSignal(app.db, companyId, projectId, req.user!.id, {
+        detector: "correspondence_inbound_unmatched",
+        severity: "low",
+        confidence: 0.9,
+        title: `An inbound email from ${parsed.sender.email} could not be filed against a record`,
+        explanation: `${decision.reason} It was captured as ${reference} so nothing is lost, but nobody has said what it answers. File it against the right record or close it.`,
+        key: `corr:inbound:${messageId}:unmatched`,
+        evidence: {
+          inboundMessageId: messageId,
+          letterId,
+          reference,
+          from: parsed.sender.email,
+          subject: parsed.cleanedSubject,
+          detectedReference: parsed.reference
+            ? `${parsed.reference.prefix}-${parsed.reference.number}`
+            : null,
+          routingReason: decision.reason,
+        },
+      });
+    }
+
     return reply.code(201).send({
       action: decision.action,
       reason: decision.reason,
@@ -1649,6 +1708,7 @@ export const letterRoutes: FastifyPluginAsync = async (app) => {
       letterId,
       reference,
       target: decision.target,
+      signalId,
       senderResolved: senderUser?.id ? "user" : senderContact?.id ? "contact" : "external",
     });
   });

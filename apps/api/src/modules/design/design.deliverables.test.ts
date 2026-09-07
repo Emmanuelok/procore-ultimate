@@ -251,7 +251,9 @@ describe("deliverable schedule", () => {
   it("refuses acceptance by the person who registered and issued it", async () => {
     const res = await post(`${base()}/deliverables/${onTrackId}/accept`, {});
     expect(res.statusCode).toBe(403);
-    expect(res.json().message).toContain("other than the person who registered");
+    // The issuer is now recorded in its own right, so the refusal names the
+    // act that matters — the issue — rather than the registration.
+    expect(res.json().message).toContain("other than the person who issued it");
     const proper = await post(`${base()}/deliverables/${onTrackId}/accept`, {}, checker.headers);
     expect(proper.statusCode).toBe(200);
     expect((proper.json() as { status: string }).status).toBe("accepted");
@@ -260,6 +262,52 @@ describe("deliverable schedule", () => {
   it("refuses to edit an accepted deliverable", async () => {
     const res = await patch(`${base()}/deliverables/${onTrackId}`, { title: "renamed" });
     expect(res.statusCode).toBe(409);
+  });
+
+  it("refuses acceptance by the ISSUER even when somebody else registered it", async () => {
+    // The check used to look at createdBy, so where A registered and B issued,
+    // B could accept their own issue: the assertion and the evidence that
+    // tests it would carry one name.
+    const created = await post(`${base()}/deliverables`, {
+      title: "Registered by one, issued by another",
+      consultantId,
+      plannedIssueDate: addDaysISO(today, 15),
+    });
+    const id = (created.json() as { id: string }).id;
+    const issued = await post(`${base()}/deliverables/${id}/issue`, {}, checker.headers);
+    expect(issued.statusCode).toBe(200);
+    expect((issued.json() as { issuedBy: string }).issuedBy).toBe(checker.userId);
+
+    const selfAccept = await post(`${base()}/deliverables/${id}/accept`, {}, checker.headers);
+    expect(selfAccept.statusCode).toBe(403);
+    expect(selfAccept.json().message).toContain("other than the person who issued it");
+
+    // The registrar did not issue it, so they may accept it.
+    const proper = await post(`${base()}/deliverables/${id}/accept`, {});
+    expect(proper.statusCode).toBe(200);
+    const body = proper.json() as { status: string; acceptedBy: string; issuedBy: string };
+    expect(body.status).toBe("accepted");
+    expect(body.acceptedBy).toBe(owner.userId);
+    expect(body.issuedBy).toBe(checker.userId);
+  });
+
+  it("clears the issuer on rejection so the next issue is attributed afresh", async () => {
+    const created = await post(`${base()}/deliverables`, {
+      title: "Rejected then reissued",
+      consultantId,
+      plannedIssueDate: addDaysISO(today, 25),
+    });
+    const id = (created.json() as { id: string }).id;
+    await post(`${base()}/deliverables/${id}/issue`, {}, checker.headers);
+    const rejected = await post(`${base()}/deliverables/${id}/reject`, { reason: "Wrong revision" });
+    expect(rejected.statusCode).toBe(200);
+    expect((rejected.json() as { issuedBy: string | null }).issuedBy).toBeNull();
+
+    const reissued = await post(`${base()}/deliverables/${id}/issue`, {});
+    expect((reissued.json() as { issuedBy: string }).issuedBy).toBe(owner.userId);
+    // The new issuer may not accept their own issue either.
+    expect((await post(`${base()}/deliverables/${id}/accept`, {})).statusCode).toBe(403);
+    expect((await post(`${base()}/deliverables/${id}/accept`, {}, checker.headers)).statusCode).toBe(200);
   });
 
   it("returns a rejected deliverable to outstanding with a fresh obligation", async () => {
@@ -343,6 +391,16 @@ describe("information requirements", () => {
     const again = await post(`${base()}/information-requirements/sweep`, {});
     expect((again.json() as { signalsRaised: number }).signalsRaised).toBe(0);
     expect(await signalsFor("design_info_requirement_overdue")).toHaveLength(1);
+  });
+
+  it("refuses to make somebody from another company responsible", async () => {
+    const res = await post(`${base()}/information-requirements`, {
+      kind: "bep",
+      title: "BEP owned by a stranger",
+      responsibleUserId: stranger.userId,
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("not a member of this company");
   });
 
   it("marks the requirement overdue and lets a re-plan clear it", async () => {
@@ -530,6 +588,20 @@ describe("readiness, summary and analytics", () => {
     const body = res.json() as { items: Array<{ detector: string }>; detectors: string[] };
     expect(body.detectors).toHaveLength(7);
     expect(body.items.length).toBeGreaterThan(0);
+    for (const item of body.items) expect(body.detectors).toContain(item.detector);
+  });
+
+  it("refuses to serve another programme's detector through the design gate", async () => {
+    // The design tool answers for design detectors. A free-string filter here
+    // would have handed a design:read holder the assurance programme's
+    // findings on this project.
+    const res = await get(`${base()}/signals?detector=ghost_vendor_shared_bank`);
+    expect(res.statusCode).toBe(400);
+    const ours = await get(`${base()}/signals?detector=design_deliverable_late`);
+    expect(ours.statusCode).toBe(200);
+    for (const item of (ours.json() as { items: Array<{ detector: string }> }).items) {
+      expect(item.detector).toBe("design_deliverable_late");
+    }
   });
 
   it("runs every sweep in one call", async () => {

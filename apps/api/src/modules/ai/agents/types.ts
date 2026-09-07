@@ -27,6 +27,7 @@ import type {
   AgentDataCategory,
   AgentTargetType,
   SignalSeverity,
+  ToolKey,
 } from "@constructos/shared";
 import type { Db } from "../../../lib/db.js";
 import type { PolicyDefaults } from "../policy.js";
@@ -82,6 +83,18 @@ export interface AgentDefinition<T = unknown> {
   inputs: string[];
   outputs: string[];
   dataCategories: AgentDataCategory[];
+  /**
+   * The operational tools that own the tables `gather()` reads.
+   *
+   * `dataCategories` says what leaves the tenant; this says who is allowed to
+   * make it leave. Every one is enforced at level "read" on the run's project
+   * BEFORE the agent gathers anything, because the gathered rows land verbatim
+   * in `ai_runs.prompt` and anyone with `ai:read` on that project can then read
+   * them back from the run detail route. An `ai:standard` / `budget:none`
+   * member must not be able to launder budget figures through the cost
+   * forecaster.
+   */
+  requiredTools: ToolKey[];
   targetTypes: AgentTargetType[];
   /** true when an approved proposal changes an operational record */
   consequential: boolean;

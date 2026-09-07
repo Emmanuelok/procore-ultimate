@@ -341,6 +341,18 @@ export const photos = pgTable(
     pin: jsonb("pin").$type<{ sheetId: string; x: number; y: number } | null>(),
     /** EXIF extracted server-side at upload: orientation, make, model, gps source (#428) */
     exif: jsonb("exif").$type<Record<string, unknown>>(),
+    /**
+     * Derived renditions keyed by size ("thumb"). Today the only generator is
+     * the camera's own EXIF thumbnail, lifted out of the uploaded bytes, so a
+     * gallery tile costs kilobytes instead of the full original; a photo
+     * without one simply has no entry and the variant route serves the
+     * original and says so. Stored inline (not as a `files` row) so
+     * thumbnails never appear in the document register.
+     */
+    variants: jsonb("variants")
+      .$type<Record<string, { storageKey: string; sizeBytes: number; sha256: string; contentType: string; source: string }>>()
+      .default({})
+      .notNull(),
     /** pending | done | failed | skipped — PhotoAiStatus; null when AI is not configured */
     aiStatus: text("ai_status"),
     aiError: text("ai_error"),

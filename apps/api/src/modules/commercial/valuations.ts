@@ -36,6 +36,7 @@ import {
   todayISO,
 } from "./shared.js";
 import {
+  computeCertificate,
   computeValuationTotals,
   paymentDueRule,
   retentionSchedule,
@@ -95,6 +96,13 @@ const certifySchema = z.object({
   certifiedSections: z.number().finite().optional(),
   varianceReason: z.string().max(2000).nullable().optional(),
   dueDate: isoDateSchema.nullable().optional(),
+});
+
+/** Query form of certifySchema for the read-only preview. */
+const certifyPreviewQuery = z.object({
+  certifiedWorkDone: z.coerce.number().min(0).optional(),
+  certifiedMaterials: z.coerce.number().min(0).optional(),
+  certifiedSections: z.coerce.number().finite().optional(),
 });
 
 const withdrawSchema = z.object({ reason: z.string().min(3).max(2000) });
@@ -193,14 +201,20 @@ export const valuationRoutes: FastifyPluginAsync = async (app) => {
    * previous implementation recomputed on the draft path only, leaving
    * `netDue` frozen at the last draft edit while `previousCertified` moved on.
    */
-  async function recomputeValuation(
+  /**
+   * The money position of a valuation, computed and NOT written.
+   *
+   * The certify preview needs exactly this arithmetic without the side effect
+   * of a write on a GET, so the read and the write are separated: this is the
+   * read, `recomputeValuation` is the same thing followed by the update.
+   */
+  async function valuationTotals(
     db: Db,
     valuationId: string,
     patch: Partial<{
       materialsOnSite: number;
       materialsOffSite: number;
       retentionPercent: number;
-      valuationDate: string;
     }> = {},
   ) {
     const rows = await db.select().from(valuations).where(eq(valuations.id, valuationId)).limit(1);
@@ -211,7 +225,7 @@ export const valuationRoutes: FastifyPluginAsync = async (app) => {
       .from(valuationLines)
       .where(eq(valuationLines.valuationId, valuationId));
     const sections = await sectionsFor(db, valuationId);
-    const totals = computeValuationTotals({
+    return computeValuationTotals({
       workDoneToDate: lines.reduce((s, l) => s + l.amountToDate, 0),
       materialsOnSite: patch.materialsOnSite ?? val.materialsOnSite,
       materialsOffSite: patch.materialsOffSite ?? val.materialsOffSite,
@@ -221,6 +235,19 @@ export const valuationRoutes: FastifyPluginAsync = async (app) => {
       retentionReleased: await releasedFor(db, val.boqId),
       previousNet: await previousNetFor(db, val.boqId, valuationId),
     });
+  }
+
+  async function recomputeValuation(
+    db: Db,
+    valuationId: string,
+    patch: Partial<{
+      materialsOnSite: number;
+      materialsOffSite: number;
+      retentionPercent: number;
+      valuationDate: string;
+    }> = {},
+  ) {
+    const totals = await valuationTotals(db, valuationId, patch);
     await db
       .update(valuations)
       .set({
@@ -927,6 +954,48 @@ export const valuationRoutes: FastifyPluginAsync = async (app) => {
   /* Payment certificates (#179-180)                                   */
   /* ---------------------------------------------------------------- */
 
+  /**
+   * The certificate the server WOULD issue, computed with the same engine as
+   * certification itself.
+   *
+   * The certify dialog used to do its own arithmetic in the browser: it left
+   * out the valuation's sections (variations, dayworks, claims, fluctuations,
+   * contra charges) and the retention cap, so a certifier was shown one net
+   * and issued another. This endpoint removes the second implementation; it
+   * writes nothing.
+   */
+  app.get("/valuations/:valuationId/certify-preview", { preHandler: subRead }, async (req, reply) => {
+    const { valuationId } = req.params as { valuationId: string };
+    const q = certifyPreviewQuery.parse(req.query);
+    const val = await fetchValuation(valuationId, req.companyId!);
+    await requireCommercialLevel(app, req, reply, val.projectId, "read");
+    const totals = await valuationTotals(app.db, valuationId);
+    const certificate = computeCertificate({
+      totals,
+      certifiedWorkDone: q.certifiedWorkDone ?? null,
+      certifiedMaterials: q.certifiedMaterials ?? null,
+      certifiedSections: q.certifiedSections ?? null,
+      retentionPercent: val.retentionPercent,
+      retentionCap: val.retentionCap,
+    });
+    return {
+      valuationId,
+      currency: val.currency,
+      retentionPercent: val.retentionPercent,
+      retentionCap: val.retentionCap,
+      applied: {
+        workDoneToDate: totals.workDoneToDate,
+        materials: round2(totals.materialsOnSite + totals.materialsOffSite),
+        sectionsTotal: totals.sectionsTotal,
+        grossTotal: totals.grossTotal,
+        retentionHeld: totals.retentionHeld,
+        previousNet: totals.previousNet,
+        netDue: totals.netDue,
+      },
+      certificate,
+    };
+  });
+
   app.post("/valuations/:valuationId/certify", { preHandler: subAdmin }, async (req, reply) => {
     const { valuationId } = req.params as { valuationId: string };
     const body = certifySchema.parse(req.body);
@@ -981,25 +1050,24 @@ export const valuationRoutes: FastifyPluginAsync = async (app) => {
       // previousCertified read fresh, which is how a certificate could go
       // negative.
       const totals = await recomputeValuation(tx, valuationId);
-      const certifiedWorkDone = round2(body.certifiedWorkDone ?? totals.workDoneToDate);
-      const certifiedMaterials = round2(
-        body.certifiedMaterials ?? totals.materialsOnSite + totals.materialsOffSite,
-      );
-      const certifiedSections = round2(body.certifiedSections ?? totals.sectionsTotal);
-      const certifiedGross = round2(certifiedWorkDone + certifiedMaterials + certifiedSections);
-      // Retention is taken on the certified gross LESS the sections that are
-      // outside the retention base (contra charges and the like). Any cut the
-      // certifier makes is treated as a cut to retainable value, which is the
-      // conservative reading — it never retains against a deduction.
-      const nonRetainableSections = round2(totals.grossTotal - totals.retentionBase);
-      const certifiedRetentionBase = round2(certifiedGross - nonRetainableSections);
-      const rawRetention = round2((val.retentionPercent / 100) * Math.max(0, certifiedRetentionBase));
-      const cappedRetention =
-        val.retentionCap != null ? Math.min(rawRetention, val.retentionCap) : rawRetention;
-      const retentionHeld = round2(Math.max(0, cappedRetention - totals.retentionReleased));
-      const previousCertified = totals.previousNet;
-      const netCertified = round2(certifiedGross - retentionHeld - previousCertified);
-      const varianceFromApplication = round2(netCertified - totals.netDue);
+      // ONE implementation of the certificate arithmetic, shared with the
+      // certify preview the web dialog shows before the button is pressed.
+      const {
+        certifiedWorkDone,
+        certifiedMaterials,
+        certifiedSections,
+        retentionHeld,
+        previousCertified,
+        netCertified,
+        varianceFromApplication,
+      } = computeCertificate({
+        totals,
+        certifiedWorkDone: body.certifiedWorkDone ?? null,
+        certifiedMaterials: body.certifiedMaterials ?? null,
+        certifiedSections: body.certifiedSections ?? null,
+        retentionPercent: val.retentionPercent,
+        retentionCap: val.retentionCap,
+      });
 
       await tx.insert(paymentCertificates).values({
         id: certId,
@@ -1294,9 +1362,14 @@ export const valuationRoutes: FastifyPluginAsync = async (app) => {
 
   app.post("/projects/:projectId/retention/releases", { preHandler: adminGate }, async (req, reply) => {
     const body = releaseSchema.parse(req.body);
+    // A release is money leaving the retention fund; it must be labelled with
+    // the currency it is actually in. The bill states it, else the contract
+    // does — and when neither is named the release is refused rather than
+    // stamped "USD" and shown to somebody as a GBP figure.
+    let currency: string | null = null;
     if (body.boqId) {
       const b = await app.db
-        .select({ id: boqs.id, currency: boqs.currency })
+        .select({ id: boqs.id, currency: boqs.currency, contractId: boqs.contractId })
         .from(boqs)
         .where(
           and(
@@ -1307,19 +1380,36 @@ export const valuationRoutes: FastifyPluginAsync = async (app) => {
         )
         .limit(1);
       if (!b[0]) throw badRequest("boqId does not reference a BoQ on this project");
+      currency = b[0].currency;
+    }
+    if (body.contractId) {
+      const c = await app.db
+        .select({ id: contracts.id, currency: contracts.currency })
+        .from(contracts)
+        .where(
+          and(
+            eq(contracts.id, body.contractId),
+            eq(contracts.companyId, req.companyId!),
+            eq(contracts.projectId, req.projectId!),
+          ),
+        )
+        .limit(1);
+      if (!c[0]) throw badRequest("contractId does not reference a contract on this project");
+      if (currency && currency !== c[0].currency) {
+        throw badRequest(
+          `The bill is priced in ${currency} and the contract in ${c[0].currency}; they cannot both describe one release.`,
+        );
+      }
+      currency = currency ?? c[0].currency;
+    }
+    if (!currency) {
+      throw badRequest(
+        "Name the bill or the contract the retention is held under, so the release carries its real currency",
+      );
     }
     if (body.kind === "bond_substitution" && !body.bondReference) {
       throw badRequest("Substituting retention with a bond requires the bond reference");
     }
-    const currency = body.boqId
-      ? (
-          await app.db
-            .select({ currency: boqs.currency })
-            .from(boqs)
-            .where(eq(boqs.id, body.boqId))
-            .limit(1)
-        )[0]?.currency ?? "USD"
-      : "USD";
     const id = newId("rrel");
     await app.db.transaction(async (tx) => {
       await tx.insert(retentionReleases).values({

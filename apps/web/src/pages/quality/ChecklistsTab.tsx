@@ -18,12 +18,14 @@ import {
   Field,
   Input,
   Modal,
+  SegmentedControl,
   Select,
   Skeleton,
   type DataColumns,
 } from "../../ui";
 import { IconPlus } from "../../ui/icons";
 import { api } from "../../lib/api";
+import TemplatesPanel from "./TemplatesPanel";
 import {
   CHECKLIST_STATUS_TONE,
   LoadError,
@@ -101,6 +103,7 @@ export default function ChecklistsTab({
   const [templateId, setTemplateId] = useState("");
   const [title, setTitle] = useState("");
   const [locationText, setLocationText] = useState("");
+  const [view, setView] = useState<"records" | "forms">("records");
   const { busy, refusal, clear, run } = useAction();
 
   const rows = checklists.data?.items ?? [];
@@ -294,18 +297,31 @@ export default function ChecklistsTab({
     }
   }
 
+  if (view === "forms") {
+    return (
+      <div className="space-y-4">
+        <ChecklistViewSwitch view={view} onView={setView} />
+        <TemplatesPanel templates={templates} onMutated={onMutated} />
+      </div>
+    );
+  }
+
   if (checklists.error) {
     return (
-      <LoadError
-        message={checklists.error}
-        onRetry={checklists.reload}
-        title="The checklist register could not be loaded"
-      />
+      <div className="space-y-4">
+        <ChecklistViewSwitch view={view} onView={setView} />
+        <LoadError
+          message={checklists.error}
+          onRetry={checklists.reload}
+          title="The checklist register could not be loaded"
+        />
+      </div>
     );
   }
 
   return (
     <div className="space-y-4">
+      <ChecklistViewSwitch view={view} onView={setView} />
       <Card>
         <CardBody className="grid gap-3 md:grid-cols-4">
           <Field label="Status">
@@ -468,5 +484,30 @@ export default function ChecklistsTab({
         </div>
       </Modal>
     </div>
+  );
+}
+
+/**
+ * Two registers, one tab: the RECORDS taken on site, and the CONTROLLED FORMS
+ * they are taken against. Keeping them together is deliberate — the question
+ * "why does nobody use form QF-014?" is answered by looking at both.
+ */
+function ChecklistViewSwitch({
+  view,
+  onView,
+}: {
+  view: "records" | "forms";
+  onView: (next: "records" | "forms") => void;
+}) {
+  return (
+    <SegmentedControl<"records" | "forms">
+      value={view}
+      onChange={onView}
+      aria-label="Checklist register or controlled forms"
+      options={[
+        { value: "records", label: "Checklists taken" },
+        { value: "forms", label: "Controlled forms" },
+      ]}
+    />
   );
 }

@@ -51,11 +51,15 @@ export default function CertificatesTab({
   inServiceOnly,
   onInServiceOnly,
   onOpenMachine,
+  onVerify,
 }: {
   register: Loadable<CertificateRegister>;
   inServiceOnly: boolean;
   onInServiceOnly: (next: boolean) => void;
   onOpenMachine: (equipmentId: string) => void;
+  /** Countersign a certificate — never offered to whoever filed it; the API
+   *  refuses that and the modal renders the refusal. */
+  onVerify?: (certificateId: string, label: string) => void;
 }) {
   const [bucket, setBucket] = useState<Bucket>("critical");
   const data = register.data;
@@ -234,6 +238,22 @@ export default function CertificatesTab({
             <Badge tone="success" size="xs" variant="outline">
               {isoDate(row.verifiedAt)}
             </Badge>
+          ) : onVerify ? (
+            <Button
+              size="xs"
+              variant="secondary"
+              onClick={(e) => {
+                e.stopPropagation();
+                onVerify(
+                  row.id,
+                  `${row.equipmentReference ?? row.equipmentId} · ${
+                    CERTIFICATE_TYPE_LABEL[row.certificateType] ?? labelize(row.certificateType)
+                  } to ${row.validTo}`,
+                );
+              }}
+            >
+              Verify
+            </Button>
           ) : (
             <Badge tone="warning" size="xs">
               Never checked
@@ -258,7 +278,7 @@ export default function CertificatesTab({
         defaultHidden: true,
       },
     ],
-    [onOpenMachine],
+    [onOpenMachine, onVerify],
   );
 
   if (register.error) return <LoadError message={register.error} onRetry={register.reload} />;

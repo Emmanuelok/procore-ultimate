@@ -389,7 +389,14 @@ export async function runDueSchedules(
   now: Date,
   nextRunAt: (cadence: string, dayOfPeriod: number | null, from: Date) => string,
   limit = 50,
-): Promise<{ due: number; sent: number; failed: number; runs: ScheduleRunSummary[] }> {
+): Promise<{
+  due: number;
+  claimed: number;
+  skippedAlreadyClaimed: number;
+  sent: number;
+  failed: number;
+  runs: ScheduleRunSummary[];
+}> {
   const nowIso = now.toISOString();
   const due = await db
     .select()
@@ -404,8 +411,36 @@ export async function runDueSchedules(
     .orderBy(asc(reportSchedules.nextRunAt))
     .limit(limit);
 
-  const runs: ScheduleRunSummary[] = [];
+  /*
+   * EACH SCHEDULE IS CLAIMED BEFORE IT RUNS.
+   *
+   * This was a check-then-act: the select found the due rows and nextRunAt was
+   * advanced only after the render and the send, so two admin clicks on
+   * POST /analytics/reports/schedules/run-due — or one click overlapping the
+   * analytics.report-delivery tick — both saw the same rows and both mailed
+   * the extract. The claim advances next_run_at in the SAME statement that
+   * verifies it is still due, so exactly one caller may run it. `now` is the
+   * same instant the run uses, so the claim and the post-run update compute
+   * the identical next instant and the claim cannot skip a period.
+   */
+  const claimed: (typeof due)[number][] = [];
   for (const schedule of due) {
+    const won = await db
+      .update(reportSchedules)
+      .set({ nextRunAt: nextRunAt(schedule.cadence, schedule.dayOfPeriod, now) })
+      .where(
+        and(
+          eq(reportSchedules.id, schedule.id),
+          eq(reportSchedules.isActive, 1),
+          lte(reportSchedules.nextRunAt, nowIso),
+        ),
+      )
+      .returning();
+    if (won[0]) claimed.push(won[0]);
+  }
+
+  const runs: ScheduleRunSummary[] = [];
+  for (const schedule of claimed) {
     try {
       runs.push(
         await runSchedule(db, config, schedule, now, (from) =>
@@ -430,6 +465,8 @@ export async function runDueSchedules(
   }
   return {
     due: due.length,
+    claimed: claimed.length,
+    skippedAlreadyClaimed: due.length - claimed.length,
     sent: runs.filter((r) => r.dispatched).length,
     failed: runs.filter((r) => r.status === "failed").length,
     runs,

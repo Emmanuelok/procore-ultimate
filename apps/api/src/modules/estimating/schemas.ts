@@ -422,7 +422,23 @@ export const takeoffCreateSchema = z.object({
   detail: detailBag.optional(),
 });
 
-export const takeoffPatchSchema = takeoffCreateSchema.partial();
+/**
+ * Voiding a measurement is the DELETE route and only the DELETE route: it is
+ * a soft void that leaves the geometry and the estimate lines citing it
+ * intact, and having two ways to reach the same state is how the two ways
+ * end up disagreeing about when it is allowed (plan §6.3). Patching a void
+ * measurement back to `measured` is allowed — that is un-voiding, not
+ * voiding.
+ */
+export const takeoffPatchSchema = takeoffCreateSchema.partial().extend({
+  status: z
+    .enum(TAKEOFF_STATUSES)
+    .refine((s) => s !== "void", {
+      message:
+        "Void a measurement with DELETE /takeoff/items/:itemId, which records the state change and reports which estimate lines still cite it.",
+    })
+    .optional(),
+});
 
 export const takeoffListQuery = pageQuerySchema.extend({
   estimateId: idRef.optional(),
@@ -503,10 +519,29 @@ export const subQuoteCreateSchema = z.object({
   detail: detailBag.optional(),
 });
 
-export const subQuotePatchSchema = subQuoteCreateSchema
-  .omit({ lines: true })
-  .extend({ status: z.enum(SUB_QUOTE_STATUSES).optional() })
-  .partial();
+/**
+ * The generic PATCH deliberately does NOT carry `status` (plan §6.3):
+ * accepting a quote writes estimate lines and stamps who accepted it,
+ * withdrawing one is the DELETE, and expiry belongs to the validity sweep.
+ * A typed status would let an accepted price be walked back underneath the
+ * estimate lines that cite it.
+ */
+export const subQuotePatchSchema = subQuoteCreateSchema.omit({ lines: true }).partial();
+
+/** The transitions a person may drive by hand on the status route. */
+export const SUB_QUOTE_MANUAL_STATUSES = [
+  "received",
+  "under_review",
+  "levelled",
+  "rejected",
+] as const;
+
+export const subQuoteStatusSchema = z.object({
+  status: z.enum(SUB_QUOTE_MANUAL_STATUSES),
+  /** re-dating a lapsed quote is how it becomes a price again */
+  validUntil: isoDate.nullable().optional(),
+  note: z.string().max(2000).optional(),
+});
 
 export const subQuoteLinesSchema = z.object({
   lines: z.array(subQuoteLineSchema).max(500),

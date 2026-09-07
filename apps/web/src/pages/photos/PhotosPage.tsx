@@ -4,9 +4,13 @@
  * Gallery with server-side album / unfiled / tag / GPS / 360 filters, albums
  * with privacy, EXIF and AI-status badges, select-mode bulk download, and a
  * lightbox for caption/album/tags/360/pin edits and on-demand AI analysis.
- * Tiles are served by the un-ledgered content route, so browsing a page of
- * photos no longer writes a page of access-log rows. AI copy is honest: when
- * AI is not configured the status says "skipped" and why.
+ * Tiles are served by the un-ledgered variant route, so browsing a page of
+ * photos no longer writes a page of access-log rows, and a photo whose file
+ * carried a camera thumbnail costs kilobytes per tile instead of the full
+ * original. A tile is fetched only once it approaches the viewport — with 48
+ * per page, fetching all of them up front was the whole cost of opening the
+ * gallery. AI copy is honest: when AI is not configured the status says
+ * "skipped" and why.
  */
 import { useCallback, useEffect, useRef, useState, type ChangeEvent, type MutableRefObject } from "react";
 import { useParams } from "react-router-dom";
@@ -38,6 +42,8 @@ interface Photo {
   uploadedBy: string;
   createdAt: string;
   albumIsPrivate?: boolean;
+  /** rendition keys the API holds for this photo (e.g. ["thumb"]) */
+  variants?: string[];
   file?: { id: string; name: string; contentType: string; sizeBytes: number } | null;
 }
 
@@ -58,7 +64,30 @@ type BlobCache = MutableRefObject<Map<string, string>>;
 function Thumb({ src, alt, cache, selected, selectMode, onClick }: { src: string; alt: string; cache: BlobCache; selected: boolean; selectMode: boolean; onClick: () => void }) {
   const [url, setUrl] = useState<string | null>(() => cache.current.get(src) ?? null);
   const [failed, setFailed] = useState(false);
+  const holder = useRef<HTMLButtonElement | null>(null);
+  // Tiles fetch when they come within a screen of the viewport. The image is
+  // authenticated, so `loading="lazy"` on the <img> cannot do this for us —
+  // the bytes come through fetch with a bearer token, and without a gate all
+  // 48 tiles on a page start downloading the moment the grid mounts.
+  const [near, setNear] = useState(() => typeof IntersectionObserver === "undefined");
   useEffect(() => {
+    if (near) return;
+    const node = holder.current;
+    if (!node) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setNear(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "600px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [near]);
+  useEffect(() => {
+    if (!near) return;
     let alive = true;
     const cached = cache.current.get(src);
     if (cached) {
@@ -82,9 +111,9 @@ function Thumb({ src, alt, cache, selected, selectMode, onClick }: { src: string
     return () => {
       alive = false;
     };
-  }, [src, cache]);
+  }, [src, cache, near]);
   return (
-    <button type="button" onClick={onClick} className={`group relative aspect-square overflow-hidden rounded-lg bg-ink-100 ring-2 focus-visible:outline-2 focus-visible:outline-brand-600 ${selected ? "ring-brand-600" : "ring-transparent"}`}>
+    <button ref={holder} type="button" onClick={onClick} className={`group relative aspect-square overflow-hidden rounded-lg bg-ink-100 ring-2 focus-visible:outline-2 focus-visible:outline-brand-600 ${selected ? "ring-brand-600" : "ring-transparent"}`}>
       {url ? <img src={url} alt={alt} loading="lazy" className="h-full w-full object-cover transition-transform duration-150 group-hover:scale-[1.03]" /> : failed ? <span className="flex h-full w-full items-center justify-center text-xs text-ink-400">Unavailable</span> : <span className="flex h-full w-full items-center justify-center"><span className="h-4 w-4 animate-spin rounded-full border-2 border-ink-200 border-t-brand-600" /></span>}
       {selectMode ? <span className={`absolute left-1.5 top-1.5 flex h-5 w-5 items-center justify-center rounded-full text-xs ${selected ? "bg-brand-600 text-white" : "bg-white/90 text-ink-500 ring-1 ring-ink-300"}`}>{selected ? "✓" : ""}</span> : null}
     </button>
@@ -239,7 +268,7 @@ export default function PhotosPage() {
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
                 {photos.map((p) => (
                   <div key={p.id} className="flex flex-col">
-                    <Thumb src={`${base}/${p.id}/content`} alt={p.caption ?? p.file?.name ?? "Site photo"} cache={blobCache} selected={selected.has(p.id)} selectMode={selectMode} onClick={() => (selectMode ? toggle(p.id) : setLightbox(p))} />
+                    <Thumb src={`${base}/${p.id}/variant/thumb`} alt={p.caption ?? p.file?.name ?? "Site photo"} cache={blobCache} selected={selected.has(p.id)} selectMode={selectMode} onClick={() => (selectMode ? toggle(p.id) : setLightbox(p))} />
                     <div className="mt-1 flex items-center gap-1 truncate text-xs text-ink-500">
                       <span className="truncate">{p.caption ?? p.file?.name ?? DASH}</span>
                       {p.is360 === 1 ? <Badge tone="blue" size="xs">360°</Badge> : null}
@@ -409,6 +438,7 @@ function Lightbox({ base, photo, albums, sheets, locations, nameOf, cache, onClo
           <span>{photo.contentType ?? photo.file?.contentType ?? DASH}{photo.sizeBytes ? ` · ${Math.round(photo.sizeBytes / 1024)} KB` : ""}</span>
           <span>{photo.pin ? `Pinned to ${photo.pin.sheetId} @ ${photo.pin.x.toFixed(2)}, ${photo.pin.y.toFixed(2)}` : "No drawing pin"}</span>
           <span>{humanize(photo.contentType?.startsWith("video/") ? "video" : "image")}</span>
+          <span>{photo.variants?.includes("thumb") ? "Tiles use the camera's own thumbnail" : "No stored thumbnail — tiles load the original"}</span>
         </div>
         <div className="flex flex-wrap items-center justify-between gap-2">
           <Button variant="danger" size="sm" disabled={busy} onClick={() => void remove()}>Delete</Button>

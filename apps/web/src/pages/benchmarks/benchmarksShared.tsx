@@ -119,7 +119,22 @@ export interface DistributionResponse {
 export interface CompareOutlier {
   adverse: boolean;
   side: "above_p90" | "below_p10" | null;
+  /** a signal is already recorded against this snapshot */
   signalRaised: boolean;
+  signalId: string | null;
+  /** the cell supports one and none has been raised — the button's condition */
+  wouldRaise: boolean;
+}
+
+/** POST .../snapshots/:id/evaluate — the only path that raises a signal. */
+export interface EvaluateResponse {
+  snapshotId: string;
+  signalRaised: boolean;
+  signalId: string | null;
+  reason?: string;
+  percentile: number | null;
+  distribution: { n: number; suppressed?: boolean; p10?: number; median?: number; p90?: number };
+  disclosures: string[];
 }
 
 export interface CompareResponse {

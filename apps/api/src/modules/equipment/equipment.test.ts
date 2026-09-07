@@ -890,7 +890,12 @@ describe("telematics ingestion inlet", () => {
       records: [
         { recordedAt: `${daysAgo(4)}T06:00:00.000Z`, engineHours: 10 },
         { deviceId: "DEV-100", recordedAt: "not-a-timestamp" },
-        { deviceId: "DEV-100", recordedAt: `${daysAgo(4)}T06:00:00.000Z`, engineHours: 1194 },
+        // 1200 — the same counter the window opens on. The engine now carries
+        // the previous reading in as the opening point (a device that reports
+        // once a day used to yield null every day), so a lower value here
+        // would credit this machine with hours it ran BEFORE the window and
+        // silently shrink the variance the reconciliation test exists to find.
+        { deviceId: "DEV-100", recordedAt: `${daysAgo(4)}T06:00:00.000Z`, engineHours: 1200 },
       ],
     });
     expect(res.statusCode).toBe(201);

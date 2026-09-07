@@ -13,11 +13,12 @@
  *  - HONEST FIGURES. A number the platform cannot derive is
  *    `{ value: null, reasons }`, never a fabricated zero.
  */
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import {
   bimModels,
+  companyMemberships,
   designConsultants,
   designPackages,
   drawingSheets,
@@ -28,7 +29,7 @@ import {
   users,
   vendors,
 } from "@constructos/db";
-import type { DesignDetector, SignalSeverity } from "@constructos/shared";
+import type { DcnAuthorisationLevel, DesignDetector, SignalSeverity } from "@constructos/shared";
 import type { Db } from "../../lib/db.js";
 import { badRequest, notFound } from "../../lib/errors.js";
 import { newId } from "../../lib/ids.js";
@@ -51,6 +52,16 @@ export const isoTimestampSchema = z
 export const idSchema = z.string().min(1).max(64);
 export const fileIdsSchema = z.array(idSchema).max(200);
 export const currencySchema = z.string().length(3).toUpperCase();
+
+/**
+ * A boolean query flag that means what it says. `z.coerce.boolean()` runs JS
+ * truthiness over the raw query string, so `?open=false` arrives as `true` and
+ * the caller is answered with the exact opposite of what they asked for.
+ * Here `false` filters to the closed side and anything else is a 400.
+ */
+export const boolQuerySchema = z
+  .union([z.boolean(), z.enum(["true", "false", "1", "0", "yes", "no"])])
+  .transform((v) => (typeof v === "boolean" ? v : v === "true" || v === "1" || v === "yes"));
 
 export const todayISO = (): string => new Date().toISOString().slice(0, 10);
 export const nowISO = (): string => new Date().toISOString();
@@ -84,6 +95,45 @@ export function buildGates(app: FastifyInstance) {
   };
 }
 export type DesignGates = ReturnType<typeof buildGates>;
+
+/**
+ * The change-notice authorisation level the caller actually HOLDS, derived
+ * from what the platform can check rather than from what the request claims
+ * (#892). Without this the threshold ladder is decorative: anyone who can
+ * reach the approve route could sign a board-level change by typing
+ * `"authorisationLevel":"board"` into the body.
+ *
+ *   design:standard on the project  → design_lead
+ *   design:admin on the project     → project_manager
+ *   company owner / admin           → board (and therefore client too)
+ *
+ * There is no per-user delegated-authority record on the platform yet; when
+ * one lands, it belongs here and nowhere else.
+ */
+export async function heldAuthorisation(
+  app: FastifyInstance,
+  req: FastifyRequest,
+  reply: FastifyReply,
+): Promise<{ level: DcnAuthorisationLevel; basis: string }> {
+  if (req.companyRole === "owner" || req.companyRole === "admin") {
+    return {
+      level: "board",
+      basis: `You are a company ${req.companyRole}, which signs at any level up to board.`,
+    };
+  }
+  try {
+    await app.requireTool("design", "admin")(req, reply);
+    return {
+      level: "project_manager",
+      basis: "You hold admin on the design tool for this project, which signs at project manager level.",
+    };
+  } catch {
+    return {
+      level: "design_lead",
+      basis: "You hold standard access to the design tool, which signs at design lead level.",
+    };
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /* Numbering                                                           */
@@ -119,6 +169,14 @@ export type DesignObjectType =
   | "design_info_requirement"
   | "design_readiness"
   | "design_link"
+  /**
+   * The downstream record a design change notice raises. It is not this
+   * module's table, but the ledger entry that records its creation belongs to
+   * the act that created it — and it must be filed under what it actually is,
+   * or a search of the chain for that id comes back claiming the change event
+   * is a design change notice.
+   */
+  | "change_event"
   | "obligation"
   | "signal";
 
@@ -235,9 +293,20 @@ export async function assertVendor(db: Db, companyId: string, vendorId: string):
   if (!rows[0]) throw badRequest(`Vendor ${vendorId} not found in this company.`);
 }
 
-export async function assertUser(db: Db, userId: string): Promise<void> {
-  const rows = await db.select({ id: users.id }).from(users).where(eq(users.id, userId)).limit(1);
-  if (!rows[0]) throw badRequest(`User ${userId} not found.`);
+/**
+ * A user this tenant may name on its own records. The membership join is the
+ * point: without it a caller who knows a user id from another company could
+ * make them the required reviewer on a cycle or the assignee of an issue —
+ * a person who can never act, blocking the record with no way out but force.
+ */
+export async function assertUser(db: Db, companyId: string, userId: string): Promise<void> {
+  const rows = await db
+    .select({ id: users.id })
+    .from(companyMemberships)
+    .innerJoin(users, eq(users.id, companyMemberships.userId))
+    .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.userId, userId)))
+    .limit(1);
+  if (!rows[0]) throw badRequest(`User ${userId} is not a member of this company.`);
 }
 
 export async function assertPackage(db: Db, companyId: string, projectId: string, packageId: string) {

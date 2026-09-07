@@ -117,6 +117,14 @@ export async function pushNotifications(
         body: t.body ?? null,
         recordType: t.recordType ?? null,
         recordId: t.recordId ?? null,
+        /*
+         * The digest decision is now PERSISTED. `decision.digested` used to be
+         * computed and thrown away: the row landed immediately and badged the
+         * bell, so a "weekly digest" was an extra weekly summary of
+         * interruptions the user had already had. Held rows are excluded from
+         * the unread count until the digest job releases them.
+         */
+        heldForDigest: decision.digested ? 1 : 0,
       });
     }
   }

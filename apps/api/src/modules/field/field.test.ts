@@ -53,7 +53,10 @@ beforeAll(async () => {
   for (const [u, templateKey] of templates) {
     await built.app.db.insert(projectMemberships).values({ id: newId("pm"), companyId: owner.companyId, projectId, userId: u.userId, templateKey, overrides: {} });
   }
-});
+  // Explicit hook timeout: booting PGlite + running every migration takes well
+  // over vitest's 30s default on a loaded shared runner, and a timed-out hook
+  // reports as 40+ skipped tests, i.e. a red package for a machine problem.
+}, 180_000);
 
 afterAll(async () => {
   await built.close();
@@ -249,6 +252,36 @@ describe("RFIs", () => {
     const res = await inject("GET", api(`/rfis/${rfiId}`), { authorization: `Bearer ${stranger.accessToken}`, "x-company-id": stranger.companyId });
     expect([403, 404]).toContain(res.statusCode);
   });
+
+  it("refuses to reference a private RFI the caller cannot see (no subject leak via relatedRfiIds)", async () => {
+    const priv = await inject("POST", api("/rfis"), H(sub), { subject: "SECRET SUBJECT LINE", question: "internal", isPrivate: true });
+    expect(priv.statusCode).toBe(201);
+    const privId = priv.json().id as string;
+    expect((await inject("GET", api(`/rfis/${privId}`), H(engineer))).statusCode).toBe(404);
+    // Referencing it from your own RFI used to echo its subject back in `related`.
+    const leak = await inject("POST", api("/rfis"), H(engineer), { subject: "Mine", question: "q", relatedRfiIds: [privId] });
+    expect(leak.statusCode).toBe(400);
+    expect(leak.json().message).toContain(privId);
+    // An admin, who may see it, may still reference it.
+    const byAdmin = await inject("POST", api("/rfis"), H(owner), { subject: "Admin ref", question: "q", relatedRfiIds: [privId] });
+    expect(byAdmin.statusCode).toBe(201);
+    const detail = await inject("GET", api(`/rfis/${byAdmin.json().id}`), H(owner));
+    expect(JSON.stringify(detail.json().related)).toContain("SECRET SUBJECT LINE");
+    await inject("POST", api(`/rfis/${privId}/void`), H(sub));
+  });
+
+  it("restricts close to the parties and reports canClose", async () => {
+    const created = await inject("POST", api("/rfis"), H(owner), { subject: "Closable", question: "q", assigneeId: engineer.userId });
+    const id = created.json().id as string;
+    await inject("POST", api(`/rfis/${id}/issue`), H(owner));
+    const byStranger = await inject("POST", api(`/rfis/${id}/close`), H(sub));
+    expect(byStranger.statusCode).toBe(403);
+    expect((await inject("GET", api(`/rfis/${id}`), H(sub))).json().permissions.canClose).toBe(false);
+    expect((await inject("GET", api(`/rfis/${id}`), H(engineer))).json().permissions.canClose).toBe(true);
+    const byAssignee = await inject("POST", api(`/rfis/${id}/close`), H(engineer));
+    expect(byAssignee.statusCode).toBe(200);
+    expect(byAssignee.json().status).toBe("closed");
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -349,6 +382,32 @@ describe("Submittals", () => {
     expect(theirs.json().permissions.canRespondStepIds).toHaveLength(0);
     const blocked = await inject("POST", api(`/submittals/${id}/steps/${stepId}/respond`), H(sub), { responseCode: "approved" });
     expect(blocked.statusCode).toBe(403);
+  });
+
+  it("lets a read-level reviewer respond only through the id-addressed step route", async () => {
+    // #334: reviewers are often consultants with read-only access to the
+    // register. The detail route offers them the step (canRespondStepIds), so
+    // the button must post to the company-level, id-addressed route — the
+    // project-scoped twin is gated on submittals:standard and would 403.
+    const res = await inject("POST", api("/submittals"), H(owner), { title: "Consultant review chain", submittalType: "product_data" });
+    const id = res.json().id as string;
+    const steps = await inject("POST", api(`/submittals/${id}/review-steps`), H(owner), { steps: [{ reviewerId: engineer.userId, position: 0 }] });
+    const stepId = steps.json().items[0].id as string;
+    await inject("POST", api(`/submittals/${id}/submit`), H(owner));
+
+    const detail = await inject("GET", api(`/submittals/${id}`), H(engineer));
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().permissions.canRespondStepIds).toContain(stepId);
+    // …and nothing else: every other action on the record runs through the
+    // standard gate, so the page must not offer Submit/Close/Edit/Resubmit.
+    expect(detail.json().permissions.canManage).toBe(false);
+    expect((await inject("GET", api(`/submittals/${id}`), H(pm))).json().permissions.canManage).toBe(true);
+    const gated = await inject("POST", api(`/submittals/${id}/steps/${stepId}/respond`), H(engineer), { responseCode: "approved" });
+    expect(gated.statusCode).toBe(403);
+    expect((await inject("POST", api(`/submittals/${id}/close`), H(engineer))).statusCode).toBe(403);
+    const ok = await inject("POST", `/api/v1/submittal-steps/${stepId}/respond`, H(engineer), { responseCode: "approved" });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json().submittalStatus).toBe("responded");
   });
 
   it("keeps a pure for_record chain as for_record and resubmits exactly once, superseding the parent", async () => {
@@ -620,11 +679,48 @@ describe("Daily logs", () => {
     expect(again.json().signalsRaised).toBe(0);
   });
 
+  it("refuses an over-long reporting window instead of silently truncating it", async () => {
+    // The old guard counted business days returned by a helper that stopped
+    // after 400 CALENDAR steps, so it could never fire and a multi-year
+    // request came back covering only the first ~13 months.
+    const wide = await inject("GET", api("/daily-logs/missing?from=2020-01-01&to=2026-01-01"), H(engineer));
+    expect(wide.statusCode).toBe(400);
+    expect(wide.json().message).toContain("Range too large");
+    const wideCompliance = await inject("GET", api("/daily-logs/compliance?from=2020-01-01&to=2026-01-01"), H(engineer));
+    expect(wideCompliance.statusCode).toBe(400);
+    // A window inside the bound still answers, and covers its whole span.
+    const ok = await inject("GET", api(`/daily-logs/missing?from=${addDaysISO(todayISO(), -300)}&to=${todayISO()}`), H(engineer));
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json().days[ok.json().days.length - 1] <= todayISO()).toBe(true);
+    expect(ok.json().days.length).toBeGreaterThan(200);
+  });
+
   it("captures weather honestly: disabled in tests, so it reports the reason", async () => {
     const res = await inject("POST", api(`/daily-logs/2026-08-13/weather`), H(engineer));
     expect(res.statusCode).toBe(200);
     expect(res.json().captured).toBe(false);
     expect(res.json().reason).toContain("disabled");
+  });
+
+  it("keeps a subcontractor self-reported log attached to its vendor (#396)", async () => {
+    const vendorId = (await built.app.db.select().from(vendors).where(eq(vendors.companyId, owner.companyId)).limit(1))[0]!.id;
+    const day = "2026-08-17"; // a Monday
+    const created = await inject("PUT", api(`/daily-logs/${day}`), H(sub), { logKind: "subcontractor", vendorId, notes: "Second fix, L2" });
+    expect(created.statusCode).toBe(201);
+    expect(created.json().vendorId).toBe(vendorId);
+    // Clearing the vendor on its own must be refused: the rule is about the
+    // EFFECTIVE kind of the stored row, not about the fields this one request
+    // happens to carry. A vendorless subcontractor log would otherwise reach
+    // the compliance grouping and the timecard reconciliation, both keyed on
+    // the vendor.
+    const stripped = await inject("PUT", api(`/daily-logs/${day}`), H(sub), { vendorId: null });
+    expect(stripped.statusCode).toBe(400);
+    expect(stripped.json().message).toContain("vendor");
+    expect((await inject("GET", api(`/daily-logs/${day}`), H(sub))).json().log.vendorId).toBe(vendorId);
+    // Turning it back into an internal log may clear the vendor in one step.
+    const internal = await inject("PUT", api(`/daily-logs/${day}`), H(sub), { logKind: "internal", vendorId: null });
+    expect(internal.statusCode).toBe(200);
+    expect(internal.json().vendorId).toBeNull();
   });
 });
 
@@ -670,6 +766,22 @@ describe("Field settings, escalations, integrity and health", () => {
     expect(list.json().byLevel["3"]).toBeGreaterThanOrEqual(1);
     const denied = await inject("POST", api("/field/escalations/run"), H(engineer));
     expect(denied.statusCode).toBe(403);
+  });
+
+  it("reports canEdit/canRun from the tool gate rather than from company-admin", async () => {
+    // A project_manager holds rfis:admin without being a company admin. The
+    // workspace drives the settings form and the "run the ladder now" button
+    // from these flags, so a flag that disagrees with the write gate either
+    // hides a capability the caller has or offers one that 403s.
+    const pmSettings = await inject("GET", api("/field/settings"), H(pm));
+    expect(pmSettings.json().permissions.canEdit).toBe(true);
+    const engineerSettings = await inject("GET", api("/field/settings"), H(engineer));
+    expect(engineerSettings.json().permissions.canEdit).toBe(false);
+    expect((await inject("GET", api("/field/escalations"), H(pm))).json().permissions.canRun).toBe(true);
+    expect((await inject("GET", api("/field/escalations"), H(engineer))).json().permissions.canRun).toBe(false);
+    // The flags match what the write routes actually do.
+    expect((await inject("PUT", api("/field/settings"), H(pm), { escalation: { stepDays: 3 } })).statusCode).toBe(200);
+    expect((await inject("PUT", api("/field/settings"), H(engineer), { escalation: { stepDays: 3 } })).statusCode).toBe(403);
   });
 
   it("flags an RFI answered by its own author through the ledger hook", async () => {

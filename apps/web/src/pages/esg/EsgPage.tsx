@@ -16,6 +16,8 @@ import { useParams, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api";
 import { PageHeader } from "../../ui";
 import CarbonTab from "./CarbonTab";
+import DisclosureTab from "./DisclosureTab";
+import EnvironmentTab from "./EnvironmentTab";
 import FactorsTab from "./FactorsTab";
 import SocialValueTab from "./SocialValueTab";
 import WasteTab from "./WasteTab";
@@ -23,8 +25,10 @@ import { TabBar, type FactorRow, type ListResponse } from "./esgShared";
 
 const TABS = [
   { key: "carbon", label: "Carbon" },
+  { key: "environment", label: "Environment" },
   { key: "waste", label: "Waste" },
   { key: "social", label: "Social value" },
+  { key: "disclosure", label: "Options & disclosure" },
   { key: "factors", label: "Factors" },
 ];
 
@@ -65,7 +69,7 @@ export default function EsgPage() {
     <div>
       <PageHeader
         title="ESG & Carbon"
-        subtitle="Whole-life carbon to EN 15978, waste diversion, and social value reconciled tender promise against delivery"
+        subtitle="Whole-life carbon to EN 15978, consent-limit monitoring and environmental incidents, biodiversity net gain, waste diversion, social value reconciled tender promise against delivery, and CSRD / IFRS S2 / TCFD disclosure"
       />
 
       <TabBar tabs={TABS} active={tab} onSelect={selectTab} />
@@ -77,7 +81,9 @@ export default function EsgPage() {
           onFactorsNeeded={() => void loadFactors()}
         />
       ) : null}
+      {tab === "environment" ? <EnvironmentTab projectId={projectId} /> : null}
       {tab === "waste" ? <WasteTab projectId={projectId} /> : null}
+      {tab === "disclosure" ? <DisclosureTab projectId={projectId} /> : null}
       {tab === "social" ? <SocialValueTab projectId={projectId} /> : null}
       {tab === "factors" ? (
         <FactorsTab factors={factors} error={factorError} onReload={loadFactors} />

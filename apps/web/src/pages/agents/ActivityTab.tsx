@@ -381,6 +381,38 @@ function ActionsPanel({ onChanged }: { onChanged: () => void }) {
   const [selected, setSelected] = useState<AgentAction | null>(null);
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
+  // The before/after image IS the record content the agent moved, so the list
+  // no longer carries it: it comes from GET /agents/actions/:id, behind the
+  // gate of the tool that owns the target.
+  const [detail, setDetail] = useState<AgentAction | null>(null);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+
+  useEffect(() => {
+    if (!selected) {
+      setDetail(null);
+      setDetailError(null);
+      return;
+    }
+    let live = true;
+    setDetailLoading(true);
+    setDetailError(null);
+    setDetail(null);
+    api
+      .get<{ action: AgentAction }>(`/api/v1/agents/actions/${selected.id}`)
+      .then((res) => {
+        if (live) setDetail(res.action);
+      })
+      .catch((err: unknown) => {
+        if (live) setDetailError(errorMessage(err, "The before/after image is not available to you"));
+      })
+      .finally(() => {
+        if (live) setDetailLoading(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [selected]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -513,20 +545,34 @@ function ActionsPanel({ onChanged }: { onChanged: () => void }) {
             <Card>
               <CardBody>
                 <div className="mb-1 text-sm font-semibold text-ink-900">Before / after</div>
-                <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
-                  <div>
-                    <div className="text-xs text-ink-400">Before</div>
-                    <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded bg-ink-50 p-2 text-[11px]">
-                      {JSON.stringify(selected.beforeImage, null, 2) ?? "null"}
-                    </pre>
+                {detailLoading ? (
+                  <Spinner size="sm" inline label="Loading the recorded images…" />
+                ) : detailError ? (
+                  <Alert tone="warning" title="Before/after image not shown">
+                    {detailError}
+                  </Alert>
+                ) : detail ? (
+                  <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+                    <div>
+                      <div className="text-xs text-ink-400">Before</div>
+                      <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded bg-ink-50 p-2 text-[11px]">
+                        {detail.beforeImage === null || detail.beforeImage === undefined
+                          ? "— nothing was recorded before this change"
+                          : JSON.stringify(detail.beforeImage, null, 2)}
+                      </pre>
+                    </div>
+                    <div>
+                      <div className="text-xs text-ink-400">After</div>
+                      <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded bg-ink-50 p-2 text-[11px]">
+                        {detail.afterImage === null || detail.afterImage === undefined
+                          ? "— no after-image was recorded"
+                          : JSON.stringify(detail.afterImage, null, 2)}
+                      </pre>
+                    </div>
                   </div>
-                  <div>
-                    <div className="text-xs text-ink-400">After</div>
-                    <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded bg-ink-50 p-2 text-[11px]">
-                      {JSON.stringify(selected.afterImage, null, 2) ?? "null"}
-                    </pre>
-                  </div>
-                </div>
+                ) : (
+                  <div className="text-xs text-ink-400">—</div>
+                )}
               </CardBody>
             </Card>
 

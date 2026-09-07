@@ -25,7 +25,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { Alert, Badge, Button, EmptyState, Field, Modal, Textarea } from "../../ui";
+import { Alert, Badge, Button, EmptyState, Field, Input, Modal, Select, Textarea } from "../../ui";
 import { formatCurrency, formatNumber } from "../../ui/data";
 import { cx } from "../../ui/cx";
 import { IconQuality, IconRefresh } from "../../ui/icons";
@@ -1119,4 +1119,223 @@ export function useNonce(): [number, () => void] {
 /** Shared memo helper: index a list by id. */
 export function useIndex<T extends { id: string }>(rows: readonly T[] | undefined): Map<string, T> {
   return useMemo(() => new Map((rows ?? []).map((r) => [r.id, r] as const)), [rows]);
+}
+
+/* ================================================================== */
+/* Correcting a record that is already in the register                 */
+/* ================================================================== */
+
+/**
+ * A REGISTER YOU CANNOT CORRECT IS A REGISTER PEOPLE KEEP OUTSIDE THE SYSTEM.
+ *
+ * Every Domain Z register is written from site under time pressure: a heat
+ * number transposed, a thickness in the wrong unit, a welder's stamp typed
+ * from memory. The API exposes a PATCH on each of them with an explicit
+ * column allowlist — execution columns (status, results, signatures) are NOT
+ * in it, because those have their own transition routes and their own
+ * segregation. This modal is the UI for exactly that allowlist: the
+ * descriptive facts, and nothing that would let an approval or a result be
+ * moved by editing.
+ *
+ * It sends only the fields the user actually changed, so an edit of one field
+ * never rewrites another with a stale value read when the drawer opened.
+ */
+export type EditFieldSpec = {
+  key: string;
+  label: string;
+  /**
+   * `list` is a comma-separated text box that sends a string[]; `boolean` is a
+   * three-state select, because "not recorded" and "no" are different answers
+   * and a checkbox cannot say the first.
+   */
+  kind: "text" | "textarea" | "date" | "number" | "integer" | "select" | "list" | "boolean";
+  hint?: string;
+  placeholder?: string;
+  /** For `select`; the empty option is offered when the column is nullable. */
+  options?: readonly { value: string; label: string }[];
+  /** Send `null` rather than omitting when cleared. Default true. */
+  nullable?: boolean;
+  /** Half-width in the two-column grid by default; set to true to span. */
+  wide?: boolean;
+};
+
+function editInitialValue(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (Array.isArray(value)) return value.map((v) => String(v)).join(", ");
+  return String(value);
+}
+
+export function EditModal({
+  open,
+  onClose,
+  title,
+  description,
+  url,
+  fields,
+  record,
+  onSaved,
+}: {
+  open: boolean;
+  onClose: () => void;
+  title: string;
+  description?: string;
+  /** The PATCH url of the record. */
+  url: string;
+  fields: readonly EditFieldSpec[];
+  /** The record as the API returned it; used for the initial values. */
+  record: Record<string, unknown> | null | undefined;
+  onSaved: () => void;
+}) {
+  const { busy, refusal, clear, run } = useAction();
+  /*
+   * The seed is keyed on the VALUES, not on the object identity. Several
+   * callers build the record on the fly (a row looked up in a list, a
+   * 0/1 column mapped to a boolean), so a parent re-render — a sibling
+   * button going busy, a register reloading — hands this component a fresh
+   * object with identical contents. Re-seeding on identity would wipe what
+   * the user had typed halfway through an edit; re-seeding on the values
+   * re-seeds only when the record really changed underneath them.
+   */
+  const seed = fields.map((f) => `${f.key}=${editInitialValue(record?.[f.key])}`).join("\u0001");
+  const initial = useMemo(() => {
+    const out: Record<string, string> = {};
+    for (const f of fields) out[f.key] = editInitialValue(record?.[f.key]);
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seed]);
+  const [draft, setDraft] = useState<Record<string, string>>(initial);
+
+  // Re-seed whenever the record's own values change (a different row, or a
+  // reload after a transition). The draft is a copy, never a live view.
+  useEffect(() => {
+    setDraft(initial);
+  }, [initial]);
+
+  const changed = fields.filter((f) => (draft[f.key] ?? "") !== (initial[f.key] ?? ""));
+
+  async function save() {
+    const body: Record<string, unknown> = {};
+    for (const f of changed) {
+      const raw = (draft[f.key] ?? "").trim();
+      if (raw === "") {
+        // A boolean column is rarely nullable in the API's schema, so an
+        // unanswered three-state select is left alone rather than sent as null
+        // unless the field says it may be cleared.
+        if (f.nullable === false || (f.kind === "boolean" && f.nullable !== true)) continue;
+        body[f.key] = f.kind === "list" ? [] : null;
+        continue;
+      }
+      if (f.kind === "number") {
+        const n = Number(raw);
+        if (!Number.isFinite(n)) continue;
+        body[f.key] = n;
+      } else if (f.kind === "integer") {
+        const n = Number(raw);
+        if (!Number.isFinite(n)) continue;
+        body[f.key] = Math.round(n);
+      } else if (f.kind === "list") {
+        body[f.key] = raw
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s !== "");
+      } else if (f.kind === "boolean") {
+        body[f.key] = raw === "true";
+      } else {
+        body[f.key] = raw;
+      }
+    }
+    if (Object.keys(body).length === 0) {
+      onClose();
+      return;
+    }
+    const done = await run("save", () => api.patch(url, body));
+    if (done) {
+      onSaved();
+      onClose();
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={title}
+      description={
+        description ??
+        "Descriptive facts only. Results, approvals and signatures are not editable here — they have their own routes, and their own record of who signed what."
+      }
+      footer={
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-2xs text-content-subtle">
+            {changed.length === 0
+              ? "Nothing changed yet."
+              : `${changed.length} ${plural(changed.length, "field")} will be sent.`}
+          </span>
+          <div className="flex gap-2">
+            <Button variant="ghost" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              loading={busy === "save"}
+              disabled={changed.length === 0}
+              onClick={save}
+            >
+              Save the correction
+            </Button>
+          </div>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        <RefusalNotice refusal={refusal} onDismiss={clear} />
+        <div className="grid gap-3 sm:grid-cols-2">
+          {fields.map((f) => (
+            <Field
+              key={f.key}
+              label={f.label}
+              hint={f.hint}
+              className={f.wide || f.kind === "textarea" ? "sm:col-span-2" : undefined}
+            >
+              {f.kind === "boolean" ? (
+                <Select
+                  value={draft[f.key] ?? ""}
+                  onChange={(e) => setDraft((d) => ({ ...d, [f.key]: e.target.value }))}
+                >
+                  <option value="">{EM_DASH} not recorded</option>
+                  <option value="true">Yes</option>
+                  <option value="false">No</option>
+                </Select>
+              ) : f.kind === "select" ? (
+                <Select
+                  value={draft[f.key] ?? ""}
+                  onChange={(e) => setDraft((d) => ({ ...d, [f.key]: e.target.value }))}
+                >
+                  <option value="">{EM_DASH} not recorded</option>
+                  {(f.options ?? []).map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </Select>
+              ) : f.kind === "textarea" ? (
+                <Textarea
+                  rows={3}
+                  value={draft[f.key] ?? ""}
+                  onChange={(e) => setDraft((d) => ({ ...d, [f.key]: e.target.value }))}
+                />
+              ) : (
+                <Input
+                  type={f.kind === "date" ? "date" : f.kind === "number" || f.kind === "integer" ? "number" : "text"}
+                  value={draft[f.key] ?? ""}
+                  placeholder={f.placeholder}
+                  onChange={(e) => setDraft((d) => ({ ...d, [f.key]: e.target.value }))}
+                />
+              )}
+            </Field>
+          ))}
+        </div>
+      </div>
+    </Modal>
+  );
 }

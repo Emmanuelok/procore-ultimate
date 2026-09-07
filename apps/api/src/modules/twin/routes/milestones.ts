@@ -280,7 +280,17 @@ export const milestoneRoutes: FastifyPluginAsync = async (app) => {
         }
         if (body.status === "delivered") {
           const { verdicts, satisfied } = await evaluateContainers(existing);
-          if (verdicts.length > 0 && !satisfied) {
+          // One rule, stated in one place, and /evaluate reports the same
+          // verdict: "delivered" is an assertion about information that
+          // exists, so a milestone with nothing attached cannot assert it.
+          // Previously an empty container set slipped through here while
+          // /evaluate said canDeliver=false about the same record.
+          if (verdicts.length === 0) {
+            throw conflict(
+              "Attach at least one information container before marking this milestone delivered — delivery is an assertion about information that exists",
+            );
+          }
+          if (!satisfied) {
             throw conflict(
               `Not every required container is in place: ${verdicts
                 .filter((v) => !v.satisfied)

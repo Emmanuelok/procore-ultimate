@@ -241,6 +241,29 @@ describe("files: multi-upload, metadata search, copy, preview, references, recyc
     expect((await get(`/api/v1/projects/${projectId}/files?contentType=text/csv`, owner.headers)).json().total).toBe(1);
   });
 
+  /**
+   * `updatedAfter`/`updatedBefore`/`since` are bound straight against
+   * `timestamptz`, so an unparseable string used to reach the driver and come
+   * back as a 500 with the raw query in the body. They are validated now.
+   */
+  it("REGRESSION: an unparseable date filter is a 400, not a driver 500", async () => {
+    const future = new Date(Date.now() + 86_400_000).toISOString();
+    const past = new Date(Date.now() - 86_400_000).toISOString();
+    expect((await get(`/api/v1/projects/${projectId}/files?updatedAfter=${past}`, owner.headers)).json().total).toBeGreaterThan(0);
+    expect((await get(`/api/v1/projects/${projectId}/files?updatedAfter=${future}`, owner.headers)).json().total).toBe(0);
+    expect((await get(`/api/v1/projects/${projectId}/files?updatedBefore=${past}`, owner.headers)).json().total).toBe(0);
+    for (const url of [
+      `/api/v1/projects/${projectId}/files?updatedAfter=notadate`,
+      `/api/v1/projects/${projectId}/files?updatedBefore=2026-13-45`,
+      `/api/v1/projects/${projectId}/files/access-report?since=notadate`,
+    ]) {
+      const res = await get(url, owner.headers);
+      expect(res.statusCode).toBe(400);
+      expect(res.body).not.toMatch(/Failed query/i);
+    }
+    expect((await get(`/api/v1/projects/${projectId}/files/access-report?since=${past}`, owner.headers)).statusCode).toBe(200);
+  });
+
   it("copies a file over the same bytes and previews inline where it can", async () => {
     const copy = await post(`/api/v1/files/${fileId}/copy`, owner.headers, {});
     expect(copy.statusCode).toBe(201);
@@ -286,6 +309,19 @@ describe("files: multi-upload, metadata search, copy, preview, references, recyc
     expect(refused.statusCode).toBe(409);
     expect(refused.json().message).toMatch(/drawing set/);
     expect((await patch(`/api/v1/files/${sourceFileId}`, owner.headers, { folderId })).statusCode).toBe(400);
+    // REGRESSION: a new version would swap the bytes every drawing revision
+    // resolves through this file id — refused exactly where DELETE is.
+    const swapped = await built.app.inject({
+      method: "POST",
+      url: `/api/v1/files/${sourceFileId}/versions`,
+      payload: multipart([{ buffer: Buffer.from("%PDF-1.4 other\n%%EOF"), filename: "other.pdf", contentType: "application/pdf" }]),
+      headers: mp(owner.headers),
+    });
+    expect(swapped.statusCode).toBe(409);
+    expect(swapped.json().message).toMatch(/drawing set|drawing revision/);
+    const untouched = (await get(`/api/v1/files/${sourceFileId}`, owner.headers)).json();
+    expect(untouched.version).toBe(1);
+    expect(untouched.name).toBe("set.pdf");
   });
 
   it("soft-deletes into a recycle bin admins can read and restore from", async () => {
@@ -341,6 +377,71 @@ describe("files: multi-upload, metadata search, copy, preview, references, recyc
     const download = await get(`/api/v1/files/${htmlId}/download`, owner.headers);
     expect(download.headers["content-disposition"]).toMatch(/^attachment/);
     expect(download.headers["x-content-type-options"]).toBe("nosniff");
+  });
+
+  /**
+   * `metadata.kind` is pipeline ownership: it hides a file from the documents
+   * list, disables its delete action and refuses a move. A client that could
+   * write it could hide any file from everyone, or free a set/book source.
+   */
+  it("REGRESSION: a standard user cannot write metadata.kind to hide or free a file", async () => {
+    const kindFolder = await mkFolder("Kind");
+    const ordinary = await upload(kindFolder, "ordinary.txt", "hello");
+    const pm = await addMember("project_manager"); // documents: standard
+
+    const hide = await patch(`/api/v1/files/${ordinary}`, pm.headers, {
+      metadata: { kind: "drawing_set", note: "kept" },
+    });
+    expect(hide.statusCode).toBe(200);
+    expect(hide.json().ignoredMetadataKeys).toEqual(["kind"]);
+    expect(hide.json().metadata).toEqual({ note: "kept" });
+    const listed = (await get(`/api/v1/projects/${projectId}/files?folderId=${kindFolder}`, owner.headers)).json();
+    expect(listed.items.some((f: { id: string }) => f.id === ordinary)).toBe(true);
+
+    // ...and the flag cannot be cleared off a file the pipeline does own.
+    const pipelineId = newId("fil");
+    await built.app.db.insert(files).values({
+      id: pipelineId,
+      companyId: owner.companyId,
+      projectId,
+      folderId: null,
+      name: "pipeline-set.pdf",
+      contentType: "application/pdf",
+      sizeBytes: 4,
+      sha256: "a".repeat(64),
+      storageKey: "sk-pipeline",
+      metadata: { kind: "drawing_set" },
+      uploadedBy: owner.userId,
+    });
+    const free = await patch(`/api/v1/files/${pipelineId}`, owner.headers, { metadata: { kind: null } });
+    expect(free.statusCode).toBe(200);
+    const [row] = await built.app.db.select().from(files).where(eq(files.id, pipelineId));
+    expect((row!.metadata as { kind?: string }).kind).toBe("drawing_set");
+    expect((await patch(`/api/v1/files/${pipelineId}`, owner.headers, { folderId: kindFolder })).statusCode).toBe(400);
+  });
+
+  /**
+   * The emptiness check only counts live files, and there is no purge: a
+   * folder whose remaining contents are all in the recycle bin used to be
+   * deleted out from under them, stranding restorable files under a folder id
+   * that no longer existed.
+   */
+  it("REGRESSION: deleting a folder keeps its recycle-bin files reachable", async () => {
+    const parent = await mkFolder("Archive");
+    const child = await mkFolder("Old drawings", parent);
+    const doomed = await upload(child, "old.txt", "old");
+    expect((await del(`/api/v1/files/${doomed}`, owner.headers)).statusCode).toBe(200);
+
+    const removed = await del(`/api/v1/projects/${projectId}/folders/${child}`, owner.headers);
+    expect(removed.statusCode).toBe(200);
+    expect(removed.json()).toMatchObject({ recycleBinFilesMoved: 1, movedToFolderId: parent });
+
+    const bin = (await get(`/api/v1/projects/${projectId}/files?deleted=1`, owner.headers)).json();
+    expect(bin.items.find((f: { id: string }) => f.id === doomed).folderId).toBe(parent);
+    expect((await post(`/api/v1/files/${doomed}/restore`, owner.headers)).statusCode).toBe(200);
+    expect((await get(`/api/v1/files/${doomed}`, owner.headers)).json().folderPath).toBe("/Archive");
+    const inParent = (await get(`/api/v1/projects/${projectId}/files?folderId=${parent}`, owner.headers)).json();
+    expect(inParent.items.some((f: { id: string }) => f.id === doomed)).toBe(true);
   });
 });
 

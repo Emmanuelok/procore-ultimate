@@ -108,7 +108,7 @@ beforeAll(async () => {
     storageKey: "test/b",
     uploadedBy: owner.userId,
   });
-});
+}, 600_000);
 
 afterAll(async () => {
   await built.close();
@@ -494,6 +494,7 @@ describe("hearing bundles (#343-344)", () => {
     expect(csv.statusCode).toBe(200);
     expect(csv.headers["content-type"]).toContain("text/csv");
     const lines = csv.body.trim().split("\n");
+    // Items are addressed by tab, not by a page number the platform cannot know.
     expect(lines[0]).toBe("tab,title,date,source,sha256");
     expect(lines).toHaveLength(4);
     expect(lines[1]).toContain("A1");

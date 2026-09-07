@@ -99,6 +99,85 @@ export function computeValuationTotals(input: ValuationTotalsInput): ValuationTo
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* Certification                                                       */
+/* ------------------------------------------------------------------ */
+
+export interface CertificateInput {
+  /** the application's recomputed position (the same totals the draft shows) */
+  totals: ValuationTotals;
+  /** what the certifier is willing to certify; omitted = the applied figure */
+  certifiedWorkDone?: number | null;
+  certifiedMaterials?: number | null;
+  certifiedSections?: number | null;
+  retentionPercent: number;
+  retentionCap: number | null;
+}
+
+export interface CertificateResult {
+  certifiedWorkDone: number;
+  certifiedMaterials: number;
+  certifiedSections: number;
+  certifiedGross: number;
+  /** sections outside the retention base (contra charges and the like) */
+  nonRetainableSections: number;
+  certifiedRetentionBase: number;
+  retentionHeld: number;
+  retentionCapped: boolean;
+  retentionReleased: number;
+  previousCertified: number;
+  netCertified: number;
+  varianceFromApplication: number;
+}
+
+/**
+ * The certificate build-up — the ONE place this arithmetic lives.
+ *
+ * The certifier may cut any of the three certified components; retention is
+ * then taken on the certified gross LESS the sections that are outside the
+ * retention base, capped by the contract's retention cap and reduced by
+ * anything already released. Cuts are treated as cuts to RETAINABLE value,
+ * which never retains against a deduction.
+ *
+ * The web certify dialog calls the same function through
+ * GET /valuations/:id/certify-preview, so what the certifier is shown before
+ * pressing "Issue certificate" is what the certificate says afterwards.
+ */
+export function computeCertificate(input: CertificateInput): CertificateResult {
+  const t = input.totals;
+  const certifiedWorkDone = round2(input.certifiedWorkDone ?? t.workDoneToDate);
+  const certifiedMaterials = round2(
+    input.certifiedMaterials ?? t.materialsOnSite + t.materialsOffSite,
+  );
+  const certifiedSections = round2(input.certifiedSections ?? t.sectionsTotal);
+  const certifiedGross = round2(certifiedWorkDone + certifiedMaterials + certifiedSections);
+  const nonRetainableSections = round2(t.grossTotal - t.retentionBase);
+  const certifiedRetentionBase = round2(certifiedGross - nonRetainableSections);
+  const rawRetention = round2(
+    (input.retentionPercent / 100) * Math.max(0, certifiedRetentionBase),
+  );
+  const cap = input.retentionCap;
+  const retentionCapped = cap != null && rawRetention > cap;
+  const cappedRetention = retentionCapped ? round2(cap) : rawRetention;
+  const retentionHeld = round2(Math.max(0, cappedRetention - t.retentionReleased));
+  const previousCertified = t.previousNet;
+  const netCertified = round2(certifiedGross - retentionHeld - previousCertified);
+  return {
+    certifiedWorkDone,
+    certifiedMaterials,
+    certifiedSections,
+    certifiedGross,
+    nonRetainableSections,
+    certifiedRetentionBase,
+    retentionHeld,
+    retentionCapped,
+    retentionReleased: t.retentionReleased,
+    previousCertified,
+    netCertified,
+    varianceFromApplication: round2(netCertified - t.netDue),
+  };
+}
+
 /**
  * Statutory / contractual payment due date.
  *

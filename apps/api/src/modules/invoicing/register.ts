@@ -1,4 +1,4 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import {
   budgetLineItems,
   budgets,
@@ -355,5 +355,3 @@ export async function reconcileInvoicesFor(db: Db, paymentIds: readonly string[]
 export function payableOf(inv: { detail: unknown; currentPaymentDue: number; amountPaid: number }): number {
   return round2(certifiedOf(inv) - inv.amountPaid);
 }
-
-export const _internal = { and };
